@@ -28,6 +28,18 @@ class SmpSettings(ctypes.Structure):
                 ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int)]
 
 
+class SmpSfMod(ctypes.Structure):
+    _fields_ = [("src", ctypes.c_uint16), ("dest", ctypes.c_uint16), ("amount", ctypes.c_int16),
+                ("amt_src", ctypes.c_uint16), ("trans", ctypes.c_uint16)]
+
+
+class SmpSfSample(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char * 21), ("start", ctypes.c_uint32), ("end", ctypes.c_uint32),
+                ("loop_start", ctypes.c_uint32), ("loop_end", ctypes.c_uint32), ("rate", ctypes.c_uint32),
+                ("pitch", ctypes.c_uint8), ("correction", ctypes.c_int8), ("link", ctypes.c_uint16),
+                ("type", ctypes.c_uint16)]
+
+
 def write_wav(path, data, rate):
     """Write a float32 wav (mono or frames x channels)."""
     sf.write(str(path), data, rate, subtype="FLOAT")
@@ -124,4 +136,19 @@ def lib(settings_file):
     dll.smp_engine_collect.argtypes = [vp]
     dll.smp_engine_render_test.restype = c_int
     dll.smp_engine_render_test.argtypes = [vp, c_char_p, c_long, c_int, c_char_p]
+    ip = ctypes.POINTER(c_int)
+    dll.smp_sf_open.restype = vp
+    dll.smp_sf_open.argtypes = [c_char_p, c_char_p, c_int]
+    dll.smp_sf_close.restype = None
+    dll.smp_sf_close.argtypes = [vp]
+    dll.smp_sf_preset_count.restype = c_int
+    dll.smp_sf_preset_count.argtypes = [vp]
+    dll.smp_sf_preset_info.restype = c_int
+    dll.smp_sf_preset_info.argtypes = [vp, c_int, ip, ip, c_char_p, c_int]
+    dll.smp_sf_find_preset.restype = c_int
+    dll.smp_sf_find_preset.argtypes = [vp, c_int, c_int]
+    dll.smp_sf_sample_count.restype = c_int
+    dll.smp_sf_sample_count.argtypes = [vp]
+    dll.smp_sf_sample.restype = ctypes.POINTER(SmpSfSample)
+    dll.smp_sf_sample.argtypes = [vp, c_int]
     return dll

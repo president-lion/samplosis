@@ -122,6 +122,29 @@ SMP_API int smp_engine_render_test(SmpEngine *e, const char *events, long frames
 SMP_API int smp_script_write(const SmpEngine *e, char *out, int cap);   /* returns the length needed, like snprintf */
 SMP_API int smp_script_apply(SmpEngine *e, const char *text, char *err, int cap); /* 0 ok; on error nothing changes and
                                     err says "line N: ..." */
+
+/* SoundFonts (sf2.c). Generator ids are the SF2.04 numbers, 0 startAddrsOffset to 58 overridingRootKey. */
+#define SMP_SF_NGEN 60
+typedef struct { uint16_t src, dest; int16_t amount; uint16_t amt_src, trans; } SmpSfMod;  /* as in pmod/imod */
+typedef struct {
+  char name[21]; uint32_t start, end, loop_start, loop_end;   /* SF2: sample frames into smpl; SF3: see Task 3 */
+  uint32_t rate; uint8_t pitch; int8_t correction; uint16_t link, type;
+} SmpSfSample;
+typedef struct {
+  uint8_t lokey, hikey, lovel, hivel; int sample;            /* index into the font's samples */
+  int16_t gen[SMP_SF_NGEN];
+  const SmpSfMod *imod; int nimod;   /* instrument level, the 10 default modulators merged in (identical ones replaced) */
+  const SmpSfMod *pmod; int npmod;   /* preset level, added on top */
+} SmpSfRegion;
+typedef struct SmpFont SmpFont;
+SMP_API SmpFont *smp_sf_open(const char *path, char *err, int cap);  /* headers only; NULL and a plain reason */
+SMP_API void smp_sf_close(SmpFont *f);
+SMP_API int smp_sf_preset_count(const SmpFont *f);
+SMP_API int smp_sf_preset_info(const SmpFont *f, int i, int *bank, int *program, char *name, int cap); /* sorted by
+                                    bank, then program; 1 ok, 0 when i is out of range. Any pointer may be NULL */
+SMP_API int smp_sf_find_preset(const SmpFont *f, int bank, int program);   /* exact; -1 if none */
+SMP_API int smp_sf_sample_count(const SmpFont *f);
+SMP_API const SmpSfSample *smp_sf_sample(const SmpFont *f, int i);         /* NULL when i is out of range */
 #ifdef __cplusplus
 }
 #endif
