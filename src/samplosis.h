@@ -46,14 +46,16 @@ SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */
 typedef struct SmpEntry SmpEntry;
 SMP_API uint64_t smp_key(const char *desc);           /* 64-bit FNV-1a */
 SMP_API int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate); /* 0 ok; .part then rename */
-SMP_API SmpEntry *smp_cache_open(uint64_t key);       /* NULL if missing; touches last-write time */
+SMP_API SmpEntry *smp_cache_open(uint64_t key);       /* NULL if missing; touches last-write time; held whole up to 1 s */
+SMP_API SmpEntry *smp_cache_open_copy(uint64_t key);  /* the same for keep-length copies: held whole only up to 0.25 s */
 SMP_API void smp_cache_close(SmpEntry *e);
 SMP_API uint64_t smp_entry_frames(const SmpEntry *e);
 SMP_API int smp_entry_rate(const SmpEntry *e);
 SMP_API int smp_entry_whole(const SmpEntry *e);       /* 1 when the head holds the whole file */
 SMP_API const float *smp_entry_head(const SmpEntry *e, uint64_t *head_frames); /* immutable after open */
 SMP_API long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames); /* streamer thread only */
-SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files; returns bytes left */
+SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files and .part files over an hour old;
+                                                         returns bytes left */
 SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */
 SMP_API uint64_t smp_cache_used_bytes(void);         /* the .smpc files' total size (scans the folder) */
 

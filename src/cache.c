@@ -99,7 +99,8 @@ static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
   return ReadFile(h, buf, n, got, &o) != 0;
 }
 
-SmpEntry *smp_cache_open(uint64_t key) {
+/* whole_div: the entry is held whole when it is at most rate / whole_div frames long */
+static SmpEntry *open_entry(uint64_t key, int whole_div) {
   wchar_t fn[1200];
   if (!file_w(key, L".smpc", fn, 1200)) return NULL;
   HANDLE h = CreateFileW(fn, GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -114,7 +115,7 @@ SmpEntry *smp_cache_open(uint64_t key) {
   if (!e) { CloseHandle(h); return NULL; }
   e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate;
   uint64_t hf = (uint64_t)rate / 4;
-  if (frames <= (uint64_t)rate) { hf = frames; e->whole = 1; }
+  if (frames <= (uint64_t)rate / (uint64_t)whole_div) { hf = frames; e->whole = 1; }
   else if (hf > frames) hf = frames;
   e->head_frames = hf;
   e->head = malloc((size_t)(hf ? hf * 8 : 8));
@@ -129,6 +130,9 @@ SmpEntry *smp_cache_open(uint64_t key) {
   LeaveCriticalSection(&cs);
   return e;
 }
+
+SmpEntry *smp_cache_open(uint64_t key) { return open_entry(key, 1); }       /* imported files: whole up to 1 s */
+SmpEntry *smp_cache_open_copy(uint64_t key) { return open_entry(key, 4); }  /* keep-length copies: whole up to 0.25 s */
 
 void smp_cache_close(SmpEntry *e) {
   if (!e) return;
@@ -160,9 +164,30 @@ static int by_time(const void *a, const void *b) {
   return x->time < y->time ? -1 : x->time > y->time;
 }
 
+/* .part files left by a crash (a write in progress is never an hour old) */
+static void trim_parts(const wchar_t *dir) {
+  wchar_t pat[1200], fn[1200];
+  WIN32_FIND_DATAW fd;
+  FILETIME now; uint64_t t, hour = 3600ULL * 10000000ULL;
+  HANDLE f;
+  swprintf(pat, 1200, L"%s\\*.part", dir);
+  f = FindFirstFileW(pat, &fd);
+  if (f == INVALID_HANDLE_VALUE) return;
+  GetSystemTimeAsFileTime(&now);
+  t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+  do {
+    uint64_t w = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || w + hour > t) continue;
+    swprintf(fn, 1200, L"%s\\%s", dir, fd.cFileName);
+    DeleteFileW(fn);
+  } while (FindNextFileW(f, &fd));
+  FindClose(f);
+}
+
 uint64_t smp_cache_trim(uint64_t limit) {
   wchar_t dir[1100], pat[1200];
   if (!dir_w(dir, 1100)) return 0;
+  trim_parts(dir);
   swprintf(pat, 1200, L"%s\\*.smpc", dir);
   Item *items = NULL; size_t n = 0, cap = 0;
   uint64_t total = 0, pinned = 0; /* open files are never deleted and do not count against the limit */
@@ -196,11 +221,12 @@ uint64_t smp_cache_trim(uint64_t limit) {
 
 int smp_cache_ok(char *why, int cap) {
   wchar_t dir[1100], probe[1200];
+  static volatile LONG counter;
   SmpSettings s;
   smp_settings_get(&s);
   if (dir_w(dir, 1100)) {
-    make_dirs(dir);
-    swprintf(probe, 1200, L"%s\\.probe", dir);
+    make_dirs(dir);   /* a probe name of its own: instances checking at once never collide */
+    swprintf(probe, 1200, L"%s\\.probe.%lu.%lu.%ld", dir, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
     HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return 1; }
     DWORD a = GetFileAttributesW(dir);

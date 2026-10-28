@@ -140,3 +140,55 @@ def test_rewrite_open_key_and_concurrent_writers(lib, tmp_path):
     [t.join() for t in ts]
     assert res == [0, 0, 0, 0]
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_cache_ok_concurrent(lib, tmp_path):
+    # every instance checks the folder with a probe of its own: none sees another's probe as "can't be written"
+    import threading
+    point_cache(lib, tmp_path)
+    res, go = [], threading.Barrier(8)
+
+    def check():
+        go.wait()
+        for _ in range(50):
+            res.append(lib.smp_cache_ok(None, 0))
+
+    ts = [threading.Thread(target=check) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert res == [1] * 400
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".probe")]
+
+
+def test_trim_deletes_stale_part_files(lib, tmp_path):
+    import time
+    point_cache(lib, tmp_path)
+    old = tmp_path / ("%016x.1.2.3.part" % 7)
+    new = tmp_path / ("%016x.1.2.4.part" % 8)
+    old.write_bytes(b"x" * 100); new.write_bytes(b"x" * 100)
+    t = time.time() - 2 * 3600
+    os.utime(old, (t, t))
+    lib.smp_cache_trim(10 * 1024 ** 3)
+    assert not old.exists()                 # left by a crash: gone
+    assert new.exists()                     # could be a write in progress: kept
+
+
+def test_open_copy_holds_only_quarter_second(lib, tmp_path):
+    lib.smp_cache_open_copy.restype = ctypes.c_void_p
+    lib.smp_cache_open_copy.argtypes = [ctypes.c_uint64]
+    point_cache(lib, tmp_path)
+    k = lib.smp_key(b"copy 1 s")
+    assert write(lib, k, ramp(44100)) == 0
+    n = ctypes.c_uint64()
+    e = lib.smp_cache_open(k)                # an imported file: whole up to 1 s
+    assert lib.smp_entry_whole(e) == 1
+    lib.smp_cache_close(e)
+    e = lib.smp_cache_open_copy(k)           # a keep-length copy: just the head
+    lib.smp_entry_head(e, ctypes.byref(n))
+    assert lib.smp_entry_whole(e) == 0 and n.value == 11025
+    lib.smp_cache_close(e)
+    k2 = lib.smp_key(b"copy 0.2 s")
+    assert write(lib, k2, ramp(8820)) == 0
+    e = lib.smp_cache_open_copy(k2)
+    assert lib.smp_entry_whole(e) == 1
+    lib.smp_cache_close(e)
