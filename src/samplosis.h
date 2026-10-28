@@ -87,6 +87,9 @@ SMP_API void smp_engine_note_on(SmpEngine *e, int key, int vel, int at);  /* at:
 SMP_API void smp_engine_note_off(SmpEngine *e, int key, int at);
 SMP_API void smp_engine_bend(SmpEngine *e, double semis_fraction /* -1..1 */, int at);
 SMP_API void smp_engine_process(SmpEngine *e, float *l, float *r, int n);  /* audio thread */
+SMP_API void smp_engine_reset(SmpEngine *e, int now);   /* audio thread, or while nothing processes: every voice ends
+                                    (now: at once; else a 5 ms fade, done within the next block or two) and bend
+                                    goes back to center */
 SMP_API int smp_engine_active_voices(const SmpEngine *e);       /* sounding voices, not counting stolen ones fading out */
 SMP_API long smp_engine_underruns(const SmpEngine *e);
 SMP_API void smp_engine_seed(SmpEngine *e, unsigned seed);

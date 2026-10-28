@@ -122,7 +122,10 @@ static int apply_text(Plug *P, const char *text) {
   char err[700] = "", line[1200], path[1100];
   if (!P->e) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
   if (!smp_script_apply(P->e, text, err, sizeof err)) {
-    const SmpSample *s = smp_engine_sample(P->e);
+    const SmpSample *s;
+    if (!sample_line(text, line, sizeof line, path, sizeof path)) smp_engine_set_sample(P->e, NULL);   /* an empty
+                                    instrument: script_apply keeps the current sample, a state without one doesn't */
+    s = smp_engine_sample(P->e);
     P->missing = 0;
     keep_text(P, text);
     if (s) snprintf(P->status, sizeof P->status, "Ready: %s", s->name);
@@ -207,13 +210,17 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
     if (t) apply_text(P, t);             /* text the engine wrote (or was given) always reads */
     free(t);
   }
+  else smp_engine_reset(P->e, 1);         /* nothing processes now: voices from before deactivate end at once */
   P->since = 0;
   return true;
 }
 
 static bool p_start(const clap_plugin_t *p) { (void)p; return true; }
 static void p_stop(const clap_plugin_t *p) { (void)p; }
-static void p_reset(const clap_plugin_t *p) { (void)p; }   /* the engine has no voice reset yet; notes end by note-off */
+static void p_reset(const clap_plugin_t *p) {   /* audio thread: every voice ends (a 5 ms fade), bend to center */
+  Plug *P = p->plugin_data;
+  if (P->e) smp_engine_reset(P->e, 0);
+}
 
 /* ---- events ---- */
 static int vel127(double v) { int k = (int)floor(v * 127.0 + 0.5); return k < 0 ? 0 : k > 127 ? 127 : k; }
@@ -270,7 +277,8 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   /* the block runs in pieces between event times, so every event lands on its frame */
   for (i = 0; i < ne; i++) {
     const clap_event_header_t *h = pr->in_events->get(pr->in_events, i);
-    uint32_t t = h->time < pos ? pos : h->time > n ? n : h->time;
+    uint32_t t = h->time >= n ? (n ? n - 1 : 0) : h->time;   /* a time past the block: its last frame */
+    if (t < pos) t = pos;
     if (t > pos) { smp_engine_process(P->e, l + pos, r + pos, (int)(t - pos)); pos = t; }
     event(P, h, 0);
   }
@@ -280,7 +288,7 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   for (i = 2; i < ob->channel_count; i++) memset(ob->data32[i], 0, sizeof(float) * n);
   if (P->collect_left > 0) {
     P->since += n;
-    if (P->since >= (uint32_t)(P->rate / 4)) { P->since = 0; P->host->request_callback(P->host); }
+    if (P->since >= (uint32_t)(P->rate / 4)) { P->since = 0; if (P->host->request_callback) P->host->request_callback(P->host); }
   }
   return CLAP_PROCESS_CONTINUE;
 }
@@ -439,6 +447,10 @@ SMP_API int smp_test_plugin_wait(const clap_plugin_t *p, int timeout_ms) {   /* 
 SMP_API void smp_test_plugin_offline(const clap_plugin_t *p, int on) {   /* note-ons past the head wait for the streamer */
   Plug *P = plug_of(p);
   if (P && P->e) P->e->offline = on;
+}
+SMP_API int smp_test_plugin_voices(const clap_plugin_t *p) {   /* sounding voices */
+  Plug *P = plug_of(p);
+  return P && P->e ? smp_engine_active_voices(P->e) : 0;
 }
 SMP_API void smp_test_plugin_sync(const clap_plugin_t *p) {   /* a whole streamer pass; call between process calls */
   Plug *P = plug_of(p);

@@ -229,3 +229,45 @@ def test_streamed_keep_length_start(P):
     y, d, r = P.play(text, events, 72000)
     assert db(ref) > -40
     assert db(y - ref) - db(ref) < -90
+
+
+def test_state_without_sample_clears_it(P, tmp_path):
+    # an empty preset (no sample line) after one with a sample: silent, "No sample loaded"
+    text = P.script(P.sample())
+    empty = "# Samplosis 0.1.0\nvolume -3.0 dB\n"
+    st2 = P.state_file(empty, "empty.txt")
+    y, d, r = P.play(text, "on 57 100 0\nstate %s 0" % st2, 24000)
+    assert d["status after"] == "No sample loaded"
+    assert np.max(np.abs(y)) == 0
+
+
+def test_reset_kills_hanging_voices(P):
+    # a looping note held with no note-off; reset() between blocks ends it within 10 ms
+    text = P.script(P.sample(), "loop forward")
+    at = 19 * 256
+    y, d, r = P.play(text, "on 57 100 0\nreset %d" % at, 24000)
+    assert np.max(np.abs(y[at - 2000:at])) > 0.05
+    assert np.max(np.abs(y[at + 480:])) == 0
+    assert d["voices"] == "0"
+    # obey note off off: the note ignores note-off, a reset still ends it
+    text = P.script(P.sample(secs=3.0, name="long A3.wav"), "obey_note_off off")
+    y, d, r = P.play(text, "on 57 100 0\noff 57 100\nreset %d" % at, 24000)
+    assert np.max(np.abs(y[at - 2000:at])) > 0.05
+    assert np.max(np.abs(y[at + 480:])) == 0
+
+
+def test_reactivate_is_silent(P):
+    text = P.script(P.sample(), "loop forward")
+    at = 19 * 256
+    y, d, r = P.play(text, "on 57 100 0\ncycle %d" % at, 24000)
+    assert np.max(np.abs(y[at - 2000:at])) > 0.05
+    assert np.max(np.abs(y[at:])) == 0
+    assert d["voices"] == "0"
+
+
+def test_note_at_block_end_clamped(P):
+    # a note whose time is past the block (a sloppy host) still plays, on the block's last frame
+    text = P.script(P.sample())
+    y, d, r = P.play(text, "rawon 57 100 0 256", 4000)
+    nz = np.nonzero(np.abs(y[:, 0]) > 0)[0]
+    assert len(nz) and nz[0] >= 255 and nz[0] < 300

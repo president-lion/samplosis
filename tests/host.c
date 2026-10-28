@@ -2,7 +2,9 @@
      host.exe samplosis.clap state <state.txt>                     load the state, save it, print it
      host.exe samplosis.clap play <state.txt> <events> <out.wav> [rate]
    Events, one per line: "on key vel frame", "off key frame" (CLAP notes), "midi status d1 d2 frame",
-   "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames". Blocks of 256 frames.
+   "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames"; between blocks: "reset frame",
+   "cycle frame" (deactivate and activate again), "state <file> frame" (load another state); and "rawon key vel frame
+   time" (a note-on in the block holding frame, with its time field set to time as is: a sloppy host). Blocks of 256 frames.
    play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks. */
 #include <windows.h>
 #include <fcntl.h>
@@ -19,6 +21,7 @@ typedef int (*StatusFn)(const clap_plugin_t *, char *, int);
 typedef int (*WaitFn)(const clap_plugin_t *, int);
 typedef void (*OfflineFn)(const clap_plugin_t *, int);
 typedef void (*SyncFn)(const clap_plugin_t *);
+typedef int (*VoicesFn)(const clap_plugin_t *);
 
 static volatile LONG want_callback;
 static const void *h_ext(const clap_host_t *h, const char *id) { (void)h; (void)id; return NULL; }
@@ -128,7 +131,8 @@ static int cmd_state(const clap_plugin_t *p, const char *path) {
   return 0;
 }
 
-typedef struct { long frame; clap_event_param_value_t pv; clap_event_note_t note; clap_event_midi_t midi; int kind; } Ev;
+typedef struct { long frame; clap_event_param_value_t pv; clap_event_note_t note; clap_event_midi_t midi; int kind;
+                 int action; char path[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and activate, 3 load state */
 static Ev *evs; static int nev;
 typedef struct { const Ev *const *list; uint32_t n; } EvList;
 static const clap_event_header_t *ev_header(const Ev *e) {
@@ -149,7 +153,12 @@ static int parse_events(const char *text, long *length) {
     if (sscanf(p, "%15s%n", w, &used) == 1) {
       int a, b, c; double x;
       if (!strcmp(w, "length")) { if (sscanf(p + used, "%ld", length) != 1) return 0; p = nl ? nl + 1 : NULL; continue; }
-      if (!strcmp(w, "on") && sscanf(p + used, "%d %d %ld", &a, &b, &e.frame) == 3) {
+      if (!strcmp(w, "reset") && sscanf(p + used, "%ld", &e.frame) == 1) { e.action = 1; ok = 1; }
+      else if (!strcmp(w, "cycle") && sscanf(p + used, "%ld", &e.frame) == 1) { e.action = 2; ok = 1; }
+      else if (!strcmp(w, "state") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2) { e.action = 3; ok = 1; }
+      else if (!strcmp(w, "rawon") && sscanf(p + used, "%d %d %ld %ld", &a, &b, &e.frame, &e.rawtime) == 4) {
+        e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; e.rawtime++; ok = 1;
+      } else if (!strcmp(w, "on") && sscanf(p + used, "%d %d %ld", &a, &b, &e.frame) == 3) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; ok = 1;
       } else if (!strcmp(w, "off") && sscanf(p + used, "%d %ld", &a, &e.frame) == 2) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_OFF; e.note.key = (int16_t)a; ok = 1;
@@ -194,6 +203,7 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
   WaitFn wait = (WaitFn)GetProcAddress(dll, "smp_test_plugin_wait");
   OfflineFn offline = (OfflineFn)GetProcAddress(dll, "smp_test_plugin_offline");
   SyncFn sync = (SyncFn)GetProcAddress(dll, "smp_test_plugin_sync");
+  VoicesFn voices = (VoicesFn)GetProcAddress(dll, "smp_test_plugin_voices");
   char *text = read_file(events, NULL); long length, b; int k = 0;
   float l[BLOCK], r[BLOCK], lr[2 * BLOCK]; float *chans[2] = {l, r};
   const Ev *list[1024]; EvList el; FILE *f;
@@ -221,7 +231,14 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
     el.list = list; el.n = 0;
     for (; k < nev && evs[k].frame < b + (long)n && el.n < 1024; k++) {
       clap_event_header_t *h = (clap_event_header_t *)ev_header(&evs[k]);
-      h->time = (uint32_t)(evs[k].frame < b ? 0 : evs[k].frame - b);
+      if (evs[k].action == 1) { p->reset(p); continue; }                     /* between blocks, as a host does */
+      if (evs[k].action == 2) {
+        p->stop_processing(p); p->deactivate(p); main_thread(p);
+        if (!p->activate(p, rate, 1, BLOCK)) { printf("error: activate failed\n"); return 1; }
+        offline(p, 1); p->start_processing(p); continue;
+      }
+      if (evs[k].action == 3) { if (load_state(p, evs[k].path) < 0) return 1; main_thread(p); continue; }
+      h->time = (uint32_t)(evs[k].rawtime ? evs[k].rawtime - 1 : evs[k].frame < b ? 0 : evs[k].frame - b);
       list[el.n++] = &evs[k];
     }
     pr.frames_count = n; pr.steady_time = b;
@@ -232,6 +249,8 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
     main_thread(p);
   }
   fclose(f);
+  if (voices) printf("voices: %d\n", voices(p));
+  { char st[2000] = ""; StatusFn sf = (StatusFn)GetProcAddress(dll, "smp_plugin_status"); if (sf) sf(p, st, sizeof st); printf("status after: %s\n", st); }
   p->stop_processing(p);
   offline(p, 0);
   p->deactivate(p);

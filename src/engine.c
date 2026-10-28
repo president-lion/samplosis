@@ -400,6 +400,18 @@ SMP_API void smp_engine_process(SmpEngine *e, float *l, float *r, int n) {
   SetEvent(e->wake);
 }
 
+SMP_API void smp_engine_reset(SmpEngine *e, int now) {
+  int i;
+  if (!e) return;
+  for (i = 0; i < SMP_MAXV; i++) {
+    SmpVoice *v = &e->v[i];
+    if (!v->live) continue;
+    if (now) kill(v); else fade_out(e, v);
+  }
+  e->bend = 0;
+  e->nev = 0;
+}
+
 SMP_API int smp_engine_active_voices(const SmpEngine *e) {
   int i, n = 0;
   if (!e) return 0;
