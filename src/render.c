@@ -5,14 +5,21 @@
    The render thread (below normal priority, separate from the worker so a long render never delays reversed
    copies or start heads):
    - Each pass it reads the current sample, keep length, reverse and speed, and works out the shifts note_lo to
-     note_hi reach (with the same formula note-on uses). When that configuration changes it waits 100 ms for it to
-     settle (scrolling through files or dragging speed renders nothing), then works nearest the root first, except
-     that shifts asked for by note-ons (a small ring the audio thread writes) go first.
+     note_hi reach (with the same formula note-on uses). It wants the reachable shifts within SMP_KLPRE (12)
+     semitones of the root, plus the shifts note-ons have asked for (a small ring the audio thread writes when a
+     note finds no copy); other keys are never rendered until played. When the configuration changes it waits
+     100 ms for it to settle (scrolling through files or dragging speed renders nothing) and forgets what note-ons
+     asked for, then works on asked-for shifts first (in the order asked), then nearest the root.
    - A copy already in the cache is just opened; otherwise it's rendered, written, and opened. Renders check
-     between chunks whether the configuration changed (or the engine is quitting) and give up if so.
+     between chunks whether the configuration changed (or the engine is quitting) and give up if so. A render the
+     thread chose itself (not asked for) also gives up when a note-on asks for another shift that isn't ready: that
+     shift is rendered next and the abandoned one comes back in its turn.
+   - Copies are opened with smp_cache_open_copy: only the 0.25 s head is held in memory (whole only when shorter);
+     the rest is streamed like any long sample.
    - Ready copies are published into e->kl[shift + 127] by atomic pointer. A copy is identified by content (the
      key it was rendered from and the speed), so the audio thread just ignores one that doesn't match its note.
-   - Stale copies are taken out of the table and retired: one is freed only after the audio thread has finished
+   - Stale copies (another sample, speed or direction, keep length off, or a shift the key range no longer
+     reaches) are taken out of the table and retired: one is freed only after the audio thread has finished
      two blocks since (no new note can pick it), no live voice reads it, and then the streamer and the worker have
      each finished two passes (neither can still be reading it or its start head). The retire list grows as needed
      and the render thread never waits on it; if it can't grow, the copy is left in place (stale copies are
@@ -111,7 +118,7 @@ SMP_API int smp_render_shift(SmpSample *s, int reversed, int semis, double speed
 
 /* ---- the render thread ---- */
 typedef struct { SmpSample *s; SmpEntry *src; uint64_t base; LONG speedp; int on, rev; } Cfg;
-typedef struct { SmpEngine *e; Cfg c; } CancelArg;
+typedef struct { SmpEngine *e; Cfg c; int slot, chosen; const char *failed; } CancelArg;
 
 static void cfg_read(const SmpEngine *e, SmpSample *s, Cfg *c) {
   SmpEntry *rev = NULL;
@@ -130,12 +137,24 @@ static int cfg_same(const Cfg *a, const Cfg *b) {
   return a->s == b->s && a->on == b->on && a->base == b->base && a->speedp == b->speedp && a->src == b->src;
 }
 
+static int is_ready(const SmpEngine *e, int slot, const Cfg *c);
+
+static int renderable(int slot) { return slot >= SMP_KLMAX - SMP_KLRENDER && slot <= SMP_KLMAX + SMP_KLRENDER; }
+
 static int cancelled(void *arg) {   /* reads only e->sample's value, never what it points to */
-  CancelArg *a = arg; Cfg now;
-  if (a->e->rquit) return 1;
-  if (a->e->sample != a->c.s) return 1;
-  cfg_read(a->e, a->c.s, &now);                              /* c.s is held by r_using: safe to read */
-  return !cfg_same(&now, &a->c);
+  CancelArg *a = arg; Cfg now; SmpEngine *e = a->e;
+  if (e->rquit) return 1;
+  if (e->sample != a->c.s) return 1;
+  cfg_read(e, a->c.s, &now);                                 /* c.s is held by r_using: safe to read */
+  if (!cfg_same(&now, &a->c)) return 1;
+  if (a->chosen) {                                           /* a note-on waits for another shift: yield to it */
+    LONG r, w = e->rq_w;
+    for (r = e->rq_r; r != w; r++) {
+      int slot = e->rq[r & (SMP_RQ - 1)];
+      if (slot != a->slot && renderable(slot) && !a->failed[slot] && !is_ready(e, slot, &a->c)) return 1;
+    }
+  }
+  return 0;
 }
 
 static void sh_free1(SmpStartHead *h) { if (h) { free(h->lr); free(h); } }
@@ -183,11 +202,11 @@ static void sweep(SmpEngine *e) {
   }
 }
 
-static void unpublish_stale(SmpEngine *e, const Cfg *c) {
+static void unpublish_stale(SmpEngine *e, const Cfg *c, const char *reach) {
   int i;
   for (i = 0; i < SMP_KLN; i++) {
     SmpKl *k = e->kl[i];
-    if (!k || (c->on && k->base == c->base && k->speedp == c->speedp)) continue;
+    if (!k || (c->on && reach[i] && k->base == c->base && k->speedp == c->speedp)) continue;
     if (!reserve(e)) return;                                  /* left in place: never used, freed later */
     InterlockedExchangePointer((PVOID volatile *)&e->kl[i], NULL);
     retire(e, k);
@@ -209,18 +228,16 @@ static int is_ready(const SmpEngine *e, int slot, const Cfg *c) {
   return k && k->base == c->base && k->speedp == c->speedp;
 }
 
-/* the shifts note_lo to note_hi reach, as note-on rounds them */
-static int needed(const SmpEngine *e, char need[SMP_KLN]) {
-  double p[SMP_NPARAMS]; int i, k, lo, hi, total = 0;
+/* the renderable shifts note_lo to note_hi reach, as note-on rounds them */
+static void reachable(const SmpEngine *e, char reach[SMP_KLN]) {
+  double p[SMP_NPARAMS]; int i, k, lo, hi;
   for (i = 0; i < SMP_NPARAMS; i++) p[i] = smp_eng_param(e, i);
-  memset(need, 0, SMP_KLN);
+  memset(reach, 0, SMP_KLN);
   lo = (int)ceil(p[SMP_P_NOTE_LO]); hi = (int)floor(p[SMP_P_NOTE_HI]);
   for (k = lo; k <= hi; k++) {
     int n = (int)floor(smp_note_semis(p, k) + 0.5);
-    if (n < -SMP_KLRENDER || n > SMP_KLRENDER || need[n + SMP_KLMAX]) continue;
-    need[n + SMP_KLMAX] = 1; total++;
+    if (n >= -SMP_KLRENDER && n <= SMP_KLRENDER) reach[n + SMP_KLMAX] = 1;
   }
-  return total;
 }
 
 static void set_why(SmpEngine *e, const char *why) {
@@ -241,11 +258,12 @@ static void idle(SmpEngine *e) { InterlockedIncrement64(&e->ridle_n); SetEvent(e
 
 static DWORD WINAPI render_thread(LPVOID arg) {
   SmpEngine *e = arg; Cfg last; ULONGLONG changed = 0, checked = 0; int dir_ok = 0, dir_known = 0, busy = 0;
-  char failed[SMP_KLN], need[SMP_KLN];
+  char failed[SMP_KLN], reach[SMP_KLN], need[SMP_KLN];
+  LONG asked[SMP_KLN], seq = 0;                              /* asked: when a note-on asked for the shift, 0 never */
   memset(&last, 0, sizeof last); last.on = -1;
-  memset(failed, 0, sizeof failed);
+  memset(failed, 0, sizeof failed); memset(asked, 0, sizeof asked);
   while (!e->rquit) {
-    SmpSample *s; Cfg c; ULONGLONG now; int i, total, ready = 0, pick = -1;
+    SmpSample *s; Cfg c; ULONGLONG now; int i, total, ready = 0, pick = -1, chosen;
     WaitForSingleObject(e->rwork, busy ? 0 : 20);
     busy = 0;
     if (e->rquit) break;
@@ -253,16 +271,27 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     s = acquire(e);
     cfg_read(e, s, &c);
     now = GetTickCount64();
-    if (!cfg_same(&c, &last)) { last = c; changed = now; memset(failed, 0, sizeof failed); dir_known = 0; set_why(e, ""); }
-    unpublish_stale(e, &c);
+    if (!cfg_same(&c, &last)) {
+      last = c; changed = now; dir_known = 0; set_why(e, "");
+      memset(failed, 0, sizeof failed); memset(asked, 0, sizeof asked); seq = 0;
+    }
+    reachable(e, reach);
+    unpublish_stale(e, &c, reach);
+    while (e->rq_r != e->rq_w) {                              /* what note-ons asked for since the last pass */
+      int slot = e->rq[e->rq_r & (SMP_RQ - 1)];
+      if (e->rq_w - e->rq_r > SMP_RQ) e->rq_r = e->rq_w - SMP_RQ; else e->rq_r++;
+      if (c.on && renderable(slot) && reach[slot] && !asked[slot]) asked[slot] = ++seq;
+    }
     if (!c.on) {
       InterlockedExchange(&e->r_total, 0); InterlockedExchange(&e->r_ready, 0);
       InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL);
       idle(e);
       continue;
     }
-    total = needed(e, need);
-    for (i = 0; i < SMP_KLN; i++) if (need[i] && is_ready(e, i, &c)) ready++;
+    for (total = 0, i = 0; i < SMP_KLN; i++) {               /* near the root, and what note-ons asked for */
+      need[i] = reach[i] && (asked[i] || (i >= SMP_KLMAX - SMP_KLPRE && i <= SMP_KLMAX + SMP_KLPRE));
+      if (need[i]) { total++; if (is_ready(e, i, &c)) ready++; }
+    }
     InterlockedExchange(&e->r_total, total); InterlockedExchange(&e->r_ready, ready);
     if (now - changed < SETTLE_MS) { InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL); continue; }
     if (!dir_known || (!dir_ok && now - checked >= DIR_RECHECK_MS)) {
@@ -272,11 +301,9 @@ static DWORD WINAPI render_thread(LPVOID arg) {
       else set_why(e, "");
     }
     if (!dir_ok) { InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL); idle(e); continue; }
-    while (e->rq_r != e->rq_w) {                              /* note-ons waiting for a copy go first */
-      int slot = e->rq[e->rq_r & (SMP_RQ - 1)];
-      if (e->rq_w - e->rq_r > SMP_RQ) e->rq_r = e->rq_w - SMP_RQ; else e->rq_r++;
-      if (slot >= SMP_KLMAX - SMP_KLRENDER && slot <= SMP_KLMAX + SMP_KLRENDER && !is_ready(e, slot, &c) && !failed[slot]) { pick = slot; break; }
-    }
+    for (i = 0; i < SMP_KLN; i++)                             /* shifts note-ons asked for go first, oldest first */
+      if (need[i] && asked[i] && !failed[i] && !is_ready(e, i, &c) && (pick < 0 || asked[i] < asked[pick])) pick = i;
+    chosen = pick < 0;
     for (i = 0; pick < 0 && i <= SMP_KLRENDER; i++) {            /* then nearest the root */
       int a = SMP_KLMAX + i, b = SMP_KLMAX - i;
       if (need[a] && !failed[a] && !is_ready(e, a, &c)) pick = a;
@@ -285,13 +312,13 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     if (pick < 0) { InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL); idle(e); continue; }
     {
       int n = pick - SMP_KLMAX; uint64_t key = kl_key(c.base, n, c.speedp);
-      SmpEntry *en = smp_cache_open(key);
+      SmpEntry *en = smp_cache_open_copy(key);
       if (!en) {
         CancelArg ca; int r; char why[300];
-        ca.e = e; ca.c = c;
+        ca.e = e; ca.c = c; ca.slot = pick; ca.chosen = chosen; ca.failed = failed;
         r = render_entry(c.src, c.base, n, c.speedp, cancelled, &ca, why, sizeof why);
         if (r == 2) { InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL); busy = 1; continue; }
-        if (r == 0) en = smp_cache_open(key);
+        if (r == 0) en = smp_cache_open_copy(key);
         if (!en) {
           failed[pick] = 1;
           char msg[400];
@@ -355,6 +382,20 @@ SMP_API int smp_engine_render_status(SmpEngine *e, int *ready, int *total, char 
   if (why && cap > 0) snprintf(why, (size_t)cap, "%s", e->r_why);
   LeaveCriticalSection(&e->r_cs);
   return ok;
+}
+
+/* tests, main thread, while the render thread is idle: the copy published for a shift, and how many copies are
+   published and how many are retired but not yet freed */
+SMP_API const SmpEntry *smp_debug_kl_entry(SmpEngine *e, int semis) {
+  SmpKl *k;
+  if (!e || semis < -SMP_KLMAX || semis > SMP_KLMAX) return NULL;
+  k = e->kl[semis + SMP_KLMAX];
+  return k ? k->e : NULL;
+}
+SMP_API void smp_debug_kl_counts(SmpEngine *e, int *published, int *retiring) {
+  int i, n = 0;
+  for (i = 0; i < SMP_KLN; i++) if (e->kl[i]) n++;
+  *published = n; *retiring = e->nklret;
 }
 
 SMP_API int smp_engine_wait_renders(SmpEngine *e, int timeout_ms) {

@@ -102,8 +102,13 @@ SMP_API int smp_render_shift(SmpSample *s, int reversed, int semis, double speed
 SMP_API long smp_debug_renders(void);                            /* Rubber Band runs so far */
 SMP_API void smp_debug_render_flags(long f);   /* tests: 1 = Rubber Band throws (caught), 2 = no 4-octave limit */
 SMP_API int smp_engine_render_status(SmpEngine *e, int *ready, int *total, char *why, int cap); /* 1 when every copy
-                                    the key range needs is ready; why is a plain reason when renders can't run */
+                                    wanted is ready (the key range's shifts within an octave of the root, and those
+                                    of keys played further out); why is a plain reason when renders can't run */
 SMP_API int smp_engine_wait_renders(SmpEngine *e, int timeout_ms); /* tests: 0 once the render thread is idle, 1 timeout */
+SMP_API const SmpEntry *smp_debug_kl_entry(SmpEngine *e, int semis);  /* tests: the copy published for a shift, or NULL */
+SMP_API void smp_debug_kl_counts(SmpEngine *e, int *published, int *retiring);   /* tests: copies in the table, and
+                                    retired ones not yet freed */
+SMP_API void smp_debug_stream_pause(SmpEngine *e, int on);      /* tests: the streamer does nothing (forces underruns) */
 /* test helper: plays notes offline in blocks and writes a stereo float32 wav; events one per line:
    "on key vel frame", "off key frame", "bend fraction frame". Starts from silence (no voices, no bend) and waits for the streamer after each block and
    at note-ons that start past the head, so offline renders are exact. 0 ok. */

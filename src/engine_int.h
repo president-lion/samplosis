@@ -28,6 +28,7 @@ typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n; float 
 #define SMP_KLN 256
 #define SMP_KLMAX 127
 #define SMP_KLRENDER 48                  /* Rubber Band R3 fails past about 4 octaves (+67 throws): wider shifts resample */
+#define SMP_KLPRE 12                     /* shifts prepared as soon as a sample loads; others on their first note-on */
 typedef struct SmpKl {
   SmpEntry *e;
   uint64_t base;                          /* src_key or rev_key it was rendered from */

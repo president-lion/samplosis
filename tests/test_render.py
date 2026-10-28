@@ -378,3 +378,102 @@ def test_too_long_refused(lib, tmp_path):
     s = load(lib, tmp_path, decaying(220, 900.0, rate, tau=5.0), "long A3.wav", rate)   # 7.2 M frames
     assert lib.smp_render_shift(s, 0, 0, 0.25) == 4     # 36 M frames of output: past 512 MB
     lib.smp_sample_free(s)
+
+
+def setup_debug(lib):
+    setup(lib)
+    lib.smp_debug_kl_entry.restype = ctypes.c_void_p
+    lib.smp_debug_kl_entry.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.smp_debug_kl_counts.restype = None
+    lib.smp_debug_kl_counts.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+
+
+def kl_counts(lib, e):
+    p, r = ctypes.c_int(), ctypes.c_int()
+    lib.smp_debug_kl_counts(e.e, ctypes.byref(p), ctypes.byref(r))
+    return p.value, r.value
+
+
+def process_blocks(lib, e, n, block=256):
+    l = np.zeros(block, dtype=np.float32); r = np.zeros(block, dtype=np.float32)
+    for _ in range(n):
+        lib.smp_engine_process(e.e, l.ctypes.data_as(FP), r.ctypes.data_as(FP), block)
+
+
+def test_default_load_prepares_one_octave_each_way(lib, tmp_path):
+    setup_debug(lib)
+    cache = tmp_path / "cache"
+    point_cache(lib, cache)
+    s = load(lib, tmp_path, decaying(261.63, 0.5), "tone C4.wav")
+    e = KL(lib, tmp_path, s, 0, 127)                   # the default key range: 97 shifts reachable
+    runs = lib.smp_debug_renders()
+    e.wait()
+    r, ready, total, why = e.status()
+    assert (r, ready, total) == (1, 25, 25), (r, ready, total, why)
+    assert lib.smp_debug_renders() - runs <= 25
+    assert len(smpc_files(cache)) <= 25                 # the source and at most 24 copies (shift 0 is the source)
+    assert not lib.smp_debug_kl_entry(e.e, 13) and not lib.smp_debug_kl_entry(e.e, -13)
+    # a key further away is asked for by its first note-on (which resamples), then rendered
+    lib.smp_engine_note_on(e.e, 80, 127, 0)            # +20
+    process_blocks(lib, e, 1)
+    e.wait()
+    r, ready, total, why = e.status()
+    assert (r, ready, total) == (1, 26, 26), (r, ready, total, why)
+    assert lib.smp_debug_kl_entry(e.e, 20)
+    y = e.render("on 80 127 0", 0.7)
+    assert abs(length_secs(y, e.host_rate, 1e-4) - 0.5) < 0.03          # the copy: the sample's whole length
+    assert abs(detect(lib, y[int(0.02 * e.host_rate):int(0.3 * e.host_rate)], e.host_rate) - 80) < 0.15
+    # narrowing the key range retires the copies it no longer reaches
+    e.set(NOTE_LO, 60); e.set(NOTE_HI, 64)
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 10:               # blocks finish and the streamer and worker pass
+        process_blocks(lib, e, 4)
+        e.wait()
+        if kl_counts(lib, e) == (4, 0):
+            break
+        time.sleep(0.02)
+    assert kl_counts(lib, e) == (4, 0), kl_counts(lib, e)    # shifts 1 to 4 left; the rest freed
+    assert e.status()[:3] == (1, 5, 5)
+    e.free()
+
+
+def test_copies_hold_only_their_head(lib, tmp_path):
+    setup_debug(lib)
+    point_cache(lib, tmp_path / "cache")
+    s = load(lib, tmp_path, decaying(220, 1.0, tau=5.0), "tone A3.wav")
+    e = KL(lib, tmp_path, s, 57, 60)
+    e.wait()
+    n = ctypes.c_uint64()
+    ent = lib.smp_debug_kl_entry(e.e, 3)
+    assert ent
+    lib.smp_entry_head(ent, ctypes.byref(n))
+    assert lib.smp_entry_whole(ent) == 0 and n.value == 44100 // 4
+    y = e.render("on 60 127 0", 1.2)                    # streamed past its head: the whole second, at pitch
+    assert abs(length_secs(y, e.host_rate) - 1.0) < 0.02
+    assert abs(detect(lib, y[int(0.5 * e.host_rate):int(0.9 * e.host_rate)], e.host_rate) - 60) < 0.15
+    assert lib.smp_engine_underruns(e.e) == 0
+    e.free()
+
+
+def test_note_on_jumps_the_prefetch_queue(lib, tmp_path):
+    setup_debug(lib)
+    point_cache(lib, tmp_path / "cache")
+    s = load(lib, tmp_path, decaying(220, 10.0, tau=5.0), "long A3.wav")
+    e = KL(lib, tmp_path, s, 57, 77)                   # prepares 0 to +12; +20 only when played
+    t0 = time.perf_counter()
+    while e.status()[1] < 2 and time.perf_counter() - t0 < 60:   # the first copy is done, the queue is under way
+        time.sleep(0.05)
+    before = e.status()[1]
+    lib.smp_engine_note_on(e.e, 77, 127, 0)
+    process_blocks(lib, e, 1)
+    t0 = time.perf_counter()
+    while not lib.smp_debug_kl_entry(e.e, 20) and time.perf_counter() - t0 < 60:
+        time.sleep(0.02)
+    r, ready, total, why = e.status()
+    assert lib.smp_debug_kl_entry(e.e, 20), why
+    assert ready < total, (ready, total)               # the rest of the queue is still to come
+    assert ready == before + 1, (before, ready)          # only +20: the copy being rendered gave way to it
+    print(f"+20 ready after {time.perf_counter() - t0:.2f} s with {ready} of {total} ready")
+    e.wait(300000)
+    assert e.status()[:3] == (1, 14, 14)
+    e.free()
