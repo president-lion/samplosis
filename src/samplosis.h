@@ -143,6 +143,9 @@ SMP_API int smp_sf_preset_count(const SmpFont *f);
 SMP_API int smp_sf_preset_info(const SmpFont *f, int i, int *bank, int *program, char *name, int cap); /* sorted by
                                     bank, then program; 1 ok, 0 when i is out of range. Any pointer may be NULL */
 SMP_API int smp_sf_find_preset(const SmpFont *f, int bank, int program);   /* exact; -1 if none */
+SMP_API int smp_sf_regions(const SmpFont *f, int preset, const SmpSfRegion **out);  /* the region count, and *out
+                                    their array (NULL when none). Built at open and never changed, so any thread may
+                                    read them until the font is closed */
 SMP_API int smp_sf_sample_count(const SmpFont *f);
 SMP_API const SmpSfSample *smp_sf_sample(const SmpFont *f, int i);         /* NULL when i is out of range */
 #ifdef __cplusplus

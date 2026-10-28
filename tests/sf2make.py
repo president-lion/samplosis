@@ -16,6 +16,8 @@ presets: a list of dicts
 A modulator is a tuple (src, dest, amount, amt_src, trans).
 A generator value is an int, or a (lo, hi) tuple for a range.
 The preset's own gens and pmods go in a global preset zone; it is only written when there are any.
+junk_pgen and junk_igen: (oper, value) generator records written after the last zone's, where no zone reaches
+them (real fonts sometimes carry junk there).
 """
 import io
 import struct
@@ -83,7 +85,7 @@ def _ogg(data, rate):
     return buf.getvalue()
 
 
-def write_sf2(path, presets, samples, sf3=False):
+def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=()):
     # sample data and headers
     smpl = bytearray()
     shdr = []

@@ -40,6 +40,13 @@ class SmpSfSample(ctypes.Structure):
                 ("type", ctypes.c_uint16)]
 
 
+class SmpSfRegion(ctypes.Structure):
+    _fields_ = [("lokey", ctypes.c_uint8), ("hikey", ctypes.c_uint8), ("lovel", ctypes.c_uint8),
+                ("hivel", ctypes.c_uint8), ("sample", ctypes.c_int), ("gen", ctypes.c_int16 * 60),
+                ("imod", ctypes.POINTER(SmpSfMod)), ("nimod", ctypes.c_int),
+                ("pmod", ctypes.POINTER(SmpSfMod)), ("npmod", ctypes.c_int)]
+
+
 def write_wav(path, data, rate):
     """Write a float32 wav (mono or frames x channels)."""
     sf.write(str(path), data, rate, subtype="FLOAT")
@@ -151,4 +158,6 @@ def lib(settings_file):
     dll.smp_sf_sample_count.argtypes = [vp]
     dll.smp_sf_sample.restype = ctypes.POINTER(SmpSfSample)
     dll.smp_sf_sample.argtypes = [vp, c_int]
+    dll.smp_sf_regions.restype = c_int
+    dll.smp_sf_regions.argtypes = [vp, c_int, ctypes.POINTER(ctypes.POINTER(SmpSfRegion))]
     return dll

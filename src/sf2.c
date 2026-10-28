@@ -142,14 +142,26 @@ static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, in
   if (!gens_ok(f->pbag, f->npbag, f->npgen, f->npmod)) { snprintf(why, wcap, "a preset zone's settings are out of range"); return 0; }
   if (!bags_ok(&f->inst[0].bag, sizeof(SfInst), f->ninst, f->nibag)) { snprintf(why, wcap, "an instrument's zones are out of range"); return 0; }
   if (!gens_ok(f->ibag, f->nibag, f->nigen, f->nimod)) { snprintf(why, wcap, "an instrument zone's settings are out of range"); return 0; }
-  for (i = 0; i < f->npgen; i++)
-    if (f->pgen[i].oper == SF_GEN_INSTRUMENT && (uint16_t)f->pgen[i].amount >= f->ninst) {
-      snprintf(why, wcap, "a preset uses instrument %u, but there are %d", (uint16_t)f->pgen[i].amount, f->ninst); return 0;
-    }
-  for (i = 0; i < f->nigen; i++)
-    if (f->igen[i].oper == SF_GEN_SAMPLEID && (uint16_t)f->igen[i].amount >= f->nshdr) {
-      snprintf(why, wcap, "an instrument uses sample %u, but there are %d", (uint16_t)f->igen[i].amount, f->nshdr); return 0;
-    }
+  /* instrument and sample ids are checked only in zones a preset or instrument owns; real fonts sometimes
+     carry junk in records no zone reaches, and those are never read */
+  for (i = 0; i < f->nphdr; i++) {
+    int b, g;
+    for (b = f->phdr[i].bag; b < f->phdr[i + 1].bag; b++)
+      for (g = f->pbag[b].gen; g < f->pbag[b + 1].gen; g++)
+        if (f->pgen[g].oper == SF_GEN_INSTRUMENT && (uint16_t)f->pgen[g].amount >= f->ninst) {
+          snprintf(why, wcap, "a preset uses instrument %u, but there are %d", (uint16_t)f->pgen[g].amount, f->ninst);
+          return 0;
+        }
+  }
+  for (i = 0; i < f->ninst; i++) {
+    int b, g;
+    for (b = f->inst[i].bag; b < f->inst[i + 1].bag; b++)
+      for (g = f->ibag[b].gen; g < f->ibag[b + 1].gen; g++)
+        if (f->igen[g].oper == SF_GEN_SAMPLEID && (uint16_t)f->igen[g].amount >= f->nshdr) {
+          snprintf(why, wcap, "an instrument uses sample %u, but there are %d", (uint16_t)f->igen[g].amount, f->nshdr);
+          return 0;
+        }
+  }
   for (i = 0; i < f->nshdr; i++) {
     SmpSfSample *s = &f->shdr[i];
     if ((s->type & (SF_RIGHT | SF_LEFT | SF_LINKED)) && s->link >= f->nshdr) {
@@ -184,6 +196,317 @@ static void clamp_samples(SmpFont *f) {
     if (s->end > l) s->end = (uint32_t)l;
     if (s->start > s->end) s->start = s->end;
   }
+}
+
+/* ---- flattening presets into regions (SF2.04 sections 8 and 9) ---- */
+
+/* each generator's default and range, from SF2.04 section 8.1.3 (the same numbers as FluidSynth's gen table).
+   The range holds the final value, instrument plus preset. keynum, velocity and overridingRootKey go down to -1,
+   which means "not set". The sample offsets and sampleModes have no range here: the voice keeps the offsets
+   inside the sample. where says at which levels a generator counts; the ones with neither (unused, reserved, and
+   the instrument, range and sample generators, which are handled apart) are never stored. */
+enum { AT_INST = 1, AT_PRESET = 2, AT_BOTH = 3 };
+typedef struct { int16_t def, lo, hi; uint8_t where; } GenInfo;
+#define ANY -32768, 32767
+static const GenInfo GENS[SMP_SF_NGEN] = {
+  {0, ANY, AT_INST},                 /* 0 startAddrsOffset */
+  {0, ANY, AT_INST},                 /* 1 endAddrsOffset */
+  {0, ANY, AT_INST},                 /* 2 startloopAddrsOffset */
+  {0, ANY, AT_INST},                 /* 3 endloopAddrsOffset */
+  {0, ANY, AT_INST},                 /* 4 startAddrsCoarseOffset */
+  {0, -12000, 12000, AT_BOTH},       /* 5 modLfoToPitch */
+  {0, -12000, 12000, AT_BOTH},       /* 6 vibLfoToPitch */
+  {0, -12000, 12000, AT_BOTH},       /* 7 modEnvToPitch */
+  {13500, 1500, 13500, AT_BOTH},     /* 8 initialFilterFc */
+  {0, 0, 960, AT_BOTH},              /* 9 initialFilterQ */
+  {0, -12000, 12000, AT_BOTH},       /* 10 modLfoToFilterFc */
+  {0, -12000, 12000, AT_BOTH},       /* 11 modEnvToFilterFc */
+  {0, ANY, AT_INST},                 /* 12 endAddrsCoarseOffset */
+  {0, -960, 960, AT_BOTH},           /* 13 modLfoToVolume */
+  {0, 0, 0, 0},                      /* 14 unused */
+  {0, 0, 1000, AT_BOTH},             /* 15 chorusEffectsSend */
+  {0, 0, 1000, AT_BOTH},             /* 16 reverbEffectsSend */
+  {0, -500, 500, AT_BOTH},           /* 17 pan */
+  {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0},   /* 18 to 20 unused */
+  {-12000, -12000, 5000, AT_BOTH},   /* 21 delayModLFO */
+  {0, -16000, 4500, AT_BOTH},        /* 22 freqModLFO */
+  {-12000, -12000, 5000, AT_BOTH},   /* 23 delayVibLFO */
+  {0, -16000, 4500, AT_BOTH},        /* 24 freqVibLFO */
+  {-12000, -12000, 5000, AT_BOTH},   /* 25 delayModEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 26 attackModEnv */
+  {-12000, -12000, 5000, AT_BOTH},   /* 27 holdModEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 28 decayModEnv */
+  {0, 0, 1000, AT_BOTH},             /* 29 sustainModEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 30 releaseModEnv */
+  {0, -1200, 1200, AT_BOTH},         /* 31 keynumToModEnvHold */
+  {0, -1200, 1200, AT_BOTH},         /* 32 keynumToModEnvDecay */
+  {-12000, -12000, 5000, AT_BOTH},   /* 33 delayVolEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 34 attackVolEnv */
+  {-12000, -12000, 5000, AT_BOTH},   /* 35 holdVolEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 36 decayVolEnv */
+  {0, 0, 1440, AT_BOTH},             /* 37 sustainVolEnv */
+  {-12000, -12000, 8000, AT_BOTH},   /* 38 releaseVolEnv */
+  {0, -1200, 1200, AT_BOTH},         /* 39 keynumToVolEnvHold */
+  {0, -1200, 1200, AT_BOTH},         /* 40 keynumToVolEnvDecay */
+  {0, 0, 0, 0},                      /* 41 instrument */
+  {0, 0, 0, 0},                      /* 42 reserved */
+  {0, 0, 0, 0},                      /* 43 keyRange */
+  {0, 0, 0, 0},                      /* 44 velRange */
+  {0, ANY, AT_INST},                 /* 45 startloopAddrsCoarseOffset */
+  {-1, -1, 127, AT_INST},            /* 46 keynum */
+  {-1, -1, 127, AT_INST},            /* 47 velocity */
+  {0, 0, 1440, AT_BOTH},             /* 48 initialAttenuation */
+  {0, 0, 0, 0},                      /* 49 reserved */
+  {0, ANY, AT_INST},                 /* 50 endloopAddrsCoarseOffset */
+  {0, -120, 120, AT_BOTH},           /* 51 coarseTune */
+  {0, -99, 99, AT_BOTH},             /* 52 fineTune */
+  {0, 0, 0, 0},                      /* 53 sampleID */
+  {0, ANY, AT_INST},                 /* 54 sampleModes */
+  {0, 0, 0, 0},                      /* 55 reserved */
+  {100, 0, 1200, AT_BOTH},           /* 56 scaleTuning */
+  {0, 0, 127, AT_INST},              /* 57 exclusiveClass */
+  {-1, -1, 127, AT_INST},            /* 58 overridingRootKey */
+  {0, 0, 0, 0},                      /* 59 unused */
+};
+#undef ANY
+
+/* SF2.04 section 8.4's default modulators. The velocity to filter cutoff one is 2.04's: -2400 cents and no amount
+   source. The pitch wheel one goes to 59, "initial pitch", which has no generator of its own (FluidSynth uses 59
+   the same way). */
+static const SmpSfMod DEFMODS[SF_NDEFMOD] = {
+  {0x0502, 48, 960, 0, 0},        /* note-on velocity to initial attenuation */
+  {0x0102, 8, -2400, 0, 0},       /* note-on velocity to filter cutoff */
+  {0x000D, 6, 50, 0, 0},          /* channel pressure to vibrato LFO pitch depth */
+  {0x0081, 6, 50, 0, 0},          /* CC1 (mod wheel) to vibrato LFO pitch depth */
+  {0x0587, 48, 960, 0, 0},        /* CC7 (volume) to initial attenuation */
+  {0x028A, 17, 1000, 0, 0},       /* CC10 (pan) to pan */
+  {0x058B, 48, 960, 0, 0},        /* CC11 (expression) to initial attenuation */
+  {0x00DB, 16, 200, 0, 0},        /* CC91 to reverb send */
+  {0x00DD, 15, 200, 0, 0},        /* CC93 to chorus send */
+  {0x020E, 59, 12700, 0x0010, 0}, /* pitch wheel to initial pitch, scaled by the bend range */
+};
+
+/* a fair cap on how many regions one font may make, so a damaged file can't ask for gigabytes
+   (a big General MIDI font makes a few thousand) */
+#define MAX_REGIONS (1 << 20)
+
+/* one zone's generators as read: the values it sets (a bit per generator in set), its ranges, and the instrument
+   or sample id it ends with (link; -1 when there is none, which makes a first zone the global one) */
+typedef struct {
+  int16_t v[SMP_SF_NGEN]; uint64_t set;
+  uint8_t lokey, hikey, lovel, hivel;
+  int link;
+} Zone;
+
+static void read_zone(const SfGen *gen, int g0, int g1, unsigned link_oper, int where, Zone *z) {
+  int g;
+  z->set = 0; z->link = -1;
+  z->lokey = z->lovel = 0; z->hikey = z->hivel = 127;
+  for (g = g0; g < g1; g++) {
+    unsigned op = gen[g].oper; int a = gen[g].amount;
+    /* the instrument or sample generator ends the zone; anything after it is ignored, as the spec says */
+    if (op == link_oper) { z->link = (uint16_t)a; break; }
+    if (op == SF_GEN_KEYRANGE || op == SF_GEN_VELRANGE) {
+      int lo = a & 255, hi = (a >> 8) & 255;
+      /* a key range counts only first, and a velocity range only first or right after the key range */
+      if (op == SF_GEN_KEYRANGE ? g != g0 : !(g == g0 || (g == g0 + 1 && gen[g0].oper == SF_GEN_KEYRANGE))) continue;
+      if (hi > 127) hi = 127;
+      if (op == SF_GEN_KEYRANGE) { z->lokey = (uint8_t)lo; z->hikey = (uint8_t)hi; }
+      else { z->lovel = (uint8_t)lo; z->hivel = (uint8_t)hi; }
+      z->set |= 1ull << op;
+      continue;
+    }
+    if (op >= SMP_SF_NGEN || !(GENS[op].where & where)) continue;
+    z->v[op] = (int16_t)a; z->set |= 1ull << op;   /* a generator given twice: the later one counts */
+  }
+}
+
+/* a zone's value for generator i: its own, else the global zone's, else dflt */
+static int zone_val(const Zone *local, const Zone *global, int i, int dflt) {
+  if (local->set >> i & 1) return local->v[i];
+  if (global && (global->set >> i & 1)) return global->v[i];
+  return dflt;
+}
+
+/* identical modulators have the same source, destination, amount source and transform; only the amount differs */
+static int same_mod(const SmpSfMod *a, const SmpSfMod *b) {
+  return a->src == b->src && a->dest == b->dest && a->amt_src == b->amt_src && a->trans == b->trans;
+}
+
+/* adds a zone's modulators to list (n long): each replaces an identical one already there, or is added to the end.
+   A second identical modulator in the same zone is ignored. Returns the new length. */
+static int merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz) {
+  int j, k;
+  for (j = 0; j < nz; j++) {
+    for (k = 0; k < j; k++) if (same_mod(&zm[k], &zm[j])) break;
+    if (k < j) continue;
+    for (k = 0; k < n; k++) if (same_mod(&list[k], &zm[j])) break;
+    list[k] = zm[j];
+    if (k == n) n++;
+  }
+  return n;
+}
+
+/* the modulator lists, stored once each: identical lists share one copy. The defaults are always at 0. */
+typedef struct {
+  SmpSfMod *m; int n, cap;
+  int *slot_off, *slot_n; unsigned mask;   /* a hash table of the lists stored so far; slot_n 0 is empty */
+} Pool;
+
+static unsigned hash_mods(const SmpSfMod *m, int n) {
+  const uint8_t *p = (const uint8_t *)m; size_t i, len = (size_t)n * sizeof *m; unsigned h = 2166136261u;
+  for (i = 0; i < len; i++) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
+
+/* the offset of this list in the pool, adding it if it isn't there yet; -1 when out of memory */
+static int pool_add(Pool *p, const SmpSfMod *m, int n) {
+  unsigned s = hash_mods(m, n) & p->mask;
+  while (p->slot_n[s]) {
+    if (p->slot_n[s] == n && !memcmp(p->m + p->slot_off[s], m, (size_t)n * sizeof *m)) return p->slot_off[s];
+    s = (s + 1) & p->mask;
+  }
+  if (p->n + n > p->cap) {
+    int cap = p->cap * 2 > p->n + n ? p->cap * 2 : p->n + n;
+    SmpSfMod *g = realloc(p->m, (size_t)cap * sizeof *g);
+    if (!g) return -1;
+    p->m = g; p->cap = cap;
+  }
+  memcpy(p->m + p->n, m, (size_t)n * sizeof *m);
+  p->slot_off[s] = p->n; p->slot_n[s] = n;
+  p->n += n;
+  return p->slot_off[s];
+}
+
+/* flattens every preset into regions: a preset zone and an instrument zone make a region where their key and
+   velocity ranges meet. Instrument generators are absolute (the zone's, the global zone's, or the default);
+   preset ones are added on top, and the sum is clamped to the generator's range. Everything goes into one
+   allocation at the end, which nothing changes until the font is closed. */
+static int build_regions(SmpFont *f, char *why, int wcap) {
+  SmpSfRegion *reg = NULL; int nreg = 0, capreg = 0;
+  int *ioff = NULL;                               /* each region's two lists, as pool offsets, until the end */
+  int *icache = NULL, *pcache = NULL;             /* per instrument and preset zone: its list's offset, or -1 */
+  int *icount = NULL, *pcount = NULL;
+  SmpSfMod *scratch = NULL;
+  Pool pool = {0};
+  int *rstart = NULL; int ok = 0, p, i, nslots = 1, maxz;
+  size_t sreg, sstart, total; char *block;
+
+  maxz = f->nimod > f->npmod ? f->nimod : f->npmod;
+  while (nslots < 2 * (f->nibag + f->npbag + 1)) nslots *= 2;
+  icache = malloc((size_t)(f->nibag + 1) * sizeof *icache); icount = malloc((size_t)(f->nibag + 1) * sizeof *icount);
+  pcache = malloc((size_t)(f->npbag + 1) * sizeof *pcache); pcount = malloc((size_t)(f->npbag + 1) * sizeof *pcount);
+  scratch = malloc((size_t)(SF_NDEFMOD + 2 * maxz + 1) * sizeof *scratch);
+  rstart = malloc((size_t)(f->nphdr + 1) * sizeof *rstart);
+  pool.slot_off = calloc(nslots, sizeof *pool.slot_off); pool.slot_n = calloc(nslots, sizeof *pool.slot_n);
+  pool.mask = (unsigned)nslots - 1;
+  if (!icache || !icount || !pcache || !pcount || !scratch || !rstart || !pool.slot_off || !pool.slot_n) goto oom;
+  for (i = 0; i <= f->nibag; i++) icache[i] = -1;
+  for (i = 0; i <= f->npbag; i++) pcache[i] = -1;
+  if (pool_add(&pool, DEFMODS, SF_NDEFMOD) != 0) goto oom;
+
+  for (p = 0; p < f->nphdr; p++) {
+    int b0 = f->phdr[p].bag, b1 = f->phdr[p + 1].bag, b;
+    Zone pg, pz; int have_pg = 0;
+    rstart[p] = nreg;
+    for (b = b0; b < b1; b++) {
+      int ins, ib0, ib1, ib, have_ig = 0, padd[SMP_SF_NGEN];
+      uint8_t pklo, pkhi, pvlo, pvhi;
+      Zone ig, iz;
+      read_zone(f->pgen, f->pbag[b].gen, f->pbag[b + 1].gen, SF_GEN_INSTRUMENT, AT_PRESET, &pz);
+      if (pz.link < 0) {   /* a first zone with no instrument is the global one; any later one is ignored */
+        if (b == b0) { pg = pz; have_pg = 1; }
+        continue;
+      }
+      for (i = 0; i < SMP_SF_NGEN; i++) padd[i] = zone_val(&pz, have_pg ? &pg : NULL, i, 0);
+      /* ranges: the zone's own, else the global zone's, else every key and velocity */
+      if (!(pz.set >> SF_GEN_KEYRANGE & 1) && have_pg) { pz.lokey = pg.lokey; pz.hikey = pg.hikey; }
+      if (!(pz.set >> SF_GEN_VELRANGE & 1) && have_pg) { pz.lovel = pg.lovel; pz.hivel = pg.hivel; }
+      pklo = pz.lokey; pkhi = pz.hikey; pvlo = pz.lovel; pvhi = pz.hivel;
+      if (pcache[b] < 0) {   /* the preset list: the global zone's modulators, then this zone's */
+        int n = 0;
+        if (have_pg) n = merge_mods(scratch, n, f->pmod + f->pbag[b0].mod, f->pbag[b0 + 1].mod - f->pbag[b0].mod);
+        n = merge_mods(scratch, n, f->pmod + f->pbag[b].mod, f->pbag[b + 1].mod - f->pbag[b].mod);
+        pcount[b] = n;
+        pcache[b] = n ? pool_add(&pool, scratch, n) : 0;
+        if (pcache[b] < 0) goto oom;
+      }
+      ins = pz.link; ib0 = f->inst[ins].bag; ib1 = f->inst[ins + 1].bag;
+      for (ib = ib0; ib < ib1; ib++) {
+        SmpSfRegion *r; uint8_t klo, khi, vlo, vhi; int s;
+        read_zone(f->igen, f->ibag[ib].gen, f->ibag[ib + 1].gen, SF_GEN_SAMPLEID, AT_INST, &iz);
+        if (iz.link < 0) {
+          if (ib == ib0) { ig = iz; have_ig = 1; }
+          continue;
+        }
+        s = iz.link;
+        if (f->shdr[s].type & SF_ROM) continue;   /* the sound card's own memory: nothing here to play */
+        if (!(iz.set >> SF_GEN_KEYRANGE & 1) && have_ig) { iz.lokey = ig.lokey; iz.hikey = ig.hikey; }
+        if (!(iz.set >> SF_GEN_VELRANGE & 1) && have_ig) { iz.lovel = ig.lovel; iz.hivel = ig.hivel; }
+        klo = iz.lokey > pklo ? iz.lokey : pklo; khi = iz.hikey < pkhi ? iz.hikey : pkhi;
+        vlo = iz.lovel > pvlo ? iz.lovel : pvlo; vhi = iz.hivel < pvhi ? iz.hivel : pvhi;
+        if (klo > khi || vlo > vhi) continue;
+        if (icache[ib] < 0) {   /* the instrument list: the defaults, the global zone's modulators, then this zone's */
+          int n = SF_NDEFMOD;
+          memcpy(scratch, DEFMODS, sizeof DEFMODS);
+          if (have_ig) n = merge_mods(scratch, n, f->imod + f->ibag[ib0].mod, f->ibag[ib0 + 1].mod - f->ibag[ib0].mod);
+          n = merge_mods(scratch, n, f->imod + f->ibag[ib].mod, f->ibag[ib + 1].mod - f->ibag[ib].mod);
+          icount[ib] = n;
+          icache[ib] = pool_add(&pool, scratch, n);
+          if (icache[ib] < 0) goto oom;
+        }
+        if (nreg == capreg) {
+          int cap = capreg ? capreg * 2 : 256; void *g;
+          if (nreg >= MAX_REGIONS) { snprintf(why, wcap, "it has too many regions"); goto fail; }
+          if (!(g = realloc(reg, (size_t)cap * sizeof *reg))) goto oom;
+          reg = g;
+          if (!(g = realloc(ioff, (size_t)cap * 2 * sizeof *ioff))) goto oom;
+          ioff = g;
+          capreg = cap;
+        }
+        r = &reg[nreg];
+        memset(r, 0, sizeof *r);
+        r->lokey = klo; r->hikey = khi; r->lovel = vlo; r->hivel = vhi; r->sample = s;
+        for (i = 0; i < SMP_SF_NGEN; i++) {
+          int v = zone_val(&iz, have_ig ? &ig : NULL, i, GENS[i].def);
+          if (GENS[i].where & AT_PRESET) v += padd[i];
+          r->gen[i] = (int16_t)(v < GENS[i].lo ? GENS[i].lo : v > GENS[i].hi ? GENS[i].hi : v);
+        }
+        r->gen[SF_GEN_KEYRANGE] = (int16_t)(klo | khi << 8);
+        r->gen[SF_GEN_VELRANGE] = (int16_t)(vlo | vhi << 8);
+        r->nimod = icount[ib]; r->npmod = pcount[b];
+        ioff[2 * nreg] = icache[ib]; ioff[2 * nreg + 1] = pcache[b];
+        nreg++;
+      }
+    }
+  }
+  rstart[f->nphdr] = nreg;
+
+  /* the one block: regions, then the per-preset starts, then the modulator lists */
+  sreg = (size_t)nreg * sizeof(SmpSfRegion);
+  sstart = (size_t)(f->nphdr + 1) * sizeof(int);
+  total = sreg + sstart + (size_t)pool.n * sizeof(SmpSfMod);
+  block = malloc(total ? total : 1);
+  if (!block) goto oom;
+  f->regions = (SmpSfRegion *)block;
+  f->rstart = (int *)(block + sreg);
+  memcpy(f->regions, reg, sreg);
+  memcpy(f->rstart, rstart, sstart);
+  memcpy(block + sreg + sstart, pool.m, (size_t)pool.n * sizeof(SmpSfMod));
+  for (i = 0; i < nreg; i++) {
+    const SmpSfMod *m = (const SmpSfMod *)(block + sreg + sstart);
+    f->regions[i].imod = m + ioff[2 * i];
+    f->regions[i].pmod = f->regions[i].npmod ? m + ioff[2 * i + 1] : NULL;
+  }
+  f->nregions = nreg;
+  ok = 1;
+  goto fail;
+oom:
+  snprintf(why, wcap, "out of memory");
+fail:
+  free(reg); free(ioff); free(icache); free(pcache); free(icount); free(pcount); free(scratch);
+  free(rstart); free(pool.m); free(pool.slot_off); free(pool.slot_n);
+  return ok;
 }
 
 SmpFont *smp_sf_open(const char *path, char *err, int cap) {
@@ -257,6 +580,7 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
   if (!rd(&s, pdta_off, pd, pdta_size)) { snprintf(why, sizeof why, "it can't be read"); goto bad; }
   if (!parse_pdta(f, pd, pdta_size, why, sizeof why)) goto bad;
   if (!build_order(f)) { snprintf(why, sizeof why, "out of memory"); goto bad; }
+  if (!build_regions(f, why, sizeof why)) goto bad;
   /* 24-bit low bytes only count when there is one for every 16-bit sample */
   if (f->sm24_size && (f->is_sf3 || f->sm24_size < f->smpl_size / 2)) f->sm24_off = f->sm24_size = 0;
   clamp_samples(f);
@@ -277,6 +601,7 @@ void smp_sf_close(SmpFont *f) {
   if (!f) return;
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
+  free(f->regions);   /* the one block that also holds rstart and the modulator lists */
   free(f);
 }
 
@@ -306,6 +631,16 @@ int smp_sf_find_preset(const SmpFont *f, int bank, int program) {
     if (p->bank == bank && p->program == program) return lo;
   }
   return -1;
+}
+
+int smp_sf_regions(const SmpFont *f, int preset, const SmpSfRegion **out) {
+  int p, n;
+  if (out) *out = NULL;
+  if (!f || !f->regions || preset < 0 || preset >= f->nphdr) return 0;
+  p = f->order[preset];
+  n = f->rstart[p + 1] - f->rstart[p];
+  if (out && n > 0) *out = f->regions + f->rstart[p];
+  return n;
 }
 
 int smp_sf_sample_count(const SmpFont *f) { return f ? f->nshdr : 0; }

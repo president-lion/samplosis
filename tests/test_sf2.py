@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pytest
 
-from conftest import SmpSfSample, write_wav
+from conftest import SmpSfRegion, SmpSfSample, write_wav
 from sf2make import write_sf2
 
 REAL_FONT = r"E:\samplepacks\soundfonts\just_t4_fixed.sf2"
@@ -135,17 +135,200 @@ def test_bad_index_fails_plainly(lib, tmp_path):
     assert "bad.sf2 isn't a SoundFont this can read (" in err, err
 
 
+# a few of SF2.04's generator ranges (section 8.1.3), checked on every region walked
+CLAMPS = {8: (1500, 13500), 9: (0, 960), 17: (-500, 500), 29: (0, 1000), 34: (-12000, 8000), 37: (0, 1440),
+          46: (-1, 127), 48: (0, 1440), 51: (-120, 120), 52: (-99, 99), 56: (0, 1200), 58: (-1, 127)}
+
+# SF2.04 section 8.4's default modulators, in the spec's order
+DEFAULT_MODS = [
+    (0x0502, 48, 960, 0, 0),        # note-on velocity to initial attenuation
+    (0x0102, 8, -2400, 0, 0),       # note-on velocity to filter cutoff
+    (0x000D, 6, 50, 0, 0),          # channel pressure to vibrato LFO pitch depth
+    (0x0081, 6, 50, 0, 0),          # CC1 to vibrato LFO pitch depth
+    (0x0587, 48, 960, 0, 0),        # CC7 to initial attenuation
+    (0x028A, 17, 1000, 0, 0),       # CC10 to pan
+    (0x058B, 48, 960, 0, 0),        # CC11 to initial attenuation
+    (0x00DB, 16, 200, 0, 0),        # CC91 to reverb send
+    (0x00DD, 15, 200, 0, 0),        # CC93 to chorus send
+    (0x020E, 59, 12700, 0x0010, 0), # pitch wheel to initial pitch, times the bend range
+]
+
+
+def regions(lib, f, preset):
+    out = ctypes.POINTER(SmpSfRegion)()
+    n = lib.smp_sf_regions(f, preset, ctypes.byref(out))
+    return [out[i] for i in range(n)]
+
+
+def mods(ptr, n):
+    return [(ptr[i].src, ptr[i].dest, ptr[i].amount, ptr[i].amt_src, ptr[i].trans) for i in range(n)]
+
+
+def one_preset_regions(lib, tmp_path, preset, samples=SAMPLES):
+    """Writes a font with just this preset and returns its regions as dicts (copied out before the font closes)."""
+    path = tmp_path / "r.sf2"
+    write_sf2(str(path), [preset], samples)
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        return [dict(keys=(r.lokey, r.hikey), vels=(r.lovel, r.hivel), sample=r.sample, gen=list(r.gen),
+                     imod=mods(r.imod, r.nimod), pmod=mods(r.pmod, r.npmod)) for r in regions(lib, f, 0)]
+    finally:
+        lib.smp_sf_close(f)
+
+
+def inst(zones, gens=None, mods=None, pgens=None, pmods=None, name="I"):
+    return dict(name=name, gens=gens or {}, mods=mods or [], zones=zones, pgens=pgens or {}, pmods=pmods or [])
+
+
+def preset(instruments, gens=None, pmods=None, bank=0, program=0, name="P"):
+    return dict(name=name, bank=bank, program=program, gens=gens or {}, pmods=pmods or [], instruments=instruments)
+
+
+def test_regions_ranges_intersect(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, keys=(0, 59)), zone(1, keys=(60, 127))],
+                                                        pgens={43: (40, 80)})]))
+    assert [(r["keys"], r["sample"]) for r in rs] == [((40, 59), 0), ((60, 80), 1)]
+    assert all(r["vels"] == (0, 127) for r in rs)
+    assert [r["gen"][43] for r in rs] == [40 | 59 << 8, 60 | 80 << 8]
+    # velocity ranges intersect the same way, and a pair that doesn't overlap makes no region
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, vels=(1, 64)), zone(1, vels=(65, 127))],
+                                                        pgens={43: (0, 30), 44: (50, 70)}),
+                                                   inst([zone(2, keys=(31, 127))], pgens={43: (0, 30)})]))
+    assert [(r["keys"], r["vels"], r["sample"]) for r in rs] == [((0, 30), (50, 64), 0), ((0, 30), (65, 70), 1)]
+
+
+def test_regions_global_zones(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0), zone(0, gens={34: -600})], gens={34: -1200})]))
+    assert [r["gen"][34] for r in rs] == [-1200, -600]
+    # a preset global zone gives the default for the preset zones, and a local one replaces it
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0)]), inst([zone(1)], pgens={51: 2})],
+                                                  gens={51: 7}))
+    assert [r["gen"][51] for r in rs] == [7, 2]
+
+
+def test_regions_preset_adds(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={51: 2, 48: 200})],
+                                                        pgens={51: 3, 54: 1, 48: 100, 58: 40, 46: 60})]))
+    assert len(rs) == 1
+    g = rs[0]["gen"]
+    assert g[51] == 5
+    assert g[54] == 0          # sampleModes is ignored at preset level
+    assert g[48] == 300
+    assert g[58] == -1 and g[46] == -1   # so are overridingRootKey and keynum
+
+
+def test_regions_defaults(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0)])]))
+    g = rs[0]["gen"]
+    assert g[8] == 13500 and g[56] == 100 and g[34] == -12000 and g[58] == -1 and g[46] == -1 and g[47] == -1
+    for e in (21, 23, 25, 26, 27, 28, 30, 33, 34, 35, 36, 38):
+        assert g[e] == -12000, e
+    for e in (5, 6, 7, 9, 13, 17, 29, 37, 48, 51, 52, 54, 57):
+        assert g[e] == 0, e
+
+
+def test_regions_clamped(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={48: 1400, 17: -450, 8: 2000})],
+                                                        pgens={48: 400, 17: -200, 8: -1000})]))
+    g = rs[0]["gen"]
+    assert g[48] == 1440
+    assert g[17] == -500
+    assert g[8] == 1500
+    # an instrument value out of range on its own is clamped too
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={56: 3000, 52: -500})])]))
+    assert rs[0]["gen"][56] == 1200 and rs[0]["gen"][52] == -99
+
+
+def test_modulators_merged(lib, tmp_path):
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0)])]))
+    assert rs[0]["imod"] == DEFAULT_MODS
+    assert rs[0]["pmod"] == []
+    cc7 = (0x0587, 48, 480, 0, 0)
+    new = (0x0081, 17, 100, 0, 0)    # CC1 to pan: not identical to any default
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, mods=[cc7]), zone(1, mods=[cc7, new])],
+                                                        pmods=[(2, 48, 100, 0, 0)])]))
+    want = list(DEFAULT_MODS)
+    want[4] = cc7
+    assert rs[0]["imod"] == want
+    assert rs[1]["imod"] == want + [new]
+    assert rs[0]["pmod"] == [(2, 48, 100, 0, 0)] and rs[1]["pmod"] == [(2, 48, 100, 0, 0)]
+    # a local modulator replaces an identical global one, at each level
+    g = (0x0081, 17, 100, 0, 0)
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, mods=[(0x0081, 17, -30, 0, 0)]), zone(1)], mods=[g],
+                                                        pmods=[(0x00DB, 16, 50, 0, 0)])],
+                                                  pmods=[(0x00DB, 16, 10, 0, 0), (0x00DD, 15, 20, 0, 0)]))
+    assert rs[0]["imod"] == DEFAULT_MODS + [(0x0081, 17, -30, 0, 0)]
+    assert rs[1]["imod"] == DEFAULT_MODS + [g]
+    assert rs[0]["pmod"] == [(0x00DB, 16, 50, 0, 0), (0x00DD, 15, 20, 0, 0)]
+
+
+def test_unreachable_junk_is_ignored(lib, tmp_path):
+    path = tmp_path / "junk.sf2"
+    write_sf2(str(path), PRESETS, SAMPLES, junk_pgen=[(41, 999)], junk_igen=[(53, 999)])
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        walk_font(lib, f)
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_bad_instrument_in_a_zone_fails(lib, tmp_path):
+    # the only preset zone points at instrument 0; patch it to 9 of 1
+    path = tmp_path / "badinst.sf2"
+    write_sf2(str(path), [PRESETS[2]], SAMPLES)
+    data = bytearray(path.read_bytes())
+    at = data.index(b"pgen") + 8
+    assert data[at:at + 4] == bytes([41, 0, 0, 0])
+    data[at + 2] = 9
+    path.write_bytes(bytes(data))
+    f, err = sf_open(lib, path)
+    assert not f
+    assert "badinst.sf2 isn't a SoundFont this can read (" in err and "instrument 9" in err, err
+
+
+def test_duplicate_presets_first_wins(lib, tmp_path):
+    path = tmp_path / "dup.sf2"
+    write_sf2(str(path), [preset([inst([zone(0)])], name="First"), preset([inst([zone(2)])], name="Second")],
+              SAMPLES)
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        j = lib.smp_sf_find_preset(f, 0, 0)
+        name = ctypes.create_string_buffer(32)
+        assert lib.smp_sf_preset_info(f, j, None, None, name, 32)
+        assert name.value == b"First"
+        assert [r.sample for r in regions(lib, f, j)] == [0]
+        assert presets(lib, f) == [(0, 0, "First"), (0, 0, "Second")]
+    finally:
+        lib.smp_sf_close(f)
+
+
 def walk_font(lib, f):
-    """Reads everything the API offers about an opened font and checks every index is in range.
-    Task 2 adds each preset's regions here."""
+    """Reads everything the API offers about an opened font and checks every index is in range,
+    including each preset's regions and their modulator lists."""
     n = lib.smp_sf_preset_count(f)
     ns = lib.smp_sf_sample_count(f)
     assert 0 <= n < 65536 and 0 <= ns < 65536
     bank, prog, name = ctypes.c_int(), ctypes.c_int(), ctypes.create_string_buffer(32)
+    b2, p2 = ctypes.c_int(), ctypes.c_int()
     for i in range(n):
         assert lib.smp_sf_preset_info(f, i, ctypes.byref(bank), ctypes.byref(prog), name, 32)
         j = lib.smp_sf_find_preset(f, bank.value, prog.value)
         assert 0 <= j < n
+        assert lib.smp_sf_preset_info(f, j, ctypes.byref(b2), ctypes.byref(p2), None, 0)
+        assert (b2.value, p2.value) == (bank.value, prog.value)
+        for r in regions(lib, f, i):
+            assert r.lokey <= r.hikey <= 127 and r.lovel <= r.hivel <= 127
+            assert 0 <= r.sample < ns
+            assert r.nimod >= 10 and r.npmod >= 0
+            assert len(mods(r.imod, r.nimod)) == r.nimod and len(mods(r.pmod, r.npmod)) == r.npmod
+            for g, (lo, hi) in CLAMPS.items():
+                assert lo <= r.gen[g] <= hi, (g, r.gen[g])
+    out = ctypes.POINTER(SmpSfRegion)()
+    assert lib.smp_sf_regions(f, n, ctypes.byref(out)) == 0 and not out
+    assert lib.smp_sf_regions(f, -1, ctypes.byref(out)) == 0 and not out
     for i in range(ns):
         h = lib.smp_sf_sample(f, i).contents
         assert h.start <= h.end
