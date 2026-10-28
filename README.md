@@ -14,7 +14,9 @@ Stage 1 plays one sample across the keyboard.
 - Notes keep their length. With Keep length on, a note played above or below the root is made by Rubber Band (the R3
   engine) so it lasts as long as the recording, instead of playing faster or slower. A chord of a guitar note then
   rings out evenly. The pitch-shifted copies are rendered in the background, one per semitone, and kept in the cache
-  folder. Until a copy is ready the note plays by changing speed, as an ordinary sampler would.
+  folder. When a sample loads, the copies for one octave each way of the root are prepared, nearest first. Any other
+  key gets its copy the first time it is played, ahead of the copies still being prepared. Until a copy is ready the
+  note plays by changing speed, as an ordinary sampler would.
 - With Keep length off, pitch changes by changing speed.
 - Envelope, loop, start and end points, reverse, speed, velocity response, key and velocity ranges, probability,
   pitch bend and polyphony (up to 64 voices, 16 by default).
@@ -32,7 +34,7 @@ Main page:
 6. Mode.
 7. Then the other parameters in the order of the list below, from Root note to Speed (the window lays them out in two columns, but Tab follows the list order),
    each one a labelled box (or a combo box for choices).
-8. Status: for example "Keep length: 40 of 128 copies ready", or the reason a file did not load.
+8. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
 9. Settings button.
 
 Settings page:
@@ -120,22 +122,28 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 Measured on 2026-10-28 with `python tests\measure.py`, through the engine's exported functions, with a temporary
 cache folder.
 
-- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48 to 63 (C3 to D#4). Keep length off:
-  0.96 percent of real time. Keep length on, all copies ready: 1.18 percent. The target was under 2 percent. This
-  includes the test helper's small waits, so it is an upper bound for the audio thread.
-- Memory: a 60 second stereo sample loaded with keep length on and all 97 copies the default key range needs
-  rendered (that took 823 seconds). Private bytes grew by 9.3 MB, against a target of under 40 MB. The copies are
-  files in the cache folder (2.2 GB here), read by a background thread, not held in memory. While rendering, the
-  process working set peaked at 984 MB (Rubber Band's working buffers and the operating system's file cache are
-  part of it, and so is the test script itself); it was not measured separately.
+- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48
+  to 63 (C3 to D#4). Keep length off: 0.84 percent of real time. Keep length on, all copies ready: 1.09 percent. The
+  target was under 2 percent. This includes the test helper's small waits, so it is an upper bound for the audio
+  thread.
+- Memory, per instance, as private bytes of the measuring process from just before smp_engine_new:
+  - A new idle engine: 8.9 MB. Nearly all of it is the voice rings, 512 KB for each of the 16 voices the Voices
+    parameter allows by default. Rings for more voices are committed only when Voices is raised.
+  - With a 60 second stereo sample loaded and keep length on: 12.9 MB, with the 25 copies for one octave each way of
+    the root rendered (that took 115 seconds). Each copy keeps only its first quarter second in memory (about 88 KB);
+    the rest is read from the cache folder (about 21 MB per copy here) by a background thread as notes play.
+  - An earlier version of this README gave a 984 MB working-set peak while rendering. That was the whole Python test
+    process (its own sample buffers and file cache pages included), not Rubber Band, and it is no longer reported.
 
 ## Known limits
 
 - Keep-length copies exist only within 48 semitones of the root. Keys further away are resampled (pitch by speed).
 - The first note after moving Start, End or the loop start may be resampled once per key, until the new copies
   have been rendered.
-- Rendering all the copies of a long sample takes a long time and a lot of cache space. Narrow the key range
-  (Lowest note, Highest note) to render less.
+- Rendering the copies of a long sample takes a long time and a lot of cache space: each copy is as big as the
+  decoded sample. Only one octave each way is prepared at load; narrowing the key range (Lowest note, Highest note)
+  renders less and frees the copies it no longer reaches.
+- The first note on a key more than an octave from the root is resampled; its copy follows in the background.
 - One sample per instance. The rest is still to come.
 
 ## What is still to come

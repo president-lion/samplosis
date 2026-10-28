@@ -1,6 +1,7 @@
 """Measures Samplosis CPU and memory through the exported engine API. Run: python tests/measure.py
 CPU: 16 held voices, 48 kHz, 256-frame blocks, through smp_engine_render_test (percent of real time).
-Memory: a 60 s sample loaded, every keep-length copy rendered; private bytes growth of this process.
+Memory: private bytes of this process from before engine_new: a new idle engine, then a 60 s sample loaded with
+its keep-length copies (one octave each way of the root) rendered.
 Uses a temporary settings file and cache folder; nothing of the user's is touched."""
 import ctypes, os, sys, tempfile, time
 import numpy as np, psutil, soundfile as sf
@@ -51,16 +52,23 @@ for keep in (0, 1):
     print(f"CPU, 16 voices, keep length {'on' if keep else 'off'}: {dt:.3f} s for {SECS} s of audio = {100 * dt / SECS:.2f} % of real time")
     lib.smp_engine_free(e)
 
-# memory
+# memory: the baseline is taken before engine_new, so the engine's rings count
+import gc
 proc = psutil.Process()
+src = sample(60, "mem.wav")                           # loaded (decoded into the cache) before the baseline
+gc.collect()
+before = proc.memory_full_info().private
 e = lib.smp_engine_new(RATE, 512)
-before = psutil.Process().memory_full_info().private
-lib.smp_engine_set_sample(e, sample(60, "mem.wav"))   # keep length on by default, whole key range
+time.sleep(0.5)
+idle = proc.memory_full_info().private
+print(f"Memory, a new idle engine (16 voices): private bytes grew {(idle - before) / 1e6:.1f} MB")
+lib.smp_engine_set_sample(e, src)                     # keep length on by default, default key range
 t0 = time.perf_counter()
 assert lib.smp_engine_wait_renders(e, 1800000) == 0
 ready, total, why = ci(), ci(), ctypes.create_string_buffer(512)
 ok = lib.smp_engine_render_status(e, ctypes.byref(ready), ctypes.byref(total), why, 512)
-after = psutil.Process().memory_full_info().private
+time.sleep(0.5)
+after = proc.memory_full_info().private
 print(f"Memory, 60 s sample, copies ready {ready.value} of {total.value} (all ready: {ok}) after {time.perf_counter() - t0:.0f} s: "
-      f"private bytes grew {(after - before) / 1e6:.1f} MB (peak working set {proc.memory_info().peak_wset / 1e6:.0f} MB)")
+      f"private bytes grew {(after - before) / 1e6:.1f} MB from before engine_new")
 lib.smp_engine_free(e)
