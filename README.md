@@ -30,8 +30,8 @@ Main page:
 3. Previous file button, and 4. Next file button: step through the audio files in the same folder.
 5. Keep length (on or off).
 6. Mode.
-7. Then the other parameters in the order of the list below, from Root note to Speed, left column first then
-   right, each one a labelled box (or a combo box for choices).
+7. Then the other parameters in the order of the list below, from Root note to Speed (the window lays them out in two columns, but Tab follows the list order),
+   each one a labelled box (or a combo box for choices).
 8. Status: for example "Keep length: 40 of 128 copies ready", or the reason a file did not load.
 9. Settings button.
 
@@ -84,7 +84,7 @@ sample line, each parameter is `name value-in-words`. Names are the lower case o
 transpose, fine, volume, pan, attack, decay, sustain, release, velocity_sens, min_volume, mode, note_lo, note_hi,
 pitch_lo, vel_lo, vel_hi, obey_note_off, loop, loop_start, start, end, bend_range, pitch_hi, reverse, keep_length,
 voices, probability, speed). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
-sample's cache key. Example, shortened:
+sample's cache key (the key below is only an example). Example, shortened:
 
     # Samplosis 0.1.0
     sample "D:\guitar\Guitar C3.wav" key=0123456789abcdef
@@ -120,7 +120,7 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 Measured on 2026-10-28 with `python tests\measure.py`, through the engine's exported functions, with a temporary
 cache folder.
 
-- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio. Keep length off:
+- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48 to 63 (C2 to D#3). Keep length off:
   0.96 percent of real time. Keep length on, all copies ready: 1.18 percent. The target was under 2 percent. This
   includes the test helper's small waits, so it is an upper bound for the audio thread.
 - Memory: a 60 second stereo sample loaded with keep length on and all 97 copies the default key range needs
