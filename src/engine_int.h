@@ -17,6 +17,11 @@
 #define SMP_TAGOF(x) ((LONG)(((x) >> 40) & 0xFFFFFF))
 #define SMP_VALOF(x) ((x) & ((1LL << 40) - 1))
 
+/* a pre-read copy of the first frames of the region from the current start point (start past the entry's head),
+   made by the worker thread and published by atomic pointer */
+typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n; float *lr; } SmpStartHead;
+#define SMP_MAXSHRET 64
+
 typedef struct SmpVoice {
   /* Written by the audio thread at note-on, before gen is bumped; read by the streamer after reading gen. */
   SmpEntry *src;                         /* what the voice reads: forward, reversed (Task 6: a rendered copy) */
@@ -33,6 +38,8 @@ typedef struct SmpVoice {
   /* audio thread only */
   int key, whole, fading, stage, underrun;
   const float *head; uint64_t head_frames;
+  const float *hp;                       /* path frames below v0 come from here: the head or a start head */
+  const SmpStartHead *volatile sh;       /* the start head in use, if any (its retirement check reads this) */
   double src_semis;                      /* semitones already in src (0 when resampling) */
   double pos, vgain, env, k, att_inc, fade, fade_step;
   int64_t left, path_len;
@@ -43,7 +50,7 @@ typedef struct SmpVoice {
 } SmpVoice;
 
 typedef struct { int type, key, vel, at; double x; } SmpEv;   /* type 0 on, 1 off, 2 bend */
-typedef struct { SmpSample *s; LONG64 a0, s0; int phase; } SmpRetired;
+typedef struct { SmpSample *s; LONG64 a0, s0, w0; int phase; } SmpRetired;
 
 struct SmpEngine {
   double rate; int max_block;
@@ -61,6 +68,10 @@ struct SmpEngine {
   volatile LONG underruns;
   volatile LONG quit, want_rev;
   HANDLE wake, idle, thread;
+  HANDLE work, widle, worker;           /* low-priority worker: reversed copies and start heads */
+  volatile LONG64 wpass;                 /* passes the worker has finished */
+  SmpStartHead *volatile sh[2];          /* forward, reversed */
+  struct { SmpStartHead *h; LONG64 a0; } shret[SMP_MAXSHRET]; int nshret;   /* worker only */
   int offline;                           /* set only inside smp_engine_render_test: note-ons may wait for the streamer */
   CRITICAL_SECTION rev_cs;               /* main and streamer, around smp_sample_reversed */
   DWORD main_tid;
@@ -72,6 +83,23 @@ double smp_eng_param(const SmpEngine *e, int id);
 int smp_stream_start(SmpEngine *e);
 void smp_stream_stop(SmpEngine *e);
 void smp_stream_wait_idle(SmpEngine *e);  /* offline helper: returns after a full streamer pass has run */
+int smp_worker_start(SmpEngine *e);
+void smp_worker_stop(SmpEngine *e);
+void smp_worker_wait_idle(SmpEngine *e);  /* offline helper: returns after a full worker pass has run */
+
+/* The region in src frames for F frames. Reversed plays the mirrored region; loop start keeps its offset into it. */
+static __inline void smp_region(double start, double end, double loop_start, int64_t F, int rev,
+                                int64_t *rs, int64_t *re, int64_t *rls) {
+  int64_t sf = (int64_t)(start / 100.0 * (double)F), ef = (int64_t)(end / 100.0 * (double)F),
+          lsf = (int64_t)(loop_start / 100.0 * (double)F);
+  if (sf >= F) sf = F - 1;
+  if (ef > F) ef = F;
+  if (ef <= sf) ef = sf + 1;
+  if (lsf < sf) lsf = sf;
+  if (lsf >= ef) lsf = ef - 1;
+  if (rev) { *rs = F - ef; *re = F - sf; *rls = *rs + (lsf - sf); }
+  else { *rs = sf; *re = ef; *rls = lsf; }
+}
 
 /* Path frame v of a voice -> src frame, direction and frames left in that straight run. 0 past the end. */
 static __inline int smp_path_run(int64_t rs, int64_t re, int64_t rls, int loop, int64_t v,

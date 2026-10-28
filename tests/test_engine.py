@@ -328,3 +328,90 @@ def test_streaming_long_sample(lib, tmp_path):
     ref = hermite(data, np.arange(len(y)) * ratio)
     err = rms_db(y - ref) - rms_db(ref)
     assert err < -60, err
+
+
+def play_live(lib, e, blocks, speed=2.0, block=256, keep=None, between=None):
+    """Real-time style: process called directly, paced at `speed` times real time, never waiting on the streamer.
+    Returns the left channel of the first `keep` blocks."""
+    import time
+    l = np.zeros(block, dtype=np.float32); r = np.zeros(block, dtype=np.float32)
+    lp, rp = l.ctypes.data_as(FP), r.ctypes.data_as(FP)
+    out = []
+    t0 = time.perf_counter()
+    for b in range(blocks):
+        if between:
+            between(b)
+        lib.smp_engine_process(e.e, lp, rp, block)
+        if keep is not None and b < keep:
+            out.append(l.copy())
+        while time.perf_counter() - t0 < (b + 1) * block / e.host_rate / speed:
+            pass
+    return np.concatenate(out) if out else None
+
+
+def test_start_past_head_realtime(lib, tmp_path):
+    import time
+    rate = 48000
+    rng = np.random.default_rng(5)
+    data = (0.3 * rng.standard_normal(rate * 4)).astype(np.float32)
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    for rev in (0, 1):
+        e.set(REVERSE, rev); e.set(START, 50)
+        time.sleep(0.3)                                   # the user set start a moment before playing
+        lib.smp_engine_note_on(e.e, 57, 127, 0)
+        y = play_live(lib, e, 40, keep=40)
+        src = data[2 * rate:] if not rev else data[::-1][:2 * rate]   # reversed: region [0, 50 %) mirrored
+        n = rate // 100
+        assert rms_db(y[1:n] - src[1:n]) - rms_db(src[1:n]) < -60, rev
+        assert lib.smp_engine_underruns(e.e) == 0, rev
+        lib.smp_engine_note_off(e.e, 57, 0)
+        play_live(lib, e, 20)
+    e.free()
+
+
+def test_loop_ignored_when_note_off_ignored(lib, tmp_path):
+    e = Engine(lib, tmp_path, sine(220, 0.5))
+    e.set(LOOP, 1); e.set(OBEY_NOTE_OFF, 0)
+    y = e.render(f"on 57 127 0\noff 57 {secs_to(e, 0.1)}", 0.8)
+    assert np.max(np.abs(y[secs_to(e, 0.6):])) == 0
+    assert lib.smp_engine_active_voices(e.e) == 0
+    e.free()
+
+
+def test_reverse_from_audio_thread(lib, tmp_path):
+    import threading, time
+    rate = 44100
+    t = np.arange(rate * 60) / rate
+    data = (0.3 * np.sin(2 * np.pi * 220 * t) * (1 + 0.5 * np.sin(2 * np.pi * 0.25 * t))).astype(np.float32)
+    e = Engine(lib, tmp_path, data, rate=rate, name="long A3.wav", host_rate=rate)
+    for k in range(8):
+        lib.smp_engine_note_on(e.e, 57 + 24 + k, 100, 0)   # two octaves up and more: rings drain fast
+
+    # at 6x real time the rings have ~30 ms of slack: a reversed copy made on the streamer (~30 ms) would drain them
+    def flip(b):
+        if b == 20:
+            lib.smp_engine_set_param(e.e, REVERSE, 1)       # from the audio thread, between process calls
+
+    th = threading.Thread(target=play_live, args=(lib, e, rate * 3 // 256), kwargs={"between": flip, "speed": 6.0})
+    th.start(); th.join()
+    assert lib.smp_engine_active_voices(e.e) == 8
+    assert lib.smp_engine_underruns(e.e) == 0
+    for _ in range(200):                                     # the reversed copy arrives in the background
+        y = e.render("on 57 127 0", 0.05)[:, 0]
+        if abs(y[100] - data[-101]) < 1e-3 and abs(y[1000] - data[-1001]) < 1e-3:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("reversed copy never became ready")
+    e.free()
+
+
+def test_streaming_long_sample_realtime(lib, tmp_path):
+    rate, secs = 44100, 60
+    data = (0.3 * np.sin(2 * np.pi * 440 * np.arange(rate * secs) / rate)).astype(np.float32)
+    e = Engine(lib, tmp_path, data, rate=rate, name="long A4.wav")
+    lib.smp_engine_note_on(e.e, 69, 127, 0)
+    play_live(lib, e, (secs - 1) * e.host_rate // 256, speed=4.0)
+    assert lib.smp_engine_active_voices(e.e) == 1
+    assert lib.smp_engine_underruns(e.e) == 0
+    e.free()

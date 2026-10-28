@@ -38,11 +38,11 @@ SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v) {
     if (GetCurrentThreadId() == e->main_tid) {           /* make the reversed copy now, on the main thread */
       SmpSample *s = e->sample;
       if (s && !s->rev) { EnterCriticalSection(&e->rev_cs); smp_sample_reversed(s); LeaveCriticalSection(&e->rev_cs); }
-    } else {                                              /* elsewhere: the streamer makes it; forward until then */
+    } else {                                              /* elsewhere: the worker makes it; forward until then */
       InterlockedExchange(&e->want_rev, 1);
-      if (e->wake) SetEvent(e->wake);
     }
   }
+  if ((id == SMP_P_REVERSE || id == SMP_P_START || id == SMP_P_END) && e->work) SetEvent(e->work);  /* start heads */
 }
 
 /* ---- life cycle ---- */
@@ -60,13 +60,14 @@ SMP_API SmpEngine *smp_engine_new(double rate, int max_block) {
   e->rings = VirtualAlloc(NULL, (SIZE_T)SMP_MAXV * SMP_RING * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!e->rings) { DeleteCriticalSection(&e->rev_cs); free(e); return NULL; }
   for (i = 0; i < SMP_MAXV; i++) { e->v[i].ring = e->rings + (size_t)i * SMP_RING * 2; e->v[i].s_gen = -1; }
-  if (!smp_stream_start(e)) { smp_engine_free(e); return NULL; }
+  if (!smp_stream_start(e) || !smp_worker_start(e)) { smp_engine_free(e); return NULL; }
   return e;
 }
 
 SMP_API void smp_engine_free(SmpEngine *e) {
   int i;
   if (!e) return;
+  smp_worker_stop(e);                                   /* frees the start heads */
   smp_stream_stop(e);
   for (i = 0; i < e->nret; i++) smp_sample_free(e->ret[i].s);
   free(e->ret);
@@ -87,8 +88,10 @@ SMP_API void smp_engine_collect(SmpEngine *e) {
   if (!e) return;
   while (i < e->nret) {
     SmpRetired *r = &e->ret[i];
-    if (r->phase == 0 && e->epoch >= r->a0 + 2 && !voice_uses(e, r->s)) { r->s0 = e->spass; r->phase = 1; }
-    if (r->phase == 1 && e->spass >= r->s0 + 2) {
+    SmpStartHead *h0 = e->sh[0], *h1 = e->sh[1];
+    if (r->phase == 0 && e->epoch >= r->a0 + 2 && !voice_uses(e, r->s)) { r->s0 = e->spass; r->w0 = e->wpass; r->phase = 1; }
+    if (r->phase == 1 && e->spass >= r->s0 + 2 && e->wpass >= r->w0 + 2 &&
+        !(h0 && h0->s == r->s) && !(h1 && h1->s == r->s)) {
       smp_sample_free(r->s);
       e->ret[i] = e->ret[--e->nret];
       continue;
@@ -115,9 +118,10 @@ SMP_API void smp_engine_set_sample(SmpEngine *e, SmpSample *s) {
     }
     if (e->nret < e->cret) {
       SmpRetired *r = &e->ret[e->nret++];
-      r->s = old; r->a0 = e->epoch; r->s0 = 0; r->phase = 0;
+      r->s = old; r->a0 = e->epoch; r->s0 = r->w0 = 0; r->phase = 0;
     } /* else out of memory: leak the old sample rather than free it under a voice */
   }
+  if (e->work) SetEvent(e->work);                       /* new start heads */
   smp_engine_collect(e);
 }
 
@@ -169,7 +173,7 @@ static void fade_out(SmpEngine *e, SmpVoice *v) {
 static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL;
   int i, count = 0, voices = (int)P->p[SMP_P_VOICES];
-  int64_t F, sf, ef, lsf, rs, re, rls; uint64_t hf; double vdb;
+  int64_t F, rs, re, rls; uint64_t hf; double vdb; int loop;
   if (!s || !s->fwd) return;
   if (key < P->p[SMP_P_NOTE_LO] || key > P->p[SMP_P_NOTE_HI]) return;
   if (vel < P->p[SMP_P_VEL_LO] || vel > P->p[SMP_P_VEL_HI]) return;
@@ -194,22 +198,21 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
     for (i = 0; i < SMP_MAXV; i++) if (!v || e->v[i].order < v->order) v = &e->v[i];
     kill(v);
   }
-  /* the region, in src frames; reversed plays the mirrored region, loop start keeps its offset into it */
-  sf = (int64_t)floor(P->p[SMP_P_START] / 100.0 * F);
-  ef = (int64_t)floor(P->p[SMP_P_END] / 100.0 * F);
-  if (sf >= F) sf = F - 1;
-  if (ef > F) ef = F;
-  if (ef <= sf) ef = sf + 1;
-  lsf = (int64_t)floor(P->p[SMP_P_LOOP_START] / 100.0 * F);
-  if (lsf < sf) lsf = sf;
-  if (lsf >= ef) lsf = ef - 1;
-  if (rev) { rs = F - ef; re = F - sf; rls = rs + (lsf - sf); }
-  else { rs = sf; re = ef; rls = lsf; }
-  v->src = src; v->rs = rs; v->re = re; v->rls = rls; v->loop = (int)P->p[SMP_P_LOOP];
+  smp_region(P->p[SMP_P_START], P->p[SMP_P_END], P->p[SMP_P_LOOP_START], F, rev != NULL, &rs, &re, &rls);
+  /* a note that ignores note-off plays to the end: no loop, or it would never stop */
+  loop = P->p[SMP_P_OBEY_NOTE_OFF] >= 0.5 ? (int)P->p[SMP_P_LOOP] : 0;
+  v->src = src; v->rs = rs; v->re = re; v->rls = rls; v->loop = loop;
   v->head = smp_entry_head(src, &hf); v->head_frames = hf;
   v->whole = smp_entry_whole(src);
-  v->v0 = v->whole ? SMP_NOFILL : (rs < (int64_t)hf ? ((re < (int64_t)hf ? re : (int64_t)hf) - rs) : 0);
   v->path_len = re - rs;
+  v->sh = NULL; v->hp = v->head + 2 * rs; v->v0 = 0;
+  if (v->whole) v->v0 = SMP_NOFILL;
+  else {
+    SmpStartHead *sh = e->sh[rev ? 1 : 0];
+    if (sh && sh->s == s && sh->src == src && sh->at == rs) {   /* the start point's pre-read frames */
+      v->sh = sh; v->hp = sh->lr; v->v0 = sh->n < v->path_len ? sh->n : v->path_len;
+    } else if (rs < (int64_t)hf) v->v0 = (re < (int64_t)hf ? re : (int64_t)hf) - rs;
+  }
   v->src_semis = 0;
   v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0;
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;
@@ -224,8 +227,8 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
     LONG g = InterlockedIncrement(&v->gen);
     v->need = SMP_TAG(g);
   }
-  /* A region starting past the head needs the ring at once. Real time can't wait (the first frames underrun);
-     offline renders let the streamer fill it first so they come out exact. */
+  /* No pre-read frames (the start head isn't ready yet, e.g. start just moved): the ring is needed at once.
+     Real time can't wait (the first frames underrun); offline renders let the streamer fill it first. */
   if (e->offline && v->v0 == 0) smp_stream_wait_idle(e);
 }
 
@@ -257,7 +260,7 @@ static __inline int fetch(const SmpVoice *v, int64_t idx, int64_t avail, float *
     int64_t at, run; int dir;
     if (!smp_path_run(v->rs, v->re, v->rls, v->loop, idx, &at, &dir, &run)) { *L = *R = 0; return 0; }
     f = v->head + 2 * at;
-  } else if (idx < v->v0) f = v->head + 2 * (v->rs + idx);
+  } else if (idx < v->v0) f = v->hp + 2 * idx;
   else if (idx < avail) f = v->ring + 2 * (idx & SMP_RMASK);
   else { *L = *R = 0; return -1; }
   *L = f[0]; *R = f[1];
@@ -395,6 +398,7 @@ SMP_API int smp_engine_render_test(SmpEngine *e, const char *events, long frames
   l = malloc(sizeof(float) * (size_t)block); r = malloc(sizeof(float) * (size_t)block); lr = malloc(sizeof(float) * 2 * (size_t)block);
   if (!l || !r || !lr) { free(l); free(r); free(lr); free(ev); fclose(f); return 3; }
   wav_header(f, (uint32_t)frames, e->rate);
+  smp_worker_wait_idle(e);                              /* start heads and reversed copies ready */
   { /* every render starts from silence: no voices from an earlier render, no bend */
     int i;
     for (i = 0; i < SMP_MAXV; i++) e->v[i].live = 0;

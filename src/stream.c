@@ -8,22 +8,16 @@
      publishes filled = tag(gen) | frames. The audio thread only reads ring frames below filled when the tag
      matches its gen, so data from an older note in the same slot is never played.
    - The audio thread publishes need = tag(gen) | oldest path frame it still needs; the streamer never writes
-     more than SMP_RING - 1 frames past it. */
+     more than SMP_RING - 1 frames past it.
+
+   The worker thread (below normal priority) does the slow one-off jobs so the streamer never stalls: reversed
+   copies asked for from threads other than the main one, and start heads (the first quarter second of the
+   region from the current start point, forward and reversed) so notes starting past the entry's head sound at
+   once. Start heads are published by atomic pointer; a replaced one is freed once the audio thread has finished
+   a block that began after the swap and no voice uses it. */
 #include <stdlib.h>
 #include <string.h>
 #include "engine_int.h"
-
-/* Reversed copies asked for from a thread other than the main thread are made here (heavy I/O, once). Until it
-   is ready, notes play forward. */
-static void prepare_reverse(SmpEngine *e) {
-  SmpSample *s;
-  if (!InterlockedExchange(&e->want_rev, 0)) return;
-  s = e->sample;
-  if (!s || smp_eng_param(e, SMP_P_REVERSE) < 0.5) return;
-  EnterCriticalSection(&e->rev_cs);
-  smp_sample_reversed(s);
-  LeaveCriticalSection(&e->rev_cs);
-}
 
 static void put(float *ring, int64_t at, const float *src, int64_t n) {
   memcpy(ring + 2 * (at & SMP_RMASK), src, (size_t)n * 8);
@@ -76,7 +70,6 @@ static DWORD WINAPI streamer(LPVOID arg) {
     int i;
     WaitForSingleObject(e->wake, 5);
     if (e->quit) break;
-    prepare_reverse(e);
     for (i = 0; i < SMP_MAXV; i++) service(e, &e->v[i]);
     InterlockedIncrement64(&e->spass);
     SetEvent(e->idle);
@@ -114,5 +107,111 @@ void smp_stream_wait_idle(SmpEngine *e) {
   while (e->spass < target && e->thread) {
     SetEvent(e->wake);
     WaitForSingleObject(e->idle, 50);
+  }
+}
+
+/* ---- the worker ---- */
+static int sh_in_use(const SmpEngine *e, const SmpStartHead *h) {
+  int i;
+  for (i = 0; i < SMP_MAXV; i++) if (e->v[i].live && e->v[i].sh == h) return 1;
+  return 0;
+}
+
+static void sh_free(SmpStartHead *h) { if (h) { free(h->lr); free(h); } }
+
+static void sh_sweep(SmpEngine *e) {
+  int i = 0;
+  while (i < e->nshret) {
+    if (e->epoch >= e->shret[i].a0 + 2 && !sh_in_use(e, e->shret[i].h)) {
+      sh_free(e->shret[i].h);
+      e->shret[i] = e->shret[--e->nshret];
+    } else i++;
+  }
+}
+
+static void sh_publish(SmpEngine *e, int d, SmpStartHead *h) {
+  SmpStartHead *old = InterlockedExchangePointer((PVOID volatile *)&e->sh[d], h);
+  if (!old) return;
+  while (e->nshret >= SMP_MAXSHRET && !e->quit) { Sleep(5); sh_sweep(e); }
+  if (e->nshret >= SMP_MAXSHRET) return;               /* quitting: leaked rather than freed under a voice */
+  e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++;
+}
+
+static void sh_build(SmpEngine *e, int d) {
+  SmpSample *s = e->sample; SmpEntry *src = NULL; SmpStartHead *cur = e->sh[d], *h;
+  int64_t F, rs = 0, re, rls, n; uint64_t hf; long got;
+  if (s) src = d ? *(SmpEntry *volatile *)&s->rev : s->fwd;
+  if (src && !smp_entry_whole(src) && (F = (int64_t)smp_entry_frames(src)) > 0)
+    smp_region(smp_eng_param(e, SMP_P_START), smp_eng_param(e, SMP_P_END), smp_eng_param(e, SMP_P_LOOP_START), F, d, &rs, &re, &rls);
+  else src = NULL;
+  if (!src || rs == 0) { if (cur) sh_publish(e, d, NULL); return; }   /* the entry's own head serves */
+  if (cur && cur->s == s && cur->src == src && cur->at == rs) return;
+  smp_entry_head(src, &hf);
+  n = (int64_t)hf;
+  if (n > F - rs) n = F - rs;
+  h = calloc(1, sizeof *h);
+  if (!h || !(h->lr = malloc((size_t)n * 8))) { free(h); return; }
+  got = smp_entry_read(src, (uint64_t)rs, h->lr, (long)n);
+  if (got < 0) got = 0;
+  if (got < n) memset(h->lr + 2 * got, 0, (size_t)(n - got) * 8);
+  h->s = s; h->src = src; h->at = rs; h->n = n;
+  sh_publish(e, d, h);                                    /* volatile/interlocked: the frames are visible first */
+}
+
+static DWORD WINAPI worker(LPVOID arg) {
+  SmpEngine *e = arg;
+  while (!e->quit) {
+    WaitForSingleObject(e->work, 20);
+    if (e->quit) break;
+    if (InterlockedExchange(&e->want_rev, 0)) {           /* reverse switched on from a non-main thread */
+      SmpSample *s = e->sample;
+      if (s && smp_eng_param(e, SMP_P_REVERSE) >= 0.5) {
+        EnterCriticalSection(&e->rev_cs);
+        smp_sample_reversed(s);
+        LeaveCriticalSection(&e->rev_cs);
+      }
+    }
+    sh_build(e, 0);
+    sh_build(e, 1);
+    sh_sweep(e);
+    InterlockedIncrement64(&e->wpass);
+    SetEvent(e->widle);
+  }
+  return 0;
+}
+
+int smp_worker_start(SmpEngine *e) {
+  e->work = CreateEventW(NULL, FALSE, FALSE, NULL);
+  e->widle = CreateEventW(NULL, FALSE, FALSE, NULL);
+  if (!e->work || !e->widle) return 0;
+  e->worker = CreateThread(NULL, 0, worker, e, 0, NULL);
+  if (!e->worker) return 0;
+  SetThreadPriority(e->worker, THREAD_PRIORITY_BELOW_NORMAL);
+  return 1;
+}
+
+void smp_worker_stop(SmpEngine *e) {   /* also frees every start head: call only when no audio thread runs */
+  int i;
+  if (e->worker) {
+    InterlockedExchange(&e->quit, 1);
+    SetEvent(e->work);
+    WaitForSingleObject(e->worker, INFINITE);
+    CloseHandle(e->worker);
+    e->worker = NULL;
+  }
+  if (e->work) CloseHandle(e->work);
+  if (e->widle) CloseHandle(e->widle);
+  e->work = e->widle = NULL;
+  for (i = 0; i < e->nshret; i++) sh_free(e->shret[i].h);
+  e->nshret = 0;
+  sh_free(e->sh[0]); sh_free(e->sh[1]);
+  e->sh[0] = e->sh[1] = NULL;
+}
+
+void smp_worker_wait_idle(SmpEngine *e) {
+  LONG64 target = e->wpass + 2;
+  while (e->wpass < target && e->worker) {
+    SetEvent(e->work);
+    WaitForSingleObject(e->widle, 50);
   }
 }
