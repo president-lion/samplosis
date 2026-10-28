@@ -70,7 +70,7 @@ static DWORD WINAPI streamer(LPVOID arg) {
     int i;
     WaitForSingleObject(e->wake, 5);
     if (e->quit) break;
-    for (i = 0; i < SMP_MAXV; i++) service(e, &e->v[i]);
+    if (!e->spause) for (i = 0; i < SMP_MAXV; i++) service(e, &e->v[i]);
     InterlockedIncrement64(&e->spass);
     SetEvent(e->idle);
   }
@@ -208,6 +208,7 @@ static DWORD WINAPI worker(LPVOID arg) {
         LeaveCriticalSection(&e->rev_cs);
       }
     }
+    smp_rings_commit(e);                                   /* Voices raised from another thread */
     sh_build(e, 0);
     sh_build(e, 1);
     kl_sh_build(e);

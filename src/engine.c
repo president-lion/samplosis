@@ -43,6 +43,10 @@ SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v) {
     }
   }
   if ((id == SMP_P_REVERSE || id == SMP_P_START || id == SMP_P_END) && e->work) SetEvent(e->work);  /* start heads */
+  if (id == SMP_P_VOICES && (int)smp_eng_param(e, id) > e->nring) {   /* more rings: never on the audio thread */
+    if (GetCurrentThreadId() == e->main_tid) smp_rings_commit(e);
+    else if (e->work) SetEvent(e->work);                  /* the worker commits them; fewer voices until then */
+  }
   switch (id) {                                          /* what keep length renders depends on these */
     case SMP_P_KEEP_LENGTH: case SMP_P_SPEED: case SMP_P_REVERSE: case SMP_P_MODE: case SMP_P_ROOT:
     case SMP_P_TRANSPOSE: case SMP_P_FINE: case SMP_P_NOTE_LO: case SMP_P_NOTE_HI: case SMP_P_PITCH_LO:
@@ -52,6 +56,17 @@ SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v) {
 }
 
 /* ---- life cycle ---- */
+void smp_rings_commit(SmpEngine *e) {
+  int want = (int)smp_eng_param(e, SMP_P_VOICES);
+  if (want > SMP_MAXV) want = SMP_MAXV;
+  if (want <= e->nring) return;
+  EnterCriticalSection(&e->ring_cs);
+  if (want > e->nring &&
+      VirtualAlloc(e->rings + (size_t)e->nring * SMP_RING * 2, (SIZE_T)(want - e->nring) * SMP_RING * 8, MEM_COMMIT, PAGE_READWRITE))
+    InterlockedExchange(&e->nring, want);                 /* committed first, then the audio thread may use them */
+  LeaveCriticalSection(&e->ring_cs);
+}
+
 SMP_API SmpEngine *smp_engine_new(double rate, int max_block) {
   SmpEngine *e; int i;
   if (rate <= 0) return NULL;
@@ -63,10 +78,15 @@ SMP_API SmpEngine *smp_engine_new(double rate, int max_block) {
   e->main_tid = GetCurrentThreadId();
   InitializeCriticalSection(&e->rev_cs);
   InitializeCriticalSection(&e->r_cs);
-  /* committed now; pages are only touched as the streamer fills a voice's ring */
-  e->rings = VirtualAlloc(NULL, (SIZE_T)SMP_MAXV * SMP_RING * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  if (!e->rings) { DeleteCriticalSection(&e->rev_cs); DeleteCriticalSection(&e->r_cs); free(e); return NULL; }
+  InitializeCriticalSection(&e->ring_cs);
+  /* address space for every voice; rings are committed only up to the Voices parameter, as it grows */
+  e->rings = VirtualAlloc(NULL, (SIZE_T)SMP_MAXV * SMP_RING * 8, MEM_RESERVE, PAGE_READWRITE);
+  if (!e->rings) {
+    DeleteCriticalSection(&e->rev_cs); DeleteCriticalSection(&e->r_cs); DeleteCriticalSection(&e->ring_cs);
+    free(e); return NULL;
+  }
   for (i = 0; i < SMP_MAXV; i++) { e->v[i].ring = e->rings + (size_t)i * SMP_RING * 2; e->v[i].s_gen = -1; }
+  smp_rings_commit(e);
   if (!smp_stream_start(e) || !smp_worker_start(e) || !smp_render_start(e)) { smp_engine_free(e); return NULL; }
   return e;
 }
@@ -84,6 +104,7 @@ SMP_API void smp_engine_free(SmpEngine *e) {
   if (e->rings) VirtualFree(e->rings, 0, MEM_RELEASE);
   DeleteCriticalSection(&e->rev_cs);
   DeleteCriticalSection(&e->r_cs);
+  DeleteCriticalSection(&e->ring_cs);
   free(e);
 }
 
@@ -223,9 +244,10 @@ static SmpKl *kl_pick(SmpEngine *e, const Snap *P, SmpSample *s, int rev, int ke
 
 static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL; SmpKl *k; int self;
-  int i, count = 0, voices = (int)P->p[SMP_P_VOICES];
+  int i, count = 0, voices = (int)P->p[SMP_P_VOICES], nr = e->nring;   /* slots with a ring */
   int64_t F, rs, re, rls; uint64_t hf; double vdb; int loop;
-  if (!s || !s->fwd) return;
+  if (!s || !s->fwd || nr <= 0) return;
+  if (voices > nr) voices = nr;                          /* more rings are being committed by the worker */
   if (key < P->p[SMP_P_NOTE_LO] || key > P->p[SMP_P_NOTE_HI]) return;
   if (vel < P->p[SMP_P_VEL_LO] || vel > P->p[SMP_P_VEL_HI]) return;
   if (P->p[SMP_P_PROBABILITY] < 100 && xorshift(e) / 4294967296.0 * 100.0 >= P->p[SMP_P_PROBABILITY]) return;
@@ -246,9 +268,9 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
     if (!old) break;
     fade_out(e, old); count--;
   }
-  for (i = 0; i < SMP_MAXV; i++) if (!e->v[i].live) { v = &e->v[i]; break; }
+  for (i = 0; i < nr; i++) if (!e->v[i].live) { v = &e->v[i]; break; }
   if (!v) {                                              /* every slot busy fading: cut the oldest */
-    for (i = 0; i < SMP_MAXV; i++) if (!v || e->v[i].order < v->order) v = &e->v[i];
+    for (i = 0; i < nr; i++) if (!v || e->v[i].order < v->order) v = &e->v[i];
     kill(v);
   }
   smp_region(P->p[SMP_P_START], P->p[SMP_P_END], P->p[SMP_P_LOOP_START], F, rev != NULL, &rs, &re, &rls);
@@ -268,7 +290,7 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   }
   v->src_semis = k ? k->semis : 0;
   v->kl = k || self;
-  v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0;
+  v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0; v->ug = 1;
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;
   if (vdb < P->p[SMP_P_MIN_VOLUME]) vdb = P->p[SMP_P_MIN_VOLUME];
   v->vgain = db2a(vdb);
@@ -318,7 +340,7 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
                          double gl, double gr) {
   double ratio = pow(2.0, voice_semis(e, v, P) * LOG2_12) * smp_entry_rate(v->src) / e->rate *
                  (v->kl ? 1.0 : P->p[SMP_P_SPEED] / 100.0);   /* a keep-length copy has speed in it already */
-  double sus = db2a(P->p[SMP_P_SUSTAIN]);
+  double sus = db2a(P->p[SMP_P_SUSTAIN]), la = SMP_UFADE * ratio;   /* la: path frames SMP_UFADE samples ahead */
   int64_t avail = 0;
   int i;
   if (!v->whole) {
@@ -332,13 +354,19 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
     double t = v->pos - (double)i0, g;
     int dry = (fetch(v, i0 - 1, avail, &x0l, &x0r) < 0) | (fetch(v, i0, avail, &x1l, &x1r) < 0) |
               (fetch(v, i0 + 1, avail, &x2l, &x2r) < 0) | (fetch(v, i0 + 2, avail, &x3l, &x3r) < 0);
+    if (!v->whole) {                                     /* fade out before the ring runs dry and back in after */
+      int64_t look = (int64_t)(v->pos + la) + 2;
+      if (dry || (look >= v->v0 && look >= avail && (v->loop || look < v->path_len))) {
+        if ((v->ug -= 1.0 / SMP_UFADE) < 0) v->ug = 0;
+      } else if (v->ug < 1 && (v->ug += 1.0 / SMP_UFADE) > 1) v->ug = 1;
+    }
     if (dry) v->underrun = 1;                            /* the ring ran dry: silence, counted per block */
     else {
       float c1l = 0.5f * (x2l - x0l), c2l = x0l - 2.5f * x1l + 2.0f * x2l - 0.5f * x3l, c3l = 0.5f * (x3l - x0l) + 1.5f * (x1l - x2l);
       float c1r = 0.5f * (x2r - x0r), c2r = x0r - 2.5f * x1r + 2.0f * x2r - 0.5f * x3r, c3r = 0.5f * (x3r - x0r) + 1.5f * (x1r - x2r);
       float tf = (float)t;
       float yl = ((c3l * tf + c2l) * tf + c1l) * tf + x1l, yr = ((c3r * tf + c2r) * tf + c1r) * tf + x1r;
-      g = v->env * v->vgain;
+      g = v->env * v->vgain * v->ug;
       if (v->fading) g *= v->fade;
       l[i] += (float)(yl * g * gl); r[i] += (float)(yr * g * gr);
     }
@@ -420,6 +448,7 @@ SMP_API int smp_engine_active_voices(const SmpEngine *e) {
 }
 
 SMP_API long smp_engine_underruns(const SmpEngine *e) { return e ? e->underruns : 0; }
+SMP_API void smp_debug_stream_pause(SmpEngine *e, int on) { if (e) InterlockedExchange(&e->spause, on); }
 
 /* ---- offline test render ---- */
 typedef struct { long frame; int type, key, vel; double x; } TEv;

@@ -6,11 +6,13 @@
 #include "samplosis.h"
 
 #define SMP_MAXV 64
-#define SMP_RING 65536                   /* frames per voice ring (power of two) */
+#define SMP_RING 65536                   /* frames per voice ring (power of two); 512 KB, committed per voice slot
+                                            up to the Voices parameter (smp_rings_commit) */
 #define SMP_RMASK (SMP_RING - 1)
 #define SMP_CHUNK 16384                  /* frames per streamer read */
 #define SMP_MAXEV 1024
 #define SMP_NOFILL INT64_MAX             /* v0 of a voice that needs no ring (whole entry) */
+#define SMP_UFADE 64                     /* samples of fade out and in around a ring underrun */
 
 /* a counter packed with a voice generation: (gen & 0xFFFFFF) << 40 | frames */
 #define SMP_TAG(g) (((LONG64)((g) & 0xFFFFFF)) << 40)
@@ -62,6 +64,7 @@ typedef struct SmpVoice {
   int kl;                                /* src is a keep-length copy (or the source standing in for shift 0):
                                             speed is already in it, so it doesn't scale the rate */
   double pos, vgain, env, k, att_inc, fade, fade_step;
+  double ug;                             /* underrun gain: fades out before the ring runs dry, back in after */
   int64_t left, path_len;
   uint64_t order;
 
@@ -78,7 +81,10 @@ struct SmpEngine {
   SmpSample *volatile sample;            /* published by the main thread */
   SmpSample *cur;                        /* the audio thread's view */
   SmpVoice v[SMP_MAXV];
-  float *rings;
+  float *rings;                          /* SMP_MAXV rings reserved; the first nring committed */
+  volatile LONG nring;                   /* voice slots with a committed ring: only these play */
+  CRITICAL_SECTION ring_cs;              /* main and worker, around committing rings */
+  volatile LONG spause;                  /* tests: the streamer skips its work (forces underruns) */
   SmpEv ev[SMP_MAXEV]; int nev;
   double bend;
   volatile unsigned rng;
@@ -121,6 +127,7 @@ int smp_render_start(SmpEngine *e);
 void smp_render_stop(SmpEngine *e);       /* stops the render thread */
 void smp_render_free_copies(SmpEngine *e);   /* frees every published and retired copy: every thread stopped */
 void smp_kl_free(SmpKl *k);
+void smp_rings_commit(SmpEngine *e);     /* main or worker thread: commits rings up to the Voices parameter */
 LONG smp_speedp(double speed_percent);
 
 /* A key's shift in semitones before bend: mode, root, transpose and fine (p: the parameters by id). Note-on and the

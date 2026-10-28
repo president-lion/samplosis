@@ -437,3 +437,62 @@ def test_start_changes_without_process_never_stall(lib, tmp_path):
     n = 2000
     assert rms_db(y[1:n] - data[2 * rate + 1:2 * rate + n]) - rms_db(data[2 * rate + 1:2 * rate + n]) < -60
     e.free()
+
+
+def test_idle_engine_memory(lib, tmp_path):
+    # rings are committed only for the Voices parameter's slots (16 by default), and more only when it grows
+    import gc, time
+    gc.collect()
+    proc = psutil.Process()
+    before = proc.memory_full_info().private
+    e = lib.smp_engine_new(48000, 512)
+    time.sleep(0.2)
+    grown = proc.memory_full_info().private - before
+    print(f"idle engine: {grown / 1e6:.1f} MB")
+    assert grown < 12 * 1024 * 1024, grown / 1e6
+    lib.smp_engine_set_param(e, VOICES, 64)               # from this (main) thread: committed at once
+    grown64 = proc.memory_full_info().private - before
+    assert grown64 >= grown + 47 * 512 * 1024, (grown, grown64)
+    lib.smp_engine_free(e)
+
+
+def test_voices_raised_off_main_thread(lib, tmp_path):
+    # Voices raised from another thread (the audio thread, in a host): the worker commits the rings; notes beyond
+    # the committed ones are simply not started until then, never allocated on the calling thread
+    import threading, time
+    e = Engine(lib, tmp_path, sine(220, 0.5))
+    th = threading.Thread(target=lambda: lib.smp_engine_set_param(e.e, VOICES, 40))
+    th.start(); th.join()
+    time.sleep(0.2)                                       # a worker pass
+    ev = "\n".join(f"on {40 + i} 127 0" for i in range(40))
+    e.render(ev, 0.01)
+    assert lib.smp_engine_active_voices(e.e) == 40
+    e.free()
+
+
+def test_underrun_fades(lib, tmp_path):
+    # the streamer is held still, so the ring runs dry after the 0.25 s head: the voice fades out over 64 samples
+    # before the gap and back in after it, instead of cutting
+    lib.smp_debug_stream_pause.restype = None
+    lib.smp_debug_stream_pause.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    rate = 48000
+    data = sine(220, 4.0, rate)
+    e = Engine(lib, tmp_path, data, rate=rate, name="tone A3.wav")
+    lib.smp_debug_stream_pause(e.e, 1)
+    lib.smp_engine_note_on(e.e, 57, 127, 0)
+
+    def resume(b):
+        if b == 80:                                       # about 0.43 s: well into the gap
+            lib.smp_debug_stream_pause(e.e, 0)
+
+    y = play_live(lib, e, 160, speed=1.0, keep=160, between=resume)
+    lib.smp_debug_stream_pause(e.e, 0)
+    assert lib.smp_engine_underruns(e.e) > 0
+    head = rate // 4
+    assert np.max(np.abs(y[head + 100:head + 4000])) == 0          # the gap
+    assert np.max(np.abs(y[-4000:])) > 0.4                         # and the sound came back
+    normal = np.max(np.abs(np.diff(y[1000:head - 1000])))
+    steps = np.max(np.abs(np.diff(y)))
+    assert steps <= normal * 1.25, (steps, normal)                 # no click: a cut would step by up to 0.5
+    print(f"normal step {normal:.4f}, largest {steps:.4f}")
+    e.free()
