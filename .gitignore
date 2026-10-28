@@ -1,0 +1,10 @@
+.superpowers/
+*.obj
+*.exp
+*.lib
+*.clap
+*.exe
+*.ilk
+*.pdb
+__pycache__/
+.pytest_cache/
