@@ -158,6 +158,37 @@ static void sh_build(SmpEngine *e, int d) {
   sh_publish(e, d, h);                                    /* volatile/interlocked: the frames are visible first */
 }
 
+/* Start heads for keep-length copies, built when a note-on asks (the copy's want_sh) and the start is past the
+   copy's own head. The copy itself can't be freed under this: the render thread waits two worker passes first.
+   A replaced start head goes on the retire list; if that is full the old one stays and the ask is kept for later. */
+static void kl_sh_build(SmpEngine *e) {
+  int i;
+  for (i = 0; i < SMP_KLN; i++) {
+    SmpKl *k = e->kl[i]; SmpStartHead *cur, *h, *old; int64_t F, rs, re, rls, n; uint64_t hf; long got;
+    if (!k || !k->want_sh) continue;
+    InterlockedExchange(&k->want_sh, 0);
+    F = (int64_t)smp_entry_frames(k->e);
+    if (F <= 0 || smp_entry_whole(k->e)) continue;
+    smp_region(smp_eng_param(e, SMP_P_START), smp_eng_param(e, SMP_P_END), smp_eng_param(e, SMP_P_LOOP_START), F, k->rev, &rs, &re, &rls);
+    smp_entry_head(k->e, &hf);
+    if (rs < (int64_t)hf) continue;
+    cur = k->sh;
+    if (cur && cur->at == rs) continue;
+    if (cur && e->nshret >= SMP_MAXSHRET) sh_sweep(e);
+    if (cur && e->nshret >= SMP_MAXSHRET) { InterlockedExchange(&k->want_sh, 1); continue; }
+    n = (int64_t)hf;
+    if (n > F - rs) n = F - rs;
+    h = calloc(1, sizeof *h);
+    if (!h || !(h->lr = malloc((size_t)n * 8))) { free(h); continue; }
+    got = smp_entry_read(k->e, (uint64_t)rs, h->lr, (long)n);
+    if (got < 0) got = 0;
+    if (got < n) memset(h->lr + 2 * got, 0, (size_t)(n - got) * 8);
+    h->s = NULL; h->src = k->e; h->at = rs; h->n = n;
+    old = InterlockedExchangePointer((PVOID volatile *)&k->sh, h);
+    if (old) { e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++; }
+  }
+}
+
 static DWORD WINAPI worker(LPVOID arg) {
   SmpEngine *e = arg;
   while (!e->quit) {
@@ -173,6 +204,7 @@ static DWORD WINAPI worker(LPVOID arg) {
     }
     sh_build(e, 0);
     sh_build(e, 1);
+    kl_sh_build(e);
     sh_sweep(e);
     InterlockedIncrement64(&e->wpass);
     SetEvent(e->widle);

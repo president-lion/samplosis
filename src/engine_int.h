@@ -22,6 +22,23 @@
 typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n; float *lr; } SmpStartHead;
 #define SMP_MAXSHRET 64
 
+/* A keep-length copy, published in the engine's table by atomic pointer (slot = shift + 127). It is identified by
+   content (the key of what it was rendered from and the speed), so a stale one is simply never used; the render
+   thread retires stale ones. Its start head (start past the copy's head) is built lazily by the worker. */
+#define SMP_KLN 256
+#define SMP_KLMAX 127
+#define SMP_KLRENDER 48                  /* Rubber Band R3 fails past about 4 octaves (+67 throws): wider shifts resample */
+typedef struct SmpKl {
+  SmpEntry *e;
+  uint64_t base;                          /* src_key or rev_key it was rendered from */
+  LONG speedp;                            /* speed in hundredths of a percent (10000 = 100 %) */
+  int semis, rev;                         /* rev: rendered from the reversed copy */
+  SmpStartHead *volatile sh;             /* written by the worker, read by the audio thread */
+  volatile LONG want_sh;                 /* the audio thread asks the worker for a start head */
+} SmpKl;
+typedef struct { SmpKl *k; LONG64 a0, s0, w0; int phase; } SmpKlRet;
+#define SMP_RQ 16
+
 typedef struct SmpVoice {
   /* Written by the audio thread at note-on, before gen is bumped; read by the streamer after reading gen. */
   SmpEntry *src;                         /* what the voice reads: forward, reversed (Task 6: a rendered copy) */
@@ -41,6 +58,8 @@ typedef struct SmpVoice {
   const float *hp;                       /* path frames below v0 come from here: the head or a start head */
   const SmpStartHead *volatile sh;       /* the start head in use, if any (its retirement check reads this) */
   double src_semis;                      /* semitones already in src (0 when resampling) */
+  int kl;                                /* src is a keep-length copy (or the source standing in for shift 0):
+                                            speed is already in it, so it doesn't scale the rate */
   double pos, vgain, env, k, att_inc, fade, fade_step;
   int64_t left, path_len;
   uint64_t order;
@@ -77,6 +96,17 @@ struct SmpEngine {
   DWORD main_tid;
   SmpRetired *ret; int nret, cret;       /* main thread only */
   float *tmp;                            /* streamer scratch */
+
+  /* keep length (render.c): the render thread renders and publishes copies; see render.c for the handoffs */
+  SmpKl *volatile kl[SMP_KLN];
+  HANDLE rwork, ridle, rthread;
+  volatile LONG rquit;
+  volatile LONG64 ridle_n;               /* render passes that found nothing to do */
+  SmpSample *volatile r_using;           /* the sample the render thread is reading (collect won't free it) */
+  volatile LONG r_ready, r_total, r_done;
+  CRITICAL_SECTION r_cs; char r_why[512];   /* render thread and main thread only */
+  volatile LONG rq[SMP_RQ]; volatile LONG rq_w; LONG rq_r;   /* note-on requests: audio writes, render reads */
+  SmpKlRet *klret; int nklret, cklret;   /* render thread only */
 };
 
 double smp_eng_param(const SmpEngine *e, int id);
@@ -86,6 +116,24 @@ void smp_stream_wait_idle(SmpEngine *e);  /* offline helper: returns after a ful
 int smp_worker_start(SmpEngine *e);
 void smp_worker_stop(SmpEngine *e);
 void smp_worker_wait_idle(SmpEngine *e);  /* offline helper: returns after a full worker pass has run */
+int smp_render_start(SmpEngine *e);
+void smp_render_stop(SmpEngine *e);       /* stops the render thread */
+void smp_render_free_copies(SmpEngine *e);   /* frees every published and retired copy: every thread stopped */
+void smp_kl_free(SmpKl *k);
+LONG smp_speedp(double speed_percent);
+
+/* A key's shift in semitones before bend: mode, root, transpose and fine (p: the parameters by id). Note-on and the
+   render thread both round it to the nearest integer to pick a keep-length copy. */
+static __inline double smp_note_semis(const double *p, int key) {
+  int mode = (int)p[SMP_P_MODE];
+  double s = 0;
+  if (mode == 1) s = key - p[SMP_P_ROOT];
+  else if (mode == 2) {
+    double nl = p[SMP_P_NOTE_LO], nh = p[SMP_P_NOTE_HI], pl = p[SMP_P_PITCH_LO], ph = p[SMP_P_PITCH_HI];
+    s = nh > nl ? pl + (key - nl) * (ph - pl) / (nh - nl) : pl;
+  }
+  return s + p[SMP_P_TRANSPOSE] + p[SMP_P_FINE] / 100.0;
+}
 
 /* The region in src frames for F frames. Reversed plays the mirrored region; loop start keeps its offset into it. */
 static __inline void smp_region(double start, double end, double loop_start, int64_t F, int rev,

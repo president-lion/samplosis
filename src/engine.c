@@ -43,6 +43,12 @@ SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v) {
     }
   }
   if ((id == SMP_P_REVERSE || id == SMP_P_START || id == SMP_P_END) && e->work) SetEvent(e->work);  /* start heads */
+  switch (id) {                                          /* what keep length renders depends on these */
+    case SMP_P_KEEP_LENGTH: case SMP_P_SPEED: case SMP_P_REVERSE: case SMP_P_MODE: case SMP_P_ROOT:
+    case SMP_P_TRANSPOSE: case SMP_P_FINE: case SMP_P_NOTE_LO: case SMP_P_NOTE_HI: case SMP_P_PITCH_LO:
+    case SMP_P_PITCH_HI:
+      if (e->rwork) SetEvent(e->rwork);
+  }
 }
 
 /* ---- life cycle ---- */
@@ -56,24 +62,28 @@ SMP_API SmpEngine *smp_engine_new(double rate, int max_block) {
   e->rng = 1;
   e->main_tid = GetCurrentThreadId();
   InitializeCriticalSection(&e->rev_cs);
+  InitializeCriticalSection(&e->r_cs);
   /* committed now; pages are only touched as the streamer fills a voice's ring */
   e->rings = VirtualAlloc(NULL, (SIZE_T)SMP_MAXV * SMP_RING * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  if (!e->rings) { DeleteCriticalSection(&e->rev_cs); free(e); return NULL; }
+  if (!e->rings) { DeleteCriticalSection(&e->rev_cs); DeleteCriticalSection(&e->r_cs); free(e); return NULL; }
   for (i = 0; i < SMP_MAXV; i++) { e->v[i].ring = e->rings + (size_t)i * SMP_RING * 2; e->v[i].s_gen = -1; }
-  if (!smp_stream_start(e) || !smp_worker_start(e)) { smp_engine_free(e); return NULL; }
+  if (!smp_stream_start(e) || !smp_worker_start(e) || !smp_render_start(e)) { smp_engine_free(e); return NULL; }
   return e;
 }
 
 SMP_API void smp_engine_free(SmpEngine *e) {
   int i;
   if (!e) return;
+  smp_render_stop(e);                                   /* first: it may be reading the sample */
   smp_worker_stop(e);                                   /* frees the start heads */
   smp_stream_stop(e);
+  smp_render_free_copies(e);
   for (i = 0; i < e->nret; i++) smp_sample_free(e->ret[i].s);
   free(e->ret);
   smp_sample_free(e->sample);
   if (e->rings) VirtualFree(e->rings, 0, MEM_RELEASE);
   DeleteCriticalSection(&e->rev_cs);
+  DeleteCriticalSection(&e->r_cs);
   free(e);
 }
 
@@ -91,7 +101,7 @@ SMP_API void smp_engine_collect(SmpEngine *e) {
     SmpStartHead *h0 = e->sh[0], *h1 = e->sh[1];
     if (r->phase == 0 && e->epoch >= r->a0 + 2 && !voice_uses(e, r->s)) { r->s0 = e->spass; r->w0 = e->wpass; r->phase = 1; }
     if (r->phase == 1 && e->spass >= r->s0 + 2 && e->wpass >= r->w0 + 2 &&
-        !(h0 && h0->s == r->s) && !(h1 && h1->s == r->s)) {
+        !(h0 && h0->s == r->s) && !(h1 && h1->s == r->s) && e->r_using != r->s) {
       smp_sample_free(r->s);
       e->ret[i] = e->ret[--e->nret];
       continue;
@@ -122,6 +132,7 @@ SMP_API void smp_engine_set_sample(SmpEngine *e, SmpSample *s) {
     } /* else out of memory: leak the old sample rather than free it under a voice */
   }
   if (e->work) SetEvent(e->work);                       /* new start heads */
+  if (e->rwork) SetEvent(e->rwork);                     /* new keep-length copies */
   smp_engine_collect(e);
 }
 
@@ -170,8 +181,46 @@ static void fade_out(SmpEngine *e, SmpVoice *v) {
   v->fading = 1; v->fade = 1; v->fade_step = 1.0 / (0.005 * e->rate);
 }
 
+/* asks the render thread for a copy (single producer: the audio thread) */
+static void kl_request(SmpEngine *e, int slot) {
+  LONG w = e->rq_w;
+  e->rq[w & (SMP_RQ - 1)] = slot;
+  InterlockedExchange(&e->rq_w, w + 1);
+  if (e->rwork) SetEvent(e->rwork);
+}
+
+/* With keep length on: the ready copy for the key's nearest integer shift, or NULL (then the note resamples).
+   *self is set when shift 0 at 100 % plays the source itself. */
+static SmpKl *kl_pick(SmpEngine *e, const Snap *P, SmpSample *s, int rev, int key, int *self) {
+  int n; LONG sp; SmpKl *k; uint64_t base, khf; int64_t F, rs, re, rls;
+  *self = 0;
+  if (P->p[SMP_P_KEEP_LENGTH] < 0.5) return NULL;
+  n = (int)floor(smp_note_semis(P->p, key) + 0.5);
+  sp = smp_speedp(P->p[SMP_P_SPEED]);
+  if (n == 0 && sp == 10000) { *self = 1; return NULL; }
+  if (n < -SMP_KLRENDER || n > SMP_KLRENDER) return NULL;   /* never rendered: resample */
+  base = rev ? s->rev_key : s->src_key;
+  k = e->kl[n + SMP_KLMAX];
+  if (!k || k->base != base || k->speedp != sp) { kl_request(e, n + SMP_KLMAX); return NULL; }
+  /* a start past the copy's head needs the copy's start head (built lazily by the worker) */
+  F = (int64_t)smp_entry_frames(k->e);
+  if (F <= 0) return NULL;
+  smp_region(P->p[SMP_P_START], P->p[SMP_P_END], P->p[SMP_P_LOOP_START], F, rev, &rs, &re, &rls);
+  smp_entry_head(k->e, &khf);
+  if (!smp_entry_whole(k->e) && rs >= (int64_t)khf) {
+    const SmpStartHead *sh = k->sh;
+    if (!sh || sh->at != rs) {
+      InterlockedExchange(&k->want_sh, 1);
+      SetEvent(e->work);
+      if (e->offline) { smp_worker_wait_idle(e); sh = k->sh; }   /* offline renders are exact */
+      if (!sh || sh->at != rs) return NULL;              /* resample until it's there */
+    }
+  }
+  return k;
+}
+
 static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
-  SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL;
+  SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL; SmpKl *k; int self;
   int i, count = 0, voices = (int)P->p[SMP_P_VOICES];
   int64_t F, rs, re, rls; uint64_t hf; double vdb; int loop;
   if (!s || !s->fwd) return;
@@ -180,6 +229,8 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   if (P->p[SMP_P_PROBABILITY] < 100 && xorshift(e) / 4294967296.0 * 100.0 >= P->p[SMP_P_PROBABILITY]) return;
   rev = P->p[SMP_P_REVERSE] >= 0.5 ? *(SmpEntry *volatile *)&s->rev : NULL;
   src = rev ? rev : s->fwd;
+  k = kl_pick(e, P, s, rev != NULL, key, &self);
+  if (k) src = k->e;
   F = (int64_t)smp_entry_frames(src);
   if (F <= 0) return;
   /* steal the oldest sounding voices beyond the limit */
@@ -208,12 +259,13 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   v->sh = NULL; v->hp = v->head + 2 * rs; v->v0 = 0;
   if (v->whole) v->v0 = SMP_NOFILL;
   else {
-    SmpStartHead *sh = e->sh[rev ? 1 : 0];
-    if (sh && sh->s == s && sh->src == src && sh->at == rs) {   /* the start point's pre-read frames */
+    SmpStartHead *sh = k ? k->sh : e->sh[rev ? 1 : 0];
+    if (sh && (k || sh->s == s) && sh->src == src && sh->at == rs) {   /* the start point's pre-read frames */
       v->sh = sh; v->hp = sh->lr; v->v0 = sh->n < v->path_len ? sh->n : v->path_len;
     } else if (rs < (int64_t)hf) v->v0 = (re < (int64_t)hf ? re : (int64_t)hf) - rs;
   }
-  v->src_semis = 0;
+  v->src_semis = k ? k->semis : 0;
+  v->kl = k || self;
   v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0;
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;
   if (vdb < P->p[SMP_P_MIN_VOLUME]) vdb = P->p[SMP_P_MIN_VOLUME];
@@ -242,14 +294,7 @@ static void note_off(SmpEngine *e, const Snap *P, int key) {
 }
 
 static double voice_semis(const SmpEngine *e, const SmpVoice *v, const Snap *P) {
-  int mode = (int)P->p[SMP_P_MODE];
-  double s = 0;
-  if (mode == 1) s = v->key - P->p[SMP_P_ROOT];
-  else if (mode == 2) {
-    double nl = P->p[SMP_P_NOTE_LO], nh = P->p[SMP_P_NOTE_HI], pl = P->p[SMP_P_PITCH_LO], ph = P->p[SMP_P_PITCH_HI];
-    s = nh > nl ? pl + (v->key - nl) * (ph - pl) / (nh - nl) : pl;
-  }
-  return s + P->p[SMP_P_TRANSPOSE] + P->p[SMP_P_FINE] / 100.0 + e->bend * P->p[SMP_P_BEND_RANGE] - v->src_semis;
+  return smp_note_semis(P->p, v->key) + e->bend * P->p[SMP_P_BEND_RANGE] - v->src_semis;
 }
 
 /* one stereo frame at path index idx; 0 = silence, -1 = not streamed yet */
@@ -269,7 +314,8 @@ static __inline int fetch(const SmpVoice *v, int64_t idx, int64_t avail, float *
 
 static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, float *r, int a, int b,
                          double gl, double gr) {
-  double ratio = pow(2.0, voice_semis(e, v, P) * LOG2_12) * smp_entry_rate(v->src) / e->rate * P->p[SMP_P_SPEED] / 100.0;
+  double ratio = pow(2.0, voice_semis(e, v, P) * LOG2_12) * smp_entry_rate(v->src) / e->rate *
+                 (v->kl ? 1.0 : P->p[SMP_P_SPEED] / 100.0);   /* a keep-length copy has speed in it already */
   double sus = db2a(P->p[SMP_P_SUSTAIN]);
   int64_t avail = 0;
   int i;
