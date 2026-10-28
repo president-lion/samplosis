@@ -116,6 +116,9 @@ SMP_API int smp_script_apply(SmpEngine *e, const char *text, char *err, int cap)
   /* every line is good; load the sample before touching the engine */
   {
     SmpSample *ns = NULL; char msg[512] = "";
+    const SmpSample *have_s = smp_engine_sample(e);
+    /* the sample already loaded (same path and key): keep it, so re-applied state doesn't restart anything */
+    if (has_sample && has_key && have_s && have_s->src_key == key && !strcmp(have_s->path, path)) has_sample = 0;
     if (has_sample) {
       ns = smp_sample_load(path, msg, sizeof msg);
       if (!ns && has_key) { msg[0] = 0; ns = smp_sample_load_known(path, key, have[SMP_P_ROOT] ? (int)val[SMP_P_ROOT] : 60, msg, sizeof msg); }

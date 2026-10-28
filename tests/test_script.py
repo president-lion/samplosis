@@ -166,3 +166,24 @@ def test_nan_rejected_by_value_parse(lib):
     v = ctypes.c_double()
     for p, s in [(3, b"nan"), (3, b"inf"), (3, b"-inf"), (1, b"nan"), (11, b"nan"), (17, b"inf")]:
         assert lib.smp_value_parse(p, s, ctypes.byref(v)) == 0, s
+
+
+def test_same_sample_not_reloaded(lib, S):
+    # REAPER re-applies state often: a script naming the sample already loaded (same path and key) keeps it
+    f, s = S.sample()
+    e = S.engine()
+    lib.smp_engine_set_sample(e, s)
+    lib.smp_engine_sample.restype = ctypes.c_void_p
+    lib.smp_engine_sample.argtypes = [ctypes.c_void_p]
+    before = lib.smp_engine_sample(e)
+    t = S.write(e)
+    r, err = S.apply(e, t.replace("volume 0.0 dB", "volume -4.0 dB"))
+    assert r == 0, err
+    assert lib.smp_engine_sample(e) == before
+    assert lib.smp_engine_get_param(e, 3) == -4
+    # another path (or key) does swap
+    g = f.with_name("other A3.wav")
+    g.write_bytes(f.read_bytes())
+    r, err = S.apply(e, 'sample "%s"' % g)
+    assert r == 0, err
+    assert lib.smp_engine_sample(e) != before

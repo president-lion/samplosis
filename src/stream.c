@@ -129,11 +129,17 @@ static void sh_sweep(SmpEngine *e) {
   }
 }
 
-static void sh_publish(SmpEngine *e, int d, SmpStartHead *h) {
+/* Room on the retire list for one more replaced start head. It drains only as the audio thread finishes blocks, so
+   while nothing is processing (a deactivated plugin) it stays full: the caller then keeps the current head and tries
+   again on a later pass, never waiting here. */
+static int sh_room(SmpEngine *e) {
+  if (e->nshret >= SMP_MAXSHRET) sh_sweep(e);
+  return e->nshret < SMP_MAXSHRET;
+}
+
+static void sh_publish(SmpEngine *e, int d, SmpStartHead *h) {   /* the caller made room (sh_room) */
   SmpStartHead *old = InterlockedExchangePointer((PVOID volatile *)&e->sh[d], h);
   if (!old) return;
-  while (e->nshret >= SMP_MAXSHRET && !e->quit) { Sleep(5); sh_sweep(e); }
-  if (e->nshret >= SMP_MAXSHRET) return;               /* quitting: leaked rather than freed under a voice */
   e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++;
 }
 
@@ -144,8 +150,9 @@ static void sh_build(SmpEngine *e, int d) {
   if (src && !smp_entry_whole(src) && (F = (int64_t)smp_entry_frames(src)) > 0)
     smp_region(smp_eng_param(e, SMP_P_START), smp_eng_param(e, SMP_P_END), smp_eng_param(e, SMP_P_LOOP_START), F, d, &rs, &re, &rls);
   else src = NULL;
-  if (!src || rs == 0) { if (cur) sh_publish(e, d, NULL); return; }   /* the entry's own head serves */
+  if (!src || rs == 0) { if (cur && sh_room(e)) sh_publish(e, d, NULL); return; }   /* the entry's own head serves */
   if (cur && cur->s == s && cur->src == src && cur->at == rs) return;
+  if (cur && !sh_room(e)) return;                         /* retire list full: build it on a later pass */
   smp_entry_head(src, &hf);
   n = (int64_t)hf;
   if (n > F - rs) n = F - rs;
@@ -174,8 +181,7 @@ static void kl_sh_build(SmpEngine *e) {
     if (rs < (int64_t)hf) continue;
     cur = k->sh;
     if (cur && cur->at == rs) continue;
-    if (cur && e->nshret >= SMP_MAXSHRET) sh_sweep(e);
-    if (cur && e->nshret >= SMP_MAXSHRET) { InterlockedExchange(&k->want_sh, 1); continue; }
+    if (cur && !sh_room(e)) { InterlockedExchange(&k->want_sh, 1); continue; }
     n = (int64_t)hf;
     if (n > F - rs) n = F - rs;
     h = calloc(1, sizeof *h);
@@ -246,4 +252,17 @@ void smp_worker_wait_idle(SmpEngine *e) {
     SetEvent(e->work);
     WaitForSingleObject(e->widle, 50);
   }
+}
+
+/* tests: 0 once a whole worker pass has run, 1 if none finished within timeout_ms */
+SMP_API int smp_test_worker_wait(SmpEngine *e, int timeout_ms) {
+  LONG64 target; ULONGLONG t0 = GetTickCount64();
+  if (!e || !e->worker) return 1;
+  target = e->wpass + 2;
+  while (e->wpass < target) {
+    if (GetTickCount64() - t0 > (ULONGLONG)(timeout_ms < 0 ? 0 : timeout_ms)) return 1;
+    SetEvent(e->work);
+    WaitForSingleObject(e->widle, 50);
+  }
+  return 0;
 }

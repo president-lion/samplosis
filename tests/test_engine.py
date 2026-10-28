@@ -415,3 +415,25 @@ def test_streaming_long_sample_realtime(lib, tmp_path):
     assert lib.smp_engine_active_voices(e.e) == 1
     assert lib.smp_engine_underruns(e.e) == 0
     e.free()
+
+
+def test_start_changes_without_process_never_stall(lib, tmp_path):
+    # No process calls (a deactivated plugin): the audio thread never finishes a block, so replaced start heads
+    # can't be freed. The worker must not sleep-wait on a full retire list.
+    import time
+    lib.smp_test_worker_wait.restype = ctypes.c_int
+    lib.smp_test_worker_wait.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    rate = 48000
+    rng = np.random.default_rng(9)
+    data = (0.3 * rng.standard_normal(rate * 4)).astype(np.float32)
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    t0 = time.perf_counter()
+    for i in range(150):
+        e.set(START, 30 + i * 0.2)
+        assert lib.smp_test_worker_wait(e.e, 3000) == 0, i
+    assert time.perf_counter() - t0 < 20
+    e.set(START, 50)
+    y = e.render("on 57 127 0", 0.05)[:, 0]               # and the start head still comes right once blocks run
+    n = 2000
+    assert rms_db(y[1:n] - data[2 * rate + 1:2 * rate + n]) - rms_db(data[2 * rate + 1:2 * rate + n]) < -60
+    e.free()
