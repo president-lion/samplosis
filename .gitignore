@@ -8,3 +8,6 @@
 *.pdb
 __pycache__/
 .pytest_cache/
+*.dll
+*.log
+tests/host.exe
