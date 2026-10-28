@@ -557,7 +557,8 @@ fail:
   return ok;
 }
 
-SmpFont *smp_sf_open(const char *path, char *err, int cap) {
+/* parses a font's headers into a new SmpFont (sffont.c's smp_sf_open shares it through the registry) */
+SmpFont *sf_parse(const char *path, char *err, int cap) {
   wchar_t w[2048]; Src s; LARGE_INTEGER sz; FILETIME mt; uint8_t h[12];
   uint64_t pos, end, pdta_off = 0; uint32_t pdta_size = 0; int have_pdta = 0, have_smpl = 0, ok = 0;
   char why[200] = "";
@@ -641,11 +642,12 @@ bad:
 done:
   free(pd);
   CloseHandle(s.h);
-  if (!ok) { smp_sf_close(f); return NULL; }
+  if (!ok) { sf_free(f); return NULL; }
   return f;
 }
 
-void smp_sf_close(SmpFont *f) {
+/* frees what sf_parse made (sffont.c frees the loader's arrays and the sample data first) */
+void sf_free(SmpFont *f) {
   if (!f) return;
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);

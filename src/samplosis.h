@@ -148,6 +148,25 @@ SMP_API int smp_sf_regions(const SmpFont *f, int preset, const SmpSfRegion **out
                                     read them until the font is closed */
 SMP_API int smp_sf_sample_count(const SmpFont *f);
 SMP_API const SmpSfSample *smp_sf_sample(const SmpFont *f, int i);         /* NULL when i is out of range */
+/* Sharing and loading (sffont.c). smp_sf_open returns the font already open when the same file (full path,
+   case-insensitive, with the same size and modified time) is open, and adds a reference; smp_sf_close drops one,
+   and the last frees everything. Open and close are main thread only. Sample data loads on a background thread
+   for the presets in use, and is freed 2 s after no preset in use needs it. */
+SMP_API void smp_sf_use(SmpFont *f, int preset, int delta);   /* any thread, audio too: a synth starts (+1) or
+                                    stops (-1) using a preset (public index), and the loader is woken */
+SMP_API const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames); /* any thread, audio too:
+                                    the sample's int16 mono data and its frame count, held until release; NULL
+                                    (and nothing to release) when it isn't loaded. A few zero frames are readable
+                                    before the start and after the end */
+SMP_API void smp_sf_pcm_release(SmpFont *f, int sample);   /* any thread: after a non-NULL acquire */
+SMP_API int smp_sf_pcm_loop(SmpFont *f, int sample, uint32_t *loop_start, uint32_t *loop_end); /* while held:
+                                    the loop in frames from the data's start, clamped to the data; 1 ok */
+SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once the loader has nothing left to do
+                                    for f, 1 on timeout */
+SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
+SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
+SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
+                                    (0 or less: back to 2000) */
 #ifdef __cplusplus
 }
 #endif

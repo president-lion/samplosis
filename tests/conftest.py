@@ -160,4 +160,21 @@ def lib(settings_file):
     dll.smp_sf_sample.argtypes = [vp, c_int]
     dll.smp_sf_regions.restype = c_int
     dll.smp_sf_regions.argtypes = [vp, c_int, ctypes.POINTER(ctypes.POINTER(SmpSfRegion))]
+    u32p = ctypes.POINTER(ctypes.c_uint32)
+    dll.smp_sf_use.restype = None
+    dll.smp_sf_use.argtypes = [vp, c_int, c_int]
+    dll.smp_sf_pcm_acquire.restype = ctypes.POINTER(ctypes.c_int16)
+    dll.smp_sf_pcm_acquire.argtypes = [vp, c_int, u32p]
+    dll.smp_sf_pcm_release.restype = None
+    dll.smp_sf_pcm_release.argtypes = [vp, c_int]
+    dll.smp_sf_pcm_loop.restype = c_int
+    dll.smp_sf_pcm_loop.argtypes = [vp, c_int, u32p, u32p]
+    dll.smp_sf_wait_idle.restype = c_int
+    dll.smp_sf_wait_idle.argtypes = [vp, c_int]
+    dll.smp_sf_loaded_samples.restype = c_int
+    dll.smp_sf_loaded_samples.argtypes = [vp]
+    dll.smp_sf_loaded_bytes.restype = c_u64
+    dll.smp_sf_loaded_bytes.argtypes = [vp]
+    dll.smp_sf_test_grace.restype = None
+    dll.smp_sf_test_grace.argtypes = [c_int]
     return dll

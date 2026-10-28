@@ -3,6 +3,7 @@
 #ifndef SF2_H
 #define SF2_H
 #include <stdint.h>
+#include <windows.h>
 #include "samplosis.h"
 
 /* generator ids used by the parser (the SF2.04 numbers) */
@@ -41,6 +42,39 @@ struct SmpFont {
      regions [rstart[i], rstart[i+1]). The modulator lists live in the same block, shared where identical. */
   SmpSfRegion *regions; int nregions;
   int *rstart;
+
+  /* ---- sharing and loading (sffont.c) ---- */
+  wchar_t *wpath;                       /* the full path, compared case-insensitively by the registry */
+  int refs;                             /* smp_sf_open calls not yet closed (main thread only) */
+  volatile LONG closing;                /* set under the registry lock when the last reference goes */
+  /* safe from any thread: */
+  volatile LONG *users;                 /* per public preset index: synths using it (smp_sf_use) */
+  volatile LONG *voices;                /* per sample: holders between pcm_acquire and pcm_release */
+  struct SfPcm *volatile *pcm;          /* per sample: the published data, or NULL */
+  volatile LONG use_gen, done_gen;      /* use() calls so far, and the count the loader last finished */
+  volatile LONG nloaded;                /* samples in memory (published or retired) */
+  volatile LONG64 loaded_bytes;
+  /* the loader thread's own: */
+  struct SfPcm **held;                  /* per sample: the buffer it owns, published or retired */
+  uint8_t *state;                       /* per sample: SF_ST_* */
+  uint8_t *need;                        /* per sample: scratch for one pass */
+  ULONGLONG *idle_since;                /* per sample: when a published sample stopped being needed (0: needed) */
 };
+
+/* A loaded sample. SF_PCM_PAD zero frames sit before data[0] and after data[frames - 1], so 4-point
+   interpolation may read a few frames past either end without leaving the allocation. Loop points count frames
+   from data[0] and are already clamped: 0 <= loop_start <= loop_end <= frames. */
+#define SF_PCM_PAD 8
+typedef struct SfPcm {
+  uint32_t frames, loop_start, loop_end;
+  uint64_t bytes;                       /* the whole allocation */
+  int16_t *data;                        /* points SF_PCM_PAD frames into the zeroed area after this header */
+} SfPcm;
+
+enum { SF_ST_NONE, SF_ST_PUBLISHED, SF_ST_RETIRED, SF_ST_BROKEN };
+
+/* sf2.c: parse a font's headers into a new SmpFont, and free one */
+SmpFont *sf_parse(const char *path, char *err, int cap);
+void sf_free(SmpFont *f);
 
 #endif
