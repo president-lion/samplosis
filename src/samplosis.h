@@ -37,6 +37,24 @@ SMP_API int smp_note_from_filename(const char *path);       /* last note-like to
 SMP_API double smp_detect_pitch(const float *mono, long n, int rate); /* fractional MIDI note, or -1 */
 SMP_API int smp_value_text(int param, double v, char *out, int cap);  /* returns length written */
 SMP_API int smp_value_parse(int param, const char *s, double *v);    /* 1 ok (clamped to range), 0 fail */
+/* settings: one "name value" per line in %APPDATA%\Samplosis\settings.txt (or $SAMPLOSIS_SETTINGS) */
+typedef struct { char cache_dir[1024]; double cache_limit_gb; } SmpSettings;
+SMP_API void smp_settings_get(SmpSettings *s);        /* defaults when the file is missing; reloads when it changes */
+SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */
+
+/* disk cache of decoded audio: <16 hex>.smpc, 32 byte header then float32 stereo interleaved */
+typedef struct SmpEntry SmpEntry;
+SMP_API uint64_t smp_key(const char *desc);           /* 64-bit FNV-1a */
+SMP_API int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate); /* 0 ok; .part then rename */
+SMP_API SmpEntry *smp_cache_open(uint64_t key);       /* NULL if missing; touches last-write time */
+SMP_API void smp_cache_close(SmpEntry *e);
+SMP_API uint64_t smp_entry_frames(const SmpEntry *e);
+SMP_API int smp_entry_rate(const SmpEntry *e);
+SMP_API int smp_entry_whole(const SmpEntry *e);       /* 1 when the head holds the whole file */
+SMP_API const float *smp_entry_head(const SmpEntry *e, uint64_t *head_frames); /* immutable after open */
+SMP_API long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames); /* streamer thread only */
+SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files; returns bytes left */
+SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */
 #ifdef __cplusplus
 }
 #endif
