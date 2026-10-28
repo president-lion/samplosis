@@ -15,6 +15,14 @@ class SmpParamInfo(ctypes.Structure):
                 ("def_", ctypes.c_double), ("kind", ctypes.c_int)]
 
 
+class SmpSample(ctypes.Structure):
+    _fields_ = [("path", ctypes.c_char * 1024), ("name", ctypes.c_char * 256),
+                ("src_key", ctypes.c_uint64), ("rev_key", ctypes.c_uint64),
+                ("rate", ctypes.c_int), ("frames", ctypes.c_uint64),
+                ("root", ctypes.c_int), ("root_from", ctypes.c_int),
+                ("fwd", ctypes.c_void_p), ("rev", ctypes.c_void_p)]
+
+
 class SmpSettings(ctypes.Structure):
     _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double)]
 
@@ -75,4 +83,15 @@ def lib(settings_file):
     dll.smp_cache_trim.argtypes = [c_u64]
     dll.smp_cache_ok.restype = c_int
     dll.smp_cache_ok.argtypes = [c_char_p, c_int]
+    sp = ctypes.POINTER(SmpSample)
+    dll.smp_sample_load.restype = sp
+    dll.smp_sample_load.argtypes = [c_char_p, c_char_p, c_int]
+    dll.smp_sample_load_known.restype = sp
+    dll.smp_sample_load_known.argtypes = [c_char_p, c_u64, c_int, c_char_p, c_int]
+    dll.smp_sample_reversed.restype = ctypes.c_void_p
+    dll.smp_sample_reversed.argtypes = [sp]
+    dll.smp_sample_free.restype = None
+    dll.smp_sample_free.argtypes = [sp]
+    dll.smp_debug_decodes.restype = c_long
+    dll.smp_debug_decodes.argtypes = []
     return dll

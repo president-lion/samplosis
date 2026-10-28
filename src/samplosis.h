@@ -55,6 +55,21 @@ SMP_API const float *smp_entry_head(const SmpEntry *e, uint64_t *head_frames); /
 SMP_API long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames); /* streamer thread only */
 SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files; returns bytes left */
 SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */
+
+/* a sample imported into the cache */
+typedef struct SmpSample {
+  char path[1024]; char name[256];      /* name: the file's base name */
+  uint64_t src_key, rev_key;            /* rev_key is made on first use */
+  int rate; uint64_t frames;
+  int root;                             /* from the file name, else detected, else 60 */
+  int root_from;                        /* 0 name, 1 detected, 2 default */
+  SmpEntry *fwd, *rev;                  /* rev NULL until needed */
+} SmpSample;
+SMP_API SmpSample *smp_sample_load(const char *path, char *err, int cap);   /* NULL and a plain message on failure */
+SMP_API SmpSample *smp_sample_load_known(const char *path, uint64_t src_key, int root, char *err, int cap); /* source may be gone */
+SMP_API SmpEntry *smp_sample_reversed(SmpSample *s);                        /* makes or opens the reversed copy */
+SMP_API void smp_sample_free(SmpSample *s);
+SMP_API long smp_debug_decodes(void);                                       /* decode_audio calls so far */
 #ifdef __cplusplus
 }
 #endif
