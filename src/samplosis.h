@@ -70,6 +70,29 @@ SMP_API SmpSample *smp_sample_load_known(const char *path, uint64_t src_key, int
 SMP_API SmpEntry *smp_sample_reversed(SmpSample *s);                        /* makes or opens the reversed copy */
 SMP_API void smp_sample_free(SmpSample *s);
 SMP_API long smp_debug_decodes(void);                                       /* decode_audio calls so far */
+
+/* the voice engine. Threads: main (new/free/set_sample/collect), audio (process; note_on/off/bend are queued by
+   the same thread right before process, as a CLAP host does), the engine's own streamer thread, and set_param
+   from any thread. The engine owns every sample handed to set_sample. */
+typedef struct SmpEngine SmpEngine;
+SMP_API SmpEngine *smp_engine_new(double rate, int max_block);   /* starts the streamer thread; preallocates 64 voices */
+SMP_API void smp_engine_free(SmpEngine *e);
+SMP_API void smp_engine_set_sample(SmpEngine *e, SmpSample *s);  /* main thread; atomic swap, sets root to the sample's;
+                                                                    old one freed once nothing can reach it */
+SMP_API void smp_engine_collect(SmpEngine *e);                   /* main thread: frees replaced samples that are safe to free */
+SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v);   /* any thread; atomic; clamped to the range */
+SMP_API double smp_engine_get_param(const SmpEngine *e, int id);
+SMP_API void smp_engine_note_on(SmpEngine *e, int key, int vel, int at);  /* at: frame offset in the next block */
+SMP_API void smp_engine_note_off(SmpEngine *e, int key, int at);
+SMP_API void smp_engine_bend(SmpEngine *e, double semis_fraction /* -1..1 */, int at);
+SMP_API void smp_engine_process(SmpEngine *e, float *l, float *r, int n);  /* audio thread */
+SMP_API int smp_engine_active_voices(const SmpEngine *e);       /* sounding voices, not counting stolen ones fading out */
+SMP_API long smp_engine_underruns(const SmpEngine *e);
+SMP_API void smp_engine_seed(SmpEngine *e, unsigned seed);
+/* test helper: plays notes offline in blocks and writes a stereo float32 wav; events one per line:
+   "on key vel frame", "off key frame", "bend fraction frame". Starts from silence (no voices, no bend) and waits for the streamer after each block and
+   at note-ons that start past the head, so offline renders are exact. 0 ok. */
+SMP_API int smp_engine_render_test(SmpEngine *e, const char *events, long frames, int block, const char *wav_out);
 #ifdef __cplusplus
 }
 #endif
