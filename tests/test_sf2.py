@@ -263,9 +263,91 @@ def test_modulators_merged(lib, tmp_path):
     assert rs[0]["pmod"] == [(0x00DB, 16, 50, 0, 0), (0x00DD, 15, 20, 0, 0)]
 
 
+def test_modulators_later_wins_in_a_zone(lib, tmp_path):
+    # SF2.04 section 7.4: of two identical modulators in one zone, the later one counts
+    cc7 = (0x0587, 48, 480, 0, 0)
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, mods=[(0x0081, 17, 100, 0, 0), cc7,
+                                                                       (0x0081, 17, -30, 0, 0), (0x0587, 48, 240, 0, 0)])],
+                                                        pmods=[(0x00DB, 16, 10, 0, 0), (0x00DB, 16, 70, 0, 0)])]))
+    want = list(DEFAULT_MODS)
+    want[4] = (0x0587, 48, 240, 0, 0)
+    assert rs[0]["imod"] == want + [(0x0081, 17, -30, 0, 0)]
+    assert rs[0]["pmod"] == [(0x00DB, 16, 70, 0, 0)]
+
+
+def test_invalid_modulators_ignored(lib, tmp_path):
+    # SF2.04 section 8.2.1: a modulator with an unknown source, destination or transform is ignored
+    bad = [
+        (0x0086, 48, 100, 0, 0),        # CC6 (data entry) isn't a source
+        (0x00F8, 48, 100, 0, 0),        # nor is CC120 (a channel mode message)
+        (0x1002, 48, 100, 0, 0),        # source type 4 doesn't exist
+        (0x0005, 48, 100, 0, 0),        # general controller 5 doesn't exist
+        (0x0002, 14, 100, 0, 0),        # an unused generator
+        (0x0002, 41, 100, 0, 0),        # the instrument generator
+        (0x0002, 60, 100, 0, 0),        # past the generators
+        (0x0002, 0x8000, 100, 0, 0),    # a link to another modulator
+        (0x007F, 48, 100, 0, 0),        # a source of "link"
+        (0x0002, 48, 100, 0x0086, 0),   # an amount source of CC6
+        (0x0587, 48, 100, 0, 1),        # transform 1 doesn't exist
+    ]
+    good = (0x0081, 17, 100, 0, 0)
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, mods=bad + [good])], pmods=bad + [good])]))
+    assert rs[0]["imod"] == DEFAULT_MODS + [good]
+    assert rs[0]["pmod"] == [good]
+
+
+def test_global_zone_ranges_are_defaults(lib, tmp_path):
+    # a global zone's key and velocity ranges hold for the zones after it that don't set their own
+    rs = one_preset_regions(lib, tmp_path, preset(
+        [inst([zone(0, keys=None, vels=None), zone(1, keys=(0, 127), vels=None)], gens={43: (0, 59), 44: (1, 90)})],
+        gens={44: (10, 127)}))
+    assert [(r["keys"], r["vels"], r["sample"]) for r in rs] == [((0, 59), (10, 90), 0), ((0, 127), (10, 90), 1)]
+
+
+def many_mods(n):
+    """n different valid modulators, none identical to a default one."""
+    ccs = [c for c in range(1, 120) if c not in (6, 32, 38, 98, 99, 100, 101)]
+    dests = [5, 7, 9, 10, 11, 13] + list(range(21, 41)) + [51, 52, 56]
+    out = []
+    for d in dests:
+        for c in ccs:
+            for bits in range(16):
+                out.append((0x80 | c | bits << 8, d, 10, 0, 0))
+                if len(out) == n:
+                    return out
+    raise ValueError(n)
+
+
+def test_many_modulators_open_fast(lib, tmp_path):
+    # a hostile font: 30000 modulators in an instrument's global zone and in a preset's, and 300 zones under each
+    big = many_mods(30000)
+    zones = [zone(i % 3, keys=(i % 128, i % 128), mods=[(0x0080 | 7, 22, i + 1, 0, 0)]) for i in range(300)]
+    others = [inst([zone(0)], pmods=[(0x0080 | 7, 22, i + 1, 0, 0)], name="O%d" % i) for i in range(299)]
+    p = preset([inst(zones, mods=big, name="Big")] + others, pmods=big)
+    path = tmp_path / "many.sf2"
+    write_sf2(str(path), [p], SAMPLES)
+    t = time.perf_counter()
+    f, err = sf_open(lib, path)
+    took = time.perf_counter() - t
+    assert f, err
+    try:
+        assert took < 1.0, took
+        rs = regions(lib, f, 0)
+        assert len(rs) == 300 + 299
+        assert rs[0].nimod == 10 + 1024 + 1      # the first 1024 of a zone's modulators are read
+        assert rs[0].npmod == 1024
+        assert rs[300].npmod == 1024 + 1
+        assert mods(rs[0].imod, rs[0].nimod)[-1] == (0x0087, 22, 1, 0, 0)
+    finally:
+        lib.smp_sf_close(f)
+
+
 def test_unreachable_junk_is_ignored(lib, tmp_path):
     path = tmp_path / "junk.sf2"
     write_sf2(str(path), PRESETS, SAMPLES, junk_pgen=[(41, 999)], junk_igen=[(53, 999)])
+    data = path.read_bytes()
+    assert bytes([41, 0]) + (999).to_bytes(2, "little") in data[data.index(b"pgen"):data.index(b"inst")]
+    assert bytes([53, 0]) + (999).to_bytes(2, "little") in data[data.index(b"igen"):data.index(b"shdr")]
     f, err = sf_open(lib, path)
     assert f, err
     try:

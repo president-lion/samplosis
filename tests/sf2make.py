@@ -13,11 +13,12 @@ presets: a list of dicts
     optional pgens and pmods (the preset zone that points at this instrument),
     zones: a list of dicts
       keys (lo, hi), vels (lo, hi), sample (index into samples), gens, mods.
+      keys or vels None leaves that range out of the zone.
 A modulator is a tuple (src, dest, amount, amt_src, trans).
 A generator value is an int, or a (lo, hi) tuple for a range.
 The preset's own gens and pmods go in a global preset zone; it is only written when there are any.
-junk_pgen and junk_igen: (oper, value) generator records written after the last zone's, where no zone reaches
-them (real fonts sometimes carry junk there).
+junk_pgen and junk_igen: (oper, value) generator records written after the last zone's, in a bag no preset or
+instrument owns, so nothing reaches them (real fonts sometimes carry junk there).
 """
 import io
 import struct
@@ -128,15 +129,24 @@ def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=()):
                 imod += _mods(ins.get("mods"))
             for z in ins.get("zones", []):
                 ibag.append(struct.pack("<HH", len(igen), len(imod)))
-                igen += _gens(z.get("gens"), keys=tuple(z.get("keys", (0, 127))), vels=tuple(z.get("vels", (0, 127))),
+                keys, vels = z.get("keys", (0, 127)), z.get("vels", (0, 127))   # None: not written
+                igen += _gens(z.get("gens"), keys=None if keys is None else tuple(keys),
+                              vels=None if vels is None else tuple(vels),
                               last=(GEN_SAMPLEID, z["sample"]))
                 imod += _mods(z.get("mods"))
-    # the terminal records
+    # the terminal records. Junk goes in a bag of its own after the last zone's: EOP and EOI point at that bag,
+    # so no preset or instrument owns it, and the final bag still points at the terminal generator.
     phdr.append(_name("EOP") + struct.pack("<HHHIII", 0, 0, len(pbag), 0, 0, 0))
+    if junk_pgen:
+        pbag.append(struct.pack("<HH", len(pgen), len(pmod)))
+        pgen += [_gen(*g) for g in junk_pgen]
     pbag.append(struct.pack("<HH", len(pgen), len(pmod)))
     pmod.append(b"\0" * 10)
     pgen.append(b"\0" * 4)
     inst.append(_name("EOI") + struct.pack("<H", len(ibag)))
+    if junk_igen:
+        ibag.append(struct.pack("<HH", len(igen), len(imod)))
+        igen += [_gen(*g) for g in junk_igen]
     ibag.append(struct.pack("<HH", len(igen), len(imod)))
     imod.append(b"\0" * 10)
     igen.append(b"\0" * 4)

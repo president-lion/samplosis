@@ -288,7 +288,7 @@ static const SmpSfMod DEFMODS[SF_NDEFMOD] = {
 
 /* a fair cap on how many regions one font may make, so a damaged file can't ask for gigabytes
    (a big General MIDI font makes a few thousand) */
-#define MAX_REGIONS (1 << 20)
+#define MAX_REGIONS (1 << 17)
 
 /* one zone's generators as read: the values it sets (a bit per generator in set), its ranges, and the instrument
    or sample id it ends with (link; -1 when there is none, which makes a first zone the global one) */
@@ -300,6 +300,7 @@ typedef struct {
 
 static void read_zone(const SfGen *gen, int g0, int g1, unsigned link_oper, int where, Zone *z) {
   int g;
+  memset(z->v, 0, sizeof z->v);
   z->set = 0; z->link = -1;
   z->lokey = z->lovel = 0; z->hikey = z->hivel = 127;
   for (g = g0; g < g1; g++) {
@@ -333,13 +334,38 @@ static int same_mod(const SmpSfMod *a, const SmpSfMod *b) {
   return a->src == b->src && a->dest == b->dest && a->amt_src == b->amt_src && a->trans == b->trans;
 }
 
+/* a modulator source or amount source the spec knows (SF2.04 sections 8.2.1 and 8.2.2): a type of linear,
+   concave, convex or switch, and either one of the general controllers or a MIDI controller that isn't one of
+   the reserved ones (bank select, data entry, the RPN and NRPN numbers, the channel mode messages) */
+static int source_ok(unsigned s) {
+  unsigned idx = s & 127;
+  if ((s >> 10) > 3) return 0;
+  if (s & 0x80) return !(idx == 0 || idx == 6 || idx == 32 || idx == 38 || (idx >= 98 && idx <= 101) || idx >= 120);
+  return idx == 0 || idx == 2 || idx == 3 || idx == 10 || idx == 13 || idx == 14 || idx == 16;
+}
+
+/* a modulator this player uses: known sources, a real generator as the destination, and a linear or absolute
+   value transform. Others are ignored (section 8.2.1). Linked modulators (a destination with bit 15 set, or a
+   source of 127, "link") are ignored too, as FluidSynth does. */
+static int mod_ok(const SmpSfMod *m) {
+  if (!source_ok(m->src) || !source_ok(m->amt_src)) return 0;
+  /* 59 is "initial pitch", the default pitch wheel modulator's destination, so a font can replace that one */
+  if (m->dest >= SMP_SF_NGEN || !(GENS[m->dest].where || m->dest == 59)) return 0;
+  return m->trans == 0 || m->trans == 2;
+}
+
+/* at most this many modulators are read from one zone (the rest are ignored), so a damaged or hostile file
+   can't make merging take hours. Real zones have a handful. */
+#define MAX_ZONE_MODS 1024
+
 /* adds a zone's modulators to list (n long): each replaces an identical one already there, or is added to the end.
-   A second identical modulator in the same zone is ignored. Returns the new length. */
+   Invalid ones are skipped. Within one zone a later identical modulator replaces the earlier one, as SF2.04
+   section 7.4 says. Returns the new length. */
 static int merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz) {
   int j, k;
+  if (nz > MAX_ZONE_MODS) nz = MAX_ZONE_MODS;
   for (j = 0; j < nz; j++) {
-    for (k = 0; k < j; k++) if (same_mod(&zm[k], &zm[j])) break;
-    if (k < j) continue;
+    if (!mod_ok(&zm[j])) continue;
     for (k = 0; k < n; k++) if (same_mod(&list[k], &zm[j])) break;
     list[k] = zm[j];
     if (k == n) n++;
@@ -359,13 +385,18 @@ static unsigned hash_mods(const SmpSfMod *m, int n) {
   return h;
 }
 
-/* the offset of this list in the pool, adding it if it isn't there yet; -1 when out of memory */
+/* the most modulators all the lists together may hold (10 MB), so a hostile file can't fill memory */
+#define MAX_POOL_MODS (1 << 20)
+
+/* the offset of this list in the pool, adding it if it isn't there yet; -1 when out of memory, -2 when the
+   pool would grow past MAX_POOL_MODS */
 static int pool_add(Pool *p, const SmpSfMod *m, int n) {
   unsigned s = hash_mods(m, n) & p->mask;
   while (p->slot_n[s]) {
     if (p->slot_n[s] == n && !memcmp(p->m + p->slot_off[s], m, (size_t)n * sizeof *m)) return p->slot_off[s];
     s = (s + 1) & p->mask;
   }
+  if (p->n + n > MAX_POOL_MODS) return -2;
   if (p->n + n > p->cap) {
     int cap = p->cap * 2 > p->n + n ? p->cap * 2 : p->n + n;
     SmpSfMod *g = realloc(p->m, (size_t)cap * sizeof *g);
@@ -387,26 +418,31 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
   int *ioff = NULL;                               /* each region's two lists, as pool offsets, until the end */
   int *icache = NULL, *pcache = NULL;             /* per instrument and preset zone: its list's offset, or -1 */
   int *icount = NULL, *pcount = NULL;
-  SmpSfMod *scratch = NULL;
+  int *ibase = NULL, *ibase_n = NULL;             /* per instrument: its defaults-plus-global list, or -1 */
+  SmpSfMod *scratch = NULL, *pbase = NULL;        /* pbase: the current preset's global list */
   Pool pool = {0};
-  int *rstart = NULL; int ok = 0, p, i, nslots = 1, maxz;
+  int *rstart = NULL; int ok = 0, p, i, nslots = 1, got;
   size_t sreg, sstart, total; char *block;
 
-  maxz = f->nimod > f->npmod ? f->nimod : f->npmod;
-  while (nslots < 2 * (f->nibag + f->npbag + 1)) nslots *= 2;
+  /* a list per instrument zone, preset zone and instrument, and the defaults: twice that many slots */
+  while (nslots < 2 * (f->nibag + f->npbag + f->ninst + 2)) nslots *= 2;
   icache = malloc((size_t)(f->nibag + 1) * sizeof *icache); icount = malloc((size_t)(f->nibag + 1) * sizeof *icount);
   pcache = malloc((size_t)(f->npbag + 1) * sizeof *pcache); pcount = malloc((size_t)(f->npbag + 1) * sizeof *pcount);
-  scratch = malloc((size_t)(SF_NDEFMOD + 2 * maxz + 1) * sizeof *scratch);
+  ibase = malloc((size_t)(f->ninst + 1) * sizeof *ibase); ibase_n = malloc((size_t)(f->ninst + 1) * sizeof *ibase_n);
+  scratch = malloc((size_t)(SF_NDEFMOD + 2 * MAX_ZONE_MODS + 1) * sizeof *scratch);
+  pbase = malloc((size_t)(MAX_ZONE_MODS + 1) * sizeof *pbase);
   rstart = malloc((size_t)(f->nphdr + 1) * sizeof *rstart);
   pool.slot_off = calloc(nslots, sizeof *pool.slot_off); pool.slot_n = calloc(nslots, sizeof *pool.slot_n);
   pool.mask = (unsigned)nslots - 1;
-  if (!icache || !icount || !pcache || !pcount || !scratch || !rstart || !pool.slot_off || !pool.slot_n) goto oom;
+  if (!icache || !icount || !pcache || !pcount || !ibase || !ibase_n || !scratch || !pbase || !rstart ||
+      !pool.slot_off || !pool.slot_n) goto oom;
   for (i = 0; i <= f->nibag; i++) icache[i] = -1;
   for (i = 0; i <= f->npbag; i++) pcache[i] = -1;
+  for (i = 0; i <= f->ninst; i++) ibase[i] = -1;
   if (pool_add(&pool, DEFMODS, SF_NDEFMOD) != 0) goto oom;
 
   for (p = 0; p < f->nphdr; p++) {
-    int b0 = f->phdr[p].bag, b1 = f->phdr[p + 1].bag, b;
+    int b0 = f->phdr[p].bag, b1 = f->phdr[p + 1].bag, b, npbase = -1;
     Zone pg, pz; int have_pg = 0;
     rstart[p] = nreg;
     for (b = b0; b < b1; b++) {
@@ -423,13 +459,15 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
       if (!(pz.set >> SF_GEN_KEYRANGE & 1) && have_pg) { pz.lokey = pg.lokey; pz.hikey = pg.hikey; }
       if (!(pz.set >> SF_GEN_VELRANGE & 1) && have_pg) { pz.lovel = pg.lovel; pz.hivel = pg.hivel; }
       pklo = pz.lokey; pkhi = pz.hikey; pvlo = pz.lovel; pvhi = pz.hivel;
-      if (pcache[b] < 0) {   /* the preset list: the global zone's modulators, then this zone's */
-        int n = 0;
-        if (have_pg) n = merge_mods(scratch, n, f->pmod + f->pbag[b0].mod, f->pbag[b0 + 1].mod - f->pbag[b0].mod);
-        n = merge_mods(scratch, n, f->pmod + f->pbag[b].mod, f->pbag[b + 1].mod - f->pbag[b].mod);
+      if (pcache[b] < 0) {   /* the preset list: the global zone's modulators (merged once), then this zone's */
+        int n;
+        if (npbase < 0)
+          npbase = have_pg ? merge_mods(pbase, 0, f->pmod + f->pbag[b0].mod, f->pbag[b0 + 1].mod - f->pbag[b0].mod) : 0;
+        memcpy(scratch, pbase, (size_t)npbase * sizeof *scratch);
+        n = merge_mods(scratch, npbase, f->pmod + f->pbag[b].mod, f->pbag[b + 1].mod - f->pbag[b].mod);
         pcount[b] = n;
-        pcache[b] = n ? pool_add(&pool, scratch, n) : 0;
-        if (pcache[b] < 0) goto oom;
+        pcache[b] = got = n ? pool_add(&pool, scratch, n) : 0;
+        if (got < 0) goto pool_bad;
       }
       ins = pz.link; ib0 = f->inst[ins].bag; ib1 = f->inst[ins + 1].bag;
       for (ib = ib0; ib < ib1; ib++) {
@@ -447,13 +485,20 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
         vlo = iz.lovel > pvlo ? iz.lovel : pvlo; vhi = iz.hivel < pvhi ? iz.hivel : pvhi;
         if (klo > khi || vlo > vhi) continue;
         if (icache[ib] < 0) {   /* the instrument list: the defaults, the global zone's modulators, then this zone's */
-          int n = SF_NDEFMOD;
-          memcpy(scratch, DEFMODS, sizeof DEFMODS);
-          if (have_ig) n = merge_mods(scratch, n, f->imod + f->ibag[ib0].mod, f->ibag[ib0 + 1].mod - f->ibag[ib0].mod);
-          n = merge_mods(scratch, n, f->imod + f->ibag[ib].mod, f->ibag[ib + 1].mod - f->ibag[ib].mod);
+          int n;
+          if (ibase[ins] < 0) {   /* the defaults and the global zone, merged once per instrument */
+            memcpy(scratch, DEFMODS, sizeof DEFMODS);
+            n = have_ig ? merge_mods(scratch, SF_NDEFMOD, f->imod + f->ibag[ib0].mod, f->ibag[ib0 + 1].mod - f->ibag[ib0].mod)
+                        : SF_NDEFMOD;
+            ibase_n[ins] = n;
+            ibase[ins] = got = pool_add(&pool, scratch, n);
+            if (got < 0) goto pool_bad;
+          }
+          memcpy(scratch, pool.m + ibase[ins], (size_t)ibase_n[ins] * sizeof *scratch);
+          n = merge_mods(scratch, ibase_n[ins], f->imod + f->ibag[ib].mod, f->ibag[ib + 1].mod - f->ibag[ib].mod);
           icount[ib] = n;
-          icache[ib] = pool_add(&pool, scratch, n);
-          if (icache[ib] < 0) goto oom;
+          icache[ib] = got = pool_add(&pool, scratch, n);
+          if (got < 0) goto pool_bad;
         }
         if (nreg == capreg) {
           int cap = capreg ? capreg * 2 : 256; void *g;
@@ -501,10 +546,13 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
   f->nregions = nreg;
   ok = 1;
   goto fail;
+pool_bad:
+  if (got == -2) { snprintf(why, wcap, "it has too many modulators"); goto fail; }
 oom:
   snprintf(why, wcap, "out of memory");
 fail:
   free(reg); free(ioff); free(icache); free(pcache); free(icount); free(pcount); free(scratch);
+  free(ibase); free(ibase_n); free(pbase);
   free(rstart); free(pool.m); free(pool.slot_off); free(pool.slot_n);
   return ok;
 }
