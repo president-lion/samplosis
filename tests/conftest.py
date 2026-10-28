@@ -164,11 +164,9 @@ def lib(settings_file):
     dll.smp_sf_use.restype = None
     dll.smp_sf_use.argtypes = [vp, c_int, c_int]
     dll.smp_sf_pcm_acquire.restype = ctypes.POINTER(ctypes.c_int16)
-    dll.smp_sf_pcm_acquire.argtypes = [vp, c_int, u32p]
+    dll.smp_sf_pcm_acquire.argtypes = [vp, c_int, u32p, u32p, u32p]
     dll.smp_sf_pcm_release.restype = None
     dll.smp_sf_pcm_release.argtypes = [vp, c_int]
-    dll.smp_sf_pcm_loop.restype = c_int
-    dll.smp_sf_pcm_loop.argtypes = [vp, c_int, u32p, u32p]
     dll.smp_sf_wait_idle.restype = c_int
     dll.smp_sf_wait_idle.argtypes = [vp, c_int]
     dll.smp_sf_loaded_samples.restype = c_int

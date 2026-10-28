@@ -154,15 +154,15 @@ SMP_API const SmpSfSample *smp_sf_sample(const SmpFont *f, int i);         /* NU
    for the presets in use, and is freed 2 s after no preset in use needs it. */
 SMP_API void smp_sf_use(SmpFont *f, int preset, int delta);   /* any thread, audio too: a synth starts (+1) or
                                     stops (-1) using a preset (public index), and the loader is woken */
-SMP_API const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames); /* any thread, audio too:
-                                    the sample's int16 mono data and its frame count, held until release; NULL
-                                    (and nothing to release) when it isn't loaded. A few zero frames are readable
-                                    before the start and after the end */
+SMP_API const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames, uint32_t *loop_start,
+                                    uint32_t *loop_end);   /* any thread, audio too: the sample's int16 mono data,
+                                    its frame count and its loop (frames from the data's start, clamped to it), held
+                                    until release even if the sample is retired meanwhile; NULL (and nothing to
+                                    release) when it isn't loaded. Any out pointer may be NULL. A few zero frames are
+                                    readable before the start and after the end */
 SMP_API void smp_sf_pcm_release(SmpFont *f, int sample);   /* any thread: after a non-NULL acquire */
-SMP_API int smp_sf_pcm_loop(SmpFont *f, int sample, uint32_t *loop_start, uint32_t *loop_end); /* while held:
-                                    the loop in frames from the data's start, clamped to the data; 1 ok */
-SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once the loader has nothing left to do
-                                    for f, 1 on timeout */
+SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once every sample the presets in use
+                                    need is loaded (or broken), 1 on timeout. Pending retires don't count as busy */
 SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed

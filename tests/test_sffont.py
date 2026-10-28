@@ -49,14 +49,12 @@ def sf_open(lib, path):
 
 def pcm(lib, f, i):
     """The sample's loaded data as int16 (copied while held), its loop points, or None when not loaded."""
-    n = ctypes.c_uint32()
-    p = lib.smp_sf_pcm_acquire(f, i, ctypes.byref(n))
+    n, ls, le = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
+    p = lib.smp_sf_pcm_acquire(f, i, ctypes.byref(n), ctypes.byref(ls), ctypes.byref(le))
     if not p:
         return None
     try:
         data = np.ctypeslib.as_array(p, shape=(n.value,)).copy()
-        ls, le = ctypes.c_uint32(), ctypes.c_uint32()
-        assert lib.smp_sf_pcm_loop(f, i, ctypes.byref(ls), ctypes.byref(le))
         return data, (ls.value, le.value)
     finally:
         lib.smp_sf_pcm_release(f, i)
@@ -99,8 +97,9 @@ def test_samples_load_only_when_used(lib, tmp_path):
         lib.smp_sf_use(f, 99, 1)
         lib.smp_sf_use(f, -1, 1)
         n = ctypes.c_uint32(7)
-        assert not lib.smp_sf_pcm_acquire(f, 99, ctypes.byref(n))
-        assert not lib.smp_sf_pcm_acquire(f, -1, ctypes.byref(n))
+        assert not lib.smp_sf_pcm_acquire(f, 99, ctypes.byref(n), None, None)
+        assert n.value == 0
+        assert not lib.smp_sf_pcm_acquire(f, -1, None, None, None)
         assert lib.smp_sf_wait_idle(f, 1000) == 0
         assert lib.smp_sf_loaded_samples(f) == 0
     finally:
@@ -198,7 +197,7 @@ def test_acquire_after_unpublish(lib, tmp_path):
     def hammer():
         n = ctypes.c_uint32()
         while not stop.is_set():
-            p = lib.smp_sf_pcm_acquire(f, 0, ctypes.byref(n))
+            p = lib.smp_sf_pcm_acquire(f, 0, ctypes.byref(n), None, None)
             if not p:
                 stats["misses"] += 1
                 continue
@@ -227,6 +226,52 @@ def test_acquire_after_unpublish(lib, tmp_path):
     finally:
         lib.smp_sf_close(f)
         lib.smp_sf_test_grace(GRACE_MS)
+
+
+def test_held_sample_survives_retire(lib, tmp_path):
+    """A voice still holding a sample after its preset stops being used (a long release after a program change)
+    keeps its data, frame count and loop points until it releases."""
+    path = str(tmp_path / "t.sf2")
+    write_sf2(path, PRESETS, SAMPLES)
+    lib.smp_sf_test_grace(10)
+    f = sf_open(lib, path)
+    try:
+        lib.smp_sf_use(f, 1, 1)
+        assert lib.smp_sf_wait_idle(f, 3000) == 0
+        n, ls, le = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
+        p = lib.smp_sf_pcm_acquire(f, 1, ctypes.byref(n), ctypes.byref(ls), ctypes.byref(le))
+        assert p
+        lib.smp_sf_use(f, 1, -1)
+        time.sleep(0.3)                                  # well past the grace: sample 1 is retired, not freed
+        assert pcm(lib, f, 1) is None                    # unpublished: a new acquire gets nothing
+        assert pcm(lib, f, 2) is None                    # not held: freed
+        assert lib.smp_sf_loaded_samples(f) == 1         # the held one is still in memory
+        assert (n.value, ls.value, le.value) == (3000, 1000, 2900)
+        assert np.array_equal(np.ctypeslib.as_array(p, shape=(3000,)), SAMPLES[1]["data"])
+        lib.smp_sf_pcm_release(f, 1)
+        assert poll(lambda: lib.smp_sf_loaded_samples(f) == 0, 2.0)
+    finally:
+        lib.smp_sf_close(f)
+        lib.smp_sf_test_grace(GRACE_MS)
+
+
+def test_load_retries_when_file_missing(lib, tmp_path):
+    """A file that can't be opened for loading isn't 'done': wait_idle keeps waiting, and the loader tries again."""
+    path = str(tmp_path / "t.sf2")
+    away = str(tmp_path / "away.sf2")
+    write_sf2(path, PRESETS, SAMPLES)
+    f = sf_open(lib, path)
+    try:
+        os.rename(path, away)
+        lib.smp_sf_use(f, 1, 1)
+        assert lib.smp_sf_wait_idle(f, 300) == 1         # not done: nothing loaded
+        assert lib.smp_sf_loaded_samples(f) == 0
+        os.rename(away, path)
+        assert lib.smp_sf_wait_idle(f, 3000) == 0        # retried on its own, no new use()
+        assert lib.smp_sf_loaded_samples(f) == 2
+        lib.smp_sf_use(f, 1, -1)
+    finally:
+        lib.smp_sf_close(f)
 
 
 def patch_shdr(path, i, start=None, end=None, loop_start=None, loop_end=None):

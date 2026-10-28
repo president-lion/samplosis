@@ -27,7 +27,11 @@
    published it again, and then it is counted the same way). So when the loader sees 0 after the exchange, nobody
    holds old and nobody can get it any more. There is never more than one buffer per sample, published or retired,
    so voices[s] only ever counts holders of that one buffer. A retired sample that is needed again before it is
-   freed is published again rather than loaded anew, which also stops quick program changes from thrashing. */
+   freed is published again rather than loaded anew, which also stops quick program changes from thrashing.
+
+   The caller's guarantee: every voice has released its samples before smp_sf_close drops the last reference (the
+   synth stops its voices first). Close frees the counters themselves, so a release after it would write freed
+   memory. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +44,7 @@
 
 #define DEFAULT_GRACE_MS 2000
 #define HELD_RECHECK_MS 20                 /* how often a retired sample that someone still holds is checked */
+#define RETRY_MS 500                       /* how often a load that failed for now (no file, no memory) is retried */
 #define MAX_VORBIS_FRAMES (1u << 26)       /* a decoded SF3 sample's limit (128 MB), against lying headers */
 
 static SRWLOCK g_lock = SRWLOCK_INIT;      /* guards the list, g_busy and g_thread */
@@ -147,7 +152,7 @@ static DWORD pass(SmpFont *f) {
   ULONGLONG grace = (ULONGLONG)(DWORD)g_grace;
   DWORD next = INFINITE;
   HANDLE h = INVALID_HANDLE_VALUE;
-  int s, p, k, cant_open = 0, aborted = 0;
+  int s, p, k, cant_open = 0, aborted = 0, retry = 0;
 
   memset(f->need, 0, (size_t)f->nshdr);
   for (p = 0; p < f->nphdr; p++) {
@@ -164,13 +169,15 @@ static DWORD pass(SmpFont *f) {
       if (f->state[s] == SF_ST_RETIRED) {          /* needed again before it was freed: publish it again */
         publish(f, s, f->held[s]);
         f->state[s] = SF_ST_PUBLISHED;
-      } else if (f->state[s] == SF_ST_NONE && !cant_open) {
+      } else if (f->state[s] == SF_ST_NONE && cant_open) {
+        retry = 1;
+      } else if (f->state[s] == SF_ST_NONE) {
         SfPcm *pc; int broken;
         if (h == INVALID_HANDLE_VALUE) {
-          h = f->wpath ? CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL)
-                       : INVALID_HANDLE_VALUE;
-          if (h == INVALID_HANDLE_VALUE) { cant_open = 1; continue; }   /* tried again on the next use() */
+          /* the same sharing as the parser's, so a file another program has open can still load */
+          h = CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+          if (h == INVALID_HANDLE_VALUE) { cant_open = retry = 1; continue; }   /* tried again in RETRY_MS */
         }
         pc = load_sample(f, h, s, &broken);
         if (pc) {
@@ -181,6 +188,8 @@ static DWORD pass(SmpFont *f) {
           f->state[s] = SF_ST_PUBLISHED;
         } else if (broken) {
           f->state[s] = SF_ST_BROKEN;                /* never tried again */
+        } else {
+          retry = 1;                                 /* out of memory: tried again in RETRY_MS */
         }
       }
       continue;
@@ -211,7 +220,9 @@ static DWORD pass(SmpFont *f) {
     }
   }
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-  if (!aborted) InterlockedExchange(&f->done_gen, gen);
+  /* a pass that left a needed sample unloaded for now isn't done: wait_idle keeps waiting, and it runs again */
+  if (retry && RETRY_MS < next) next = RETRY_MS;
+  if (!aborted && !retry) InterlockedExchange(&f->done_gen, gen);
   return next ? next : 1;
 }
 
@@ -247,6 +258,11 @@ static DWORD WINAPI loader(void *arg) {
 
 static void free_font(SmpFont *f) {
   int s;
+#ifdef _DEBUG
+  /* the caller's guarantee (see the top): no voice still holds a sample */
+  if (f->voices) for (s = 0; s < f->nshdr; s++)
+    if (f->voices[s] > 0) { OutputDebugStringA("samplosis: a SoundFont was closed while a voice held a sample\n"); break; }
+#endif
   if (f->held) for (s = 0; s < f->nshdr; s++) free_pcm(f->held[s]);
   free((void *)f->users); free((void *)f->voices); free((void *)f->pcm);
   free(f->held); free(f->state); free(f->need); free(f->idle_since); free(f->wpath);
@@ -281,7 +297,14 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
   WIN32_FILE_ATTRIBUTE_DATA a;
   SmpFont *f;
   int i;
-  if (full && GetFileAttributesExW(full, GetFileExInfoStandard, &a)) {
+  if (err && cap > 0) err[0] = 0;
+  if (!full) {                                      /* not a usable path: the loader could never find it */
+    const char *b = path ? path : "(no file)", *q;
+    for (q = b; *q; q++) if (*q == '\\' ||*q == '/' || *q == ':') b = q + 1;
+    if (err && cap > 0) snprintf(err, cap, "can't open %s", b);
+    return NULL;
+  }
+  if (GetFileAttributesExW(full, GetFileExInfoStandard, &a)) {
     uint64_t size = (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
     uint64_t mt = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
     SmpFont *found = NULL;
@@ -292,7 +315,7 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
           CompareStringOrdinal(g->wpath, -1, full, -1, TRUE) == CSTR_EQUAL) { found = g; found->refs++; break; }
     }
     ReleaseSRWLockExclusive(&g_lock);
-    if (found) { free(full); if (err && cap > 0) err[0] = 0; return found; }
+    if (found) { free(full); return found; }
   }
   f = sf_parse(path, err, cap);
   if (!f) { free(full); return NULL; }
@@ -363,14 +386,20 @@ void smp_sf_use(SmpFont *f, int preset, int delta) {
   SetEvent(g_wake);                                 /* made before the first font, never closed */
 }
 
-const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames) {
+const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames, uint32_t *loop_start,
+                                  uint32_t *loop_end) {
   SfPcm *p;
   if (frames) *frames = 0;
+  if (loop_start) *loop_start = 0;
+  if (loop_end) *loop_end = 0;
   if (!f || sample < 0 || sample >= f->nshdr) return NULL;
   InterlockedIncrement(&f->voices[sample]);         /* first count ourselves, then read (see the top comment) */
   p = f->pcm[sample];
   if (!p) { InterlockedDecrement(&f->voices[sample]); return NULL; }
+  /* everything from the one pointer read: it stays valid while held, even after the sample is retired */
   if (frames) *frames = p->frames;
+  if (loop_start) *loop_start = p->loop_start;
+  if (loop_end) *loop_end = p->loop_end;
   return p->data;
 }
 
@@ -379,14 +408,7 @@ void smp_sf_pcm_release(SmpFont *f, int sample) {
   InterlockedDecrement(&f->voices[sample]);
 }
 
-int smp_sf_pcm_loop(SmpFont *f, int sample, uint32_t *loop_start, uint32_t *loop_end) {
-  SfPcm *p;
-  if (!f || sample < 0 || sample >= f->nshdr || !(p = f->pcm[sample])) return 0;
-  if (loop_start) *loop_start = p->loop_start;
-  if (loop_end) *loop_end = p->loop_end;
-  return 1;
-}
-
+/* pending retires (unneeded samples waiting out the grace or a holder) don't count as busy */
 int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
   ULONGLONG end = GetTickCount64() + (ULONGLONG)(timeout_ms > 0 ? timeout_ms : 0);
   if (!f) return 0;
@@ -399,4 +421,6 @@ int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
 
 int smp_sf_loaded_samples(const SmpFont *f) { return f ? (int)f->nloaded : 0; }
 
-uint64_t smp_sf_loaded_bytes(const SmpFont *f) { return f ? (uint64_t)f->loaded_bytes : 0; }
+uint64_t smp_sf_loaded_bytes(const SmpFont *f) {
+  return f ? (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&f->loaded_bytes, 0, 0) : 0;
+}
