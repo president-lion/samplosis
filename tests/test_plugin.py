@@ -271,3 +271,131 @@ def test_note_at_block_end_clamped(P):
     y, d, r = P.play(text, "rawon 57 100 0 256", 4000)
     nz = np.nonzero(np.abs(y[:, 0]) > 0)[0]
     assert len(nz) and nz[0] >= 255 and nz[0] < 300
+
+
+# ---- the window, driven by messages through host.exe's gui command ----
+MAIN_ORDER = [
+    ("Edit", "Sample"), ("Button", "Browse"), ("Button", "Previous file"), ("Button", "Next file"),
+    ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
+    ("Edit", "Root note"), ("Edit", "Transpose"), ("Edit", "Fine tune"), ("Edit", "Volume"), ("Edit", "Pan"),
+    ("Edit", "Attack"), ("Edit", "Decay"), ("Edit", "Sustain"), ("Edit", "Release"),
+    ("Edit", "Velocity sensitivity"), ("Edit", "Minimum volume"), ("Edit", "Lowest note"), ("Edit", "Highest note"),
+    ("Edit", "Pitch at lowest note"), ("Edit", "Lowest velocity"), ("Edit", "Highest velocity"),
+    ("ComboBox", "Obey note off"), ("ComboBox", "Loop"), ("Edit", "Loop start"), ("Edit", "Start"), ("Edit", "End"),
+    ("Edit", "Bend range"), ("Edit", "Pitch at highest note"), ("ComboBox", "Reverse"), ("Edit", "Voices"),
+    ("Edit", "Probability"), ("Edit", "Speed"), ("Edit", "Status"), ("Button", "Settings"),
+]
+
+
+def gui(P, tmp_path, text, actions):
+    """Opens the window on a state and runs actions; returns the printed lines."""
+    st = P.state_file(text, "gui_state.txt")
+    sc = tmp_path / "gui_script.txt"
+    sc.write_text("\n".join(actions) + "\n")
+    code, out, err = host("gui", st, sc, timeout=120)
+    assert code == 0, out + err
+    return out
+
+
+def got(out, tag):
+    """Each `tag: class | name | value` line, split."""
+    return [ln[len(tag) + 2:].split(" | ") for ln in out.splitlines() if ln.startswith(tag + ": ")]
+
+
+def test_gui_tab_order(P, tmp_path):
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["say"] + ["key tab"] * len(MAIN_ORDER) +
+              ["focus Sample", "key tab shift", "focus Volume", "window", "say"])
+    f = got(out, "focus")
+    assert [x[:2] for x in f[:len(MAIN_ORDER)]] == [list(x) for x in MAIN_ORDER], out   # opens on the first control
+    assert f[len(MAIN_ORDER)][:2] == ["Button", "after"], out
+    assert f[len(MAIN_ORDER) + 1][:2] == ["Button", "before"], out
+    assert f[-1][:2] == ["Edit", "Volume"], out          # the window focused: on to the last control used
+
+
+def test_gui_values_in_words(P, tmp_path):
+    text = P.script(P.sample("tone C3.wav"))
+    out = gui(P, tmp_path, text, ["dump"])
+    d = {x[1]: x[2] for x in got(out, "control")}
+    assert d["Root note"] == "C3"
+    assert d["Volume"] == "0.0 dB"
+    assert d["Pan"] == "center"
+    assert d["Attack"] == "0 ms"
+    assert d["Keep length"] == "Off" and d["Mode"] == "Note"      # P.script turns keep length off
+    assert d["Sample"] == "tone C3.wav, 0.80 s, root C3 from the file name"
+    assert d["Status"] == "Ready: tone C3.wav"
+
+
+def test_gui_up_down_limits(P, tmp_path):
+    text = P.script(P.sample(), "volume 10\nvoices 1")
+    out = gui(P, tmp_path, text, ["focus Volume"] + ["key up"] * 13 + ["param 3", "focus Voices", "key down",
+              "key up shift", "focus Attack", "key up", "key up shift", "key up ctrl", "key down shift",
+              "key down shift"])
+    v = [x[2] for x in got(out, "focus")]
+    assert v[:3] == ["11.0 dB", "12.0 dB", "12.0 dB"]
+    assert v[12] == "12.0 dB"
+    assert "param 3: 12" in out
+    assert v[13:] == ["1", "11", "10 ms", "110 ms", "111 ms", "11 ms", "0 ms"]
+
+
+def test_gui_typed_value(P, tmp_path):
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["focus Volume", "type -6", "key enter", "param 3", "flush", "counts",
+                                  "type loud", "key enter", "param 3", "counts",
+                                  "type -3", "key tab", "param 3"])
+    f = got(out, "focus")
+    assert f[0][1:] == ["Volume", "-6.0 dB"]
+    assert "param 3: -6" in out
+    assert "out: gesture_begin 3" in out and "out: value 3 -6" in out and "out: gesture_end 3" in out
+    c = got(out, "counts")
+    assert c[0][0] == "beeps 0" and c[0][1] != "request_flush 0"
+    assert f[1][1:] == ["Volume", "-6.0 dB"] and c[1][0] == "beeps 1"     # "loud" beeps and goes back
+    assert out.count("param 3: -6") == 2
+    assert f[2][1] == "Pan" and "param 3: -3" in out                     # leaving the box applies it too
+
+
+def test_gui_next_file(P, tmp_path):
+    d = tmp_path / "files"
+    d.mkdir()
+    for n in ("a.wav", "B.wav", "c.wav"):
+        P.sample(n)
+        os.replace(tmp_path / n, d / n)
+    (d / "notes.txt").write_text("not audio")
+    text = P.script(d / "B.wav")
+    out = gui(P, tmp_path, text, ["read Sample", "focus Next file", "key enter", "read Sample", "key enter",
+                                  "read Sample", "focus Previous file", "key space", "read Sample", "state", "counts"])
+    r = [x[1] for x in got(out, "read")]
+    assert r[0].startswith("B.wav, 0.80 s, root ")
+    assert r[1].startswith("c.wav, ") and r[2].startswith("a.wav, ") and r[3].startswith("c.wav, ")
+    assert ('sample "%s"' % (d / "c.wav")) in out
+    assert got(out, "counts")[0][2] != "mark_dirty 0"
+
+
+def test_gui_settings_page(P, tmp_path, settings_file):
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "key tab", "key tab", "type 5", "key enter",
+                                  "key up", "key down", "key tab", "key tab", "key tab", "key tab",
+                                  "focus Back", "key enter", "focus Back", "say"])
+    f = got(out, "focus")
+    assert f[0][:3] == ["Edit", "Cache folder", str(tmp_path / "cache")]
+    assert f[1][:2] == ["Button", "Browse folder"]
+    assert f[2] == ["Edit", "Cache size limit", "10 GB"]
+    assert f[3][2] == "5 GB" and f[4][2] == "6 GB" and f[5][2] == "5 GB"
+    assert f[6][:2] == ["Edit", "Cache in use"] and f[6][2].endswith(" of 5 GB")
+    assert [x[:2] for x in f[7:10]] == [["Button", "Clear cache"], ["Button", "Back"], ["Button", "after"]]
+    assert f[10][:2] == ["Button", "Settings"]           # Back: on the Settings button again
+    assert f[11][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+    with open(settings_file) as fh:
+        assert "cache_limit_gb 5\n" in fh.read()
+
+
+def test_gui_keep_length_combo(P, tmp_path):
+    text = P.script(P.sample(), "keep_length on")
+    out = gui(P, tmp_path, text, ["focus Keep length", "say", "key up", "param 25", "flush",
+                                  "focus Mode", "say", "key down", "key down", "param 11"])
+    f = got(out, "focus")
+    assert f[0] == ["ComboBox", "Keep length", "On"] and f[1] == ["ComboBox", "Keep length", "Off"]
+    assert "param 25: 0" in out
+    assert "out: value 25 0" in out
+    assert [x[2] for x in f[2:]] == ["Note", "Free", "Free"]
+    assert "param 11: 2" in out

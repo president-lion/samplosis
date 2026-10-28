@@ -18,22 +18,12 @@
 #include <ctype.h>
 #include <clap/clap.h>
 #include "engine_int.h"
+#include "plugin_int.h"
 
 #define DEFAULT_RATE 48000.0
 #define COLLECT_ROUNDS 8
 
-typedef struct {
-  clap_plugin_t plugin;
-  const clap_host_t *host;
-  SmpEngine *e;
-  double rate;
-  char *text;                        /* the state as last accepted */
-  int missing;                       /* its sample couldn't be loaded: silent, and saving writes text's sample line */
-  char status[1400];
-  float *scratch; uint32_t maxf;     /* the right channel when a host gives a mono output */
-  volatile LONG collect_left;        /* main-thread callbacks still wanted to free replaced samples */
-  uint32_t since;                    /* audio thread: frames since it last asked for one */
-} Plug;
+/* Plug (plugin_int.h) is shared with the window (gui.c). */
 
 static const char *const features[] = {CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SAMPLER,
                                        CLAP_PLUGIN_FEATURE_STEREO, NULL};
@@ -176,6 +166,10 @@ static char *state_text(Plug *P) {
 static bool p_init(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   P->rate = DEFAULT_RATE;
+  if (P->host && P->host->get_extension) {
+    P->host_params = P->host->get_extension(P->host, CLAP_EXT_PARAMS);
+    P->host_state = P->host->get_extension(P->host, CLAP_EXT_STATE);
+  }
   P->e = smp_engine_new(P->rate, 4096);
   snprintf(P->status, sizeof P->status, P->e ? "No sample loaded" : "Not working: the sound engine couldn't start");
   return P->e != NULL;
@@ -188,6 +182,7 @@ static void p_deactivate(const clap_plugin_t *p) {
 
 static void p_destroy(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
+  smp_gui_close(P);                      /* a host that didn't destroy the window first */
   smp_engine_free(P->e);
   free(P->text); free(P->scratch);
   free(P);
@@ -260,6 +255,27 @@ static void event(Plug *P, const clap_event_header_t *h, int at) {
   }
 }
 
+/* Parameters the window changed, to the host as a gesture each (begin, the value, end), so REAPER records
+   automation and its own controls follow. Audio thread (process) or main thread (flush); no allocation. */
+static void emit_gui_params(Plug *P, const clap_output_events_t *out) {
+  int id;
+  if (!out || !P->e || !InterlockedExchange(&P->gui_any, 0)) return;
+  for (id = 0; id < SMP_NPARAMS; id++) {
+    clap_event_param_gesture_t g; clap_event_param_value_t v;
+    if (!InterlockedExchange(&P->gui_pending[id], 0)) continue;
+    memset(&g, 0, sizeof g); memset(&v, 0, sizeof v);
+    g.header.size = sizeof g; g.header.space_id = CLAP_CORE_EVENT_SPACE_ID; g.header.type = CLAP_EVENT_PARAM_GESTURE_BEGIN;
+    g.param_id = (clap_id)id;
+    out->try_push(out, &g.header);
+    v.header.size = sizeof v; v.header.space_id = CLAP_CORE_EVENT_SPACE_ID; v.header.type = CLAP_EVENT_PARAM_VALUE;
+    v.param_id = (clap_id)id; v.note_id = -1; v.port_index = -1; v.channel = -1; v.key = -1;
+    v.value = smp_engine_get_param(P->e, id);
+    out->try_push(out, &v.header);
+    g.header.type = CLAP_EVENT_PARAM_GESTURE_END;
+    out->try_push(out, &g.header);
+  }
+}
+
 static clap_process_status p_process(const clap_plugin_t *p, const clap_process_t *pr) {
   Plug *P = p->plugin_data;
   uint32_t n = pr->frames_count, ne = pr->in_events ? pr->in_events->size(pr->in_events) : 0, i, pos = 0;
@@ -286,6 +302,7 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   else smp_engine_process(P->e, l, r, 0);              /* clears events queued at the very end */
   if (ob->channel_count < 2) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
   for (i = 2; i < ob->channel_count; i++) memset(ob->data32[i], 0, sizeof(float) * n);
+  emit_gui_params(P, pr->out_events);
   if (P->collect_left > 0) {
     P->since += n;
     if (P->since >= (uint32_t)(P->rate / 4)) { P->since = 0; if (P->host->request_callback) P->host->request_callback(P->host); }
@@ -328,7 +345,7 @@ static bool ap_get(const clap_plugin_t *p, uint32_t i, bool in, clap_audio_port_
 static const clap_plugin_audio_ports_t audio_ports = {ap_count, ap_get};
 
 /* ---- parameters (ids are the engine's) ---- */
-static const char *const pretty[SMP_NPARAMS] = {
+const char *const smp_param_label[SMP_NPARAMS] = {
   "Root note", "Transpose", "Fine tune", "Volume", "Pan", "Attack", "Decay", "Sustain", "Release",
   "Velocity sensitivity", "Minimum volume", "Mode", "Lowest note", "Highest note", "Pitch at lowest note",
   "Lowest velocity", "Highest velocity", "Obey note off", "Loop", "Loop start", "Start", "End", "Bend range",
@@ -347,7 +364,7 @@ static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info)
       info->flags |= CLAP_PARAM_IS_STEPPED;
   }
   if (pi->kind == SMP_K_CHOICE || pi->kind == SMP_K_BOOL) info->flags |= CLAP_PARAM_IS_ENUM;
-  snprintf(info->name, sizeof info->name, "%s", pretty[i]);
+  snprintf(info->name, sizeof info->name, "%s", smp_param_label[i]);
   info->min_value = pi->lo; info->max_value = pi->hi; info->default_value = pi->def;
   return true;
 }
@@ -369,12 +386,12 @@ static bool pa_parse(const clap_plugin_t *p, clap_id id, const char *s, double *
 }
 static void pa_flush(const clap_plugin_t *p, const clap_input_events_t *in, const clap_output_events_t *out) {
   Plug *P = p->plugin_data; uint32_t i, n = in ? in->size(in) : 0;
-  (void)out;
   if (!P->e) return;
   for (i = 0; i < n; i++) {
     const clap_event_header_t *h = in->get(in, i);
     if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) event(P, h, 0);
   }
+  emit_gui_params(P, out);
 }
 static const clap_plugin_params_t params = {pa_count, pa_info, pa_value, pa_text, pa_parse, pa_flush};
 
@@ -425,6 +442,7 @@ static const void *p_ext(const clap_plugin_t *p, const char *id) {
   if (!strcmp(id, CLAP_EXT_PARAMS)) return &params;
   if (!strcmp(id, CLAP_EXT_STATE)) return &state;
   if (!strcmp(id, CLAP_EXT_LATENCY)) return &latency;
+  if (!strcmp(id, CLAP_EXT_GUI)) return &smp_gui_ext;
   return NULL;
 }
 
@@ -434,6 +452,74 @@ SMP_API int smp_plugin_status(const clap_plugin_t *p, char *out, int cap) {
   if (!P || !out || cap <= 0) return 0;
   snprintf(out, (size_t)cap, "%s", P->status);
   return 1;
+}
+
+/* ---- what the window does (plugin_int.h); main thread ---- */
+static void mark_dirty(Plug *P) { if (P->host_state && P->host_state->mark_dirty) P->host_state->mark_dirty(P->host); }
+
+static void tell_host(Plug *P, int id) {
+  InterlockedExchange(&P->gui_pending[id], 1);
+  InterlockedExchange(&P->gui_any, 1);
+  if (P->host_params && P->host_params->request_flush) P->host_params->request_flush(P->host);
+}
+
+void smp_plug_set_param(Plug *P, int id, double v) {
+  if (!P->e || id < 0 || id >= SMP_NPARAMS) return;
+  smp_engine_set_param(P->e, id, v);
+  tell_host(P, id);
+  mark_dirty(P);
+}
+
+double smp_plug_get_param(Plug *P, int id) {
+  return P->e ? smp_engine_get_param(P->e, id) : smp_param_info(id)->def;
+}
+
+int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
+  SmpSample *s; char *t;
+  if (!P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  s = smp_sample_load(path, err, cap);
+  if (!s) return 0;
+  smp_engine_set_sample(P->e, s);        /* the root follows the sample's */
+  P->missing = 0;
+  t = engine_text(P->e);
+  if (t) { free(P->text); P->text = t; }
+  snprintf(P->status, sizeof P->status, "Ready: %s", s->name);
+  tell_host(P, SMP_P_ROOT);
+  mark_dirty(P);
+  ask_collect(P);
+  return 1;
+}
+
+int smp_plug_sample_path(Plug *P, char *path, int cap) {
+  const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
+  char line[1200];
+  if (s) { snprintf(path, (size_t)cap, "%s", s->path); return 1; }
+  if (P->missing && P->text && sample_line(P->text, line, sizeof line, path, cap) == 2) return 2;
+  if (cap > 0) path[0] = 0;
+  return 0;
+}
+
+void smp_plug_sample_text(Plug *P, char *out, int cap) {
+  static const char *const from[] = {"from the file name", "detected", "by default"};
+  const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
+  char note[16], path[1100];
+  if (s) {
+    smp_note_name(s->root, note, sizeof note);
+    snprintf(out, (size_t)cap, "%s, %.2f s, root %s %s", s->name, s->rate > 0 ? (double)s->frames / s->rate : 0.0,
+             note, from[s->root_from < 0 || s->root_from > 2 ? 2 : s->root_from]);
+  } else if (smp_plug_sample_path(P, path, sizeof path) == 2) snprintf(out, (size_t)cap, "Missing: %s", path);
+  else snprintf(out, (size_t)cap, "No sample loaded");
+}
+
+void smp_plug_status_text(Plug *P, char *out, int cap) {
+  int ready = 0, total = 0; char why[600] = "";
+  if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }
+  if (smp_engine_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_engine_render_status(P->e, &ready, &total, why, sizeof why)) {
+    if (why[0]) snprintf(out, (size_t)cap, "%s", why);
+    else snprintf(out, (size_t)cap, "Keep length: %d of %d copies ready", ready, total);
+    return;
+  }
+  snprintf(out, (size_t)cap, "%s", P->status);
 }
 
 /* ---- test hooks (tests\host.c): make a real-time plugin render exactly like smp_engine_render_test ---- */

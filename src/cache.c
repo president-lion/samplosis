@@ -208,3 +208,18 @@ int smp_cache_ok(char *why, int cap) {
   } else if (why && cap > 0) snprintf(why, cap, "the cache folder %s isn't a valid path", s.cache_dir);
   return 0;
 }
+
+uint64_t smp_cache_used_bytes(void) {
+  wchar_t dir[1100], pat[1200];
+  WIN32_FIND_DATAW fd;
+  uint64_t total = 0;
+  if (!dir_w(dir, 1100)) return 0;
+  swprintf(pat, 1200, L"%s\\*.smpc", dir);
+  HANDLE f = FindFirstFileW(pat, &fd);
+  if (f == INVALID_HANDLE_VALUE) return 0;
+  do {
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+  } while (FindNextFileW(f, &fd));
+  FindClose(f);
+  return total;
+}

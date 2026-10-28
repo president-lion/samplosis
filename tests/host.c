@@ -5,7 +5,24 @@
    "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames"; between blocks: "reset frame",
    "cycle frame" (deactivate and activate again), "state <file> frame" (load another state); and "rawon key vel frame
    time" (a note-on in the block holding frame, with its time field set to time as is: a sloppy host). Blocks of 256 frames.
-   play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks. */
+   play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks.
+     host.exe samplosis.clap gui <state.txt> <actions.txt>
+   Opens the plugin's window in a hidden top-level window (off screen) between a "before" and an "after" button, as
+   REAPER's FX window has controls around it, and runs actions, one per line. Keys go to the focused control by
+   message (never SendInput: someone is using the desktop). A line "focus: <class> | <name> | <value>" tells what a
+   screen reader would find focused: a button's name is its text, another control's the label just before it.
+     key <tab|up|down|enter|space|escape|left|right> [shift] [ctrl]   a key, then the focus line
+     say                     the focus line
+     focus <name>            focus the plugin's control with that name (silent; "note: no control" if none shows)
+     window                  focus the plugin's window itself, as REAPER does coming back to it (silent)
+     type <text>             set the focused control's text (silent)
+     read <name>             "read: <name> | <value>"
+     dump                    "control: <class> | <name> | <value>" for every control that shows
+     param <id>              "param <id>: <value>"
+     flush                   the host's params flush: "out: gesture_begin|value|gesture_end <id> [value]"
+     state                   the saved state's sample line: "state: sample ..."
+     counts                  "counts: beeps N | request_flush N | mark_dirty N"
+     pump <ms>               let the window's timers run */
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
@@ -24,7 +41,19 @@ typedef void (*SyncFn)(const clap_plugin_t *);
 typedef int (*VoicesFn)(const clap_plugin_t *);
 
 static volatile LONG want_callback;
-static const void *h_ext(const clap_host_t *h, const char *id) { (void)h; (void)id; return NULL; }
+static int flushes, dirties;
+static void hp_rescan(const clap_host_t *h, clap_param_rescan_flags f) { (void)h; (void)f; }
+static void hp_clear(const clap_host_t *h, clap_id id, clap_param_clear_flags f) { (void)h; (void)id; (void)f; }
+static void hp_flush(const clap_host_t *h) { (void)h; flushes++; }
+static const clap_host_params_t host_params = {hp_rescan, hp_clear, hp_flush};
+static void hs_dirty(const clap_host_t *h) { (void)h; dirties++; }
+static const clap_host_state_t host_state = {hs_dirty};
+static const void *h_ext(const clap_host_t *h, const char *id) {
+  (void)h;
+  if (!strcmp(id, CLAP_EXT_PARAMS)) return &host_params;
+  if (!strcmp(id, CLAP_EXT_STATE)) return &host_state;
+  return NULL;
+}
 static void h_restart(const clap_host_t *h) { (void)h; }
 static void h_process(const clap_host_t *h) { (void)h; }
 static void h_callback(const clap_host_t *h) { (void)h; InterlockedExchange(&want_callback, 1); }
@@ -143,6 +172,15 @@ static const clap_event_header_t *el_get(const clap_input_events_t *l, uint32_t 
   const EvList *x = l->ctx; return i < x->n ? ev_header(x->list[i]) : NULL;
 }
 static bool oe_push(const clap_output_events_t *l, const clap_event_header_t *h) { (void)l; (void)h; return true; }
+static bool oe_print(const clap_output_events_t *l, const clap_event_header_t *h) {   /* what the plugin tells the host */
+  (void)l;
+  if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return true;
+  if (h->type == CLAP_EVENT_PARAM_GESTURE_BEGIN) printf("out: gesture_begin %u\n", ((const clap_event_param_gesture_t *)h)->param_id);
+  else if (h->type == CLAP_EVENT_PARAM_GESTURE_END) printf("out: gesture_end %u\n", ((const clap_event_param_gesture_t *)h)->param_id);
+  else if (h->type == CLAP_EVENT_PARAM_VALUE)
+    printf("out: value %u %g\n", ((const clap_event_param_value_t *)h)->param_id, ((const clap_event_param_value_t *)h)->value);
+  return true;
+}
 
 static int parse_events(const char *text, long *length) {
   const char *p = text; int cap = 0;
@@ -259,11 +297,173 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
   return 0;
 }
 
+/* ---- the window ---- */
+typedef long (*BeepsFn)(void);
+typedef void (*QuietFn)(int);
+static HWND plugwin;
+
+static int cls_is(HWND h, const wchar_t *c) { wchar_t n[64] = L""; GetClassNameW(h, n, 64); return !_wcsicmp(n, c); }
+static void utf8(const wchar_t *w, char *out, int cap) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL); }
+
+/* class, name and value as a screen reader finds them */
+static void describe(HWND h, char *cls, char *name, char *value) {
+  wchar_t c[64] = L"", t[1100] = L"";
+  cls[0] = name[0] = value[0] = 0;
+  if (!h) { strcpy(cls, "nothing"); return; }
+  GetClassNameW(h, c, 64); utf8(c, cls, 64);
+  GetWindowTextW(h, t, 1100);
+  if (cls_is(h, L"Button")) { utf8(t, name, 300); return; }
+  {
+    HWND prev = GetWindow(h, GW_HWNDPREV);
+    if (prev && cls_is(prev, L"Static")) { wchar_t lt[300]; GetWindowTextW(prev, lt, 300); utf8(lt, name, 300); }
+  }
+  if (cls_is(h, L"ComboBox")) {
+    LRESULT i = SendMessageW(h, CB_GETCURSEL, 0, 0);
+    t[0] = 0;
+    if (i >= 0) SendMessageW(h, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
+  }
+  utf8(t, value, 1100);
+}
+static void say(void) {
+  char c[64], n[300], v[1100];
+  describe(GetFocus(), c, n, v);
+  printf("focus: %s | %s | %s\n", c, n, v);
+}
+static HWND find_named(const char *want) {
+  HWND w;
+  for (w = GetWindow(plugwin, GW_CHILD); w; w = GetWindow(w, GW_HWNDNEXT)) {
+    char c[64], n[300], v[1100];
+    if (!IsWindowVisible(w) || !(GetWindowLongW(w, GWL_STYLE) & WS_TABSTOP)) continue;
+    describe(w, c, n, v);
+    if (!strcmp(n, want)) return w;
+  }
+  return NULL;
+}
+static void pump(int ms) {
+  DWORD end = GetTickCount() + (DWORD)ms; MSG m;
+  for (;;) {
+    while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    if ((int)(end - GetTickCount()) <= 0) break;
+    Sleep(5);
+  }
+}
+/* keys straight to the focused control, as REAPER's FX window leaves them */
+static void key(WPARAM vk, int shift, int ctrl) {
+  BYTE ks[256];
+  GetKeyboardState(ks);
+  ks[VK_SHIFT] = shift ? 0x80 : 0; ks[VK_CONTROL] = ctrl ? 0x80 : 0; SetKeyboardState(ks);
+  SendMessageW(GetFocus(), WM_KEYDOWN, vk, 1);
+  if (vk == VK_SPACE) SendMessageW(GetFocus(), WM_CHAR, ' ', 1);
+  if (vk == VK_RETURN) SendMessageW(GetFocus(), WM_CHAR, 13, 1);
+  if (vk == VK_TAB) SendMessageW(GetFocus(), WM_CHAR, 9, 1);
+  SendMessageW(GetFocus(), WM_KEYUP, vk, 0xC0000001);
+  ks[VK_SHIFT] = 0; ks[VK_CONTROL] = 0; SetKeyboardState(ks);
+}
+static DWORD WINAPI watchdog(LPVOID arg) { (void)arg; Sleep(90000); printf("HUNG\n"); ExitProcess(3); return 0; }
+
+static int cmd_gui(const clap_plugin_t *p, const char *state, const char *actions) {
+  const clap_plugin_gui_t *gui = p->get_extension(p, CLAP_EXT_GUI);
+  const clap_plugin_params_t *pa = p->get_extension(p, CLAP_EXT_PARAMS);
+  BeepsFn beeps = (BeepsFn)GetProcAddress(dll, "smp_test_gui_beeps");
+  QuietFn quiet = (QuietFn)GetProcAddress(dll, "smp_test_gui_quiet");
+  char *text = read_file(actions, NULL), *line, *next;
+  HWND top, holder; clap_window_t cw; uint32_t w = 0, h = 0;
+  if (!gui || !beeps || !quiet) { printf("error: no gui extension or test hooks\n"); return 1; }
+  if (!text) { printf("error: can't read %s\n", actions); return 1; }
+  CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+  quiet(1);
+  if (load_state(p, state) < 0) return 1;
+  main_thread(p);
+  if (!gui->is_api_supported(p, CLAP_WINDOW_API_WIN32, false) || !gui->create(p, CLAP_WINDOW_API_WIN32, false)) {
+    printf("error: gui create failed\n"); return 1;
+  }
+  gui->get_size(p, &w, &h);
+  top = CreateWindowExW(WS_EX_CONTROLPARENT | WS_EX_TOOLWINDOW, L"#32770", L"FX: samplosis test", WS_POPUP, -3000, -3000,
+                        (int)w + 120, (int)h + 20, NULL, NULL, NULL, NULL);
+  CreateWindowExW(0, L"BUTTON", L"before", WS_CHILD | WS_VISIBLE | WS_TABSTOP, (int)w + 10, 10, 80, 26, top, (HMENU)1, NULL, NULL);
+  holder = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, (int)w, (int)h, top, NULL, NULL, NULL);
+  CreateWindowExW(0, L"BUTTON", L"after", WS_CHILD | WS_VISIBLE | WS_TABSTOP, (int)w + 10, 50, 80, 26, top, (HMENU)2, NULL, NULL);
+  memset(&cw, 0, sizeof cw); cw.api = CLAP_WINDOW_API_WIN32; cw.win32 = holder;
+  if (!gui->set_parent(p, &cw)) { printf("error: set_parent failed\n"); return 1; }
+  gui->show(p);
+  plugwin = FindWindowExW(holder, NULL, L"SamplosisWindow", NULL);
+  if (!plugwin) { printf("error: no SamplosisWindow\n"); return 1; }
+  ShowWindow(top, SW_SHOWNOACTIVATE);
+  SetFocus(top);
+  pump(400);
+  for (line = text; line && *line; line = next) {
+    char a[1100] = "", *arg;
+    size_t n;
+    next = strchr(line, '\n');
+    if (next) *next++ = 0;
+    snprintf(a, sizeof a, "%s", line);
+    n = strlen(a);
+    while (n && (a[n - 1] == '\r' || a[n - 1] == ' ')) a[--n] = 0;
+    if (!a[0]) continue;
+    arg = strchr(a, ' ');
+    if (arg) *arg++ = 0; else arg = a + strlen(a);
+    if (!strcmp(a, "key")) {
+      static const struct { const char *n; WPARAM vk; } keys[] = {{"tab", VK_TAB}, {"up", VK_UP}, {"down", VK_DOWN},
+        {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT}};
+      char k[32] = ""; int i, found = 0;
+      sscanf(arg, "%31s", k);
+      for (i = 0; i < 8; i++)
+        if (!strcmp(k, keys[i].n)) { key(keys[i].vk, strstr(arg, "shift") != NULL, strstr(arg, "ctrl") != NULL); found = 1; }
+      if (!found) { printf("error: no key %s\n", k); return 1; }
+      pump(60); say();
+    } else if (!strcmp(a, "say")) say();
+    else if (!strcmp(a, "focus")) {
+      HWND c = find_named(arg);
+      if (c) { SetFocus(c); pump(30); } else printf("note: no control %s\n", arg);
+    } else if (!strcmp(a, "window")) { SetFocus(plugwin); pump(60); }
+    else if (!strcmp(a, "type")) {
+      wchar_t wt[1100]; MultiByteToWideChar(CP_UTF8, 0, arg, -1, wt, 1100);
+      SendMessageW(GetFocus(), WM_SETTEXT, 0, (LPARAM)wt); pump(30);
+    } else if (!strcmp(a, "read")) {
+      HWND c = find_named(arg); char cl[64], nm[300], v[1100];
+      describe(c, cl, nm, v);
+      printf("read: %s | %s\n", arg, c ? v : "(none)");
+    } else if (!strcmp(a, "dump")) {
+      HWND c;
+      for (c = GetWindow(plugwin, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        char cl[64], nm[300], v[1100];
+        if (!IsWindowVisible(c) || !(GetWindowLongW(c, GWL_STYLE) & WS_TABSTOP)) continue;
+        describe(c, cl, nm, v);
+        printf("control: %s | %s | %s\n", cl, nm, v);
+      }
+    } else if (!strcmp(a, "param")) {
+      double v = 0; pa->get_value(p, (clap_id)atoi(arg), &v);
+      printf("param %d: %g\n", atoi(arg), v);
+    } else if (!strcmp(a, "flush")) {
+      clap_input_events_t in; clap_output_events_t out; EvList none = {NULL, 0};
+      in.ctx = &none; in.size = el_size; in.get = el_get;
+      out.ctx = NULL; out.try_push = oe_print;
+      pa->flush(p, &in, &out);
+    } else if (!strcmp(a, "state")) {
+      const clap_plugin_state_t *st = p->get_extension(p, CLAP_EXT_STATE);
+      Mem m = {0}; clap_ostream_t os = {&m, os_write}; char *sl;
+      st->save(p, &os);
+      sl = m.buf ? strstr(m.buf, "\nsample ") : NULL;
+      if (sl) { char *e = strchr(sl + 1, '\n'); if (e) *e = 0; printf("state: %s\n", sl + 1); }
+      else printf("state: no sample\n");
+      free(m.buf);
+    } else if (!strcmp(a, "counts")) printf("counts: beeps %ld | request_flush %d | mark_dirty %d\n", beeps(), flushes, dirties);
+    else if (!strcmp(a, "pump")) pump(atoi(arg));
+    else { printf("error: unknown action %s\n", a); return 1; }
+  }
+  free(text);
+  gui->destroy(p);
+  DestroyWindow(top);
+  main_thread(p);
+  printf("closed\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const clap_plugin_entry_t *entry; const clap_plugin_factory_t *fac; const clap_plugin_t *p; int r;
   _setmode(_fileno(stdout), _O_BINARY);
   setvbuf(stdout, NULL, _IONBF, 0);
-  if (argc < 4) { printf("usage: host.exe samplosis.clap state <state.txt> | play <state.txt> <events> <out.wav> [rate]\n"); return 2; }
+  if (argc < 4) { printf("usage: host.exe samplosis.clap state <state.txt> | play <state.txt> <events> <out.wav> [rate] | gui <state.txt> <actions.txt>\n"); return 2; }
   dll = LoadLibraryA(argv[1]);
   if (!dll) { printf("error: can't load %s\n", argv[1]); return 1; }
   entry = (const clap_plugin_entry_t *)GetProcAddress(dll, "clap_entry");
@@ -273,6 +473,7 @@ int main(int argc, char **argv) {
   p = fac->create_plugin(fac, &host, fac->get_plugin_descriptor(fac, 0)->id);
   if (!p || !p->init(p)) { printf("error: the plugin didn't start\n"); return 1; }
   if (!strcmp(argv[2], "state")) r = cmd_state(p, argv[3]);
+  else if (!strcmp(argv[2], "gui") && argc >= 5) r = cmd_gui(p, argv[3], argv[4]);
   else if (!strcmp(argv[2], "play") && argc >= 6) r = cmd_play(p, argv[3], argv[4], argv[5], argc > 6 ? atof(argv[6]) : 48000.0);
   else { printf("unknown command %s\n", argv[2]); r = 2; }
   p->destroy(p);

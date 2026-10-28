@@ -55,6 +55,7 @@ SMP_API const float *smp_entry_head(const SmpEntry *e, uint64_t *head_frames); /
 SMP_API long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames); /* streamer thread only */
 SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files; returns bytes left */
 SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */
+SMP_API uint64_t smp_cache_used_bytes(void);         /* the .smpc files' total size (scans the folder) */
 
 /* a sample imported into the cache */
 typedef struct SmpSample {

@@ -13,7 +13,7 @@ rem Rubber Band, C++ (warnings about narrowing silenced); src is on the include 
 cl /nologo /c /O2 /W3 /wd4244 /wd4267 /MT /EHsc /I src /Fo"%OBJ%\rb.obj" src\rb.cpp || exit /b 1
 rem The try/catch shim around Rubber Band: /EHs, so calls into its extern "C" API may throw and are caught
 cl /nologo /c /O2 /W3 /MT /EHs /I src /Fo"%OBJ%\rbsafe.obj" src\rbsafe.cpp || exit /b 1
-cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /I "%CLAPINC%" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\rbsafe.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib || exit /b 1
+cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /I "%CLAPINC%" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\rbsafe.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib || exit /b 1
 if /i "%1"=="test" (
   cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /I "%CLAPINC%" /I src /Fo"%OBJ%\\" tests\host.c /Fe:tests\host.exe /link /NOLOGO user32.lib ole32.lib || exit /b 1
 )
