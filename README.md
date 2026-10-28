@@ -120,7 +120,7 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 Measured on 2026-10-28 with `python tests\measure.py`, through the engine's exported functions, with a temporary
 cache folder.
 
-- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48 to 63 (C2 to D#3). Keep length off:
+- CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48 to 63 (C3 to D#4). Keep length off:
   0.96 percent of real time. Keep length on, all copies ready: 1.18 percent. The target was under 2 percent. This
   includes the test helper's small waits, so it is an upper bound for the audio thread.
 - Memory: a 60 second stereo sample loaded with keep length on and all 97 copies the default key range needs
