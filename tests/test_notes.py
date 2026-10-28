@@ -6,7 +6,7 @@ import ctypes
 import pytest
 
 K_NOTE, K_SEMI, K_CENT, K_DB, K_PAN, K_MS, K_PERCENT, K_CHOICE, K_BOOL, K_COUNT, K_POSITION = range(11)
-NPARAMS = 29
+NPARAMS = 31
 
 
 @pytest.mark.parametrize("s,n", [("C-1", 0), ("C4", 60), ("a4", 69), ("Db4", 61), ("B#3", 60),
@@ -69,6 +69,8 @@ def test_value_words(lib):
     assert parse(lib, 5, "1.2 s") == 1200 and parse(lib, 5, "120") == 120
     assert parse(lib, 1, "+7 st") == 7 and parse(lib, 1, "nonsense") is None
     assert parse(lib, 1, "999") == 48  # clamped to range
+    assert txt(lib, 29, 0) == "off" and txt(lib, 29, 250) == "250 ms" and parse(lib, 29, "off") == 0
+    assert txt(lib, 30, 0) == "always" and txt(lib, 30, 1) == "legato" and parse(lib, 30, "Legato") == 1
 
 
 def test_value_roundtrip(lib):

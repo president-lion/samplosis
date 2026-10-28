@@ -24,7 +24,8 @@ class SmpSample(ctypes.Structure):
 
 
 class SmpSettings(ctypes.Structure):
-    _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double)]
+    _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double),
+                ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int)]
 
 
 def write_wav(path, data, rate):

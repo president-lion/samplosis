@@ -7,11 +7,14 @@
    time" (a note-on in the block holding frame, with its time field set to time as is: a sloppy host). Blocks of 256 frames.
    play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks.
      host.exe samplosis.clap gui <state.txt> <actions.txt>
-   Opens the plugin's window in a hidden top-level window (off screen) between a "before" and an "after" button, as
+   Opens the plugin's window on a desktop of its own (never the one in use) between a "before" and an "after" button, as
    REAPER's FX window has controls around it, and runs actions, one per line. Keys go to the focused control by
    message (never SendInput: someone is using the desktop). A line "focus: <class> | <name> | <value>" tells what a
-   screen reader would find focused: a button's name is its text, another control's the label just before it.
-     key <tab|up|down|enter|space|escape|left|right> [shift] [ctrl]   a key, then the focus line
+   screen reader would find focused: a button's name is its text; another control's name is its accessible name
+   (MSAA, as a screen reader asks for it), else the label just before it. A slider (a trackbar) shows as class
+   "Slider" with its accessible value.
+     key <tab|up|down|enter|space|escape|left|right|pageup|pagedown|home|end> [shift] [ctrl]   a key, then the focus line
+     char <c>                a character typed (WM_CHAR), then the focus line
      say                     the focus line
      focus <name>            focus the plugin's control with that name (silent; "note: no control" if none shows)
      window                  focus the plugin's window itself, as REAPER does coming back to it (silent)
@@ -27,6 +30,7 @@
                              destroys the window, destroy the whole plugin (as REAPER can while a dialog is open)
      alive                   "alive: plugin" or "alive: plugin destroyed" (the host got this far) */
 #include <windows.h>
+#include <oleacc.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdint.h>
@@ -310,6 +314,17 @@ static int plugin_gone;                     /* a "dialog destroy" freed the plug
 static int cls_is(HWND h, const wchar_t *c) { wchar_t n[64] = L""; GetClassNameW(h, n, 64); return !_wcsicmp(n, c); }
 static void utf8(const wchar_t *w, char *out, int cap) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL); }
 
+/* the accessible name and value (MSAA), as a screen reader asks for them; 0 when there is no accessible object */
+static int msaa(HWND h, char *name, char *value) {
+  IAccessible *a = NULL; VARIANT self; BSTR b = NULL;
+  if (FAILED(AccessibleObjectFromWindow(h, (DWORD)OBJID_CLIENT, &IID_IAccessible, (void **)&a)) || !a) return 0;
+  VariantInit(&self); self.vt = VT_I4; self.lVal = CHILDID_SELF;
+  if (SUCCEEDED(a->lpVtbl->get_accName(a, self, &b)) && b) { utf8(b, name, 300); SysFreeString(b); b = NULL; }
+  if (value && SUCCEEDED(a->lpVtbl->get_accValue(a, self, &b)) && b) { utf8(b, value, 1100); SysFreeString(b); }
+  a->lpVtbl->Release(a);
+  return 1;
+}
+
 /* class, name and value as a screen reader finds them */
 static void describe(HWND h, char *cls, char *name, char *value) {
   wchar_t c[64] = L"", t[1100] = L"";
@@ -318,7 +333,9 @@ static void describe(HWND h, char *cls, char *name, char *value) {
   GetClassNameW(h, c, 64); utf8(c, cls, 64);
   GetWindowTextW(h, t, 1100);
   if (cls_is(h, L"Button")) { utf8(t, name, 300); return; }
-  {
+  if (cls_is(h, L"msctls_trackbar32")) { strcpy(cls, "Slider"); msaa(h, name, value); return; }
+  msaa(h, name, NULL);
+  if (!name[0]) {
     HWND prev = GetWindow(h, GW_HWNDPREV);
     if (prev && cls_is(prev, L"Static")) { wchar_t lt[300]; GetWindowTextW(prev, lt, 300); utf8(lt, name, 300); }
   }
@@ -374,8 +391,15 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
   DialogFn dialog = (DialogFn)GetProcAddress(dll, "smp_test_gui_dialog");
   char *text = read_file(actions, NULL), *line, *next;
   HWND top, holder; clap_window_t cw; uint32_t w = 0, h = 0;
+  HDESK desk;
   if (!gui || !beeps || !quiet) { printf("error: no gui extension or test hooks\n"); return 1; }
   if (!text) { printf("error: can't read %s\n", actions); return 1; }
+  /* The window lives on a desktop of its own, before this thread has any window: it can never become the
+     foreground window, so it can't take the keyboard from whoever is using the real desktop (and a screen reader
+     there never sees it) */
+  desk = CreateDesktopW(L"samplosis_test", NULL, NULL, 0, GENERIC_ALL, NULL);
+  if (!desk || !SetThreadDesktop(desk)) { printf("error: no desktop of its own (%lu)\n", GetLastError()); return 1; }
+  CoInitialize(NULL);                        /* for the accessible objects (msaa) */
   CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
   quiet(1);
   if (load_state(p, state) < 0) return 1;
@@ -410,12 +434,16 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     if (arg) *arg++ = 0; else arg = a + strlen(a);
     if (!strcmp(a, "key")) {
       static const struct { const char *n; WPARAM vk; } keys[] = {{"tab", VK_TAB}, {"up", VK_UP}, {"down", VK_DOWN},
-        {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT}};
+        {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT},
+        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}};
       char k[32] = ""; int i, found = 0;
       sscanf(arg, "%31s", k);
-      for (i = 0; i < 8; i++)
+      for (i = 0; i < 12; i++)
         if (!strcmp(k, keys[i].n)) { key(keys[i].vk, strstr(arg, "shift") != NULL, strstr(arg, "ctrl") != NULL); found = 1; }
       if (!found) { printf("error: no key %s\n", k); return 1; }
+      pump(60); say();
+    } else if (!strcmp(a, "char")) {
+      SendMessageW(GetFocus(), WM_CHAR, (WPARAM)(unsigned char)arg[0], 1);
       pump(60); say();
     } else if (!strcmp(a, "say")) say();
     else if (!strcmp(a, "focus")) {

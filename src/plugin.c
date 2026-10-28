@@ -349,7 +349,7 @@ const char *const smp_param_label[SMP_NPARAMS] = {
   "Root note", "Transpose", "Fine tune", "Volume", "Pan", "Attack", "Decay", "Sustain", "Release",
   "Velocity sensitivity", "Minimum volume", "Mode", "Lowest note", "Highest note", "Pitch at lowest note",
   "Lowest velocity", "Highest velocity", "Obey note off", "Loop", "Loop start", "Start", "End", "Bend range",
-  "Pitch at highest note", "Reverse", "Keep length", "Voices", "Probability", "Speed"};
+  "Pitch at highest note", "Reverse", "Keep length", "Voices", "Probability", "Speed", "Glide", "Glide mode"};
 
 static uint32_t pa_count(const clap_plugin_t *p) { (void)p; return SMP_NPARAMS; }
 static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info) {

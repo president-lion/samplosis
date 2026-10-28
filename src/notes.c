@@ -36,6 +36,8 @@ static const SmpParamInfo PARAMS[SMP_NPARAMS] = {
   {"voices", 1, 64, 16, SMP_K_COUNT},
   {"probability", 0, 100, 100, SMP_K_PERCENT},
   {"speed", 25, 400, 100, SMP_K_PERCENT},
+  {"glide", 0, 10000, 0, SMP_K_MS},
+  {"glide_mode", 0, 1, 0, SMP_K_CHOICE},
 };
 
 SMP_API const SmpParamInfo *smp_param_info(int id) {
@@ -132,10 +134,12 @@ SMP_API int smp_note_from_filename(const char *path) {
 static const char *const MODE_NAMES[] = {"sample", "note", "free"};
 static const char *const LOOP_NAMES[] = {"off", "forward", "pingpong"};
 static const char *const BOOL_NAMES[] = {"off", "on"};
+static const char *const GLIDE_NAMES[] = {"always", "legato"};
 
 static const char *const *choice_names(int param, int *count) {
   if (param == SMP_P_MODE) { *count = 3; return MODE_NAMES; }
   if (param == SMP_P_LOOP) { *count = 3; return LOOP_NAMES; }
+  if (param == SMP_P_GLIDE_MODE) { *count = 2; return GLIDE_NAMES; }
   *count = 2;
   return BOOL_NAMES;
 }
@@ -169,6 +173,7 @@ SMP_API int smp_value_text(int param, double v, char *out, int cap) {
   }
   case SMP_K_MS: {
     double m = floor(v + 0.5);
+    if (param == SMP_P_GLIDE && m < 1) { r = snprintf(out, cap, "off"); break; }
     r = m < 1000 ? snprintf(out, cap, "%.0f ms", m) : snprintf(out, cap, "%.2f s", v / 1000.0);
     break;
   }
@@ -223,6 +228,7 @@ SMP_API int smp_value_parse(int param, const char *s, double *v) {
   } else {
     if (kind == SMP_K_PAN && ieq(buf, "center")) { *v = 0; return 1; }
     if (kind == SMP_K_DB && ieq(buf, "off") && pi->lo <= -60) { *v = pi->lo; return 1; }
+    if (param == SMP_P_GLIDE && ieq(buf, "off")) { *v = 0; return 1; }
     char *e; double d = strtod(buf, &e);
     if (e == buf || !isfinite(d)) return 0;
     while (isspace((unsigned char)*e)) e++;

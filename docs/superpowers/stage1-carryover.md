@@ -30,3 +30,26 @@ Rulings, plus findings that per-task and final reviews deferred. Each line comes
 - Ruling: deferred to stage 2 — streaming render/import buffers (whole-file temporaries, 512 MB cap), cold load on REAPER's main thread, streamer fill order, all_off single event, two sample lines, cache.c realloc leak — reviewer triaged as before-stage-2, not before Mike's first try — cost if wrong: a long mp3 load freezes REAPER for seconds
 - Ruling: the remaining deferred minors stay parked (reviewer triaged "can wait")
 - Final: minor (parked): copies 0.25-1 s now stream, so start past head resamples until start head built; failed initial ring commit unreported; fade look-ahead per block; flaky ready==before+1 assert
+
+## After stage 1: stretcher choice and parallel copies (2026-10-28)
+
+Mike found keep length slow, and keys far from the root only kept length after he had played them once. He asked
+for a better stretcher, and then for the stretchers to be selectable in Settings. What changed:
+- Signalsmith Stretch (MIT, src\signalsmith) now runs alongside Rubber Band.
+- There are settings for the stretcher and for keeping the tone.
+- Every reachable key is prepared at load.
+- Copies are made in parallel on a shared thread pool.
+
+A fresh review found no critical issues. It found seven others, all fixed:
+- The level bump at the end of Signalsmith copies.
+- Engine free waiting on queued pool jobs.
+- Memory and disk budgets that applied to each instance rather than the whole process.
+- Reading the source couldn't be cancelled.
+- Changing the cache limit restarted the work.
+- The new combo boxes rescanned the cache folder.
+- Trailing spaces in the settings file weren't ignored.
+
+Parked:
+- The thread pool is never closed, so one pool is leaked each time the DLL is unloaded.
+- A note-on's copy can wait behind other instances' running jobs (queued ones are not reordered across instances).
+- At speeds above 100 %, a Signalsmith copy of a tone that stops dead fades over its last few milliseconds.

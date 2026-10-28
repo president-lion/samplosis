@@ -1,7 +1,8 @@
 # Samplosis
 
 An accessible sampler for REAPER, written in C as a CLAP instrument for Windows. The window is made of plain Windows
-controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING).
+controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It includes Rubber Band (GPL) and
+Signalsmith Stretch (MIT, see src\signalsmith).
 
 ## What stage 1 does
 
@@ -11,15 +12,19 @@ Stage 1 plays one sample across the keyboard.
   by dragging it onto the window, or from a saved REAPER project.
 - The root note comes from a note name in the file name ("Guitar C3.wav", "Pad F#2.flac") or, if there is none,
   from pitch detection on the audio.
-- Notes keep their length. With Keep length on, a note played above or below the root is made by Rubber Band (the R3
-  engine) so it lasts as long as the recording, instead of playing faster or slower. A chord of a guitar note then
-  rings out evenly. The pitch-shifted copies are rendered in the background, one per semitone, and kept in the cache
-  folder. When a sample loads, the copies for one octave each way of the root are prepared, nearest first. Any other
-  key gets its copy the first time it is played, ahead of the copies still being prepared. Until a copy is ready the
-  note plays by changing speed, as an ordinary sampler would.
+- Notes keep their length. With Keep length on, a note played above or below the root is made by a time stretcher
+  so it lasts as long as the recording, instead of playing faster or slower. A chord of a guitar note then rings out
+  evenly. The stretcher is chosen on the Settings page: Signalsmith Stretch (the default, fast) or Rubber Band (the
+  R3 engine, slower), either one keeping the tone of the instrument or not.
+- The pitch-shifted copies are rendered in the background, one per semitone, several at once (as many as the
+  processors allow, less two, up to 16), and kept in the cache folder. When a sample loads, every key in the key
+  range gets its copy, nearest the root first, as long as the copies fit in a quarter of the cache size limit
+  (shared out between the instances; an octave each way always fits). A key played before its copy is ready goes to the front of the queue. Until a copy
+  is ready the note plays by changing speed, as an ordinary sampler would.
 - With Keep length off, pitch changes by changing speed.
 - Envelope, loop, start and end points, reverse, speed, velocity response, key and velocity ranges, probability,
   pitch bend and polyphony (up to 64 voices, 16 by default).
+- Glide: a note slides in from the pitch of the note before it.
 - Every control is also a REAPER parameter you can automate.
 - The whole instrument can be read and written as plain text (see "The script format").
 
@@ -32,22 +37,36 @@ Main page:
 3. Previous file button, and 4. Next file button: step through the audio files in the same folder.
 5. Keep length (on or off).
 6. Mode.
-7. Then the other parameters in the order of the list below, from Root note to Speed (the window lays them out in two columns, but Tab follows the list order),
-   each one a labelled box (or a combo box for choices).
+7. Then the other parameters in the order of the list below, from Root note to Glide mode (the window lays them out
+   in two columns, but Tab follows the list order), each one a slider (or a combo box for choices).
 8. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
 9. Settings button.
 
 Settings page:
 
-1. Cache folder (edit box), then Browse folder.
-2. Cache size limit (in gigabytes).
-3. Cache in use (read only).
-4. Clear cache button.
-5. Back button.
+1. Stretcher: Signalsmith Stretch, fast, or Rubber Band, slower.
+2. Keep the tone: off or on. On keeps the body of the instrument where it was, so a note shifted up doesn't go
+   thin and a note shifted down doesn't go boomy.
+3. Cache folder (edit box), then Browse folder.
+4. Cache size limit (in gigabytes), a slider.
+5. Cache in use (read only).
+6. Clear cache button.
+7. Back button.
 
-Keys: Tab and Shift+Tab move through the controls and, past the first or last, out to REAPER's FX window. In a value
-box, type a value in words and press Enter, or press Up and Down to step it (Shift: ten times as far, Control: a
-tenth). Numbers stop at their limits. Choices are combo boxes. Every change applies at once.
+Keys: Tab and Shift+Tab move through the controls and, past the first or last, out to REAPER's FX window.
+
+Every value is a slider, and the screen reader reads its value in words ("-6.0 dB", "120 ms", "C3"). On a slider:
+
+- Up or Right steps it up, Down or Left steps it down: a semitone, a cent, a dB, 10 ms, 1 percent, 1 GB. Shift
+  steps ten times as far, Control a tenth.
+- Page Up and Page Down step ten times as far. Home and End go to the lowest and highest values.
+- It stops at its limits.
+- Enter turns the slider into an edit box in the same place, holding the value, to type a value in words. Typing a
+  character on the slider does the same, starting with that character. In the box, Enter sets the value and
+  Escape leaves it as it was; either one turns the box back into the slider. A value that doesn't read beeps, and
+  the old value stays. Tab, or leaving the box another way, sets the value too.
+
+Choices are combo boxes. Every change applies at once.
 
 ## The parameters
 
@@ -78,6 +97,17 @@ Values are read and typed in words. Ranges and defaults in brackets.
 - Voices: 1 to 64, default 16. Playing more steals the oldest.
 - Probability: percent chance a note plays (default 100).
 - Speed: 25 to 400 percent (default 100). With Keep length on this changes speed without changing pitch.
+- Glide: how long a note takes to slide from the pitch of the note before it to its own, "off" or "120 ms" (0 to
+  10000, off by default). The slide is even in semitones. It starts from wherever the last note is, even part way
+  through its own glide.
+- Glide mode: always (the default) or legato.
+  - Always: every note glides from the one before.
+  - Legato: a note glides only when another key is still held, so playing detached notes doesn't glide. With Voices
+    at 1, a key pressed while another is held doesn't start the note again: the note that is sounding carries on
+    (no new attack) and slides to the new key, and letting go of that key slides it back to the key still held,
+    as on a mono synth. This works with Glide off too: the pitch then jumps.
+  - With Keep length on, a gliding note plays the copy made for its own key, and the glide changes its speed a little
+    while it slides. A note carried on in legato keeps the copy of the key it started on.
 
 ## The script format
 
@@ -85,7 +115,7 @@ The instrument is plain text, one thing per line. Blank lines and lines starting
 sample line, each parameter is `name value-in-words`. Names are the lower case ones used by the engine (root,
 transpose, fine, volume, pan, attack, decay, sustain, release, velocity_sens, min_volume, mode, note_lo, note_hi,
 pitch_lo, vel_lo, vel_hi, obey_note_off, loop, loop_start, start, end, bend_range, pitch_hi, reverse, keep_length,
-voices, probability, speed). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
+voices, probability, speed, glide, glide_mode). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
 sample's cache key (the key below is only an example). Example, shortened:
 
     # Samplosis 0.1.0
@@ -107,6 +137,9 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 - Cache folder: default `D:\samplosis\cache`. Holds the decoded copy of each loaded file, the reversed copy and the
   keep-length copies. Everything in it can be rebuilt.
 - Cache size limit: default 10 GB. When it is passed, the oldest unused files are deleted.
+- Stretcher: `stretcher signalsmith` (default) or `stretcher rubberband`. Keep the tone: `keep_tone off` (default) or
+  `keep_tone on`. They apply to every Samplosis in every project. Changing either makes new keep-length copies; the
+  old ones stay in the cache, so changing back is instant.
 - The environment variable SAMPLOSIS_SETTINGS names a different settings file (the tests use it).
 
 ## Build, install and test
@@ -119,31 +152,33 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 
 ## Measured numbers
 
-Measured on 2026-10-28 with `python tests\measure.py`, through the engine's exported functions, with a temporary
-cache folder.
+Measured on 2026-10-28 on a 20-thread Intel Core Ultra 7 255HX, with `python tests\measure.py` (through the engine's
+exported functions, with a temporary cache folder) unless it says otherwise.
 
 - CPU: 16 voices held, 48 kHz, 256-frame blocks, through smp_engine_render_test, 10 seconds of audio, note range 48
-  to 63 (C3 to D#4). Keep length off: 0.84 percent of real time. Keep length on, all copies ready: 1.09 percent. The
+  to 63 (C3 to D#4). Keep length off: 1.00 percent of real time. Keep length on, all copies ready: 1.09 percent. The
   target was under 2 percent. This includes the test helper's small waits, so it is an upper bound for the audio
   thread.
+- Getting every key ready (97 copies, 4 octaves each way) for a 5.2 second guitar note (KSHMR Vol 5, Acoustic
+  Chime): Signalsmith Stretch 1.7 seconds (2.9 keeping the tone), Rubber Band 11.4 seconds (12.7 keeping the tone).
+  Before copies were made in parallel, Rubber Band took about 0.55 seconds a copy, one at a time.
 - Memory, per instance, as private bytes of the measuring process from just before smp_engine_new:
   - A new idle engine: 8.9 MB. Nearly all of it is the voice rings, 512 KB for each of the 16 voices the Voices
     parameter allows by default. Rings for more voices are committed only when Voices is raised.
-  - With a 60 second stereo sample loaded and keep length on: 12.9 MB, with the 25 copies for one octave each way of
-    the root rendered (that took 115 seconds). Each copy keeps only its first quarter second in memory (about 88 KB);
-    the rest is read from the cache folder (about 21 MB per copy here) by a background thread as notes play.
-  - An earlier version of this README gave a 984 MB working-set peak while rendering. That was the whole Python test
-    process (its own sample buffers and file cache pages included), not Rubber Band, and it is no longer reported.
+  - With a 60 second stereo sample loaded and keep length on: 19.9 MB, with all 97 copies rendered (that took 33
+    seconds with Signalsmith Stretch). Each copy keeps only its first quarter second in memory (about 88 KB); the
+    rest is read from the cache folder (about 21 MB per copy here, 2.1 GB in all) by a background thread as notes
+    play. While copies are being made, they use at most 512 MB of temporary memory, shared by every instance.
 
 ## Known limits
 
 - Keep-length copies exist only within 48 semitones of the root. Keys further away are resampled (pitch by speed).
 - The first note after moving Start, End or the loop start may be resampled once per key, until the new copies
   have been rendered.
-- Rendering the copies of a long sample takes a long time and a lot of cache space: each copy is as big as the
-  decoded sample. Only one octave each way is prepared at load; narrowing the key range (Lowest note, Highest note)
-  renders less and frees the copies it no longer reaches.
-- The first note on a key more than an octave from the root is resampled; its copy follows in the background.
+- The copies of a long sample take a lot of cache space: each copy is as big as the decoded sample. Copies past a
+  quarter of the cache size limit (beyond an octave each way) are made only when their key is first played, and
+  that first note is resampled. Narrowing the key range (Lowest note, Highest note) renders less and frees the
+  copies it no longer reaches.
 - One sample per instance. The rest is still to come.
 
 ## What is still to come

@@ -17,6 +17,7 @@ NOTE_LO, NOTE_HI, PITCH_LO, VEL_LO, VEL_HI = 12, 13, 14, 15, 16
 OBEY_NOTE_OFF, LOOP, LOOP_START, START, END = 17, 18, 19, 20, 21
 BEND_RANGE, PITCH_HI, REVERSE, KEEP_LENGTH = 22, 23, 24, 25
 VOICES, PROBABILITY, SPEED = 26, 27, 28
+GLIDE, GLIDE_MODE = 29, 30
 
 
 def sine(freq, secs, rate=44100, amp=0.5):
@@ -495,4 +496,67 @@ def test_underrun_fades(lib, tmp_path):
     steps = np.max(np.abs(np.diff(y)))
     assert steps <= normal * 1.25, (steps, normal)                 # no click: a cut would step by up to 0.5
     print(f"normal step {normal:.4f}, largest {steps:.4f}")
+    e.free()
+
+
+def freq_at(e, y, t0, t1):
+    """The pitch of a clean sine between t0 and t1 seconds, from its zero crossings."""
+    x = y[secs_to(e, t0):secs_to(e, t1), 0]
+    ups = np.nonzero((x[:-1] <= 0) & (x[1:] > 0))[0]
+    return (len(ups) - 1) / ((ups[-1] - ups[0]) / e.host_rate)
+
+
+def st(f, ref=220.0):
+    return 12 * math.log2(f / ref)
+
+
+def test_glide(lib, tmp_path):
+    e = Engine(lib, tmp_path, sine(220, 2.0))
+    e.set(GLIDE, 200)
+    notes = f"on 57 127 0\noff 57 {secs_to(e, 0.25)}\non 69 127 {secs_to(e, 0.3)}"
+    y = e.render(notes, 0.7)
+    assert st(freq_at(e, y, 0.30, 0.32)) < 1.5                  # starts from the last note, A3
+    assert abs(st(freq_at(e, y, 0.39, 0.41)) - 6) < 0.6         # half way at half the time, in semitones
+    assert abs(st(freq_at(e, y, 0.55, 0.65)) - 12) < 0.05       # there: A4
+    e.set(GLIDE_MODE, 1)                                         # legato: the notes don't overlap, so no glide
+    y = e.render(notes, 0.7)
+    assert abs(st(freq_at(e, y, 0.30, 0.32)) - 12) < 0.1
+    e.set(GLIDE, 0)                                              # off: no glide in either mode
+    e.set(GLIDE_MODE, 0)
+    y = e.render(notes, 0.7)
+    assert abs(st(freq_at(e, y, 0.30, 0.32)) - 12) < 0.1
+    e.free()
+
+
+def test_glide_legato_overlap(lib, tmp_path):
+    e = Engine(lib, tmp_path, sine(220, 2.0))
+    e.set(GLIDE, 100); e.set(GLIDE_MODE, 1)
+    y = e.render(f"on 57 127 0\non 69 127 {secs_to(e, 0.3)}\noff 57 {secs_to(e, 0.35)}", 0.6)
+    assert 6 < st(freq_at(e, y, 0.36, 0.38)) < 11               # the old key was held: it glides
+    assert abs(st(freq_at(e, y, 0.45, 0.55)) - 12) < 0.05
+    y = e.render(f"on 57 127 0\noff 57 {secs_to(e, 0.3)}\non 69 127 {secs_to(e, 0.3)}", 0.6)
+    assert abs(st(freq_at(e, y, 0.31, 0.33)) - 12) < 0.1        # let go at the same moment: not held, no glide
+    e.free()
+
+
+def test_glide_mono_legato(lib, tmp_path):
+    # Voices 1, legato: a key pressed while another is held carries the sounding note on (no new attack) and slides
+    # to it; letting it go slides back to the key still held
+    e = Engine(lib, tmp_path, sine(220, 2.0))
+    e.set(VOICES, 1); e.set(GLIDE_MODE, 1); e.set(GLIDE, 50); e.set(ATTACK, 100)
+    y = e.render(f"on 57 127 0\non 64 127 {secs_to(e, 0.3)}\noff 64 {secs_to(e, 0.7)}\noff 57 {secs_to(e, 1.0)}", 1.2)
+    assert abs(st(freq_at(e, y, 0.2, 0.3))) < 0.05
+    assert abs(st(freq_at(e, y, 0.45, 0.65)) - 7) < 0.05        # E4 (7 semitones up)
+    assert abs(st(freq_at(e, y, 0.85, 0.95))) < 0.05            # back to A3
+    a = rms_db(y[secs_to(e, 0.25):secs_to(e, 0.3), 0])
+    b = rms_db(y[secs_to(e, 0.3):secs_to(e, 0.33), 0])
+    assert abs(a - b) < 1, (a, b)                                # no new attack
+    assert last_sound(y, e.host_rate) < 1.05                     # both let go: it ends
+    e.set(GLIDE, 0)                                              # no glide time: it jumps, still without an attack
+    y = e.render(f"on 57 127 0\non 64 127 {secs_to(e, 0.3)}", 0.5)
+    assert abs(st(freq_at(e, y, 0.31, 0.35)) - 7) < 0.05
+    assert abs(rms_db(y[secs_to(e, 0.3):secs_to(e, 0.32), 0]) - a) < 1
+    e.set(GLIDE_MODE, 0)                                         # always: Voices 1 starts the new note again
+    y = e.render(f"on 57 127 0\non 64 127 {secs_to(e, 0.3)}", 0.5)
+    assert rms_db(y[secs_to(e, 0.305):secs_to(e, 0.315), 0]) < a - 10
     e.free()

@@ -12,7 +12,8 @@ os.environ["SAMPLOSIS_SETTINGS"] = os.path.join(work, "settings.txt")
 lib = ctypes.CDLL(os.path.join(ROOT, "samplosis.clap"))
 
 class Settings(ctypes.Structure):
-    _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double)]
+    _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double),
+                ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int)]
 vp, ci, cd, cp = ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_char_p
 lib.smp_settings_set.argtypes = [ctypes.POINTER(Settings)]
 lib.smp_sample_load.restype = vp; lib.smp_sample_load.argtypes = [cp, cp, ci]

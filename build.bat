@@ -11,10 +11,10 @@ set "OBJ=%TEMP%\samplosis_obj"
 if not exist "%OBJ%" mkdir "%OBJ%"
 rem Rubber Band, C++ (warnings about narrowing silenced); src is on the include path
 cl /nologo /c /O2 /W3 /wd4244 /wd4267 /MT /EHsc /I src /Fo"%OBJ%\rb.obj" src\rb.cpp || exit /b 1
-rem The try/catch shim around Rubber Band: /EHs, so calls into its extern "C" API may throw and are caught
-cl /nologo /c /O2 /W3 /MT /EHs /I src /Fo"%OBJ%\rbsafe.obj" src\rbsafe.cpp || exit /b 1
-cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /I "%CLAPINC%" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\rbsafe.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib || exit /b 1
+rem The stretchers and the try/catch shim around them (Signalsmith Stretch is header only): /EHs, so calls into Rubber Band's extern "C" API may throw and are caught
+cl /nologo /c /O2 /W3 /wd4244 /wd4267 /wd4305 /MT /EHs /I src /Fo"%OBJ%\stretch.obj" src\stretch.cpp || exit /b 1
+cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /I "%CLAPINC%" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\stretch.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib oleacc.lib || exit /b 1
 if /i "%1"=="test" (
-  cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /I "%CLAPINC%" /I src /Fo"%OBJ%\\" tests\host.c /Fe:tests\host.exe /link /NOLOGO user32.lib ole32.lib || exit /b 1
+  cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /I "%CLAPINC%" /I src /Fo"%OBJ%\\" tests\host.c /Fe:tests\host.exe /link /NOLOGO user32.lib ole32.lib oleaut32.lib oleacc.lib || exit /b 1
 )
 del samplosis.exp samplosis.lib 2>nul

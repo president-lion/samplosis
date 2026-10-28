@@ -7,7 +7,7 @@ import pytest
 from conftest import write_wav
 from test_cache import point_cache
 
-NP = 29
+NP = 31
 
 
 @pytest.fixture

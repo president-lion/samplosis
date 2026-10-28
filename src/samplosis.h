@@ -19,9 +19,9 @@ enum {
   SMP_P_NOTE_LO = 12, SMP_P_NOTE_HI = 13, SMP_P_PITCH_LO = 14, SMP_P_VEL_LO = 15, SMP_P_VEL_HI = 16,
   SMP_P_OBEY_NOTE_OFF = 17, SMP_P_LOOP = 18, SMP_P_LOOP_START = 19, SMP_P_START = 20, SMP_P_END = 21,
   SMP_P_BEND_RANGE = 22, SMP_P_PITCH_HI = 23, SMP_P_REVERSE = 24, SMP_P_KEEP_LENGTH = 25,
-  SMP_P_VOICES = 26, SMP_P_PROBABILITY = 27, SMP_P_SPEED = 28
+  SMP_P_VOICES = 26, SMP_P_PROBABILITY = 27, SMP_P_SPEED = 28, SMP_P_GLIDE = 29, SMP_P_GLIDE_MODE = 30
 };
-#define SMP_NPARAMS 29
+#define SMP_NPARAMS 31
 
 /* how a parameter reads in words */
 enum { SMP_K_NOTE, SMP_K_SEMI, SMP_K_CENT, SMP_K_DB, SMP_K_PAN, SMP_K_MS, SMP_K_PERCENT,
@@ -38,7 +38,10 @@ SMP_API double smp_detect_pitch(const float *mono, long n, int rate); /* fractio
 SMP_API int smp_value_text(int param, double v, char *out, int cap);  /* returns length written */
 SMP_API int smp_value_parse(int param, const char *s, double *v);    /* 1 ok (clamped to range), 0 fail */
 /* settings: one "name value" per line in %APPDATA%\Samplosis\settings.txt (or $SAMPLOSIS_SETTINGS) */
-typedef struct { char cache_dir[1024]; double cache_limit_gb; } SmpSettings;
+/* stretcher: SMP_STRETCH_SIGNALSMITH (the default) or SMP_STRETCH_RUBBERBAND; keep_tone: 1 keeps the instrument's
+   formants where they were when keep length shifts it (off by default) */
+enum { SMP_STRETCH_SIGNALSMITH = 0, SMP_STRETCH_RUBBERBAND = 1 };
+typedef struct { char cache_dir[1024]; double cache_limit_gb; int stretcher, keep_tone; } SmpSettings;
 SMP_API void smp_settings_get(SmpSettings *s);        /* defaults when the file is missing; reloads when it changes */
 SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */
 

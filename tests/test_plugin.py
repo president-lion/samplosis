@@ -13,7 +13,7 @@ from test_cache import point_cache
 
 HOST = os.path.join(ROOT, "tests", "host.exe")
 CLAP = os.path.join(ROOT, "samplosis.clap")
-NP = 29
+NP = 31
 VOLUME = 3
 
 
@@ -277,13 +277,14 @@ def test_note_at_block_end_clamped(P):
 MAIN_ORDER = [
     ("Edit", "Sample"), ("Button", "Browse"), ("Button", "Previous file"), ("Button", "Next file"),
     ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
-    ("Edit", "Root note"), ("Edit", "Transpose"), ("Edit", "Fine tune"), ("Edit", "Volume"), ("Edit", "Pan"),
-    ("Edit", "Attack"), ("Edit", "Decay"), ("Edit", "Sustain"), ("Edit", "Release"),
-    ("Edit", "Velocity sensitivity"), ("Edit", "Minimum volume"), ("Edit", "Lowest note"), ("Edit", "Highest note"),
-    ("Edit", "Pitch at lowest note"), ("Edit", "Lowest velocity"), ("Edit", "Highest velocity"),
-    ("ComboBox", "Obey note off"), ("ComboBox", "Loop"), ("Edit", "Loop start"), ("Edit", "Start"), ("Edit", "End"),
-    ("Edit", "Bend range"), ("Edit", "Pitch at highest note"), ("ComboBox", "Reverse"), ("Edit", "Voices"),
-    ("Edit", "Probability"), ("Edit", "Speed"), ("Edit", "Status"), ("Button", "Settings"),
+    ("Slider", "Root note"), ("Slider", "Transpose"), ("Slider", "Fine tune"), ("Slider", "Volume"), ("Slider", "Pan"),
+    ("Slider", "Attack"), ("Slider", "Decay"), ("Slider", "Sustain"), ("Slider", "Release"),
+    ("Slider", "Velocity sensitivity"), ("Slider", "Minimum volume"), ("Slider", "Lowest note"),
+    ("Slider", "Highest note"), ("Slider", "Pitch at lowest note"), ("Slider", "Lowest velocity"),
+    ("Slider", "Highest velocity"), ("ComboBox", "Obey note off"), ("ComboBox", "Loop"), ("Slider", "Loop start"),
+    ("Slider", "Start"), ("Slider", "End"), ("Slider", "Bend range"), ("Slider", "Pitch at highest note"),
+    ("ComboBox", "Reverse"), ("Slider", "Voices"), ("Slider", "Probability"), ("Slider", "Speed"), ("Slider", "Glide"),
+    ("ComboBox", "Glide mode"), ("Edit", "Status"), ("Button", "Settings"),
 ]
 
 
@@ -310,7 +311,7 @@ def test_gui_tab_order(P, tmp_path):
     assert [x[:2] for x in f[:len(MAIN_ORDER)]] == [list(x) for x in MAIN_ORDER], out   # opens on the first control
     assert f[len(MAIN_ORDER)][:2] == ["Button", "after"], out
     assert f[len(MAIN_ORDER) + 1][:2] == ["Button", "before"], out
-    assert f[-1][:2] == ["Edit", "Volume"], out          # the window focused: on to the last control used
+    assert f[-1][:2] == ["Slider", "Volume"], out        # the window focused: on to the last control used
 
 
 def test_gui_values_in_words(P, tmp_path):
@@ -321,6 +322,7 @@ def test_gui_values_in_words(P, tmp_path):
     assert d["Volume"] == "0.0 dB"
     assert d["Pan"] == "center"
     assert d["Attack"] == "0 ms"
+    assert d["Glide"] == "off" and d["Glide mode"] == "Always"
     assert d["Keep length"] == "Off" and d["Mode"] == "Note"      # P.script turns keep length off
     assert d["Sample"] == "tone C3.wav, 0.80 s, root C3 from the file name"
     assert d["Status"] == "Ready: tone C3.wav"
@@ -339,19 +341,38 @@ def test_gui_up_down_limits(P, tmp_path):
 
 
 def test_gui_typed_value(P, tmp_path):
+    # Enter on a slider: an edit box in its place, holding the value; Enter reads it and goes back to the slider
     text = P.script(P.sample())
-    out = gui(P, tmp_path, text, ["focus Volume", "type -6", "key enter", "param 3", "flush", "counts",
-                                  "type loud", "key enter", "param 3", "counts",
-                                  "type -3", "key tab", "param 3"])
+    out = gui(P, tmp_path, text, ["focus Volume", "key enter", "type -6", "key enter", "param 3", "flush", "counts",
+                                  "key enter", "type loud", "key enter", "param 3", "counts",
+                                  "key enter", "type -3", "key escape", "param 3",
+                                  "char 2", "key enter", "param 3",
+                                  "key enter", "type -3", "key tab", "param 3", "key tab shift"])
     f = got(out, "focus")
-    assert f[0][1:] == ["Volume", "-6.0 dB"]
+    assert f[0] == ["Edit", "Volume", "0.0 dB"]                           # the box, named like its slider
+    assert f[1] == ["Slider", "Volume", "-6.0 dB"]
     assert "param 3: -6" in out
     assert "out: gesture_begin 3" in out and "out: value 3 -6" in out and "out: gesture_end 3" in out
     c = got(out, "counts")
     assert c[0][0] == "beeps 0" and c[0][1] != "request_flush 0"
-    assert f[1][1:] == ["Volume", "-6.0 dB"] and c[1][0] == "beeps 1"     # "loud" beeps and goes back
-    assert out.count("param 3: -6") == 2
-    assert f[2][1] == "Pan" and "param 3: -3" in out                     # leaving the box applies it too
+    assert f[3] == ["Slider", "Volume", "-6.0 dB"] and c[1][0] == "beeps 1"    # "loud" beeps; the value stays
+    assert f[5] == ["Slider", "Volume", "-6.0 dB"] and out.count("param 3: -6") == 3   # Escape: as it was
+    assert f[6] == ["Edit", "Volume", "2"] and f[7] == ["Slider", "Volume", "2.0 dB"]  # typing starts the box
+    assert "param 3: 2" in out
+    assert f[9][:2] == ["Slider", "Pan"] and "param 3: -3" in out        # Tab out of the box applies it too
+    assert f[10] == ["Slider", "Volume", "-3.0 dB"]                       # and the slider is back in its place
+
+
+def test_gui_slider_keys(P, tmp_path):
+    text = P.script(P.sample(), "attack 100 ms")
+    out = gui(P, tmp_path, text, ["focus Attack", "key right", "key left", "key left", "key pageup", "key pagedown",
+                                  "key end", "key up", "key home", "key down",
+                                  "focus Glide", "key up", "key up shift", "key enter", "type 1.5 s", "key enter",
+                                  "key home", "param 29"])
+    v = [x[2] for x in got(out, "focus")]
+    assert v[:9] == ["110 ms", "100 ms", "90 ms", "190 ms", "90 ms", "10.00 s", "10.00 s", "0 ms", "0 ms"]
+    assert v[9:] == ["10 ms", "110 ms", "110 ms", "1.50 s", "off"]
+    assert "param 29: 0" in out
 
 
 def test_gui_next_file(P, tmp_path):
@@ -373,20 +394,32 @@ def test_gui_next_file(P, tmp_path):
 
 def test_gui_settings_page(P, tmp_path, settings_file):
     text = P.script(P.sample())
-    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "key tab", "key tab", "type 5", "key enter",
-                                  "key up", "key down", "key tab", "key tab", "key tab", "key tab",
-                                  "focus Back", "key enter", "focus Back", "say"])
-    f = got(out, "focus")
-    assert f[0][:3] == ["Edit", "Cache folder", str(tmp_path / "cache")]
-    assert f[1][:2] == ["Button", "Browse folder"]
-    assert f[2] == ["Edit", "Cache size limit", "10 GB"]
-    assert f[3][2] == "5 GB" and f[4][2] == "6 GB" and f[5][2] == "5 GB"
-    assert f[6][:2] == ["Edit", "Cache in use"] and f[6][2].endswith(" of 5 GB")
-    assert [x[:2] for x in f[7:10]] == [["Button", "Clear cache"], ["Button", "Back"], ["Button", "after"]]
-    assert f[10][:2] == ["Button", "Settings"]           # Back: on the Settings button again
-    assert f[11][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
     with open(settings_file) as fh:
-        assert "cache_limit_gb 5\n" in fh.read()
+        before = fh.read()
+    try:
+        out = gui(P, tmp_path, text, ["focus Settings", "key enter", "key down", "key down", "key tab", "key down",
+                                      "key tab", "key tab", "key tab", "key enter", "type 5", "key enter",
+                                      "key up", "key down", "key tab", "key tab", "key tab", "key tab",
+                                      "focus Back", "key enter", "focus Back", "say"])
+        f = got(out, "focus")
+        assert f[0] == ["ComboBox", "Stretcher", "Signalsmith Stretch, fast"]
+        assert f[1] == f[2] == ["ComboBox", "Stretcher", "Rubber Band, slower"]   # Down stops at the last
+        assert f[3] == ["ComboBox", "Keep the tone", "Off"] and f[4] == ["ComboBox", "Keep the tone", "On"]
+        assert f[5][:3] == ["Edit", "Cache folder", str(tmp_path / "cache")]
+        assert f[6][:2] == ["Button", "Browse folder"]
+        assert f[7] == ["Slider", "Cache size limit", "10 GB"]
+        assert f[8] == ["Edit", "Cache size limit", "10 GB"]
+        assert f[9][2] == "5 GB" and f[10][2] == "6 GB" and f[11][2] == "5 GB"
+        assert f[12][:2] == ["Edit", "Cache in use"] and f[12][2].endswith(" of 5 GB")
+        assert [x[:2] for x in f[13:16]] == [["Button", "Clear cache"], ["Button", "Back"], ["Button", "after"]]
+        assert f[16][:2] == ["Button", "Settings"]           # Back: on the Settings button again
+        assert f[17][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+        with open(settings_file) as fh:
+            saved = fh.read()
+        assert "cache_limit_gb 5\n" in saved and "stretcher rubberband\n" in saved and "keep_tone on\n" in saved
+    finally:
+        with open(settings_file, "w") as fh:
+            fh.write(before)
 
 
 def test_gui_keep_length_combo(P, tmp_path):

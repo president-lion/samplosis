@@ -1,9 +1,10 @@
-"""Task 6: keep length. Rubber Band R3 copies per key, rendered in the background."""
+"""Keep length: a pitch-shifted copy per key (Signalsmith Stretch or Rubber Band R3), rendered in the background."""
 import ctypes
 import math
 import time
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from conftest import SmpSample, write_wav
@@ -123,29 +124,60 @@ def read_entry(lib, key):
     return buf[0::2]
 
 
-def kl_key(lib, base, semis, speed_percent=100.0):
-    return lib.smp_key(f"kl|{base:016x}|{semis}|{speed_percent:.2f}|r3".encode())
+TAGS = {(0, 0): "ss", (0, 1): "sst", (1, 0): "r3", (1, 1): "r3t"}   # (stretcher, keep_tone): the key's tag
+STRETCHERS = list(TAGS)
 
 
-def test_render_shift(lib, tmp_path):
+def kl_key(lib, base, semis, speed_percent=100.0, tag="ss"):
+    return lib.smp_key(f"kl|{base:016x}|{semis}|{speed_percent:.2f}|{tag}".encode())
+
+
+@pytest.mark.parametrize("stretcher,keep_tone", STRETCHERS)
+def test_render_shift(lib, tmp_path, stretcher, keep_tone):
     setup(lib)
-    point_cache(lib, tmp_path / "cache")
+    point_cache(lib, tmp_path / "cache", stretcher=stretcher, keep_tone=keep_tone)
     rate = 44100
     data = pluck(196, 2.0, rate)
     s = load(lib, tmp_path, data, "pluck G3.wav")
-    t0 = time.perf_counter()
-    assert lib.smp_render_shift(s, 0, 7, 1.0) == 0
-    took = time.perf_counter() - t0
-    y = read_entry(lib, kl_key(lib, s.contents.src_key, 7))
-    assert len(y) == len(data)
-    assert abs(detect(lib, y, rate) - midi(293.66)) < 0.15
-    a, n = env_db(data, rate)
-    b, _ = env_db(y, rate)
-    for at in (0.5, 1.0, 1.5):
-        i = int(at * rate) // n
-        assert abs(a[i] - b[i]) < 2, (at, a[i], b[i])
-    print(f"render +7 of 2 s: {took:.3f} s")
+    for semis, freq in ((7, 293.66), (-12, 98.0)):
+        t0 = time.perf_counter()
+        assert lib.smp_render_shift(s, 0, semis, 1.0) == 0
+        took = time.perf_counter() - t0
+        y = read_entry(lib, kl_key(lib, s.contents.src_key, semis, tag=TAGS[stretcher, keep_tone]))
+        assert len(y) == len(data)
+        assert abs(detect(lib, y, rate) - midi(freq)) < 0.15, semis
+        first = np.nonzero(np.abs(y) > 0.01)[0][0]
+        assert first < 0.003 * rate, (semis, first)        # starts when the original does
+        a, n = env_db(data, rate)
+        b, _ = env_db(y, rate)
+        i0 = int(0.25 * rate) // n
+        assert abs(a[i0] - b[i0]) < 6, (semis, a[i0], b[i0])   # about as loud (keeping the tone shifts it a little)
+        for at in (0.5, 1.0, 1.5):                         # and dies away as it does
+            i = int(at * rate) // n
+            assert abs((a[i] - a[i0]) - (b[i] - b[i0])) < 3, (semis, at, a[i] - a[i0], b[i] - b[i0])
+        print(f"{TAGS[stretcher, keep_tone]} {semis:+} of 2 s: {took:.3f} s")
     lib.smp_sample_free(s)
+
+
+def test_changing_the_stretcher_makes_new_copies(lib, tmp_path):
+    setup_debug(lib)
+    cache = tmp_path / "cache"
+    point_cache(lib, cache)
+    s = load(lib, tmp_path, decaying(220, 1.0, tau=5.0), "tone A3.wav")
+    key = s.contents.src_key
+    e = KL(lib, tmp_path, s, 57, 62)
+    e.wait()
+    assert e.status()[:3] == (1, 6, 6)
+    for stretcher, keep_tone in ((1, 0), (1, 1), (0, 1), (0, 0)):
+        point_cache(lib, cache, stretcher=stretcher, keep_tone=keep_tone)
+        e.wait()
+        assert e.status()[:3] == (1, 6, 6), (stretcher, keep_tone)
+        files = smpc_files(cache)
+        assert all(kl_key(lib, key, n, tag=TAGS[stretcher, keep_tone]) in files for n in range(1, 6))
+        y = e.render("on 62 127 0", 1.3)                   # the new copy: in tune, the whole second
+        assert abs(length_secs(y, e.host_rate) - 1.0) < 0.02
+        assert abs(detect(lib, y[int(0.05 * e.host_rate):int(0.5 * e.host_rate)], e.host_rate) - midi(220 * 2 ** (5 / 12))) < 0.15
+    e.free()
 
 
 def test_render_shift_speed_and_reverse(lib, tmp_path):
@@ -278,7 +310,7 @@ def test_start_past_head_uses_copy(lib, tmp_path):
 
 def test_free_while_rendering(lib, tmp_path):
     setup(lib)
-    point_cache(lib, tmp_path / "cache")
+    point_cache(lib, tmp_path / "cache", stretcher=1)      # Rubber Band: slow enough to still be at it
     s = load(lib, tmp_path, decaying(220, 30.0, tau=5.0), "long A3.wav")
     e = KL(lib, tmp_path, s, 50, 70)
     time.sleep(0.5)                                    # a 30 s render is under way
@@ -287,6 +319,7 @@ def test_free_while_rendering(lib, tmp_path):
     t0 = time.perf_counter()
     e.free()                                           # cancels it between chunks
     assert time.perf_counter() - t0 < 0.5
+    point_cache(lib, tmp_path / "cache")
 
 
 def smpc_files(folder):
@@ -342,11 +375,12 @@ def test_tiny_samples(lib, tmp_path):
             lib.smp_sample_free(s)
 
 
-def test_rubber_band_exceptions_caught(lib, tmp_path):
+@pytest.mark.parametrize("stretcher", [0, 1])
+def test_stretcher_exceptions_caught(lib, tmp_path, stretcher):
     setup(lib)
     lib.smp_debug_render_flags.restype = None
     lib.smp_debug_render_flags.argtypes = [ctypes.c_long]
-    point_cache(lib, tmp_path / "cache")
+    point_cache(lib, tmp_path / "cache", stretcher=1)
     s = load(lib, tmp_path, pluck(196, 0.1), "short G3.wav")
     lib.smp_debug_render_flags(2)                       # past the 4-octave limit: Rubber Band itself throws at -127
     try:
@@ -354,6 +388,7 @@ def test_rubber_band_exceptions_caught(lib, tmp_path):
     finally:
         lib.smp_debug_render_flags(0)
     lib.smp_sample_free(s)
+    point_cache(lib, tmp_path / "cache", stretcher=stretcher)
     data = decaying(220, 1.0, tau=5.0)
     s = load(lib, tmp_path, data, "tone A3.wav")
     lib.smp_debug_render_flags(1)                       # every render throws inside the guard
@@ -362,22 +397,28 @@ def test_rubber_band_exceptions_caught(lib, tmp_path):
         e = KL(lib, tmp_path, s, 57, 62)
         e.wait()
         r, ready, total, why = e.status()
-        assert r == 0 and ready == 1 and total == 6 and "Rubber Band failed" in why, (r, ready, total, why)
+        name = "Rubber Band" if stretcher else "Signalsmith Stretch"
+        assert r == 0 and ready == 1 and total == 6 and f"{name} failed" in why, (r, ready, total, why)
         y = e.render("on 62 127 0", 1.5)                # that key resamples
         assert abs(length_secs(y, e.host_rate) - 1.0 / 2 ** (5 / 12)) < 0.02
         assert abs(detect(lib, y[int(0.05 * e.host_rate):int(0.5 * e.host_rate)], e.host_rate) - midi(220 * 2 ** (5 / 12))) < 0.1
         e.free()
     finally:
         lib.smp_debug_render_flags(0)
+        point_cache(lib, tmp_path / "cache")
 
 
-def test_too_long_refused(lib, tmp_path):
+@pytest.mark.parametrize("stretcher,speed", [(1, 0.25), (0, 0.1)])
+def test_too_long_refused(lib, tmp_path, stretcher, speed):
     setup(lib)
-    point_cache(lib, tmp_path / "cache")
+    point_cache(lib, tmp_path / "cache", stretcher=stretcher)
     rate = 8000                                         # few bytes on disk; the frame count is what matters
     s = load(lib, tmp_path, decaying(220, 900.0, rate, tau=5.0), "long A3.wav", rate)   # 7.2 M frames
-    assert lib.smp_render_shift(s, 0, 0, 0.25) == 4     # 36 M frames of output: past 512 MB
+    # Rubber Band at 25 %: 29 M frames out, (7.2 + 29) M x 16 bytes; Signalsmith at 10 %: 72 M frames x 8 bytes.
+    # Either way past 512 MB
+    assert lib.smp_render_shift(s, 0, 0, speed) == 4
     lib.smp_sample_free(s)
+    point_cache(lib, tmp_path / "cache")
 
 
 def setup_debug(lib):
@@ -400,29 +441,25 @@ def process_blocks(lib, e, n, block=256):
         lib.smp_engine_process(e.e, l.ctypes.data_as(FP), r.ctypes.data_as(FP), block)
 
 
-def test_default_load_prepares_one_octave_each_way(lib, tmp_path):
+def test_default_load_prepares_every_key(lib, tmp_path):
     setup_debug(lib)
     cache = tmp_path / "cache"
     point_cache(lib, cache)
     s = load(lib, tmp_path, decaying(261.63, 0.5), "tone C4.wav")
-    e = KL(lib, tmp_path, s, 0, 127)                   # the default key range: 97 shifts reachable
+    t0 = time.perf_counter()
+    e = KL(lib, tmp_path, s, 0, 127)                   # the default key range: 97 shifts reachable (4 octaves each way)
     runs = lib.smp_debug_renders()
     e.wait()
+    took = time.perf_counter() - t0
     r, ready, total, why = e.status()
-    assert (r, ready, total) == (1, 25, 25), (r, ready, total, why)
-    assert lib.smp_debug_renders() - runs <= 25
-    assert len(smpc_files(cache)) <= 25                 # the source and at most 24 copies (shift 0 is the source)
-    assert not lib.smp_debug_kl_entry(e.e, 13) and not lib.smp_debug_kl_entry(e.e, -13)
-    # a key further away is asked for by its first note-on (which resamples), then rendered
-    lib.smp_engine_note_on(e.e, 80, 127, 0)            # +20
-    process_blocks(lib, e, 1)
-    e.wait()
-    r, ready, total, why = e.status()
-    assert (r, ready, total) == (1, 26, 26), (r, ready, total, why)
-    assert lib.smp_debug_kl_entry(e.e, 20)
-    y = e.render("on 80 127 0", 0.7)
-    assert abs(length_secs(y, e.host_rate, 1e-4) - 0.5) < 0.03          # the copy: the sample's whole length
-    assert abs(detect(lib, y[int(0.02 * e.host_rate):int(0.3 * e.host_rate)], e.host_rate) - 80) < 0.15
+    assert (r, ready, total) == (1, 97, 97), (r, ready, total, why)
+    assert lib.smp_debug_renders() - runs <= 96          # shift 0 is the source
+    assert lib.smp_debug_kl_entry(e.e, 48) and lib.smp_debug_kl_entry(e.e, -48)
+    print(f"every key of a 0.5 s sample ready in {took:.2f} s")
+    assert took < 10, took
+    y = e.render("on 100 127 0", 0.7)                  # a far key, never played before: its copy, whole length
+    assert abs(length_secs(y, e.host_rate, 1e-4) - 0.5) < 0.03
+    assert abs(detect(lib, y[int(0.02 * e.host_rate):int(0.3 * e.host_rate)], e.host_rate) - 100) < 0.15
     # narrowing the key range retires the copies it no longer reaches
     e.set(NOTE_LO, 60); e.set(NOTE_HI, 64)
     t0 = time.perf_counter()
@@ -435,6 +472,23 @@ def test_default_load_prepares_one_octave_each_way(lib, tmp_path):
     assert kl_counts(lib, e) == (4, 0), kl_counts(lib, e)    # shifts 1 to 4 left; the rest freed
     assert e.status()[:3] == (1, 5, 5)
     e.free()
+
+
+def test_prepared_keys_fit_a_quarter_of_the_cache(lib, tmp_path):
+    setup_debug(lib)
+    point_cache(lib, tmp_path / "cache", gb=0.02)        # a quarter is 5.4 MB: 15 one-second copies, so the floor of 25
+    s = load(lib, tmp_path, decaying(261.63, 1.0, tau=5.0), "tone C4.wav")
+    e = KL(lib, tmp_path, s, 0, 127)
+    e.wait()
+    assert e.status()[:3] == (1, 25, 25)                 # an octave each way and the root
+    assert lib.smp_debug_kl_entry(e.e, 12) and not lib.smp_debug_kl_entry(e.e, 13)
+    lib.smp_engine_note_on(e.e, 90, 127, 0)              # +30: asked for by its first note-on (which resamples)
+    process_blocks(lib, e, 1)
+    e.wait()
+    assert e.status()[:3] == (1, 26, 26)
+    assert lib.smp_debug_kl_entry(e.e, 30)
+    e.free()
+    point_cache(lib, tmp_path / "cache")
 
 
 def test_copies_hold_only_their_head(lib, tmp_path):
@@ -457,23 +511,57 @@ def test_copies_hold_only_their_head(lib, tmp_path):
 
 def test_note_on_jumps_the_prefetch_queue(lib, tmp_path):
     setup_debug(lib)
-    point_cache(lib, tmp_path / "cache")
+    point_cache(lib, tmp_path / "cache", stretcher=1)      # Rubber Band: slow enough to see the order
     s = load(lib, tmp_path, decaying(220, 10.0, tau=5.0), "long A3.wav")
-    e = KL(lib, tmp_path, s, 57, 77)                   # prepares 0 to +12; +20 only when played
+    e = KL(lib, tmp_path, s, 57, 105)                  # 0 to +48, nearest the root first
     t0 = time.perf_counter()
-    while e.status()[1] < 2 and time.perf_counter() - t0 < 60:   # the first copy is done, the queue is under way
-        time.sleep(0.05)
-    before = e.status()[1]
-    lib.smp_engine_note_on(e.e, 77, 127, 0)
+    while e.status()[1] < 2 and time.perf_counter() - t0 < 60:   # the first copies are done, the rest under way
+        time.sleep(0.02)
+    lib.smp_engine_note_on(e.e, 102, 127, 0)           # +45: one of the last in the queue
     process_blocks(lib, e, 1)
     t0 = time.perf_counter()
-    while not lib.smp_debug_kl_entry(e.e, 20) and time.perf_counter() - t0 < 60:
+    while not lib.smp_debug_kl_entry(e.e, 45) and time.perf_counter() - t0 < 120:
         time.sleep(0.02)
     r, ready, total, why = e.status()
-    assert lib.smp_debug_kl_entry(e.e, 20), why
-    assert ready < total, (ready, total)               # the rest of the queue is still to come
-    assert ready == before + 1, (before, ready)          # only +20: the copy being rendered gave way to it
-    print(f"+20 ready after {time.perf_counter() - t0:.2f} s with {ready} of {total} ready")
+    assert lib.smp_debug_kl_entry(e.e, 45), why
+    assert ready < total, (ready, total)               # it jumped the queue
+    assert not lib.smp_debug_kl_entry(e.e, 44)          # the one queued before it isn't done
+    print(f"+45 ready after {time.perf_counter() - t0:.2f} s with {ready} of {total} ready")
     e.wait(300000)
-    assert e.status()[:3] == (1, 14, 14)
+    assert e.status()[:3] == (1, 49, 49)
     e.free()
+    point_cache(lib, tmp_path / "cache")
+
+
+@pytest.mark.parametrize("speed", [1.0, 2.0])
+def test_signalsmith_copy_ends_level(lib, tmp_path, speed):
+    setup(lib)
+    point_cache(lib, tmp_path / "cache")
+    rate = 44100
+    t_ = np.arange(2 * rate) / rate
+    data = (0.3 * np.sin(2 * np.pi * 220 * t_)).astype(np.float32)   # a steady tone to the very end
+    s = load(lib, tmp_path, data, "steady A3.wav")
+    assert lib.smp_render_shift(s, 0, 5, speed) == 0
+    y = read_entry(lib, kl_key(lib, s.contents.src_key, 5, speed * 100))
+    def rms(a):
+        return 20 * np.log10(np.sqrt(np.mean(np.square(a.astype(np.float64)))) + 1e-12)
+    end, before = rms(y[-int(0.015 * rate):]), rms(y[-int(0.2 * rate):-int(0.05 * rate)])
+    assert end - before < 1.5, (end, before)            # no bump at the end
+    if speed == 1.0:                                     # (faster, the last window fades a little: the tone stops dead)
+        assert abs(end - before) < 1.5, (end, before)
+    lib.smp_sample_free(s)
+
+
+def test_free_while_other_engines_render(lib, tmp_path):
+    setup(lib)
+    point_cache(lib, tmp_path / "cache", stretcher=1)      # Rubber Band: copies take a while
+    busy = KL(lib, tmp_path, load(lib, tmp_path, decaying(220, 8.0, tau=5.0), "busy A3.wav"), 57, 105)
+    time.sleep(0.3)                                        # its batch fills the pool
+    queued = KL(lib, tmp_path, load(lib, tmp_path, decaying(196, 8.0, tau=5.0), "queued G3.wav"), 55, 103)
+    time.sleep(0.4)                                        # its batch waits behind the first one's
+    t0 = time.perf_counter()
+    queued.free()                                          # its queued jobs are dropped, not waited for
+    took = time.perf_counter() - t0
+    busy.free()
+    point_cache(lib, tmp_path / "cache")
+    assert took < 0.5, took

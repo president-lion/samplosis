@@ -30,11 +30,11 @@ typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n; float 
 #define SMP_KLN 256
 #define SMP_KLMAX 127
 #define SMP_KLRENDER 48                  /* Rubber Band R3 fails past about 4 octaves (+67 throws): wider shifts resample */
-#define SMP_KLPRE 12                     /* shifts prepared as soon as a sample loads; others on their first note-on */
 typedef struct SmpKl {
   SmpEntry *e;
   uint64_t base;                          /* src_key or rev_key it was rendered from */
   LONG speedp;                            /* speed in hundredths of a percent (10000 = 100 %) */
+  int eng;                                /* the stretcher and keep-tone settings it was made with (render.c) */
   int semis, rev;                         /* rev: rendered from the reversed copy */
   SmpStartHead *volatile sh;             /* written by the worker, read by the audio thread */
   volatile LONG want_sh;                 /* the audio thread asks the worker for a start head */
@@ -65,6 +65,7 @@ typedef struct SmpVoice {
                                             speed is already in it, so it doesn't scale the rate */
   double pos, vgain, env, k, att_inc, fade, fade_step;
   double ug;                             /* underrun gain: fades out before the ring runs dry, back in after */
+  double gl, gl_step; int64_t gl_left;   /* glide: semitones still to go (to 0), per sample, samples left */
   int64_t left, path_len;
   uint64_t order;
 
@@ -87,6 +88,10 @@ struct SmpEngine {
   volatile LONG spause;                  /* tests: the streamer skips its work (forces underruns) */
   SmpEv ev[SMP_MAXEV]; int nev;
   double bend;
+  /* glide (audio thread only): the keys held, by when they were pressed (0 = up); the voice last started or carried
+     on, and the pitch it was going to */
+  uint64_t held[128], hseq;
+  SmpVoice *lastv; LONG last_gen; double last_pitch; int have_last;
   volatile unsigned rng;
   uint64_t order;
   volatile LONG64 epoch;                 /* blocks the audio thread has finished */
@@ -114,6 +119,7 @@ struct SmpEngine {
   CRITICAL_SECTION r_cs; char r_why[512];   /* render thread and main thread only */
   volatile LONG rq[SMP_RQ]; volatile LONG rq_w; LONG rq_r;   /* note-on requests: audio writes, render reads */
   SmpKlRet *klret; int nklret, cklret;   /* render thread only */
+  int rcounted;                          /* counted in render.c's engines alive */
 };
 
 double smp_eng_param(const SmpEngine *e, int id);

@@ -14,10 +14,12 @@ def get(lib):
     return s
 
 
-def point_cache(lib, folder, gb=10.0):
+def point_cache(lib, folder, gb=10.0, stretcher=0, keep_tone=0):
+    """The cache folder and limit; and the stretcher (0 Signalsmith, 1 Rubber Band) and keep tone."""
     s = SmpSettings()
     s.cache_dir = str(folder).encode()
     s.cache_limit_gb = gb
+    s.stretcher, s.keep_tone = stretcher, keep_tone
     assert lib.smp_settings_set(ctypes.byref(s)) == 0
 
 
@@ -36,13 +38,25 @@ def test_settings_defaults_and_roundtrip(lib, settings_file, tmp_path):
     s = get(lib)
     assert s.cache_dir == rb"D:\samplosis\cache"
     assert s.cache_limit_gb == 10
-    point_cache(lib, tmp_path, 0.001)
+    assert (s.stretcher, s.keep_tone) == (0, 0)          # Signalsmith, tone not kept
+    point_cache(lib, tmp_path, 0.001, stretcher=1, keep_tone=1)
     s = get(lib)
     assert s.cache_dir == str(tmp_path).encode()
     assert s.cache_limit_gb == 0.001
+    assert (s.stretcher, s.keep_tone) == (1, 1)
     text = open(settings_file).read().splitlines()
     assert text[0].startswith("cache_dir ")
     assert "cache_limit_gb 0.001" in text
+    assert "stretcher rubberband" in text and "keep_tone on" in text
+    with open(settings_file, "w") as f:                  # by hand: words, any case; unknown words keep the default
+        f.write("cache_dir %s\nstretcher SignalSmith\nkeep_tone maybe\n" % tmp_path)
+    s = get(lib)
+    assert (s.stretcher, s.keep_tone) == (0, 0)
+    with open(settings_file, "w") as f:                  # spaces after a value are ignored
+        f.write("cache_dir %s  \nstretcher rubberband \nkeep_tone on\t\n" % tmp_path)
+    s = get(lib)
+    assert (s.stretcher, s.keep_tone) == (1, 1) and s.cache_dir == str(tmp_path).encode()
+    point_cache(lib, tmp_path)
 
 
 def test_cache_write_open_read(lib, tmp_path):

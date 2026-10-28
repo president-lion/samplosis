@@ -242,15 +242,55 @@ static SmpKl *kl_pick(SmpEngine *e, const Snap *P, SmpSample *s, int rev, int ke
   return k;
 }
 
+/* ---- glide ----
+   A note starts at the pitch the last note is at (where its own glide has got to) and slides to its own over the
+   Glide time, in semitones at an even rate. Glide mode legato glides only while another key is held; and with Voices
+   at 1 a held note isn't started again: the sounding one carries on and slides to the new key, and back to the
+   latest key still held when that one is let go. */
+static int held_other(const SmpEngine *e, int key) {
+  int k;
+  for (k = 0; k < 128; k++) if (e->held[k] && k != key) return 1;
+  return 0;
+}
+static int glide_from(const SmpEngine *e, const Snap *P, double *from) {
+  const SmpVoice *l = e->lastv;
+  if (!e->have_last) return 0;
+  *from = l && l->live && l->gen == e->last_gen ? smp_note_semis(P->p, l->key) + l->gl : e->last_pitch;
+  return 1;
+}
+static void glide_to(SmpEngine *e, const Snap *P, SmpVoice *v, int key, int glide, double from) {
+  double to = smp_note_semis(P->p, key), t = P->p[SMP_P_GLIDE] * e->rate / 1000.0;
+  v->key = key; v->gl = 0; v->gl_step = 0; v->gl_left = 0;
+  if (glide && t >= 1 && fabs(from - to) > 1e-9) {
+    v->gl = from - to; v->gl_left = (int64_t)ceil(t); v->gl_step = -v->gl / (double)v->gl_left;
+  }
+  e->lastv = v; e->last_gen = v->gen; e->last_pitch = to; e->have_last = 1;
+}
+static SmpVoice *carried(SmpEngine *e) {             /* Voices at 1, legato: the note still held and sounding */
+  int i;
+  for (i = 0; i < SMP_MAXV; i++) {
+    SmpVoice *v = &e->v[i];
+    if (v->live && !v->fading && v->stage < 3 && e->held[v->key]) return v;
+  }
+  return NULL;
+}
+static int mono_legato(const Snap *P) { return P->p[SMP_P_GLIDE_MODE] >= 0.5 && (int)P->p[SMP_P_VOICES] == 1; }
+
 static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL; SmpKl *k; int self;
   int i, count = 0, voices = (int)P->p[SMP_P_VOICES], nr = e->nring;   /* slots with a ring */
-  int64_t F, rs, re, rls; uint64_t hf; double vdb; int loop;
+  int64_t F, rs, re, rls; uint64_t hf; double vdb, from = 0; int loop, glide;
   if (!s || !s->fwd || nr <= 0) return;
   if (voices > nr) voices = nr;                          /* more rings are being committed by the worker */
   if (key < P->p[SMP_P_NOTE_LO] || key > P->p[SMP_P_NOTE_HI]) return;
   if (vel < P->p[SMP_P_VEL_LO] || vel > P->p[SMP_P_VEL_HI]) return;
   if (P->p[SMP_P_PROBABILITY] < 100 && xorshift(e) / 4294967296.0 * 100.0 >= P->p[SMP_P_PROBABILITY]) return;
+  glide = (P->p[SMP_P_GLIDE_MODE] < 0.5 || held_other(e, key)) && glide_from(e, P, &from);
+  if (mono_legato(P) && held_other(e, key) && (v = carried(e)) != NULL) {
+    e->held[key] = ++e->hseq;
+    glide_to(e, P, v, key, glide, from);
+    return;
+  }
   rev = P->p[SMP_P_REVERSE] >= 0.5 ? *(SmpEntry *volatile *)&s->rev : NULL;
   src = rev ? rev : s->fwd;
   k = kl_pick(e, P, s, rev != NULL, key, &self);
@@ -303,14 +343,28 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
     LONG g = InterlockedIncrement(&v->gen);
     v->need = SMP_TAG(g);
   }
+  e->held[key] = ++e->hseq;
+  glide_to(e, P, v, key, glide, from);
   /* No pre-read frames (the start head isn't ready yet, e.g. start just moved): the ring is needed at once.
      Real time can't wait (the first frames underrun); offline renders let the streamer fill it first. */
   if (e->offline && v->v0 == 0) smp_stream_wait_idle(e);
 }
 
 static void note_off(SmpEngine *e, const Snap *P, int key) {
-  int i;
+  int i, k, back = -1;
+  e->held[key] = 0;
   if (P->p[SMP_P_OBEY_NOTE_OFF] < 0.5) return;
+  if (mono_legato(P)) {                                  /* back to the latest key still held, if any */
+    for (k = 0; k < 128; k++) if (e->held[k] && (back < 0 || e->held[k] > e->held[back])) back = k;
+    for (i = 0; back >= 0 && i < SMP_MAXV; i++) {
+      SmpVoice *v = &e->v[i];
+      if (v->live && v->key == key && v->stage < 3 && !v->fading) {
+        double from = smp_note_semis(P->p, v->key) + v->gl;
+        glide_to(e, P, v, back, 1, from);
+        return;
+      }
+    }
+  }
   for (i = 0; i < SMP_MAXV; i++) {
     SmpVoice *v = &e->v[i];
     if (v->live && v->key == key && v->stage < 3 && !v->fading) env_release(e, v, P);
@@ -338,8 +392,10 @@ static __inline int fetch(const SmpVoice *v, int64_t idx, int64_t avail, float *
 
 static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, float *r, int a, int b,
                          double gl, double gr) {
-  double ratio = pow(2.0, voice_semis(e, v, P) * LOG2_12) * smp_entry_rate(v->src) / e->rate *
-                 (v->kl ? 1.0 : P->p[SMP_P_SPEED] / 100.0);   /* a keep-length copy has speed in it already */
+  double base = pow(2.0, voice_semis(e, v, P) * LOG2_12) * smp_entry_rate(v->src) / e->rate *
+                (v->kl ? 1.0 : P->p[SMP_P_SPEED] / 100.0);    /* a keep-length copy has speed in it already */
+  double ratio = v->gl_left > 0 ? base * pow(2.0, v->gl * LOG2_12) : base,
+         gmul = v->gl_left > 0 ? pow(2.0, v->gl_step * LOG2_12) : 1;   /* a glide: the ratio's change per sample */
   double sus = db2a(P->p[SMP_P_SUSTAIN]), la = SMP_UFADE * ratio;   /* la: path frames SMP_UFADE samples ahead */
   int64_t avail = 0;
   int i;
@@ -371,6 +427,10 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
       l[i] += (float)(yl * g * gl); r[i] += (float)(yr * g * gr);
     }
     v->pos += ratio;
+    if (v->gl_left > 0) {
+      if (--v->gl_left == 0) { v->gl = 0; ratio = base; }
+      else { v->gl += v->gl_step; ratio *= gmul; }
+    }
     switch (v->stage) {                                  /* envelope, one step */
       case 0: v->env += v->att_inc; if (v->env >= 1) env_decay(e, v, P); break;
       case 1: v->env *= v->k; if (--v->left <= 0) { v->stage = 2; v->env = sus; } break;
@@ -438,6 +498,7 @@ SMP_API void smp_engine_reset(SmpEngine *e, int now) {
   }
   e->bend = 0;
   e->nev = 0;
+  memset(e->held, 0, sizeof e->held); e->have_last = 0;
 }
 
 SMP_API int smp_engine_active_voices(const SmpEngine *e) {
@@ -492,6 +553,7 @@ SMP_API int smp_engine_render_test(SmpEngine *e, const char *events, long frames
     int i;
     for (i = 0; i < SMP_MAXV; i++) e->v[i].live = 0;
     e->bend = 0;
+    memset(e->held, 0, sizeof e->held); e->have_last = 0;
   }
   e->offline = 1;
   for (b = 0; b < frames; b += block) {

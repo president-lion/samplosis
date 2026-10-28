@@ -1,4 +1,5 @@
-/* Settings file: "name value" per line. Reloaded when the file's last-write time changes. */
+/* Settings file: "name value" per line (cache_dir, cache_limit_gb, stretcher signalsmith|rubberband,
+   keep_tone on|off). Reloaded when the file's last-write time changes. */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +45,16 @@ static void parse(char *text, SmpSettings *s) {
     if (sp) {
       *sp++ = 0;
       while (*sp == ' ') sp++;
+      { size_t n = strlen(sp); while (n && (sp[n - 1] == ' ' || sp[n - 1] == '	')) sp[--n] = 0; }   /* hand edits */
       if (!strcmp(line, "cache_dir") && *sp && strlen(sp) < sizeof s->cache_dir) strcpy(s->cache_dir, sp);
       else if (!strcmp(line, "cache_limit_gb")) { double v = atof(sp); if (v > 0) s->cache_limit_gb = v; }
+      else if (!strcmp(line, "stretcher")) {
+        if (!_stricmp(sp, "signalsmith")) s->stretcher = SMP_STRETCH_SIGNALSMITH;
+        else if (!_stricmp(sp, "rubberband")) s->stretcher = SMP_STRETCH_RUBBERBAND;
+      } else if (!strcmp(line, "keep_tone")) {
+        if (!_stricmp(sp, "on")) s->keep_tone = 1;
+        else if (!_stricmp(sp, "off")) s->keep_tone = 0;
+      }
     }
     line = next;
     while (line && (*line == '\r' || *line == '\n')) line++;
@@ -89,7 +98,9 @@ int smp_settings_set(const SmpSettings *s) {
   int rc = -1;
   InitOnceExecuteOnce(&once, init_cs, NULL, NULL);
   if (!path_w(p, 1100)) return -1;
-  int n = snprintf(text, sizeof text, "cache_dir %s\r\ncache_limit_gb %.10g\r\n", s->cache_dir, s->cache_limit_gb);
+  int n = snprintf(text, sizeof text, "cache_dir %s\r\ncache_limit_gb %.10g\r\nstretcher %s\r\nkeep_tone %s\r\n",
+                   s->cache_dir, s->cache_limit_gb, s->stretcher == SMP_STRETCH_RUBBERBAND ? "rubberband" : "signalsmith",
+                   s->keep_tone ? "on" : "off");
   if (n <= 0 || n >= (int)sizeof text) return -1;
   EnterCriticalSection(&cs);
   make_dirs(p);

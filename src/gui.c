@@ -6,10 +6,14 @@
    FX window around it (tab_out, from cosmos_clap/gui.c).
    Focus is never lost: when a page switches the focus goes to a control on the new page, and when REAPER focuses the
    window itself (coming back to it) the focus goes on to the control last used.
-   Values. Edit boxes show values in words (smp_value_text); Enter or leaving a box reads what was typed (a bad entry
-   beeps and the old value comes back); Up and Down step it (Shift ten times as far, Control a tenth) and stop at its
-   limits. Choices are combo boxes. Every change goes to the engine at once and the host is told (plugin.c).
-   A 250 ms timer brings the boxes up to date (automation, renders) and frees replaced samples; a box's text is set
+   Values are sliders (trackbars) that a screen reader reads in words: the words are set as the slider's accessible
+   name and value (Dynamic Annotation, IAccPropServices). Up or Right and Down or Left step a value (Shift ten times as
+   far, Control a tenth), Page Up and Page Down ten steps, Home and End go to the limits, and it stops there. Enter,
+   or typing a character, swaps the slider for an edit box in its place holding the value; Enter there reads what was
+   typed (a bad entry beeps and the old value stays), Escape leaves it as it was, and either goes back to the slider.
+   Tab or leaving the box reads it too. Choices are combo boxes. Every change goes to the engine at once and the host
+   is told (plugin.c).
+   A 250 ms timer brings the controls up to date (automation, renders) and frees replaced samples; a value is set
    only when it changes, so the screen reader isn't interrupted.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
@@ -18,6 +22,8 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <ole2.h>
+#include <initguid.h>
+#include <oleacc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,23 +38,31 @@
 #define LIMIT_HI 10000.0
 #define NOTE_MS 6000
 
-enum { ID_VAL = 100,                          /* + parameter id */
+enum { ID_VAL = 100,                          /* + parameter id: its slider or combo box */
        ID_SAMPLE = 200, ID_BROWSE, ID_PREV, ID_NEXT, ID_STATUS, ID_SETTINGS,
-       ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK };
+       ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
+       ID_EDIT = 300 };                       /* + slider number: the edit box that stands in for it */
+#define SL_LIMIT (-1)                         /* the slider that isn't a parameter: the cache size limit */
 enum { T_REFRESH = 1, T_OPEN = 2 };
 #define WM_DROPPED (WM_APP + 1)
 
 typedef struct { IDropTarget t; struct Gui *g; int ok; } Drop;
+
+/* a value's slider and the edit box that stands in for it while typing */
+typedef struct { HWND tb, ed; int what; char said[64]; bool editing; } Slider;
 
 typedef struct Gui {
   Plug *P;
   HWND win; HFONT font;
   int page;                                   /* 0 the main page, 1 Settings */
   HWND sample, browse, prev, next, status, settings;
-  HWND val[SMP_NPARAMS];
-  char shown[SMP_NPARAMS][64];                /* what each parameter box last showed */
-  HWND dir, dirbrowse, limit, used, clear, back;
-  char dir_shown[1024], limit_shown[32], used_text[700];
+  HWND val[SMP_NPARAMS];                      /* each parameter's slider or combo box */
+  Slider sl[SMP_NPARAMS + 1]; int nsl;
+  Slider *sl_of[SMP_NPARAMS];                 /* a parameter's slider, or NULL (a choice) */
+  IAccPropServices *aps;                      /* the words a screen reader reads for a slider; NULL: numbers */
+  HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
+  Slider *limit;
+  char dir_shown[1024], used_text[700];
   HWND all[2][96]; int nall[2];               /* every window on each page (labels too), to show and hide */
   HWND order[2][48]; int norder[2];           /* the Tab order of each page */
   HWND last; bool had_focus, closing;
@@ -116,6 +130,113 @@ static void param_text(int id, double v, char *out, int cap) {
   smp_value_text(id, v, out, cap);
   if (is_choice(id) && out[0] >= 'a' && out[0] <= 'z') out[0] = (char)(out[0] - 'a' + 'A');   /* "Off", "Note" */
 }
+static void gb_text(double gb, char *out, int cap) {
+  if (fabs(gb - floor(gb + 0.5)) < 1e-9) snprintf(out, (size_t)cap, "%.0f GB", gb);
+  else snprintf(out, (size_t)cap, "%.1f GB", gb);
+}
+static void set_limit(Gui *g, double gb);
+
+/* ---- sliders ---- */
+static void sl_range(const Slider *s, double *lo, double *hi, double *step) {
+  const SmpParamInfo *pi;
+  if (s->what == SL_LIMIT) { *lo = LIMIT_LO; *hi = LIMIT_HI; *step = 1; return; }
+  pi = smp_param_info(s->what);
+  *lo = pi->lo; *hi = pi->hi; *step = pi->kind == SMP_K_MS ? 10 : 1;
+}
+static double sl_get(Gui *g, const Slider *s) {
+  SmpSettings st;
+  if (s->what != SL_LIMIT) return smp_plug_get_param(g->P, s->what);
+  smp_settings_get(&st);
+  return st.cache_limit_gb;
+}
+static void sl_text(const Slider *s, double v, char *out, int cap) {
+  if (s->what == SL_LIMIT) gb_text(v, out, cap); else param_text(s->what, v, out, cap);
+}
+static int sl_parse(const Slider *s, const char *t, double *v) {
+  char *e;
+  if (s->what != SL_LIMIT) return smp_value_parse(s->what, t, v);
+  *v = strtod(t, &e);
+  while (*e == ' ') e++;
+  return e != t && (!*e || !_stricmp(e, "GB")) && *v > 0;
+}
+static void annotate(Gui *g, HWND h, MSAAPROPID prop, const char *text) {
+  wchar_t w[128];
+  if (!g->aps || !MultiByteToWideChar(CP_UTF8, 0, text, -1, w, 128)) return;
+  g->aps->lpVtbl->SetHwndPropStr(g->aps, h, (DWORD)OBJID_CLIENT, CHILDID_SELF, prop, w);
+}
+/* the slider shows the value: its words (said) as the screen reader's value, and the thumb where the value is */
+static void sl_show(Gui *g, Slider *s, bool force) {
+  char t[64]; double v = sl_get(g, s), lo, hi, step; LRESULT n, pos;
+  sl_text(s, v, t, sizeof t);
+  if (!force && !strcmp(t, s->said)) return;
+  strcpy(s->said, t);
+  annotate(g, s->tb, PROPID_ACC_VALUE, t);
+  sl_range(s, &lo, &hi, &step);
+  n = SendMessageW(s->tb, TBM_GETRANGEMAX, 0, 0);
+  pos = hi > lo ? (LRESULT)floor((v - lo) / (hi - lo) * (double)n + 0.5) : 0;
+  if (SendMessageW(s->tb, TBM_GETPOS, 0, 0) != pos) SendMessageW(s->tb, TBM_SETPOS, TRUE, pos);
+  NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, s->tb, OBJID_CLIENT, CHILDID_SELF);
+}
+static void sl_set(Gui *g, Slider *s, double v) {
+  double lo, hi, step;
+  sl_range(s, &lo, &hi, &step);
+  if (v < lo) v = lo;                            /* past either end it stays at the end */
+  if (v > hi) v = hi;
+  if (s->what == SL_LIMIT) set_limit(g, v); else smp_plug_set_param(g->P, s->what, v);
+  sl_show(g, s, true);
+}
+/* Up and Down: a semitone, a cent, a dB, 10 ms, 1 %, 1 GB (by: 1, 10 or 0.1, and the sign); whole-number values
+   never step less than 1 */
+static void sl_nudge(Gui *g, Slider *s, double by) {
+  double lo, hi, step, v;
+  int kind = s->what == SL_LIMIT ? -1 : smp_param_info(s->what)->kind;
+  bool whole = kind == SMP_K_NOTE || kind == SMP_K_SEMI || kind == SMP_K_CENT || kind == SMP_K_COUNT || kind == SMP_K_PAN;
+  sl_range(s, &lo, &hi, &step);
+  step *= fabs(by);
+  if (whole && step < 1) step = 1;
+  v = sl_get(g, s) + (by < 0 ? -step : step);
+  v = whole ? floor(v + 0.5) : s->what == SL_LIMIT ? floor(v * 10 + 0.5) / 10 : floor(v * 1000 + 0.5) / 1000;
+  sl_set(g, s, v);
+}
+/* the mouse moved the thumb */
+static void sl_dragged(Gui *g, Slider *s) {
+  double lo, hi, step, n = (double)SendMessageW(s->tb, TBM_GETRANGEMAX, 0, 0), v;
+  sl_range(s, &lo, &hi, &step);
+  v = lo + (double)SendMessageW(s->tb, TBM_GETPOS, 0, 0) / (n > 0 ? n : 1) * (hi - lo);
+  v = s->what == SL_LIMIT ? floor(v * 10 + 0.5) / 10 : floor(v / step + 0.5) * step;
+  sl_set(g, s, v);
+}
+
+/* Enter (or a character typed) on a slider: the edit box takes its place, holding the value (or the character) */
+static void edit_begin(Gui *g, Slider *s, wchar_t first) {
+  RECT r; wchar_t w[64];
+  if (first) { w[0] = first; w[1] = 0; } else MultiByteToWideChar(CP_UTF8, 0, s->said, -1, w, 64);
+  SetWindowTextW(s->ed, w);
+  GetWindowRect(s->tb, &r); MapWindowPoints(NULL, g->win, (POINT *)&r, 2);
+  SetWindowPos(s->ed, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+  s->editing = true;
+  ShowWindow(s->ed, SW_SHOW);
+  SetFocus(s->ed);
+  if (first) SendMessageW(s->ed, EM_SETSEL, 1, 1); else SendMessageW(s->ed, EM_SETSEL, 0, -1);
+  ShowWindow(s->tb, SW_HIDE);
+}
+/* Back to the slider: apply reads what was typed (a bad entry beeps and the value stays); to_slider puts the focus
+   on the slider (Enter, Escape), else the focus is going somewhere else already (Tab, a click) */
+static void edit_end(Gui *g, Slider *s, bool apply, bool to_slider) {
+  if (!s->editing) return;
+  s->editing = false;                            /* first: the focus leaving the box comes back here */
+  if (apply) {
+    char t[128]; double v;
+    get_text(s->ed, t, sizeof t);
+    if (strcmp(t, s->said)) {
+      if (sl_parse(s, t, &v)) sl_set(g, s, v); else beep();
+    }
+  }
+  ShowWindow(s->tb, SW_SHOW);
+  g->last = s->tb;
+  if (to_slider) focus(s->tb);
+  ShowWindow(s->ed, SW_HIDE);
+}
 
 static void show_param(Gui *g, int id, bool force) {
   double v = smp_plug_get_param(g->P, id);
@@ -124,46 +245,10 @@ static void show_param(Gui *g, int id, bool force) {
     if (SendMessageW(g->val[id], CB_GETCURSEL, 0, 0) != k) SendMessageW(g->val[id], CB_SETCURSEL, (WPARAM)k, 0);
     return;
   }
-  {
-    char t[64]; param_text(id, v, t, sizeof t);
-    if (!force && !strcmp(t, g->shown[id])) return;
-    strcpy(g->shown[id], t); set_text(g->val[id], t);
-  }
-}
-
-/* Enter or leaving the box: what was typed, if it changed. 0 when it didn't read (it beeps; the old value is back). */
-static int apply_param(Gui *g, int id) {
-  char t[128]; double v;
-  get_text(g->val[id], t, sizeof t);
-  if (!strcmp(t, g->shown[id])) return 1;
-  if (!smp_value_parse(id, t, &v)) { beep(); show_param(g, id, true); return 0; }
-  smp_plug_set_param(g->P, id, v);
-  show_param(g, id, true);
-  return 1;
-}
-
-/* Up and Down: a semitone, a cent, a dB, 10 ms, 1 %; whole-number values never step less than 1 */
-static void nudge_param(Gui *g, int id, double by) {
-  const SmpParamInfo *pi = smp_param_info(id);
-  double step = pi->kind == SMP_K_MS ? 10 : 1, v;
-  bool whole = pi->kind == SMP_K_NOTE || pi->kind == SMP_K_SEMI || pi->kind == SMP_K_CENT || pi->kind == SMP_K_COUNT ||
-               pi->kind == SMP_K_PAN;
-  if (!apply_param(g, id)) return;
-  step *= fabs(by);
-  if (whole && step < 1) step = 1;
-  v = smp_plug_get_param(g->P, id) + (by < 0 ? -step : step);
-  v = whole ? floor(v + 0.5) : floor(v * 1000 + 0.5) / 1000;
-  if (v < pi->lo) v = pi->lo;                    /* past either end it stays at the end */
-  if (v > pi->hi) v = pi->hi;
-  smp_plug_set_param(g->P, id, v);
-  show_param(g, id, true);
+  if (!g->sl_of[id]->editing) sl_show(g, g->sl_of[id], force);
 }
 
 /* ---- the Settings page ---- */
-static void gb_text(double gb, char *out, int cap) {
-  if (fabs(gb - floor(gb + 0.5)) < 1e-9) snprintf(out, (size_t)cap, "%.0f GB", gb);
-  else snprintf(out, (size_t)cap, "%.1f GB", gb);
-}
 static void rescan_used(Gui *g) {             /* scans the folder: on opening the page and after a change */
   SmpSettings s; char why[600], lim[32]; uint64_t b;
   smp_settings_get(&s);
@@ -177,8 +262,10 @@ static void show_settings(Gui *g) {
   SmpSettings s; HWND foc = GetFocus();
   smp_settings_get(&s);
   if (foc != g->dir) { set_text(g->dir, s.cache_dir); snprintf(g->dir_shown, sizeof g->dir_shown, "%s", s.cache_dir); }
-  if (foc != g->limit) { gb_text(s.cache_limit_gb, g->limit_shown, sizeof g->limit_shown); set_text(g->limit, g->limit_shown); }
+  if (!g->limit->editing) sl_show(g, g->limit, false);
   set_text(g->used, g->used_text);
+  if (SendMessageW(g->stretcher, CB_GETCURSEL, 0, 0) != s.stretcher) SendMessageW(g->stretcher, CB_SETCURSEL, (WPARAM)s.stretcher, 0);
+  if (SendMessageW(g->keeptone, CB_GETCURSEL, 0, 0) != s.keep_tone) SendMessageW(g->keeptone, CB_SETCURSEL, (WPARAM)s.keep_tone, 0);
 }
 static void save_settings(Gui *g, const SmpSettings *s) {
   if (smp_settings_set(s)) beep();
@@ -196,32 +283,21 @@ static int apply_dir(Gui *g) {
   set_text(g->used, g->used_text);
   return 1;
 }
-static void set_limit(Gui *g, double gb) {
+static void set_limit(Gui *g, double gb) {     /* the slider has clamped it */
   SmpSettings s;
   smp_settings_get(&s);
-  if (gb < LIMIT_LO) gb = LIMIT_LO;
-  if (gb > LIMIT_HI) gb = LIMIT_HI;
   s.cache_limit_gb = floor(gb * 10 + 0.5) / 10;
   save_settings(g, &s);
-  gb_text(s.cache_limit_gb, g->limit_shown, sizeof g->limit_shown);
-  set_text(g->limit, g->limit_shown);
   set_text(g->used, g->used_text);
 }
-static int apply_limit(Gui *g) {
-  char t[64], *e; double v;
-  get_text(g->limit, t, sizeof t);
-  if (!strcmp(t, g->limit_shown)) return 1;
-  v = strtod(t, &e);
-  while (*e == ' ') e++;
-  if (e == t || (*e && _stricmp(e, "GB")) || !(v > 0)) { beep(); set_text(g->limit, g->limit_shown); return 0; }
-  set_limit(g, v);
-  return 1;
-}
-static void nudge_limit(Gui *g, double by) {
+/* the Stretcher and Keep the tone combo boxes: every engine makes its copies again with the new choice (old ones
+   stay in the cache, so changing back is instant) */
+static void choose(Gui *g, int id, int k) {
   SmpSettings s;
-  if (!apply_limit(g)) return;
   smp_settings_get(&s);
-  set_limit(g, s.cache_limit_gb + by);
+  if (id == ID_STRETCHER) s.stretcher = k; else s.keep_tone = k;
+  if (smp_settings_set(&s)) beep();             /* not save_settings: the cache folder needs no rescan */
+  show_settings(g);
 }
 static void clear_cache(Gui *g) {             /* every file not in use */
   smp_cache_trim(0);
@@ -306,10 +382,10 @@ static void show_sample(Gui *g) {
   char t[1500]; smp_plug_sample_text(g->P, t, sizeof t); set_text(g->sample, t);
 }
 static void refresh(Gui *g) {
-  HWND foc = GetFocus(); int id;
+  int id;
   if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
   show_sample(g);
-  for (id = 0; id < SMP_NPARAMS; id++) if (g->val[id] != foc || is_choice(id)) show_param(g, id, false);
+  for (id = 0; id < SMP_NPARAMS; id++) show_param(g, id, false);
   show_status(g);
   if (g->page == 1) show_settings(g);
 }
@@ -492,37 +568,54 @@ static void click(Gui *g, int id) {
   }
 }
 
+static Slider *slider_of(Gui *g, HWND h) {
+  int i;
+  for (i = 0; i < g->nsl; i++) if (g->sl[i].tb == h || g->sl[i].ed == h) return &g->sl[i];
+  return NULL;
+}
+
 static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR data) {
   Gui *g = (Gui *)data;
-  bool shift, ctrl, val_edit;
+  bool shift, ctrl;
+  Slider *s;
   /* every key comes to the control (Tab, Enter and the arrows included), not to the window or REAPER around it */
   if (m == WM_GETDLGCODE) return DefSubclassProc(h, m, w, l) | DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTTAB | DLGC_WANTCHARS;
   if (g->closing) return DefSubclassProc(h, m, w, l);
   if (m == WM_SETFOCUS) { g->last = h; g->had_focus = true; }
   if (m == WM_KILLFOCUS && !(w && IsChild(g->win, (HWND)w))) g->had_focus = false;   /* gone out of the window */
   shift = GetKeyState(VK_SHIFT) < 0; ctrl = GetKeyState(VK_CONTROL) < 0;
-  val_edit = id >= ID_VAL && id < ID_VAL + SMP_NPARAMS && !is_choice((int)(id - ID_VAL));
+  s = slider_of(g, h);
+  if (s && h == s->ed) {                                  /* typing a value in place of its slider */
+    if (m == WM_KEYDOWN && w == VK_TAB) { tab_key(g, s->tb, shift); return 0; }   /* leaving the box reads it */
+    if (m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) { edit_end(g, s, w == VK_RETURN, true); return 0; }
+    if (m == WM_CHAR && (w == 9 || w == '\r' || w == '\n' || w == 27)) return 0;
+    if (m == WM_KILLFOCUS) edit_end(g, s, true, false);
+    return DefSubclassProc(h, m, w, l);
+  }
   if (m == WM_KEYDOWN && w == VK_TAB) { tab_key(g, h, shift); return 0; }
   if (m == WM_CHAR && w == 9) return 0;                                   /* the Tab's character */
   if (m == WM_CHAR && (w == '\r' || w == '\n') && !is_class(h, L"ComboBox")) return 0;
+  if (s) {                                                /* a slider: the keys are ours, not the trackbar's */
+    double by = shift ? 10 : ctrl ? 0.1 : 1, lo, hi, step;
+    if (m == WM_KEYDOWN) {
+      switch (w) {
+        case VK_RETURN: edit_begin(g, s, 0); return 0;
+        case VK_UP: case VK_RIGHT: sl_nudge(g, s, by); return 0;
+        case VK_DOWN: case VK_LEFT: sl_nudge(g, s, -by); return 0;
+        case VK_PRIOR: sl_nudge(g, s, 10); return 0;
+        case VK_NEXT: sl_nudge(g, s, -10); return 0;
+        case VK_HOME: case VK_END: sl_range(s, &lo, &hi, &step); sl_set(g, s, w == VK_HOME ? lo : hi); return 0;
+      }
+    }
+    if (m == WM_CHAR && w > ' ' && w != 127) { edit_begin(g, s, (wchar_t)w); return 0; }   /* typing starts the box */
+    if (m == WM_CHAR) return 0;
+  }
   if (m == WM_KEYDOWN && w == VK_RETURN) {
-    if (val_edit) { apply_param(g, (int)(id - ID_VAL)); SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
     if (id == ID_DIR) { apply_dir(g); SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
-    if (id == ID_LIMIT) { apply_limit(g); SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
     if (is_class(h, L"Button")) { SendMessageW(h, BM_CLICK, 0, 0); return 0; }
     if (is_class(h, L"Edit")) return 0;
   }
-  if (m == WM_KEYDOWN && (w == VK_UP || w == VK_DOWN) && (val_edit || id == ID_LIMIT)) {
-    double by = (w == VK_UP ? 1 : -1) * (shift ? 10 : ctrl ? 0.1 : 1);
-    if (val_edit) nudge_param(g, (int)(id - ID_VAL), by); else nudge_limit(g, by);
-    SendMessageW(h, EM_SETSEL, 0, -1);
-    return 0;
-  }
-  if (m == WM_KILLFOCUS) {
-    if (val_edit) apply_param(g, (int)(id - ID_VAL));
-    else if (id == ID_DIR) apply_dir(g);
-    else if (id == ID_LIMIT) apply_limit(g);
-  }
+  if (m == WM_KILLFOCUS && id == ID_DIR) apply_dir(g);
   return DefSubclassProc(h, m, w, l);
 }
 
@@ -539,7 +632,16 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NPARAMS) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) smp_plug_set_param(g->P, id - ID_VAL, (double)k);
+      } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE)) {
+        LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
+        if (k >= 0) choose(g, id, (int)k);
       } else if (code == BN_CLICKED) click(g, id);
+      return 0;
+    }
+    case WM_HSCROLL: {                         /* the mouse on a slider (its keys never reach the trackbar) */
+      Slider *s = l ? slider_of(g, (HWND)l) : NULL;
+      int code = LOWORD(w);
+      if (s && (code == TB_THUMBTRACK || code == TB_THUMBPOSITION || code == TB_PAGEUP || code == TB_PAGEDOWN)) sl_dragged(g, s);
       return 0;
     }
     case WM_SETFOCUS: keep_focus(g); return 0;
@@ -571,6 +673,30 @@ static HWND labelled(Gui *g, int page, const char *label, const wchar_t *cls, DW
   return ctl(g, page, cls, L"", style, x + lw + 4, y, cw, ch, id);
 }
 
+/* a label, then the edit box that stands in for the slider (hidden; outside the Tab order), then the slider */
+static Slider *slider(Gui *g, int page, const char *label, int what, int x, int y, int lw, int cw, int id) {
+  Slider *s = &g->sl[g->nsl]; wchar_t lab[96]; double lo, hi, step, n;
+  int i = g->nsl++;
+  MultiByteToWideChar(CP_UTF8, 0, label, -1, lab, 96);
+  s->what = what;
+  ctl(g, page, L"STATIC", lab, SS_LEFT, x, y + 4, lw, 20, -1);
+  s->ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, x + lw + 4, y, cw, 24, g->win,
+                          (HMENU)(INT_PTR)(ID_EDIT + i), module(), NULL);
+  SendMessageW(s->ed, WM_SETFONT, (WPARAM)g->font, FALSE);
+  SendMessageW(s->ed, EM_SETLIMITTEXT, 60, 0);
+  SetWindowSubclass(s->ed, ctl_proc, (UINT_PTR)(ID_EDIT + i), (DWORD_PTR)g);
+  s->tb = ctl(g, page, TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_HORZ | TBS_NOTICKS | TBS_BOTH, x + lw + 4, y, cw, 24, id);
+  sl_range(s, &lo, &hi, &step);
+  n = floor((hi - lo) / step + 0.5);
+  SendMessageW(s->tb, TBM_SETRANGEMIN, FALSE, 0);
+  SendMessageW(s->tb, TBM_SETRANGEMAX, FALSE, (LPARAM)(n > 1000 ? 1000 : n < 1 ? 1 : n));
+  SendMessageW(s->tb, TBM_SETPAGESIZE, 0, 10);
+  annotate(g, s->tb, PROPID_ACC_NAME, label);
+  annotate(g, s->ed, PROPID_ACC_NAME, label);
+  sl_show(g, s, true);
+  return s;
+}
+
 static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
   const DWORD T = WS_TABSTOP;
   HWND c;
@@ -584,8 +710,8 @@ static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
       SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)wt);
     }
   } else {
-    c = labelled(g, 0, smp_param_label[id], L"EDIT", T | ES_AUTOHSCROLL, x, y, lw, cw, 24, ID_VAL + id);
-    SendMessageW(c, EM_SETLIMITTEXT, 60, 0);
+    g->sl_of[id] = slider(g, 0, smp_param_label[id], id, x, y, lw, cw, ID_VAL + id);
+    c = g->sl_of[id]->tb;
   }
   g->val[id] = c;
   return c;
@@ -598,7 +724,7 @@ static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
 static bool build(Gui *g, HWND parent) {
   HINSTANCE hi = module();
   WNDCLASSW wc; NONCLIENTMETRICSW nm; const DWORD T = WS_TABSTOP; int id, k, y;
-  INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_STANDARD_CLASSES};
+  INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
   InitCommonControlsEx(&icc);
   memset(&wc, 0, sizeof wc);
   wc.lpfnWndProc = win_proc; wc.hInstance = hi; wc.lpszClassName = CLASS_NAME;
@@ -612,6 +738,8 @@ static bool build(Gui *g, HWND parent) {
   memset(&nm, 0, sizeof nm); nm.cbSize = sizeof nm;
   SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof nm, &nm, 0);
   g->font = CreateFontIndirectW(&nm.lfMessageFont);
+  drop_start(g);                               /* OLE first: the sliders' words need COM */
+  if (FAILED(CoCreateInstance(&CLSID_AccPropServices, NULL, CLSCTX_INPROC_SERVER, &IID_IAccPropServices, (void **)&g->aps))) g->aps = NULL;
 
   /* the main page, in Tab order */
   y = 8;
@@ -636,11 +764,19 @@ static bool build(Gui *g, HWND parent) {
 
   /* Settings */
   y = 8;
+  g->stretcher = labelled(g, 1, "Stretcher", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_STRETCHER);
+  SendMessageW(g->stretcher, CB_ADDSTRING, 0, (LPARAM)L"Signalsmith Stretch, fast");
+  SendMessageW(g->stretcher, CB_ADDSTRING, 0, (LPARAM)L"Rubber Band, slower");
+  y += ROW;
+  g->keeptone = labelled(g, 1, "Keep the tone", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_KEEPTONE);
+  SendMessageW(g->keeptone, CB_ADDSTRING, 0, (LPARAM)L"Off");
+  SendMessageW(g->keeptone, CB_ADDSTRING, 0, (LPARAM)L"On");
+  y += ROW;
   g->dir = labelled(g, 1, "Cache folder", L"EDIT", T | ES_AUTOHSCROLL, 8, y, 140, 470, 24, ID_DIR);
   SendMessageW(g->dir, EM_SETLIMITTEXT, 1000, 0);
   g->dirbrowse = ctl(g, 1, L"BUTTON", L"Browse folder", T | BS_PUSHBUTTON, 630, y, 120, 26, ID_DIRBROWSE);
   y += ROW;
-  g->limit = labelled(g, 1, "Cache size limit", L"EDIT", T | ES_AUTOHSCROLL, 8, y, 140, 160, 24, ID_LIMIT);
+  g->limit = slider(g, 1, "Cache size limit", SL_LIMIT, 8, y, 140, 160, ID_LIMIT);
   y += ROW;
   g->used = labelled(g, 1, "Cache in use", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 140, 470, 24, ID_USED);
   y += ROW;
@@ -650,7 +786,6 @@ static bool build(Gui *g, HWND parent) {
 
   for (id = 0; id < SMP_NPARAMS; id++) show_param(g, id, true);
   refresh(g);
-  drop_start(g);
   SetTimer(g->win, T_REFRESH, 250, NULL);
   SetTimer(g->win, T_OPEN, 150, NULL);          /* just opened: start on the first control */
   return true;
@@ -663,6 +798,13 @@ void smp_gui_close(Plug *P) {
   P->gui = NULL; g->P = NULL;                 /* the plugin may be freed right after this */
   if (g->win) {
     KillTimer(g->win, T_REFRESH); KillTimer(g->win, T_OPEN);
+    if (g->aps) {
+      MSAAPROPID props[2] = {PROPID_ACC_NAME, PROPID_ACC_VALUE}; int i;
+      for (i = 0; i < g->nsl; i++) {
+        g->aps->lpVtbl->ClearHwndProps(g->aps, g->sl[i].tb, (DWORD)OBJID_CLIENT, CHILDID_SELF, props, 2);
+        g->aps->lpVtbl->ClearHwndProps(g->aps, g->sl[i].ed, (DWORD)OBJID_CLIENT, CHILDID_SELF, props, 1);
+      }
+    }
     if (g->drop_registered) RevokeDragDrop(g->win);
     DestroyWindow(g->win); g->win = NULL;
   }
@@ -670,6 +812,7 @@ void smp_gui_close(Plug *P) {
 }
 
 static void gui_free(Gui *g) {
+  if (g->aps) g->aps->lpVtbl->Release(g->aps);
   if (g->ole_init) OleUninitialize();
   if (g->font) DeleteObject(g->font);
   memset(g, 0xDD, sizeof *g);                 /* a use after free shows up as garbage, not as old values */
