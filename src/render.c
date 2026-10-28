@@ -30,11 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "engine_int.h"
-#include "rubberband/rubberband/rubberband-c.h"
 
 #define RB_CHUNK 4096
 #define SETTLE_MS 100
 #define DIR_RECHECK_MS 1000
+#define SMP_KLMEM (512.0 * 1024 * 1024)   /* bytes: copies needing more temporary memory are refused */
 
 static volatile LONG g_renders;
 SMP_API long smp_debug_renders(void) { return g_renders; }
@@ -49,69 +49,64 @@ static uint64_t kl_key(uint64_t base, int semis, LONG speedp) {
 
 typedef int (*CancelFn)(void *);
 
-static void drain(RubberBandState st, float *out, uint64_t T, uint64_t *got, float *ob) {
-  int a;
-  while ((a = rubberband_available(st)) > 0) {
-    float *o[2]; unsigned m = a > RB_CHUNK ? RB_CHUNK : (unsigned)a, i;
-    o[0] = ob; o[1] = ob + RB_CHUNK;
-    m = rubberband_retrieve(st, o, m);
-    if (!m) break;
-    for (i = 0; i < m && *got < T; i++, (*got)++) { out[2 * *got] = ob[i]; out[2 * *got + 1] = ob[RB_CHUNK + i]; }
-  }
-}
+/* rbsafe.cpp: the Rubber Band calls, inside try/catch (no C++ exception may reach C or the host) */
+int smp_rb_render(const float *L, const float *R, unsigned F, int rate, double time_ratio, double pitch_scale,
+                  float *out, unsigned long long T, CancelFn cancel, void *arg, float *ob, char *why, int cap);
+void smp_rb_set_debug_flags(long f);
 
-/* 0 ok, 1 failed, 2 cancelled, 3 the cache write failed */
-static int render_entry(SmpEntry *src, uint64_t base, int semis, LONG speedp, CancelFn cancel, void *arg) {
-  uint64_t F = smp_entry_frames(src), T, i, got = 0; int rate = smp_entry_rate(src), r = 1;
-  float *L = NULL, *R = NULL, *lr = NULL, *out = NULL, *ob = NULL; RubberBandState st = NULL;
-  if (!F || F > 0x7FFFFFFF || speedp <= 0 || rate <= 0 || semis < -SMP_KLRENDER || semis > SMP_KLRENDER) return 1;
+/* tests: 1 = Rubber Band throws inside the guard, 2 = no 4-octave limit (to reach Rubber Band's own failures) */
+static volatile LONG g_dflags;
+SMP_API void smp_debug_render_flags(long f) { g_dflags = f; smp_rb_set_debug_flags(f & 1); }
+
+/* 0 ok, 1 failed, 2 cancelled, 3 the cache write failed, 4 too big (temporary memory past SMP_KLMEM);
+   why: a plain reason for 1, 3 and 4 */
+static int render_entry(SmpEntry *src, uint64_t base, int semis, LONG speedp, CancelFn cancel, void *arg,
+                        char *why, int cap) {
+  uint64_t F = smp_entry_frames(src), T, i; int rate = smp_entry_rate(src), r = 1;
+  float *L = NULL, *R = NULL, *lr = NULL, *out = NULL, *ob = NULL;
+  snprintf(why, (size_t)cap, "a keep-length copy couldn't be made");
+  if (!F || speedp <= 0 || rate <= 0) return 1;
+  if (!(g_dflags & 2) && (semis < -SMP_KLRENDER || semis > SMP_KLRENDER)) {
+    snprintf(why, (size_t)cap, "keep length only shifts up to 4 octaves");
+    return 1;
+  }
   T = speedp == 10000 ? F : (uint64_t)floor((double)F * 10000.0 / (double)speedp + 0.5);
   if (!T) T = 1;
+  /* the source (both sides), the copy (interleaved), and about as much again inside Rubber Band */
+  if (F > 0x7FFFFFFF || (double)(F + T) * 8.0 * 2.0 > SMP_KLMEM) {
+    snprintf(why, (size_t)cap, "the sample is too long for keep-length copies at this speed");
+    return 4;
+  }
   L = malloc(sizeof(float) * (size_t)F); R = malloc(sizeof(float) * (size_t)F);
   lr = malloc(sizeof(float) * 2 * RB_CHUNK); ob = malloc(sizeof(float) * 2 * RB_CHUNK);
   out = calloc((size_t)T * 2, sizeof(float));
-  if (!L || !R || !lr || !ob || !out) goto done;
+  if (!L || !R || !lr || !ob || !out) { snprintf(why, (size_t)cap, "out of memory for a keep-length copy"); goto done; }
   for (i = 0; i < F; i += RB_CHUNK) {                      /* the source, deinterleaved */
     long n = (long)(F - i < RB_CHUNK ? F - i : RB_CHUNK), k, g = smp_entry_read(src, i, lr, n);
     if (g < 0) g = 0;
     for (k = 0; k < n; k++) { L[i + k] = k < g ? lr[2 * k] : 0; R[i + k] = k < g ? lr[2 * k + 1] : 0; }
     if (cancel && cancel(arg)) { r = 2; goto done; }
   }
-  st = rubberband_new((unsigned)rate, 2,
-                      RubberBandOptionProcessOffline | RubberBandOptionEngineFiner | RubberBandOptionChannelsTogether,
-                      10000.0 / (double)speedp, pow(2.0, semis / 12.0));
-  if (!st) goto done;
-  rubberband_set_expected_input_duration(st, (unsigned)F);
-  rubberband_set_max_process_size(st, RB_CHUNK);
-  for (i = 0; i < F; i += RB_CHUNK) {                      /* study the whole sample */
-    unsigned n = (unsigned)(F - i < RB_CHUNK ? F - i : RB_CHUNK); const float *in[2];
-    in[0] = L + i; in[1] = R + i;
-    rubberband_study(st, in, n, i + n >= F);
-    if (cancel && cancel(arg)) { r = 2; goto done; }
-  }
-  for (i = 0; i < F; i += RB_CHUNK) {                      /* then process it, retrieving as it goes */
-    unsigned n = (unsigned)(F - i < RB_CHUNK ? F - i : RB_CHUNK); const float *in[2];
-    in[0] = L + i; in[1] = R + i;
-    rubberband_process(st, in, n, i + n >= F);
-    drain(st, out, T, &got, ob);
-    if (cancel && cancel(arg)) { r = 2; goto done; }
-  }
-  drain(st, out, T, &got, ob);                             /* everything; past T is dropped, short of T is silence */
+  r = smp_rb_render(L, R, (unsigned)F, rate, 10000.0 / (double)speedp, pow(2.0, semis / 12.0), out, T, cancel, arg,
+                    ob, why, cap);
+  if (r) goto done;
   InterlockedIncrement(&g_renders);
-  r = smp_cache_write(kl_key(base, semis, speedp), out, T, rate) ? 3 : 0;
+  if (smp_cache_write(kl_key(base, semis, speedp), out, T, rate)) {
+    snprintf(why, (size_t)cap, "keep-length copies can't be written to the cache folder");
+    r = 3;
+  }
 done:
-  if (st) rubberband_delete(st);
   free(L); free(R); free(lr); free(ob); free(out);
   return r;
 }
 
 SMP_API int smp_render_shift(SmpSample *s, int reversed, int semis, double speed) {
-  SmpEntry *src; LONG sp;
+  SmpEntry *src; LONG sp; char why[300];
   if (!s || !s->fwd || speed <= 0) return 1;
   src = reversed ? smp_sample_reversed(s) : s->fwd;
   if (!src) return 1;
   sp = smp_speedp(speed * 100.0);
-  return render_entry(src, reversed ? s->rev_key : s->src_key, semis, sp, NULL, NULL);
+  return render_entry(src, reversed ? s->rev_key : s->src_key, semis, sp, NULL, NULL, why, sizeof why);
 }
 
 /* ---- the render thread ---- */
@@ -292,17 +287,25 @@ static DWORD WINAPI render_thread(LPVOID arg) {
       int n = pick - SMP_KLMAX; uint64_t key = kl_key(c.base, n, c.speedp);
       SmpEntry *en = smp_cache_open(key);
       if (!en) {
-        CancelArg ca; int r;
+        CancelArg ca; int r; char why[300];
         ca.e = e; ca.c = c;
-        r = render_entry(c.src, c.base, n, c.speedp, cancelled, &ca);
+        r = render_entry(c.src, c.base, n, c.speedp, cancelled, &ca, why, sizeof why);
         if (r == 2) { InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL); busy = 1; continue; }
         if (r == 0) en = smp_cache_open(key);
         if (!en) {
           failed[pick] = 1;
-          set_why(e, r == 3 ? "Keep length can't write copies to the cache folder" : "Keep length couldn't make a copy");
+          char msg[400];
+          if (r == 0) snprintf(why, sizeof why, "a keep-length copy couldn't be read back from the cache folder");
+          snprintf(msg, sizeof msg, "Keep length: %s; that key resamples", why);
+          set_why(e, msg);
         }
       }
-      if (en && !publish(e, pick, en, &c)) { smp_cache_close(en); failed[pick] = 1; }
+      if (en && !publish(e, pick, en, &c)) { smp_cache_close(en); en = NULL; failed[pick] = 1; }
+      if (en) {                                               /* open now, so trimming never deletes it */
+        SmpSettings st;
+        smp_settings_get(&st);
+        smp_cache_trim((uint64_t)(st.cache_limit_gb * 1024.0 * 1024.0 * 1024.0));
+      }
     }
     InterlockedExchangePointer((PVOID volatile *)&e->r_using, NULL);
     busy = 1;

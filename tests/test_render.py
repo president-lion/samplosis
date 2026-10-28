@@ -287,3 +287,94 @@ def test_free_while_rendering(lib, tmp_path):
     t0 = time.perf_counter()
     e.free()                                           # cancels it between chunks
     assert time.perf_counter() - t0 < 0.5
+
+
+def smpc_files(folder):
+    import os
+    return {int(f[:16], 16): os.path.getsize(os.path.join(folder, f))
+            for f in os.listdir(folder) if f.endswith(".smpc")}
+
+
+def test_cache_limit_enforced(lib, tmp_path):
+    setup(lib)
+    cache = tmp_path / "cache"
+    point_cache(lib, cache, gb=0.002)                   # about 2 MB; one 2 s copy is 0.7 MB
+    data = decaying(261.63, 2.0, tau=5.0)
+    s = load(lib, tmp_path, data, "tone C4.wav")
+    src_key = s.contents.src_key
+    e = KL(lib, tmp_path, s, 58, 63)
+    e.wait()
+    for speed in (50, 75):                              # each speed makes a new set; the old set is retired
+        e.set(SPEED, speed)
+        e.render("on 60 127 0", 0.1)                    # the audio thread moves on, so retired copies close
+        e.wait()
+    e.render("on 60 127 0", 0.1)
+    time.sleep(0.2)
+    e.set(NOTE_HI, 64)                                  # one more copy: a trim with only the current set open
+    e.wait()
+    files = smpc_files(cache)
+    open_keys = {src_key} | {kl_key(lib, src_key, n, 75.0) for n in range(-2, 5)}
+    limit = 0.002 * 1024 ** 3
+    assert sum(files.values()) <= limit + sum(v for k, v in files.items() if k in open_keys), files
+    assert sum(1 for n in range(-2, 4) if kl_key(lib, src_key, n, 100.0) in files) < 5   # old copies were trimmed
+    r, ready, total, why = e.status()
+    assert (r, ready, total) == (1, 7, 7), (r, ready, total, why)
+    e.set(SPEED, 100)                                   # renders again where trimmed
+    e.wait()
+    for k in range(58, 65):
+        y = e.render(f"on {k} 127 0", 0.6)
+        f = 261.63 * 2 ** ((k - 60) / 12)
+        assert abs(detect(lib, y[int(0.05 * e.host_rate):int(0.5 * e.host_rate)], e.host_rate) - midi(f)) < 0.15, k
+    e.free()
+    point_cache(lib, cache)
+
+
+def test_tiny_samples(lib, tmp_path):
+    setup(lib)
+    point_cache(lib, tmp_path / "cache")
+    for rate in (22050, 96000):
+        for frames in (1, 3):
+            s = load(lib, tmp_path, np.array([0.3, -0.2, 0.1][:frames], np.float32), f"tiny{frames}_{rate} C4.wav", rate)
+            for semis in (12, -12):
+                r = lib.smp_render_shift(s, 0, semis, 1.0)
+                if r == 0:
+                    assert len(read_entry(lib, kl_key(lib, s.contents.src_key, semis))) == frames
+            lib.smp_sample_free(s)
+
+
+def test_rubber_band_exceptions_caught(lib, tmp_path):
+    setup(lib)
+    lib.smp_debug_render_flags.restype = None
+    lib.smp_debug_render_flags.argtypes = [ctypes.c_long]
+    point_cache(lib, tmp_path / "cache")
+    s = load(lib, tmp_path, pluck(196, 0.1), "short G3.wav")
+    lib.smp_debug_render_flags(2)                       # past the 4-octave limit: Rubber Band itself throws at -127
+    try:
+        assert lib.smp_render_shift(s, 0, -127, 1.0) == 1
+    finally:
+        lib.smp_debug_render_flags(0)
+    lib.smp_sample_free(s)
+    data = decaying(220, 1.0, tau=5.0)
+    s = load(lib, tmp_path, data, "tone A3.wav")
+    lib.smp_debug_render_flags(1)                       # every render throws inside the guard
+    try:
+        assert lib.smp_render_shift(s, 0, 5, 1.0) == 1
+        e = KL(lib, tmp_path, s, 57, 62)
+        e.wait()
+        r, ready, total, why = e.status()
+        assert r == 0 and ready == 1 and total == 6 and "Rubber Band failed" in why, (r, ready, total, why)
+        y = e.render("on 62 127 0", 1.5)                # that key resamples
+        assert abs(length_secs(y, e.host_rate) - 1.0 / 2 ** (5 / 12)) < 0.02
+        assert abs(detect(lib, y[int(0.05 * e.host_rate):int(0.5 * e.host_rate)], e.host_rate) - midi(220 * 2 ** (5 / 12))) < 0.1
+        e.free()
+    finally:
+        lib.smp_debug_render_flags(0)
+
+
+def test_too_long_refused(lib, tmp_path):
+    setup(lib)
+    point_cache(lib, tmp_path / "cache")
+    rate = 8000                                         # few bytes on disk; the frame count is what matters
+    s = load(lib, tmp_path, decaying(220, 900.0, rate, tau=5.0), "long A3.wav", rate)   # 7.2 M frames
+    assert lib.smp_render_shift(s, 0, 0, 0.25) == 4     # 36 M frames of output: past 512 MB
+    lib.smp_sample_free(s)

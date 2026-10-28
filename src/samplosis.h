@@ -93,6 +93,7 @@ SMP_API void smp_engine_seed(SmpEngine *e, unsigned seed);
 SMP_API int smp_render_shift(SmpSample *s, int reversed, int semis, double speed); /* renders one copy now, on this
                                     thread, into the cache (key kl|<src or rev key>|<semis>|<speed %.2f>|r3); 0 ok */
 SMP_API long smp_debug_renders(void);                            /* Rubber Band runs so far */
+SMP_API void smp_debug_render_flags(long f);   /* tests: 1 = Rubber Band throws (caught), 2 = no 4-octave limit */
 SMP_API int smp_engine_render_status(SmpEngine *e, int *ready, int *total, char *why, int cap); /* 1 when every copy
                                     the key range needs is ready; why is a plain reason when renders can't run */
 SMP_API int smp_engine_wait_renders(SmpEngine *e, int timeout_ms); /* tests: 0 once the render thread is idle, 1 timeout */
