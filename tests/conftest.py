@@ -175,4 +175,6 @@ def lib(settings_file):
     dll.smp_sf_loaded_bytes.argtypes = [vp]
     dll.smp_sf_test_grace.restype = None
     dll.smp_sf_test_grace.argtypes = [c_int]
+    dll.smp_sf_test_note.restype = c_int
+    dll.smp_sf_test_note.argtypes = [vp, c_int, c_int, c_int, c_dbl, c_long, c_long, fp]
     return dll

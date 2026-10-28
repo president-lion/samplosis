@@ -167,6 +167,12 @@ SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */
+/* sfvoice.c, tests: plays one note of a preset (public index) on a default channel (GM reset controllers, bend
+   centred, a 200 cent bend range), every region the key and velocity match, and writes frames of stereo into
+   out_lr (frames * 2 floats, interleaved). The note is released at frame release_at (negative: never). Uses the
+   preset and waits for its samples first (main thread). Returns the number of voices started, -1 on error. */
+SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double rate, long frames, long release_at,
+                             float *out_lr);
 #ifdef __cplusplus
 }
 #endif
