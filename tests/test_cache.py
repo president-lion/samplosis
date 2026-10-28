@@ -119,3 +119,24 @@ def test_bad_cache_dir_falls_back(lib):
     assert lib.smp_cache_ok(why, 256) == 0
     assert rb"Q:\nope" in why.value
     assert write(lib, lib.smp_key(b"x"), ramp(100)) != 0
+
+
+def test_rewrite_open_key_and_concurrent_writers(lib, tmp_path):
+    import threading
+    point_cache(lib, tmp_path)
+    data = ramp(44100 * 2)
+    k = lib.smp_key(b"dup")
+    assert write(lib, k, data) == 0
+    e = lib.smp_cache_open(k)
+    assert write(lib, k, data) == 0
+    out = np.zeros(2000, dtype=np.float32)
+    assert lib.smp_entry_read(e, 30000, out.ctypes.data_as(FP), 1000) == 1000
+    assert np.array_equal(out, data[60000:62000])
+    lib.smp_cache_close(e)
+    k2 = lib.smp_key(b"race")
+    res = []
+    ts = [threading.Thread(target=lambda: res.append(write(lib, k2, data))) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert res == [0, 0, 0, 0]
+    assert not list(tmp_path.glob("*.part"))

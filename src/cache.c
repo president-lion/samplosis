@@ -70,7 +70,10 @@ static int write_all(HANDLE h, const void *buf, uint64_t n) {
 
 int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) {
   wchar_t dir[1100], part[1200], fin[1200];
-  if (!dir_w(dir, 1100) || !file_w(key, L".smpc", fin, 1200) || !file_w(key, L".part", part, 1200)) return 1;
+  static volatile LONG counter;
+  wchar_t ext[64];
+  swprintf(ext, 64, L".%lu.%lu.%ld.part", GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
+  if (!dir_w(dir, 1100) || !file_w(key, L".smpc", fin, 1200) || !file_w(key, ext, part, 1200)) return 1;
   make_dirs(dir);
   HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return 2;
@@ -79,8 +82,14 @@ int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) {
   memcpy(hdr, "SMPC", 4); memcpy(hdr + 4, &v, 4); memcpy(hdr + 8, &ch, 4); memcpy(hdr + 12, &r, 4); memcpy(hdr + 16, &frames, 8);
   int ok = write_all(h, hdr, HDR) && write_all(h, lr, frames * 8);
   CloseHandle(h);
-  if (!ok || !MoveFileExW(part, fin, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(part); return 3; }
-  return 0;
+  if (ok && MoveFileExW(part, fin, MOVEFILE_REPLACE_EXISTING)) return 0;
+  DeleteFileW(part);
+  if (ok) { /* keys are content-addressed: a complete file already there (maybe held open) is as good as ours */
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (GetFileAttributesExW(fin, GetFileExInfoStandard, &d) &&
+        (((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow) == HDR + frames * 8) return 0;
+  }
+  return 3;
 }
 
 static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
