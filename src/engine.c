@@ -136,6 +136,8 @@ SMP_API void smp_engine_set_sample(SmpEngine *e, SmpSample *s) {
   smp_engine_collect(e);
 }
 
+SMP_API const SmpSample *smp_engine_sample(const SmpEngine *e) { return e ? e->sample : NULL; }
+
 SMP_API void smp_engine_seed(SmpEngine *e, unsigned seed) { if (e) e->rng = seed ? seed : 1; }
 
 /* ---- events (queued by the audio thread before process) ---- */

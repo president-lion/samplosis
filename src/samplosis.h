@@ -79,6 +79,7 @@ SMP_API SmpEngine *smp_engine_new(double rate, int max_block);   /* starts the s
 SMP_API void smp_engine_free(SmpEngine *e);
 SMP_API void smp_engine_set_sample(SmpEngine *e, SmpSample *s);  /* main thread; atomic swap, sets root to the sample's;
                                                                     old one freed once nothing can reach it */
+SMP_API const SmpSample *smp_engine_sample(const SmpEngine *e);  /* main thread only: the current sample or NULL; valid until the next set_sample/collect */
 SMP_API void smp_engine_collect(SmpEngine *e);                   /* main thread: frees replaced samples that are safe to free */
 SMP_API void smp_engine_set_param(SmpEngine *e, int id, double v);   /* any thread; atomic; clamped to the range */
 SMP_API double smp_engine_get_param(const SmpEngine *e, int id);
@@ -101,6 +102,12 @@ SMP_API int smp_engine_wait_renders(SmpEngine *e, int timeout_ms); /* tests: 0 o
    "on key vel frame", "off key frame", "bend fraction frame". Starts from silence (no voices, no bend) and waits for the streamer after each block and
    at note-ons that start past the head, so offline renders are exact. 0 ok. */
 SMP_API int smp_engine_render_test(SmpEngine *e, const char *events, long frames, int block, const char *wav_out);
+/* the instrument as text (script.c): "# Samplosis 0.1.0", an optional `sample "path" key=<16 hex>` line, then
+   `name value-in-words` for every parameter in id order. Paths are quoted with no escapes (backslashes are literal).
+   Main thread only. */
+SMP_API int smp_script_write(const SmpEngine *e, char *out, int cap);   /* returns the length needed, like snprintf */
+SMP_API int smp_script_apply(SmpEngine *e, const char *text, char *err, int cap); /* 0 ok; on error nothing changes and
+                                    err says "line N: ..." */
 #ifdef __cplusplus
 }
 #endif

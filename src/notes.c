@@ -216,7 +216,7 @@ SMP_API int smp_value_parse(int param, const char *s, double *v) {
     }
     if (k < 0) {
       char *e; double d = strtod(buf, &e);
-      if (e == buf || *e) return 0;
+      if (e == buf || *e || !isfinite(d)) return 0;
       k = (int)floor(d + 0.5);
     }
     r = k;
@@ -224,7 +224,7 @@ SMP_API int smp_value_parse(int param, const char *s, double *v) {
     if (kind == SMP_K_PAN && ieq(buf, "center")) { *v = 0; return 1; }
     if (kind == SMP_K_DB && ieq(buf, "off") && pi->lo <= -60) { *v = pi->lo; return 1; }
     char *e; double d = strtod(buf, &e);
-    if (e == buf) return 0;
+    if (e == buf || !isfinite(d)) return 0;
     while (isspace((unsigned char)*e)) e++;
     r = d;
     switch (kind) {
