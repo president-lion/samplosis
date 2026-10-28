@@ -399,3 +399,35 @@ def test_gui_keep_length_combo(P, tmp_path):
     assert "out: value 25 0" in out
     assert [x[2] for x in f[2:]] == ["Note", "Free", "Free"]
     assert "param 11: 2" in out
+
+
+def test_gui_closed_during_dialog(P, tmp_path, settings_file):
+    # A file or folder dialog runs its own message loop: REAPER can close the window, or free the whole plugin,
+    # before it returns. Nothing may load or touch freed memory then. (Dialogs stubbed: no real dialog opens.)
+    d = tmp_path / "files"
+    d.mkdir()
+    for n in ("b.wav", "c.wav"):
+        P.sample(n)
+        os.replace(tmp_path / n, d / n)
+    text = P.script(d / "b.wav")
+    c = d / "c.wav"
+    out = gui(P, tmp_path, text, ["dialog pick %s" % c, "focus Browse", "key enter", "read Sample", "say"])
+    assert got(out, "read")[0][1].startswith("c.wav, ")
+    assert got(out, "focus")[-1][:2] == ["Button", "Browse"]
+    out = gui(P, tmp_path, text, ["dialog closegui %s" % c, "focus Browse", "key enter", "pump 600", "state", "alive"])
+    assert ('state: sample "%s"' % (d / "b.wav")) in out          # not loaded: the window had gone
+    assert "alive: plugin\n" in out and "closed" in out
+    out = gui(P, tmp_path, text, ["dialog destroy %s" % c, "focus Browse", "key enter", "pump 600", "alive"])
+    assert "alive: plugin destroyed" in out and "closed" in out
+    # the Settings page's Browse folder
+    new = tmp_path / "cache2"
+    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "dialog closegui %s" % new, "focus Browse folder",
+                                  "key enter", "pump 600", "alive"])
+    assert "alive: plugin\n" in out and "closed" in out
+    with open(settings_file) as fh:
+        assert str(new) not in fh.read()
+    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "dialog pick %s" % new, "focus Browse folder",
+                                  "key enter", "say"])
+    assert got(out, "focus")[-1][:2] == ["Button", "Browse folder"]
+    with open(settings_file) as fh:
+        assert ("cache_dir %s\n" % new) in fh.read()

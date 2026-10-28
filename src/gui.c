@@ -36,6 +36,7 @@ enum { ID_VAL = 100,                          /* + parameter id */
        ID_SAMPLE = 200, ID_BROWSE, ID_PREV, ID_NEXT, ID_STATUS, ID_SETTINGS,
        ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK };
 enum { T_REFRESH = 1, T_OPEN = 2 };
+#define WM_DROPPED (WM_APP + 1)
 
 typedef struct { IDropTarget t; struct Gui *g; int ok; } Drop;
 
@@ -53,6 +54,8 @@ typedef struct Gui {
   HWND last; bool had_focus, closing;
   char note[800]; ULONGLONG note_until;       /* a message the status box shows for a while (a file that won't load) */
   Drop drop; int ole_init, drop_registered;
+  wchar_t dropped[1100];                      /* the file a drop noted, loaded on WM_DROPPED */
+  int modal;                                  /* file or folder dialogs open (see modal_begin) */
 } Gui;
 
 /* ---- tests (tests\host.c): beeps are counted, and can be kept quiet ---- */
@@ -226,28 +229,66 @@ static void clear_cache(Gui *g) {             /* every file not in use */
   set_text(g->used, g->used_text);
 }
 
-static void browse_folder(Gui *g) {
-  IFileOpenDialog *d = NULL; IShellItem *it = NULL; PWSTR path = NULL; DWORD opt = 0;
-  if (FAILED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void **)&d))) {
-    beep(); return;
-  }
+/* ---- modal dialogs ----
+   A file or folder dialog runs its own message loop and only disables REAPER's FX window, so while it is open the
+   user can close the FX chain, delete the track or close the project: the window is destroyed (smp_gui_close) and
+   the plugin may be freed. So g->modal counts dialogs open; smp_gui_close then destroys the window and cuts g off
+   from the plugin (g->P = NULL) but leaves freeing g to modal_end, and the code after a dialog does nothing more. */
+static void gui_free(Gui *g);
+static void modal_begin(Gui *g) { g->modal++; }
+static bool modal_end(Gui *g) {          /* true when the window closed meanwhile: g is gone, touch nothing */
+  g->modal--;
+  if (!g->closing) return false;
+  if (!g->modal) gui_free(g);
+  return true;
+}
+
+/* tests: a dialog that returns a path at once, after closing the window (2) or destroying the plugin (3) first */
+static int test_dialog; static char test_path[1100]; static const clap_plugin_t *test_plugin;
+SMP_API void smp_test_gui_dialog(const clap_plugin_t *p, int action, const char *path) {
+  test_plugin = p; test_dialog = action;
+  snprintf(test_path, sizeof test_path, "%s", path ? path : "");
+}
+static int stub_dialog(Gui *g, wchar_t *out, int cap) {
+  int a = test_dialog;
+  test_dialog = 0;
+  if (a == 2 && g->P) smp_gui_close(g->P);
+  else if (a == 3 && test_plugin) test_plugin->destroy(test_plugin);
+  return MultiByteToWideChar(CP_UTF8, 0, test_path, -1, out, cap) > 0;
+}
+
+static int pick_folder(HWND owner, wchar_t *out, int cap) {
+  IFileOpenDialog *d = NULL; IShellItem *it = NULL; PWSTR path = NULL; DWORD opt = 0; int ok = 0;
+  if (FAILED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void **)&d))) return -1;
   d->lpVtbl->GetOptions(d, &opt);
   d->lpVtbl->SetOptions(d, opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
   d->lpVtbl->SetTitle(d, L"Cache folder");
-  if (SUCCEEDED(d->lpVtbl->Show(d, GetAncestor(g->win, GA_ROOT))) && SUCCEEDED(d->lpVtbl->GetResult(d, &it)) &&
+  if (SUCCEEDED(d->lpVtbl->Show(d, owner)) && SUCCEEDED(d->lpVtbl->GetResult(d, &it)) &&
       SUCCEEDED(it->lpVtbl->GetDisplayName(it, SIGDN_FILESYSPATH, &path))) {
-    SmpSettings s; char u[1024];
-    smp_settings_get(&s);
-    if (WideCharToMultiByte(CP_UTF8, 0, path, -1, u, sizeof u, NULL, NULL) > 0) {
-      strcpy(s.cache_dir, u);
-      save_settings(g, &s);
-      show_settings(g);
-    } else beep();
+    ok = wcslen(path) < (size_t)cap;
+    if (ok) wcscpy(out, path);
     CoTaskMemFree(path);
   }
   if (it) it->lpVtbl->Release(it);
   d->lpVtbl->Release(d);
-  if (g->win) focus(g->dirbrowse);
+  return ok;
+}
+
+static void browse_folder(Gui *g) {
+  wchar_t w[1100]; int ok;
+  modal_begin(g);
+  ok = test_dialog ? stub_dialog(g, w, 1100) : pick_folder(GetAncestor(g->win, GA_ROOT), w, 1100);
+  if (modal_end(g)) return;
+  if (ok > 0) {
+    SmpSettings s; char u[1024];
+    smp_settings_get(&s);
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) > 0) {
+      strcpy(s.cache_dir, u);
+      save_settings(g, &s);
+      show_settings(g);
+    } else beep();
+  } else if (ok < 0) beep();
+  focus(g->dirbrowse);
 }
 
 /* ---- the sample ---- */
@@ -336,7 +377,7 @@ static void step_file(Gui *g, int dir) {
 }
 
 static void browse_file(Gui *g) {
-  wchar_t file[1100] = L"", dirw[1100] = L""; char path[1100]; OPENFILENAMEW of;
+  wchar_t file[1100] = L"", dirw[1100] = L""; char path[1100]; OPENFILENAMEW of; int ok;
   if (smp_plug_sample_path(g->P, path, sizeof path) && MultiByteToWideChar(CP_UTF8, 0, path, -1, dirw, 1100)) {
     wchar_t *s = wcsrchr(dirw, L'\\'), *s2 = wcsrchr(dirw, L'/');
     if (s2 > s) s = s2;
@@ -350,8 +391,11 @@ static void browse_file(Gui *g) {
   of.lpstrInitialDir = dirw[0] ? dirw : NULL;
   of.lpstrTitle = L"Load a sample";
   of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
-  if (GetOpenFileNameW(&of)) load_path_w(g, file);
-  if (g->win) focus(g->browse);
+  modal_begin(g);
+  ok = test_dialog ? stub_dialog(g, file, 1100) : GetOpenFileNameW(&of);
+  if (modal_end(g)) return;               /* the window (and maybe the plugin) went while the dialog was open */
+  if (ok) load_path_w(g, file);
+  focus(g->browse);
 }
 
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
@@ -375,12 +419,20 @@ static void drop_hdrop(Gui *g, HDROP h) {
   wchar_t w[1100];
   if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w);
 }
+/* The drop only notes the file and posts WM_DROPPED: the load (maybe a decode) runs after the drag has returned, so
+   Explorer or the Media Explorer isn't kept waiting, and nothing loads inside OLE's drag loop. */
 static HRESULT STDMETHODCALLTYPE d_drop(IDropTarget *t, IDataObject *o, DWORD k, POINTL p, DWORD *eff) {
   Drop *d = (Drop *)t; STGMEDIUM m; (void)k; (void)p;
   *eff = DROPEFFECT_NONE;
-  if (o && d->g && SUCCEEDED(o->lpVtbl->GetData(o, &hdrop_fmt, &m))) {
+  if (o && d->g && !d->g->closing && SUCCEEDED(o->lpVtbl->GetData(o, &hdrop_fmt, &m))) {
     HDROP h = (HDROP)GlobalLock(m.hGlobal);
-    if (h) { drop_hdrop(d->g, h); GlobalUnlock(m.hGlobal); *eff = DROPEFFECT_COPY; }
+    if (h) {
+      if (DragQueryFileW(h, 0, d->g->dropped, 1100) && d->g->win) {
+        PostMessageW(d->g->win, WM_DROPPED, 0, 0);
+        *eff = DROPEFFECT_COPY;
+      }
+      GlobalUnlock(m.hGlobal);
+    }
     ReleaseStgMedium(&m);
   }
   d->ok = 0;
@@ -492,6 +544,7 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SETFOCUS: keep_focus(g); return 0;
     case WM_DROPFILES: drop_hdrop(g, (HDROP)w); DragFinish((HDROP)w); return 0;
+    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f); } return 0;
   }
   return DefWindowProcW(h, m, w, l);
 }
@@ -607,14 +660,20 @@ void smp_gui_close(Plug *P) {
   Gui *g = P ? P->gui : NULL;
   if (!g) return;
   g->closing = true;
+  P->gui = NULL; g->P = NULL;                 /* the plugin may be freed right after this */
   if (g->win) {
     KillTimer(g->win, T_REFRESH); KillTimer(g->win, T_OPEN);
     if (g->drop_registered) RevokeDragDrop(g->win);
     DestroyWindow(g->win); g->win = NULL;
   }
+  if (!g->modal) gui_free(g);                 /* else the dialog's caller frees it when the dialog returns */
+}
+
+static void gui_free(Gui *g) {
   if (g->ole_init) OleUninitialize();
   if (g->font) DeleteObject(g->font);
-  free(g); P->gui = NULL;
+  memset(g, 0xDD, sizeof *g);                 /* a use after free shows up as garbage, not as old values */
+  free(g);
 }
 
 /* ---- the CLAP gui extension: embedded in the host's window, Win32 only ---- */

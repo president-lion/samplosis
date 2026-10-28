@@ -22,7 +22,10 @@
      flush                   the host's params flush: "out: gesture_begin|value|gesture_end <id> [value]"
      state                   the saved state's sample line: "state: sample ..."
      counts                  "counts: beeps N | request_flush N | mark_dirty N"
-     pump <ms>               let the window's timers run */
+     pump <ms>               let the window's timers run
+     dialog <pick|closegui|destroy> <path>   the next file or folder dialog returns path at once; closegui first
+                             destroys the window, destroy the whole plugin (as REAPER can while a dialog is open)
+     alive                   "alive: plugin" or "alive: plugin destroyed" (the host got this far) */
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
@@ -300,7 +303,9 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
 /* ---- the window ---- */
 typedef long (*BeepsFn)(void);
 typedef void (*QuietFn)(int);
+typedef void (*DialogFn)(const clap_plugin_t *, int, const char *);
 static HWND plugwin;
+static int plugin_gone;                     /* a "dialog destroy" freed the plugin: don't touch it again */
 
 static int cls_is(HWND h, const wchar_t *c) { wchar_t n[64] = L""; GetClassNameW(h, n, 64); return !_wcsicmp(n, c); }
 static void utf8(const wchar_t *w, char *out, int cap) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL); }
@@ -366,6 +371,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
   const clap_plugin_params_t *pa = p->get_extension(p, CLAP_EXT_PARAMS);
   BeepsFn beeps = (BeepsFn)GetProcAddress(dll, "smp_test_gui_beeps");
   QuietFn quiet = (QuietFn)GetProcAddress(dll, "smp_test_gui_quiet");
+  DialogFn dialog = (DialogFn)GetProcAddress(dll, "smp_test_gui_dialog");
   char *text = read_file(actions, NULL), *line, *next;
   HWND top, holder; clap_window_t cw; uint32_t w = 0, h = 0;
   if (!gui || !beeps || !quiet) { printf("error: no gui extension or test hooks\n"); return 1; }
@@ -449,12 +455,21 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       free(m.buf);
     } else if (!strcmp(a, "counts")) printf("counts: beeps %ld | request_flush %d | mark_dirty %d\n", beeps(), flushes, dirties);
     else if (!strcmp(a, "pump")) pump(atoi(arg));
+    else if (!strcmp(a, "dialog")) {     /* the next file or folder dialog: returns the path at once */
+      char mode[32] = ""; int used = 0, act;
+      sscanf(arg, "%31s %n", mode, &used);
+      act = !strcmp(mode, "pick") ? 1 : !strcmp(mode, "closegui") ? 2 : !strcmp(mode, "destroy") ? 3 : 0;
+      if (!act || !dialog) { printf("error: dialog %s\n", mode); return 1; }
+      dialog(p, act, arg + used);
+      if (act == 3) plugin_gone = 1;
+    } else if (!strcmp(a, "alive")) printf("alive: %s\n", plugin_gone ? "plugin destroyed" : "plugin");
     else { printf("error: unknown action %s\n", a); return 1; }
   }
   free(text);
-  gui->destroy(p);
+  if (!plugin_gone) gui->destroy(p);
   DestroyWindow(top);
-  main_thread(p);
+  if (!plugin_gone) main_thread(p);
+  pump(300);                                 /* timers or posted messages of a window gone must not run into freed memory */
   printf("closed\n");
   return 0;
 }
@@ -476,7 +491,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "gui") && argc >= 5) r = cmd_gui(p, argv[3], argv[4]);
   else if (!strcmp(argv[2], "play") && argc >= 6) r = cmd_play(p, argv[3], argv[4], argv[5], argc > 6 ? atof(argv[6]) : 48000.0);
   else { printf("unknown command %s\n", argv[2]); r = 2; }
-  p->destroy(p);
+  if (!plugin_gone) p->destroy(p);
   entry->deinit();
   free(evs);
   return r;
