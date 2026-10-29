@@ -1,8 +1,9 @@
 /* A stand-in CLAP host for the tests: loads samplosis.clap through clap_entry and prints plain lines.
      host.exe samplosis.clap state <state.txt>                     load the state, save it, print it
      host.exe samplosis.clap play <state.txt> <events> <out.wav> [rate [all]]
-   Events, one per line: "on key vel frame", "off key frame" (CLAP notes), "midi status d1 d2 frame",
-   "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames"; between blocks: "reset frame",
+   Events, one per line: "on key vel frame", "off key frame [channel]" (CLAP notes on channel 0, or a note-off on
+   that channel, -1 any), "midi status d1 d2 frame", "bend fraction frame" (a MIDI pitch bend), "param id value
+   frame", "length frames"; between blocks: "reset frame",
    "cycle frame" (deactivate and activate again), "state <file> frame" (load another state), "render offline|realtime
    frame" (the render extension's set); and "rawon key vel frame time" (a note-on in the block holding frame, with its
    time field set to time as is: a sloppy host). "sleep ms frame" lets wall time pass between
@@ -218,7 +219,7 @@ static int parse_events(const char *text, long *length) {
   const char *p = text; int cap = 0;
   *length = -1;
   while (p && *p) {
-    char w[16]; int used = 0, ok = 0; Ev e; const char *nl = strchr(p, '\n');
+    char w[16]; int used = 0, ok = 0, nch = 0; Ev e; const char *nl = strchr(p, '\n');
     memset(&e, 0, sizeof e);
     if (sscanf(p, "%15s%n", w, &used) == 1) {
       int a, b, c; double x;
@@ -236,6 +237,7 @@ static int parse_events(const char *text, long *length) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; ok = 1;
       } else if (!strcmp(w, "off") && sscanf(p + used, "%d %ld", &a, &e.frame) == 2) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_OFF; e.note.key = (int16_t)a; ok = 1;
+        if (sscanf(p + used, "%d %ld %d", &a, &e.frame, &c) == 3) nch = c;               /* a channel: set below */
       } else if (!strcmp(w, "midi") && sscanf(p + used, "%d %d %d %ld", &a, &b, &c, &e.frame) == 4) {
         e.kind = 1; e.midi.header.type = CLAP_EVENT_MIDI;
         e.midi.data[0] = (uint8_t)a; e.midi.data[1] = (uint8_t)b; e.midi.data[2] = (uint8_t)c; ok = 1;
@@ -255,6 +257,7 @@ static int parse_events(const char *text, long *length) {
         h->size = e.kind == 0 ? sizeof e.note : e.kind == 1 ? sizeof e.midi : sizeof e.pv;
         h->space_id = CLAP_CORE_EVENT_SPACE_ID;
         if (e.kind == 0) { e.note.note_id = -1; e.note.port_index = 0; e.note.channel = 0; }
+        if (e.kind == 0) e.note.channel = (int16_t)nch;
       }
       if (nev == cap) { cap = cap ? cap * 2 : 64; evs = realloc(evs, sizeof *evs * (size_t)cap); if (!evs) return 0; }
       evs[nev++] = e;

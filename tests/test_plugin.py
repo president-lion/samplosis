@@ -352,6 +352,20 @@ def test_plugin_old_state_is_sampler(P):
     assert saved_state(out).startswith("plays sampler\n" + text)
 
 
+def test_plugin_note_off_any_channel(P):
+    # a CLAP note-off with channel -1 (any) and a real key ends that key on every channel
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\n' % f
+    frames = 48000
+    notes = "midi 145 57 100 0\nmidi 147 57 100 0\nmidi 144 60 100 0"     # channels 2 and 4 key 57, channel 1 key 60
+    ref = P.sf_reference(text, "midi 193 33 0\n" + notes + "\nmidi 129 57 0 12000\nmidi 131 57 0 12000", frames)
+    y, d, r = P.play(text, "midi 193 33 0 0\n" + notes + "\noff 57 12000 -1", frames)
+    assert db(ref) > -40
+    assert db(y - ref) - db(ref) < -90
+    held = P.sf_reference(text, "midi 193 33 0\n" + notes, frames)   # without the note-off the two notes ring on
+    assert db(held - ref) - db(ref) > -40
+
+
 def test_plugin_outputs(P):
     f = P.font()
     text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\nsf_output 2 3\n' % f

@@ -421,7 +421,8 @@ static void synth_event(Plug *P, const clap_event_header_t *h, int at) {
     case CLAP_EVENT_NOTE_OFF: case CLAP_EVENT_NOTE_CHOKE: {
       const clap_event_note_t *n = (const clap_event_note_t *)h;
       int one = n->channel >= 0 && n->channel < 16, lo = one ? n->channel : 0, hi = one ? n->channel : 15, ch;
-      if (n->key >= 0 && n->key < 128) { midi3(s, 0x80 | lo, n->key, 0, at); break; }
+      /* a key on one channel, or with channel -1 (a wildcard) on every channel */
+      if (n->key >= 0 && n->key < 128) { for (ch = lo; ch <= hi; ch++) midi3(s, 0x80 | ch, n->key, 0, at); break; }
       /* every key: All Notes Off, or All Sound Off for a choke */
       for (ch = lo; ch <= hi; ch++) midi3(s, 0xB0 | ch, h->type == CLAP_EVENT_NOTE_CHOKE ? 120 : 123, 0, at);
       break;
