@@ -28,9 +28,11 @@ def T(lib, tmp_path):
     class H:
         synths = []
 
-        def synth(self, regions, samples=None, seed=None):
-            """a player on a one-preset font (bank 0 program 0) with these region lines"""
-            desc = (samples or sample_lines()) + "\npreset 0 0 Test\n" + "\n".join("region " + r for r in regions) + "\n"
+        def synth(self, regions, samples=None, seed=None, more=""):
+            """a player on a font whose first preset (bank 0 program 0) has these region lines; more: further
+            description lines (other presets)"""
+            desc = ((samples or sample_lines()) + "\npreset 0 0 Test\n" + "\n".join("region " + r for r in regions) +
+                    "\n" + more)
             path = tmp_path / ("t%d.smptest" % next(_count))
             err = ctypes.create_string_buffer(512)
             f = lib.smp_sf_test_font(desc.encode(), str(path).encode(), err, 512)
@@ -215,6 +217,18 @@ def test_release_trigger(T):
     assert abs(20 * math.log10(a_ped / a_short) - (-6.0 * 0.4)) < 0.3, (a_short, a_ped)
 
 
+def test_release_trigger_legato_pedalling(T):
+    """pedal down, key down and up, the same key again, pedal up while it is down: no release then; the key's
+    own note-off plays exactly one"""
+    s = T.synth(["sample=0 g38=-12000", "sample=1 trigger=release g38=-12000"], samples=sample_lines(2.0))
+    ev = [cc(64, 127, 0.0), on(60, 100, 0.0), off(60, 0.1), on(60, 100, 0.2), cc(64, 0, 0.4), off(60, 0.7)]
+    x = T.render(s, "\n".join(ev), 1.0)
+    assert tone(win(x, 0.12, 0.68), 500) < 0.002          # no release before the key's own note-off
+    att = tone(win(x, 0.25, 0.38), 300)
+    rel = tone(win(x, 0.73, 0.9), 500)
+    assert abs(20 * math.log10(rel / att)) < 0.3, (att, rel)   # one release (two would be 6 dB louder)
+
+
 def test_trigger_first_legato(T):
     s = T.synth(["sample=0 trigger=first", "sample=1 trigger=legato"])
     ev = [on(60, 100, 0.0),                                # alone: first
@@ -268,6 +282,46 @@ def test_crossfade_velocity(T):
                 assert abs((a * a + b * b) / (full * full) - 1) < 0.02, (vel, a, b)
 
 
+def test_crossfade_silent_starts_no_voice(lib, T):
+    s = T.synth(["sample=0 xfout_lovel=40 xfout_hivel=100", "sample=1 xfin_lovel=40 xfin_hivel=100"])
+    for vel, voices in ((110, 1), (30, 1), (70, 2)):
+        T.render(s, on(60, vel, 0.0), 0.1)                     # held past the render's end
+        assert lib.smp_synth_voices(s, None) == voices, vel
+
+
+def test_round_robin_many_sets(T):
+    """more than 4096 sets in a preset: each keeps its own counter (none shared)"""
+    fill = ["sample=3 lokey=%d hikey=%d lovel=%d hivel=%d seq_len=2 seq_pos=1" % (k, k, v, v)
+            for k in range(32) for v in range(128)]           # 4096 more sets, ids 1..4096
+    s = T.synth(["sample=0 lokey=60 hikey=60 seq_len=2 seq_pos=1",            # set 0
+                 "sample=1 lokey=60 hikey=60 seq_len=2 seq_pos=2"] + fill)
+    ev = [on(31, 127, 0.0), off(31, 0.05),                     # set 4096 (which 4096 counters would fold onto 0)
+          on(60, 100, 0.2), off(60, 0.3), on(60, 100, 0.4), off(60, 0.5)]
+    x = T.render(s, "\n".join(ev), 0.6)
+    assert heard(x, 0.22, 0.29) == [0] and heard(x, 0.42, 0.49) == [1]
+
+
+def test_keyswitch_rules(T):
+    """sw_down keys outside a keyswitch range sound as notes; sw_previous counts keyswitch presses; a preset change
+    forgets the last keyswitch, so the new preset's sw_default applies"""
+    sw = "sw_lokey=24 sw_hikey=25 lokey=48 hikey=96"
+    s = T.synth(["sample=0 sw_down=30 lokey=48 hikey=96",
+                 "sample=1 lokey=30 hikey=30 g58=30",            # a real note on the sw_down key
+                 "sample=2 sw_previous=24 lokey=48 hikey=96 " + "sw_last=24 sw_default=24 sw_lokey=24 sw_hikey=25",
+                 "sample=3 sw_last=25 sw_default=24 " + sw],
+                more="preset 0 1 Other\nregion sample=2 sw_last=24 sw_default=24 %s\nregion sample=3 sw_last=25 sw_default=24 %s\n" % (sw, sw))
+    ev = [on(30, 100, 0.0), off(30, 0.1),                      # key 30 sounds (sample 1 at its root)
+          on(24, 100, 0.2), off(24, 0.25),                     # a keyswitch press...
+          on(60, 100, 0.3), off(60, 0.4),                      # ...is the previous note: sample 2
+          on(25, 100, 0.5), off(25, 0.55),                     # switch to 25 (sample 3) in this preset
+          "midi 192 1 %d" % fr(0.6),                           # the other preset: its default, 24 (sample 2)
+          on(60, 100, 0.7), off(60, 0.8)]
+    x = T.render(s, "\n".join(ev), 0.9)
+    assert heard(x, 0.02, 0.09) == [1]
+    assert heard(x, 0.32, 0.39) == [2]
+    assert heard(x, 0.72, 0.79) == [2]
+
+
 def test_group_off_by(T):
     # key 46 is an open hi-hat (group 1, turned off by group 2); key 42 a closed one (group 2)
     for mode, gone in (("fast", True), ("normal", False)):
@@ -287,7 +341,9 @@ def test_group_off_by(T):
 
 
 def test_amp_veltrack(T):
-    for vt, want_db in ((0, 0.0), (100, 40 * math.log10(30 / 127)), (50, 20 * math.log10(1 - 0.5 * (1 - (30 / 127) ** 2)))):
+    c30 = (30 / 127) ** 2
+    for vt, want_db in ((0, 0.0), (100, 40 * math.log10(30 / 127)), (50, 20 * math.log10(1 - 0.5 * (1 - c30))),
+                        (-50, 20 * math.log10((1 - 0.5 * c30) / 0.5))):    # negative: 1 + t c, loudest when soft
         s = T.synth(["sample=0 amp_veltrack=%g" % vt])
         amp = []
         for vel in (127, 30):

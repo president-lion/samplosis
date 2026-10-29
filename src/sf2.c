@@ -780,6 +780,8 @@ static void set_key(const SmpSfRegion *r, SetKey *k) {
 
 static void mask_set(uint8_t *m, int key) { if (key >= 0 && key < 128) m[key >> 3] |= (uint8_t)(1 << (key & 7)); }
 
+static int finish_index(SmpFont *f);
+
 /* Round-robin set ids, per preset, by a hash table of the set keys (open addressing, sized at twice the preset's
    regions with seq), so a preset of many thousands of regions takes no quadratic search. And the keyswitch masks. */
 int sf_finish_regions(SmpFont *f) {
@@ -815,29 +817,76 @@ int sf_finish_regions(SmpFont *f) {
           if (!memcmp(&keys[j], &k, sizeof k)) { r->rr_set = f->regions[slot[j]].rr_set; break; }
         }
       }
+      if (next > f->max_sets) f->max_sets = next;
     }
     free(slot); free(keys);
   }
-  if (any_sw) {
-    f->swmask = calloc((size_t)f->nphdr, 32);
+  if (any_sw) {                                  /* the keyswitch keys: sw_lokey..sw_hikey ranges and sw_last keys */
+    f->swmask = calloc((size_t)f->nphdr, 16);
     if (!f->swmask) return 0;
     for (p = 0; p < f->nphdr; p++) {
-      uint8_t *last = f->swmask + 32 * (size_t)p, *quiet = last + 16;
+      uint8_t *m = f->swmask + 16 * (size_t)p;
       for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) {
         const SmpSfCond *c = &f->regions[i].cond; int k;
-        if (c->sw_lokey >= 0) for (k = c->sw_lokey; k <= c->sw_hikey && k < 128; k++) mask_set(last, k);
-        mask_set(last, c->sw_last);
-        mask_set(quiet, c->sw_down); mask_set(quiet, c->sw_up);
+        if (c->sw_lokey >= 0) for (k = c->sw_lokey; k <= c->sw_hikey && k < 128; k++) mask_set(m, k);
+        mask_set(m, c->sw_last);
       }
-      for (i = 0; i < 16; i++) quiet[i] |= last[i];
     }
+  }
+  return finish_index(f);
+}
+
+/* The per-preset flags and the key index. A preset whose regions' key spans add up to more than 8 entries a region
+   (plus 1024) gets no index (SF_PF_NOINDEX: a player scans all its regions), so the index stays within about 32
+   bytes a region on top of 516 bytes of offsets a preset. */
+static int finish_index(SmpFont *f) {
+  int p, i, k; size_t total = 0, at = 0;
+  f->pflags = calloc((size_t)f->nphdr, 1);
+  if (!f->pflags) return 0;
+  for (p = 0; p < f->nphdr; p++) {
+    size_t span = 0; int n = f->rstart[p + 1] - f->rstart[p];
+    for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) {
+      const SmpSfRegion *r = &f->regions[i];
+      if (r->cond.trigger == SMP_TRIG_RELEASE) f->pflags[p] |= SF_PF_RELEASE;
+      if (r->gen[57] || r->cond.group) f->pflags[p] |= SF_PF_ROOM;   /* exclusiveClass, or an SFZ group */
+      if (r->hikey >= r->lokey) span += (size_t)(r->hikey > 127 ? 127 : r->hikey) - r->lokey + 1;
+    }
+    if (span > 8 * (size_t)n + 1024) f->pflags[p] |= SF_PF_NOINDEX;
+    else total += span;
+  }
+  f->kix_off = malloc((size_t)f->nphdr * 129 * sizeof *f->kix_off);
+  f->kix = malloc((total ? total : 1) * sizeof *f->kix);
+  if (!f->kix_off || !f->kix) return 0;
+  for (p = 0; p < f->nphdr; p++) {
+    uint32_t *off = f->kix_off + 129 * (size_t)p;
+    if (f->pflags[p] & SF_PF_NOINDEX) { for (k = 0; k <= 128; k++) off[k] = (uint32_t)at; continue; }
+    for (k = 0; k < 128; k++) {                  /* key by key, so each list keeps the regions' order */
+      off[k] = (uint32_t)at;
+      for (i = f->rstart[p]; i < f->rstart[p + 1]; i++)
+        if (k >= f->regions[i].lokey && k <= f->regions[i].hikey) f->kix[at++] = (uint32_t)(i - f->rstart[p]);
+    }
+    off[128] = (uint32_t)at;
   }
   return 1;
 }
 
 const uint8_t *sf_preset_swmask(const SmpFont *f, int preset) {
   if (!f || !f->swmask || preset < 0 || preset >= f->nphdr) return NULL;
-  return f->swmask + 32 * (size_t)f->order[preset];
+  return f->swmask + 16 * (size_t)f->order[preset];
+}
+
+int sf_key_regions(const SmpFont *f, int preset, int key, const SmpSfRegion **regs, const uint32_t **idx, int *flags) {
+  int p, n = smp_sf_regions(f, preset, regs);
+  *idx = NULL; *flags = 0;
+  if (n <= 0 || !f->pflags) return n;
+  p = f->order[preset];
+  *flags = f->pflags[p];
+  if (!(f->pflags[p] & SF_PF_NOINDEX) && f->kix_off && key >= 0 && key < 128) {
+    const uint32_t *off = f->kix_off + 129 * (size_t)p;
+    *idx = f->kix + off[key];
+    return (int)(off[key + 1] - off[key]);
+  }
+  return n;
 }
 
 /* parses a font's headers into a new SmpFont (sffont.c's smp_sf_open shares it through the registry) */
@@ -998,7 +1047,7 @@ void sf_free(SmpFont *f) {
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */
-  free(f->swmask);
+  free(f->swmask); free(f->pflags); free(f->kix_off); free(f->kix);
   free(f);
 }
 

@@ -136,8 +136,8 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   int i, k;
   m.c = c; m.key = v->pkey; m.vel = v->vel; m.poly_key = v->key;   /* the key source is keynum when set, as in FluidSynth */
   memset(v->mod, 0, sizeof v->mod);
-  add_mods(v->mod, r->imod, r->nimod, &m, r->cond.amp_veltrack == r->cond.amp_veltrack);   /* not NaN: replaced */
-  add_mods(v->mod, r->pmod, r->npmod, &m, r->cond.amp_veltrack == r->cond.amp_veltrack);
+  add_mods(v->mod, r->imod, r->nimod, &m, !isnan(r->cond.amp_veltrack));   /* set: the default is replaced */
+  add_mods(v->mod, r->pmod, r->npmod, &m, !isnan(r->cond.amp_veltrack));
   for (i = 0; i < SMP_SF_NGEN; i++) g[i] = r->gen[i] + v->mod[i];
 
   /* Pitch, in cents from the sample as recorded. The channel's pitch bend is not added here: it comes through
@@ -374,20 +374,32 @@ static double xf_out(int x, int lo, int hi) { return x <= lo ? 1 : x >= hi ? 0 :
    - crossfades by key (when set) and velocity: the product of the fade-in and fade-out positions, through
      xf_curve: gain is the position itself, power its square root (so two regions fading across each other keep
      the same power: at the midpoint each is at sqrt(0.5), -3 dB);
-   - amp_veltrack (when not NaN; then the default velocity modulator is skipped): sfizz's reading of the SFZ
-     default velocity curve, amplitude (vel / 127)^2, tracked by t = amp_veltrack / 100: gain = 1 - t (1 - c)
-     for t >= 0, and |t| (1 - c) for t < 0, so 100 % is (vel / 127)^2 (-40 log10(127 / vel) dB), 0 % is flat;
+   - amp_veltrack (when not NaN; then the default velocity modulator is skipped): the SFZ default velocity curve,
+     amplitude c = (vel / 127)^2, tracked by t = amp_veltrack / 100. For t >= 0, gain = 1 - t (1 - c) (sfizz's
+     reading): 100 % is c itself (40 log10(vel / 127) dB), 0 % is flat. For t < 0 the curve turns over, loudest
+     at the softest velocity: gain = 1 + t c, so -100 % is 1 - c (silent at 127) and the gain is continuous through
+     0 % (sfzformat.com only says negative values invert the tracking; this is the form that meets 0 % smoothly);
    - a release trigger's rt_decay: -rt_decay dB per second the note was held. */
-static double cond_gain(const SmpSfRegion *r, int key, int vel, double held) {
+static double xf_pos(const SmpSfRegion *r, int key, int vel) {
   const SmpSfCond *c = &r->cond;
-  double x = 1, g;
+  double x = 1;
   if (c->xfin_lokey >= 0 && c->xfin_hikey >= 0) x *= xf_in(key, c->xfin_lokey, c->xfin_hikey);
   if (c->xfout_lokey >= 0 && c->xfout_hikey >= 0) x *= xf_out(key, c->xfout_lokey, c->xfout_hikey);
-  x *= xf_in(vel, c->xfin_lovel, c->xfin_hivel) * xf_out(vel, c->xfout_lovel, c->xfout_hivel);
+  return x * xf_in(vel, c->xfin_lovel, c->xfin_hivel) * xf_out(vel, c->xfout_lovel, c->xfout_hivel);
+}
+
+int smp_sfv_xf_silent(const SmpSfRegion *r, int key, int vel) {
+  if (r->gen[G_VELOCITY] >= 0) vel = r->gen[G_VELOCITY] & 127;   /* as smp_sfv_start reads the velocity */
+  return xf_pos(r, key & 127, vel & 127) <= 0;
+}
+
+static double cond_gain(const SmpSfRegion *r, int key, int vel, double held) {
+  const SmpSfCond *c = &r->cond;
+  double x = xf_pos(r, key, vel), g;
   g = c->xf_curve == 1 ? x : sqrt(x);
-  if (c->amp_veltrack == c->amp_veltrack) {
+  if (!isnan(c->amp_veltrack)) {
     double t = clampd(c->amp_veltrack / 100.0, -1, 1), cv = (vel / 127.0) * (vel / 127.0);
-    g *= t >= 0 ? 1 - t * (1 - cv) : -t * (1 - cv);
+    g *= t >= 0 ? 1 - t * (1 - cv) : 1 + t * cv;
   }
   if (held >= 0 && c->rt_decay > 0) g *= pow(10.0, -c->rt_decay * held / 20.0);
   return g;

@@ -79,10 +79,17 @@ struct SmpFont {
      regions [rstart[i], rstart[i+1]). The modulator lists live in the same block, shared where identical. */
   SmpSfRegion *regions; int nregions;
   int *rstart;
-  /* per phdr preset, 32 bytes (sf_finish_regions): a 128-bit mask of the keys that set the last keyswitch (the
-     regions' sw_lokey..sw_hikey ranges and sw_last keys), then one of the keys that never sound (those and the
-     sw_down and sw_up keys). NULL when no region of the font has a keyswitch. */
+  /* Built by sf_finish_regions at open, immutable after:
+     - swmask: per phdr preset, 16 bytes: a 128-bit mask of the keyswitch keys (the regions' sw_lokey..sw_hikey
+       ranges and sw_last keys), which set the last keyswitch and never sound. NULL when no region has one.
+     - pflags: per phdr preset, SF_PF_*.
+     - kix_off, kix: per phdr preset (unless SF_PF_NOINDEX), the regions that cover each key: for key k, kix entries
+       [kix_off[129 p + k], kix_off[129 p + k + 1]) are region indices within the preset, in region order.
+     - max_sets: the most round-robin sets any one preset has (a player sizes its counters by it). */
   uint8_t *swmask;
+  uint8_t *pflags;
+  uint32_t *kix_off, *kix;
+  int max_sets;
 
   /* ---- sharing and loading (sffont.c) ---- */
   wchar_t *wpath;                       /* the full path, compared case-insensitively by the registry */
@@ -158,7 +165,14 @@ int sf_build_order(SmpFont *f);
    except seq_pos (trigger, seq_len, the random range, keyswitches and CC ranges); ids count from 0 per preset. */
 void sf_cond_defaults(SmpSfCond *c);
 int sf_finish_regions(SmpFont *f);
-const uint8_t *sf_preset_swmask(const SmpFont *f, int preset);   /* public preset index: its 32 bytes, or NULL */
+const uint8_t *sf_preset_swmask(const SmpFont *f, int preset);   /* public preset index: its 16 bytes, or NULL */
+/* per-preset flags: it has release-trigger regions; it has regions that can stop others (an exclusive class or a
+   group); it has no key index (too many key-wide regions for a modest one) */
+enum { SF_PF_RELEASE = 1, SF_PF_ROOM = 2, SF_PF_NOINDEX = 4 };
+/* public preset index: the preset's regions (*regs) and how many of them a note of key may concern. With *idx
+   set, those are regs[idx[0..n-1]], in region order; with *idx NULL, every region of the preset (n of them).
+   *flags gets the preset's SF_PF_*. Any thread. */
+int sf_key_regions(const SmpFont *f, int preset, int key, const SmpSfRegion **regs, const uint32_t **idx, int *flags);
 /* sffont.c: registers a font a builder made (f->path, size and mtime set; wpath is taken over), as smp_sf_open does
    after parsing: finishes its regions, sets up its loader arrays and adds it to the registry with one reference.
    On failure the font is freed and NULL returned with a reason. */

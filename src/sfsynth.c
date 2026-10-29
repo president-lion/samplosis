@@ -27,30 +27,36 @@
      who does it. The plugin's reset on stop, seek and loop is smp_synth_flush, which keeps them.
 
    Region conditions (SmpSfCond, as sfzformat.com defines the SFZ opcodes; the SF2 family leaves them at "always",
-   so its regions play exactly as before). Their state is per channel, in fixed arrays inside the synth:
+   so its regions play exactly as before). Their state is per channel, in fixed arrays inside the synth, and in
+   the round-robin counters, which smp_synth_load sizes on the main thread (see Seq below). An event looks only at
+   the regions that cover its key (the font's key index, sf_key_regions), and skips the passes its preset can't
+   need (no release regions, nothing that stops other voices).
    - trigger: attack regions start at note-on only, release regions at note-off only. first plays only when no
      other key of the channel is down, legato only when one is (keys physically down, keyswitches aside).
    - Round robin (seq_len, seq_pos): a counter per round-robin set (sf_finish_regions: one preset's regions with
      the same key and velocity ranges and the same conditions but seq_pos), per channel. It advances once per
      note-on (or note-off, for release triggers) on which the set is otherwise eligible, and the region plays when
-     (the count before that note % seq_len) + 1 == seq_pos, so the first note plays seq_pos 1. Set ids are folded
-     into SEQ_SETS counters (a preset with more sets shares counters between some). The counters start again on a
-     GM, GS or XG reset, a font change and a channel's preset change; they are kept across a host's stop, seek and
-     loop (smp_synth_flush), so a song that stops and plays on keeps cycling.
+     (the count before that note % seq_len) + 1 == seq_pos, so the first note plays seq_pos 1. There is a counter
+     for every set of the font's largest preset. The counters start again on a GM, GS or XG reset, a font change
+     and a channel's preset change; they are kept across a host's stop, seek and loop (smp_synth_flush), so a song
+     that stops and plays on keeps cycling.
    - Random (lorand, hirand): one draw in [0, 1) per note-on (xorshift32, seeded the same in every new synth;
      smp_synth_test_seed), shared by every region of the note; a region plays when lorand <= draw < hirand (or
      hirand is 1 or more). A note's release triggers use its note-on's draw.
    - Keyswitches: keys in a region's sw_lokey..sw_hikey, and its sw_last key, set the channel's last keyswitch;
-     those keys and the sw_down and sw_up keys never sound (sf_preset_swmask). sw_last plays when the last
-     keyswitch (or, before any, the region's sw_default) is that key; sw_down and sw_up test whether that key is
-     down now; sw_previous whether the channel's previous sounding note-on was that key.
+     those keys never sound (sf_preset_swmask). sw_last plays when the last keyswitch (or, before any since the
+     channel's preset was chosen, the region's sw_default) is that key; sw_down and sw_up test whether that key is
+     down now (any key, a keyswitch or not); sw_previous whether the channel's previous note-on (keyswitches too)
+     was that key.
    - CC ranges (locc): each controller within its range at the moment the region would start.
    - Release triggers: at note-off, or when the sustain pedal (or the sostenuto that caught the key) lets go, with
      the note-on's velocity and the time from the note-on to then (rt_decay; sfvoice.c). They count against the
      voice limit and can be stolen, but no note-off or pedal releases them: they play their sample through its own
      envelope (one whose sample loops is released at once, so it can't drone on). A key struck again while its
-     release waits for the pedal keeps one waiting release, timed from the last strike. All Notes Off and Sound Off
-     drop waiting releases without playing them.
+     release waits for the pedal drops that waiting release: the new note's own note-off (or the pedal after it)
+     plays one, timed from the new strike, and a pedal let go while the key is down plays none. All Notes Off and
+     Sound Off drop waiting releases without playing them.
+   - Crossfades that put a note at 0 start no voice at all.
    - group and off_by: a region starting in group G stops this channel's voices whose region has off_by G (off_by
      0 is none), with that voice's off_mode: fast is the 5 ms kill, normal its release. SF2's exclusive classes
      work as before beside them.
@@ -82,7 +88,6 @@
 #define COLLECT_WAIT_MS 200       /* collect waits this long for the streamer, else tries again on its next call */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
 #define G_MODES 54                /* sampleModes */
-#define SEQ_SETS 4096             /* round-robin counters per channel (a power of two) */
 
 enum { V_FREE, V_PENDING, V_LIVE };
 enum { EV_MSG, EV_SYSRESET, EV_RESET };
@@ -116,9 +121,14 @@ typedef struct {
   uint8_t rel_wait[128];          /* a note-off came while a pedal held the key: its release triggers wait */
   uint8_t ksost[128];             /* the sostenuto pedal caught the key */
   int sw_last;                    /* the last keyswitch pressed, -1 none */
-  int prev_key;                   /* the previous sounding note-on's key, -1 none */
-  uint32_t seq[SEQ_SETS];         /* round-robin counters, by the channel preset's set ids */
+  int prev_key;                   /* the previous note-on's key, -1 none */
 } Chan;
+
+/* Round-robin counters: n per channel (by the channel preset's set ids) and n event stamps, in one allocation.
+   smp_synth_load makes a bigger one, on the main thread, when a font needs more sets than the last held, and
+   publishes it before the font; the audio thread takes it with the font. Old ones stay until smp_synth_free, so
+   the audio thread never uses a freed one (sizes only grow, so there are few). */
+typedef struct { int n; uint32_t *stamp; uint32_t seq[1]; } Seq;
 
 typedef struct {
   int st;                         /* V_FREE, V_PENDING (waiting for its sample) or V_LIVE */
@@ -167,7 +177,9 @@ struct SmpSynth {
   uint64_t now;                   /* the frame of the event being handled, on that clock */
   uint32_t rng;                   /* xorshift32 state for the random draw */
   uint32_t serial;                /* note events so far: a round-robin set advances once per event */
-  uint32_t seq_stamp[SEQ_SETS];   /* the event that last advanced each set id's counter (on its channel) */
+  Seq *sq;                        /* the counters the audio thread uses (taken with the font), or NULL */
+  Seq *volatile sq_want;          /* the newest counters smp_synth_load made (main thread writes) */
+  Seq **sq_all; int nsq;          /* every Seq made, freed by smp_synth_free (main thread) */
   Ev ev[MAXEV]; int nev;
   float *rev, *cho;               /* effect sends of output 1, one block at a time */
   SmpSfFx *fx;                    /* the reverb and chorus: their output joins output 1 before sf_volume */
@@ -256,8 +268,15 @@ static void chan_defaults(Chan *h) {        /* power on, and the GM, GS and XG r
 /* the condition state that names keys and set ids of the font: on a font change, all of it */
 static void chan_cond_reset(Chan *h) {
   memset(h->held, 0, sizeof h->held); memset(h->rel_wait, 0, sizeof h->rel_wait); memset(h->ksost, 0, sizeof h->ksost);
-  memset(h->seq, 0, sizeof h->seq);
   h->sw_last = h->prev_key = -1;
+}
+
+/* the round-robin counters of channel c (c < 0: every channel) start again */
+static void seq_clear(SmpSynth *s, int c) {
+  Seq *q = s->sq;
+  if (!q || q->n <= 0) return;
+  if (c < 0) memset(q->seq, 0, sizeof(uint32_t) * (size_t)q->n * NCH);
+  else memset(q->seq + (size_t)c * q->n, 0, sizeof(uint32_t) * (size_t)q->n);
 }
 
 static int listens(const SmpSynth *s, int c) {
@@ -307,7 +326,8 @@ static void resolve(SmpSynth *s, int c) {
   if (p >= 0) smp_sf_use(s->cur, p, 1);
   if (h->preset >= 0) smp_sf_use(s->cur, h->preset, -1);
   h->preset = p;
-  memset(h->seq, 0, sizeof h->seq);           /* set ids are the preset's own */
+  seq_clear(s, c);                            /* set ids are the preset's own */
+  h->sw_last = -1;                            /* so the new preset's sw_default applies */
   InterlockedExchange(&s->chan_preset[c], p);
 }
 
@@ -450,9 +470,11 @@ static int cond_ok(SmpSynth *s, int c, const SmpSfRegion *r, int key, int vel, i
   for (i = 0; i < d->locc_n && i < 4; i++)
     if (h->c.cc[d->locc[i].cc & 127] < d->locc[i].lo || h->c.cc[d->locc[i].cc & 127] > d->locc[i].hi) return 0;
   if (d->seq_len && r->rr_set >= 0) {
-    int set = r->rr_set & (SEQ_SETS - 1);
-    if (s->seq_stamp[set] != s->serial) { s->seq_stamp[set] = s->serial; h->seq[set]++; }
-    if ((int)((h->seq[set] - 1) % d->seq_len) + 1 != d->seq_pos) return 0;
+    Seq *q = s->sq; uint32_t *cnt;
+    if (!q || r->rr_set >= q->n) return d->seq_pos == 1;   /* never (the counters fit the font): the first step */
+    cnt = &q->seq[(size_t)c * q->n + r->rr_set];
+    if (q->stamp[r->rr_set] != s->serial) { q->stamp[r->rr_set] = s->serial; (*cnt)++; }
+    if ((int)((*cnt - 1) % d->seq_len) + 1 != d->seq_pos) return 0;
   }
   return 1;
 }
@@ -471,30 +493,38 @@ static void make_room(SmpSynth *s, int c, const SmpSfRegion *r) {
   }
 }
 
-/* the regions of one note event: first what they stop (exclusive classes, off_by), then they start. A region
-   that could stop nothing (no class, no group) isn't checked twice. */
-static void start_event(SmpSynth *s, int c, int key, int vel, int release, float rnd, int others, double held) {
-  Chan *h = &s->ch[c]; const SmpSfRegion *regs = NULL; int n, k;
+/* the regions of one note event (only those covering its key, by the font's key index; regs, idx and n from
+   sf_key_regions): first what they stop (exclusive classes, off_by), then they start. That first pass runs only
+   for a preset with regions that can stop others, and then only on those regions. A region whose crossfades put
+   the note at 0 starts no voice. */
+static void start_event(SmpSynth *s, int c, int key, int vel, int release, float rnd, int others, double held,
+                        const SmpSfRegion *regs, const uint32_t *idx, int n, int flags) {
+  int k;
   s->serial++;
-  n = smp_sf_regions(s->cur, h->preset, &regs);
-  for (k = 0; k < n; k++) {
-    const SmpSfRegion *r = &regs[k];
-    if (!r->gen[G_EXCL] && !r->cond.group) continue;
-    if (cond_ok(s, c, r, key, vel, release, rnd, others)) make_room(s, c, r);
-  }
+  if (flags & SF_PF_ROOM)
+    for (k = 0; k < n; k++) {
+      const SmpSfRegion *r = &regs[idx ? idx[k] : k];
+      if (!r->gen[G_EXCL] && !r->cond.group) continue;
+      if (cond_ok(s, c, r, key, vel, release, rnd, others)) make_room(s, c, r);
+    }
   s->protect = s->age + 1;                      /* the voices this event starts are never its victims */
-  for (k = 0; k < n; k++)
-    if (cond_ok(s, c, &regs[k], key, vel, release, rnd, others)) start_region(s, c, key, vel, &regs[k], held);
+  for (k = 0; k < n; k++) {
+    const SmpSfRegion *r = &regs[idx ? idx[k] : k];
+    if (cond_ok(s, c, r, key, vel, release, rnd, others) && !smp_sfv_xf_silent(r, key, vel))
+      start_region(s, c, key, vel, r, held);
+  }
   s->protect = 0;
 }
 
-/* a key's release triggers, now: at the note-on's velocity and draw, held for the time since the note-on */
+/* a key's release triggers, now: at the note-on's velocity and draw, held for the time since the note-on. Nothing
+   to do (not even a look at the regions) for a preset with no release regions. */
 static void release_triggers(SmpSynth *s, int c, int key) {
-  Chan *h = &s->ch[c]; const uint8_t *mask;
+  Chan *h = &s->ch[c]; const SmpSfRegion *regs; const uint32_t *idx; int n, flags;
   if (!listens(s, c) || !s->cur || h->preset < 0) return;
-  mask = sf_preset_swmask(s->cur, h->preset);
-  if (mask && bit(mask + 16, key)) return;     /* a keyswitch key */
-  start_event(s, c, key, h->on_vel[key], 1, h->rnd[key], 0, (double)(s->now - h->on_at[key]) / s->rate);
+  n = sf_key_regions(s->cur, h->preset, key, &regs, &idx, &flags);
+  if (!(flags & SF_PF_RELEASE) || bit(sf_preset_swmask(s->cur, h->preset), key)) return;   /* or a keyswitch key */
+  start_event(s, c, key, h->on_vel[key], 1, h->rnd[key], 0, (double)(s->now - h->on_at[key]) / s->rate,
+              regs, idx, n, flags);
 }
 
 static void note_off(SmpSynth *s, int c, int key) {
@@ -514,14 +544,17 @@ static void note_off(SmpSynth *s, int c, int key) {
 }
 
 static void note_on(SmpSynth *s, int c, int key, int vel) {
-  Chan *h = &s->ch[c]; const uint8_t *mask, *quiet; int i, others = 0;
+  Chan *h = &s->ch[c]; const uint8_t *mask; const SmpSfRegion *regs; const uint32_t *idx; int i, n, flags, others = 0;
   if (!listens(s, c) || !s->cur || h->preset < 0) return;
   mask = sf_preset_swmask(s->cur, h->preset);
-  quiet = mask ? mask + 16 : NULL;
-  if (bit(mask, key)) h->sw_last = key;          /* a keyswitch */
-  for (i = 0; i < 128; i++) if (i != key && h->held[i] && !bit(quiet, i)) others++;
+  for (i = 0; i < 128; i++) if (i != key && h->held[i] && !bit(mask, i)) others++;
   h->held[key] = 1; h->ksost[key] = 0;
-  if (bit(quiet, key)) return;                  /* keyswitch keys never sound */
+  h->rel_wait[key] = 0;                         /* struck again: a release still waiting for the pedal is dropped */
+  if (bit(mask, key)) {                         /* a keyswitch: it never sounds */
+    h->sw_last = key;
+    h->prev_key = key;
+    return;
+  }
   h->on_vel[key] = (uint8_t)vel; h->on_at[key] = s->now; h->rnd[key] = draw(s);
   /* the same key again: the earlier voices of that key are released (as FluidSynth does); release triggers
      play on */
@@ -531,7 +564,8 @@ static void note_on(SmpSynth *s, int c, int key, int vel) {
     t->keydown = 0; t->sost = 0;
     release_voice(s, i);
   }
-  start_event(s, c, key, vel, 0, h->rnd[key], others, -1);
+  n = sf_key_regions(s->cur, h->preset, key, &regs, &idx, &flags);
+  start_event(s, c, key, vel, 0, h->rnd[key], others, -1, regs, idx, n, flags);
   h->prev_key = key;
 }
 
@@ -547,7 +581,7 @@ static void let_go(SmpSynth *s, int c) {
     release_voice(s, i);
   }
   for (i = 0; i < 128; i++) {
-    if (!h->rel_wait[i] || sustained(h) || (h->ksost[i] && sostenuto(h))) continue;
+    if (!h->rel_wait[i] || h->held[i] || sustained(h) || (h->ksost[i] && sostenuto(h))) continue;
     h->rel_wait[i] = 0;
     release_triggers(s, c, i);
   }
@@ -637,6 +671,7 @@ static void system_reset(SmpSynth *s) {           /* GM, GS and XG reset: every 
   int c;
   sound_off(s, -1);
   for (c = 0; c < NCH; c++) chan_defaults(&s->ch[c]);
+  seq_clear(s, -1);
   resolve_all(s);
 }
 
@@ -709,6 +744,8 @@ SMP_API void smp_synth_free(SmpSynth *s) {
   used_drop_main(s);
   if (s->font) smp_sf_close(s->font);
   for (i = 0; i < s->nret; i++) smp_sf_close(s->ret[i].f);
+  for (i = 0; i < s->nsq; i++) free(s->sq_all[i]);
+  free(s->sq_all);
   free(s->ret); free(s->v); free(s->sl); free(s->rev); free(s->cho);
   smp_sffx_free(s->fx);
   free(s);
@@ -754,6 +791,16 @@ SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap) {
     Retired *n = (Retired *)realloc(s->ret, sizeof *n * (size_t)c);
     if (!n) { smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "out of memory"); return 0; }
     s->ret = n; s->cret = c;
+  }
+  if (f->max_sets > 0 && (!s->sq_want || s->sq_want->n < f->max_sets)) {   /* round-robin counters that fit */
+    size_t nn = (size_t)f->max_sets;
+    Seq **all = (Seq **)realloc(s->sq_all, sizeof *all * (size_t)(s->nsq + 1)), *q;
+    if (all) s->sq_all = all;
+    q = all ? (Seq *)calloc(1, sizeof(Seq) + sizeof(uint32_t) * (nn * NCH + nn)) : NULL;
+    if (!q) { smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "out of memory"); return 0; }
+    q->n = f->max_sets; q->stamp = q->seq + nn * NCH;
+    s->sq_all[s->nsq++] = q;
+    InterlockedExchangePointer((PVOID volatile *)&s->sq_want, q);   /* before the font, which it must fit */
   }
   if (s->used_font != f) used_drop_main(s);    /* the old font's sf_used presets mean nothing now */
   old = s->font;
@@ -902,6 +949,8 @@ static void block_start(SmpSynth *s, int n) {
   SmpFont *w = s->want; int i, changed = cfg_take(s);
   if (w != s->cur) {
     drop_font(s);
+    s->sq = s->sq_want;                         /* published before the font, so it fits w */
+    seq_clear(s, -1);
     InterlockedExchangePointer((PVOID volatile *)&s->cur, w);
     changed = 1;
   }
@@ -1359,6 +1408,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   s->dormant = 0;
   for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; }
   for (i = 0; i < NCH; i++) chan_defaults(&s->ch[i]);
+  seq_clear(s, -1);
   resolve_all(s);
   s->nev = 0; s->peak = 0;
   smp_sffx_clear(s->fx);

@@ -83,6 +83,8 @@ typedef struct SmpSfVoice {
 struct SfStream;
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
                   double rate, double transpose, struct SfStream *st, int slot, double held);
+int smp_sfv_xf_silent(const SmpSfRegion *r, int key, int vel);   /* 1 when the region's crossfades put this note at
+                                                          0 (the player doesn't start such a voice) */
 int smp_sfv_needs_ring_now(const SmpSfVoice *v);       /* the voice's first frames are past its head (an offline
                                                           render waits for the streamer then) */
 int smp_sfv_ring_low(SmpSfVoice *v);                   /* the voice streams and its ring holds less than half a ring

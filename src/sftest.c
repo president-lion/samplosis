@@ -10,7 +10,7 @@
 #include "sf2.h"
 
 #define PI 3.14159265358979323846
-#define MAX_ITEMS 4096
+#define MAX_ITEMS 20000
 
 typedef struct { char name[21]; uint32_t frames, rate, ls, le; int root; double hz, amp; } TSample;
 
