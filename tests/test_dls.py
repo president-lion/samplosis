@@ -288,3 +288,77 @@ def test_windows_gm_dls_opens(lib):
         assert any(abs(got - 261.63 * h) < 261.63 * h * 0.02 for h in (1, 2, 3)), got
     finally:
         lib.smp_sf_close(f)
+
+
+@pytest.mark.parametrize("kind", ["3gri", "3gnl", "einf", "ewav", "3gix", "ptbl8"])
+def test_gigastudio_refused(lib, tmp_path, kind):
+    """GigaStudio files are RIFF "DLS " too; until they have a loader they are refused plainly, not played as
+    noise (their compressed waves' fmt says PCM)."""
+    waves = [dict(WAVES[0])]
+    extra, ptbl8 = [], False
+    if kind in ("3gri", "3gnl"):
+        extra = [D._list(kind.encode(), [D._chunk(b"3gnm", b"Default Group\0")])]
+    elif kind == "einf":
+        extra = [D._chunk(b"einf", b"\0" * 16)]
+    elif kind in ("ewav", "3gix"):
+        waves[0]["extra"] = [D._chunk(kind.encode(), b"\0" * 4)]
+    else:
+        ptbl8 = True
+    path = str(tmp_path / "t.gig")
+    D.write_dls(path, INSTRUMENTS[2:3], waves, extra=extra, ptbl8=ptbl8)
+    f, err = sf_open(lib, path)
+    assert not f
+    assert err == "t.gig is a GigaStudio file; this can't read it yet", err
+
+
+def one(lib, tmp_path, name, art, level):
+    path = str(tmp_path / name)
+    D.write_dls(path, [dict(name="One", program=0, art=art, level=level, regions=[dict(keys=(0, 127), wave=0)])],
+                WAVES[:1])
+    f, err = sf_open(lib, path)
+    assert f, err
+    return f
+
+
+def test_dls1_pitch_wheel_at_rest(lib, tmp_path):
+    """DLS1's pitch wheel x RPN0 to pitch has no bipolar bit: it is made bipolar and replaces SF2's default, so at
+    rest the note is at its root (a unipolar one would sit about 100 cents sharp)."""
+    f = one(lib, tmp_path, "pw.dls", [(0x6, 0x100, D.DST_PITCH, 0, 12700)], 1)
+    try:
+        (r,) = regions(lib, f, 0)
+        pw = [m for m in mods(r.imod, r.nimod) if m[0] & 0xFF == 0x0E]
+        assert pw == [(0x020E, 59, 12700, 0x0010, 0)]
+        x = note(lib, f, 0, 69)[0][2400:]
+        assert abs(peak_hz(x, 48000) - 441.0) < 441.0 * 0.002
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_dls1_cc10_pan_centred(lib, tmp_path):
+    """DLS1's CC10 to pan is made bipolar: at CC10 64 the note is in the centre."""
+    f = one(lib, tmp_path, "pan.dls", [(0x8A, 0, D.DST_PAN, 0, 500)], 1)
+    try:
+        (r,) = regions(lib, f, 0)
+        assert [m for m in mods(r.imod, r.nimod) if m[1] == 17] == [(0x028A, 17, 500, 0, 0)]
+        left, right = note(lib, f, 0, 69)
+        assert abs(20 * np.log10(rms(left[2400:]) / rms(right[2400:]))) < 0.1
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_dls2_linear_velocity_gain_replaces_default(lib, tmp_path):
+    """A linear velocity to gain connection replaces SF2's concave default instead of adding to it: at velocity 127
+    the level is the same as with no connection, and at 64 it is the linear curve's 960 x 63/128 cB down alone."""
+    f = one(lib, tmp_path, "vel.dls", [(D.SRC_VELOCITY, 0, D.DST_GAIN, 0, -960)], 2)
+    g = one(lib, tmp_path, "plain.dls", [], 2)
+    try:
+        (r,) = regions(lib, f, 0)
+        assert [m for m in mods(r.imod, r.nimod) if m[1] == 48 and m[0] & 0xFF == 2] == [(0x0102, 48, 960, 0, 0)]
+        top = rms(note(lib, f, 0, 69, vel=127)[0][2400:20000])
+        plain = rms(note(lib, g, 0, 69, vel=127)[0][2400:20000])
+        assert abs(20 * np.log10(top / plain)) < 0.05
+        mid = rms(note(lib, f, 0, 69, vel=64)[0][2400:20000])
+        assert abs(20 * np.log10(mid / top) + 96 * 63 / 128) < 1.0
+    finally:
+        lib.smp_sf_close(f)
+        lib.smp_sf_close(g)

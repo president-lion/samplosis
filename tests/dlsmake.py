@@ -1,11 +1,14 @@
 """Writes small DLS (Downloadable Sounds level 1 and 2) files for the tests.
 
-write_dls(path, instruments, waves, ptbl=True)
+write_dls(path, instruments, waves, ptbl=True, extra=(), ptbl8=False)
+  extra: raw chunks added at the top level (a GigaStudio LIST 3gri, say); ptbl8 writes 8-byte pool table entries
+  (offset, file number), as GigaStudio's extension files have them.
 
 waves: a list of dicts
   data: a numpy array: int16 (16-bit PCM), uint8 (8-bit PCM, unsigned as DLS has it), or int16 with
         adpcm=True (written as Microsoft ADPCM through soundfile);
-  rate; optional name; optional wsmp (see below) written inside the wave.
+  rate; optional name; optional wsmp (see below) written inside the wave; optional extra: raw chunks added to
+  the wave (a GigaStudio ewav or 3gix chunk, say).
 instruments: a list of dicts
   name, program, bank (ulBank's MSB, default 0), lsb (default 0), drum (bit 31, default False),
   optional art (connection blocks for the instrument), level (1 writes lart/art1, 2 writes lar2/art2; default 1),
@@ -123,6 +126,7 @@ def _wave(w):
         body = [_chunk(b"fmt ", struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)), _chunk(b"data", d.tobytes())]
     if w.get("wsmp"):
         body.append(_wsmp(w["wsmp"]))
+    body += list(w.get("extra", ()))
     return _list(b"wave", body + _info(w.get("name")))
 
 
@@ -156,7 +160,7 @@ def _instrument(ins):
     return _list(b"ins ", chunks + _info(ins.get("name")))
 
 
-def write_dls(path, instruments, waves, ptbl=True):
+def write_dls(path, instruments, waves, ptbl=True, extra=(), ptbl8=False):
     pool = [_wave(w) for w in waves]
     offsets, pos = [], 0
     for w in pool:
@@ -166,7 +170,9 @@ def write_dls(path, instruments, waves, ptbl=True):
             _chunk(b"vers", struct.pack("<II", 0x00010000, 0)),
             _list(b"lins", [_instrument(i) for i in instruments])]
     if ptbl:
-        body.append(_chunk(b"ptbl", struct.pack("<II", 8, len(offsets)) + b"".join(struct.pack("<I", o) for o in offsets)))
+        entry = (lambda o: struct.pack("<II", o, 0)) if ptbl8 else (lambda o: struct.pack("<I", o))
+        body.append(_chunk(b"ptbl", struct.pack("<II", 8, len(offsets)) + b"".join(entry(o) for o in offsets)))
+    body += list(extra)
     body.append(_list(b"wvpl", pool))
     body += _info("Test bank")
     data = b"DLS " + b"".join(body)

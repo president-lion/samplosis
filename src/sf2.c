@@ -784,7 +784,14 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
     f->is_dls = 1;
     f->path = _strdup(path);
     if (!f->path) snprintf(why, sizeof why, "out of memory");
-    else if (sf_parse_dls(f, s.h, s.size, path, why, sizeof why)) { ok = 1; goto done; }
+    else {
+      int r = sf_parse_dls(f, s.h, s.size, path, why, sizeof why);
+      if (r > 0) { ok = 1; goto done; }
+      if (r < 0) {
+        if (err && cap > 0) snprintf(err, cap, "%s is a GigaStudio file; this can't read it yet", base_name(path));
+        goto done;
+      }
+    }
     if (err && cap > 0) snprintf(err, cap, "%s isn't a DLS file this can read (%s)", base_name(path), why);
     goto done;
   }

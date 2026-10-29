@@ -60,7 +60,8 @@ struct SmpFont {
   int version;                          /* ifil's major number (1 for SoundFont 1; 0 when the file has no ifil) */
   int is_pack;                          /* SF2Pack: smpl is one compressed stream of the whole 16-bit sample data */
   int is_dls;                           /* DLS (sfdls.c): only phdr, shdr, src, paths, order and regions are filled */
-  int dls_ignored;                      /* DLS: connection blocks that map to nothing here (see sfdls.c) */
+  int dls_ignored;                      /* DLS: connection blocks (or their output curves) that map to nothing here */
+  int dls_boosts;                       /* DLS: regions with a gain above 0 (see sfdls.c) */
   SfPhdr *phdr; int nphdr;
   SfBag *pbag; int npbag;
   SmpSfMod *pmod; int npmod;
@@ -150,7 +151,8 @@ int sf_build_order(SmpFont *f);
 #define SF_MAX_ZONE_MODS 1024
 #define SF_MAX_REGIONS (1 << 17)
 #define SF_MAX_POOL_MODS (1 << 20)
-/* sfdls.c: fills f from a DLS file (RIFF form "DLS ", already checked) open on h; 0 with why when it can't */
+/* sfdls.c: fills f from a DLS file (RIFF form "DLS ", already checked) open on h: 1 when it did, 0 with why when it
+   can't, -1 for a GigaStudio file (which this can't read yet) */
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);

@@ -36,8 +36,13 @@
      the generator is -gain / 0.4, and a modulator's amount -gain.
    - pitch: cents, into coarseTune (100s) and fineTune (the rest), or "initial pitch" (59) for modulators, which is
      what SF2's default pitch wheel modulator uses, so DLS's pitch wheel connection replaces it.
+   - gain above 0 (a boost, from wsmp or a gain connection) makes initialAttenuation negative. The voice limits
+     0.4 x initialAttenuation plus the modulators' attenuation to 0..1440 cB, so a boost only takes back what
+     velocity and the volume controllers would take off; it can't go past full scale. Such regions are counted in
+     f->dls_boosts.
    - sustain: DLS gives a level in 0.1 % (1000 is full). The volume envelope's is 1000 - level centibels, as
-     SpessaSynth reads it (0 % is 100 dB down, past this player's 96 dB floor, so silent); the modulation
+     SpessaSynth and Wine's dmsynth both read it (0 % is 100 dB down, past this player's 96 dB floor, so silent);
+     the modulation
      envelope's is SF2's 0.1 % below full, 1000 - level, exactly.
    - pan and the effect sends: 0.1 % both, as SF2.
    - filter Q: centibels, as SF2.
@@ -53,13 +58,23 @@
    - DLS1 articulations give a curve only in the output transform: it is used as the source's curve when the
      source's own is linear. Velocity, CC7 and CC11 to gain always fall as the source rises (SF2's negative
      direction): DLS1 has no invert bit and its concave curve already falls, and some DLS2 files leave the bit out.
+     DLS1 also has no bipolar bit, so the pitch wheel and CC10 to pan are made bipolar there (centred at rest).
+   - SF2's default modulators: a default whose source, amount source and destination match one of the
+     articulation's modulators is dropped before they merge, whatever its curve and flags, so a DLS connection
+     replaces its default instead of adding to it (a linear velocity curve, a unipolar pitch wheel).
+   - art1 and art2 chunks may sit in one articulation; each chunk's blocks follow their own level's rules.
 
    Connection blocks that map to nothing here are ignored and counted in f->dls_ignored:
    - destinations: none, the reserved EG ones (0x208, 0x30C), the EG1 shutdown time (0x20D), key number (5), the
      channel outputs (left, right, centre, LFE, rear: 0x10 to 0x15), and any unknown one;
    - sources: the volume envelope (4), the fine and coarse tune RPNs (0x101, 0x102) and any unknown one; an LFO or
      envelope used as a control; an LFO or envelope as the source to anything but pitch, gain or cutoff;
-   - transforms past switch (4 to 15) on a source or control.
+   - transforms past switch (4 to 15) on a source or control;
+   - an output transform SF2 has no place for: any on an art2 block (SF2 has no output curve), and an art1 one on a
+     block whose source already has a curve or on a block with no source. The block itself still counts.
+   GigaStudio files are RIFF "DLS " too, with compressed waves whose fmt still says PCM. Until they have a loader of
+   their own they are refused (sf_parse_dls returns -1): a top-level LIST 3gri or 3gnl, an einf chunk, a wave with
+   an ewav or 3gix chunk, or ptbl entries of 8 bytes (Giga's extension files).
    Also not used: rgnh's fusOptions (self non-exclusive is what SF2 does anyway) and usLayer, wsmp's fulOptions,
    wlnk's phase groups, and a wave's second and later loops.
 
@@ -258,6 +273,7 @@ typedef struct {
   Wsmp wsmp;
   char name[21];
   int first;                 /* its first sample (one per channel), or -1 */
+  int giga;                  /* it has GigaStudio's ewav or 3gix chunk */
 } Wave;
 
 /* a wave's fmt, from the first 40 bytes or fewer: PCM (with its encoding) or decoded; 0 when it can't be used */
@@ -306,6 +322,7 @@ static void read_wave(Rd *s, Wave *w, uint64_t off, uint32_t n) {
     if (!rd(s, pos, c, 8)) return;
     m = u32(c + 4);
     if (m > end - pos - 8) break;                        /* runs past the wave: the rest is lost */
+    if (!memcmp(c, "ewav", 4) || !memcmp(c, "3gix", 4)) w->giga = 1;
     if (!memcmp(c, "cdl ", 4)) {
       uint8_t b[256]; uint32_t k = m < sizeof b ? m : sizeof b;
       live = rd(s, pos + 8, b, k) ? cdl_true(b, k) : 1;
@@ -434,7 +451,6 @@ typedef struct {
   int v[SMP_SF_NGEN]; uint64_t set;
   int key_scale[4], has_key_scale[4];   /* key to vol hold, vol decay, mod hold, mod decay: the DLS scale */
   double tune, atten;
-  int dls1;
   SmpSfMod mods[SF_MAX_ZONE_MODS]; int nmods;
 } ArtOut;
 
@@ -450,7 +466,6 @@ static void art_apply(ArtOut *o, const Art *a, int *ignored) {
   for (s = 0; s < a->nseg; s++) {
     const ArtSeg *g = &a->seg[s];
     uint32_t b;
-    if (g->dls1) o->dls1 = 1;
     for (b = 0; b < g->n; b++) {
       const uint8_t *c = g->p + 12 * (size_t)b;
       unsigned src = u16(c), ctl = u16(c + 2), dst = u16(c + 4), trn = u16(c + 6);
@@ -462,17 +477,28 @@ static void art_apply(ArtOut *o, const Art *a, int *ignored) {
         if (gen < 0) { (*ignored)++; continue; }
         if (kind == 2) o->atten += -v / 0.4;
         else if (kind == 3) o->tune += v;
-        else { o->v[gen] = kind == 1 ? 1000 - v : v; o->set |= 1ull << gen; }
+        else {
+          o->v[gen] = kind == 1 ? 1000 - v : v; o->set |= 1ull << gen;
+          /* DLS1's one LFO is SF2's vibrato LFO too (its pitch depth goes there) */
+          if (g->dls1 && gen == G_FREQ_MODLFO) o->v[G_FREQ_VIBLFO] = v;
+          if (g->dls1 && gen == G_DELAY_MODLFO) o->v[G_DELAY_VIBLFO] = v;
+        }
+        if (out_trn) (*ignored)++;                                 /* a curve on a value means nothing */
         continue;
       }
       if (src == S_KEY && ctl == S_NONE) {
         int k = dst == D_EG1_HOLD ? 0 : dst == D_EG1_DECAY ? 1 : dst == D_EG2_HOLD ? 2 : dst == D_EG2_DECAY ? 3 : -1;
-        if (dst == D_PITCH) { o->v[G_SCALE] = (int)floor(v / 128.0 + 0.5); o->set |= 1ull << G_SCALE; continue; }
-        if (k >= 0) { o->key_scale[k] = v; o->has_key_scale[k] = 1; continue; }
+        if (dst == D_PITCH || k >= 0) {
+          if (out_trn) (*ignored)++;                               /* the curve is dropped */
+          if (dst == D_PITCH) { o->v[G_SCALE] = (int)floor(v / 128.0 + 0.5); o->set |= 1ull << G_SCALE; }
+          else { o->key_scale[k] = v; o->has_key_scale[k] = 1; }
+          continue;
+        }
       }
       if (src == S_LFO || src == S_VIBRATO || src == S_EG2) {      /* a depth, maybe under a controller */
         gen = depth_gen(src, dst, g->dls1);
         if (gen < 0) { (*ignored)++; continue; }
+        if (out_trn) (*ignored)++;                                 /* the curve is dropped */
         if (ctl == S_NONE) { o->v[gen] = v; o->set |= 1ull << gen; continue; }
         {
           int w = sf_source(ctl, ctl_trn, ctl_bip, ctl_inv);
@@ -486,9 +512,12 @@ static void art_apply(ArtOut *o, const Art *a, int *ignored) {
       }
       {                                                            /* a modulator from a MIDI source */
         int ws, wc, amount = v;
-        if (g->dls1 && src_trn == 0 && out_trn <= 3) src_trn = out_trn;   /* DLS1's curve is the output's */
+        if (g->dls1 && src_trn == 0 && out_trn <= 3) { src_trn = out_trn; out_trn = 0; }   /* DLS1: the output's */
+        if (out_trn) (*ignored)++;                                 /* SF2 has no output curve: dropped */
         gen = dest_gen(dst, &kind);
         if ((dst == D_GAIN) && (src == S_VELOCITY || src == S_CC7 || src == S_CC11)) src_inv = 1;
+        /* DLS1 has no bipolar bit: the pitch wheel, and CC10 to pan, are centred at rest */
+        if (g->dls1 && (src == S_PITCHWHEEL || (src == 0x8A && dst == D_PAN))) src_bip = 1;
         ws = sf_source(src, src_trn, src_bip, src_inv);
         wc = sf_source(ctl, ctl_trn, ctl_bip, ctl_inv);
         if (gen < 0 || ws < 0 || wc < 0 || o->nmods >= SF_MAX_ZONE_MODS) { (*ignored)++; continue; }
@@ -510,11 +539,6 @@ static void art_apply(ArtOut *o, const Art *a, int *ignored) {
       o->v[kg[i]] = (int)floor(-o->key_scale[i] / 128.0 + 0.5);
       if (o->set >> bg[i] & 1) o->v[bg[i]] += (int)floor(60.0 * o->key_scale[i] / 128.0 + 0.5);
     }
-  }
-  /* DLS1: the one LFO's vibrato is SF2's vibrato LFO */
-  if (o->dls1) {
-    o->v[G_FREQ_VIBLFO] = o->v[G_FREQ_MODLFO];
-    o->v[G_DELAY_VIBLFO] = o->v[G_DELAY_MODLFO];
   }
 }
 
@@ -588,10 +612,20 @@ static int out_mods(Out *o, const SmpSfMod *m, int n) {
 static int mod_list(Out *o, const ArtOut *a, int *n_out) {
   SmpSfMod list[SF_NDEFMOD + SF_MAX_ZONE_MODS];
   int n, i;
-  memcpy(list, sf_default_mods(), SF_NDEFMOD * sizeof *list);
-  for (i = 0; i < SF_NDEFMOD; i++)
-    if (list[i].src == 0x00DB || list[i].src == 0x00DD) list[i].amount = 1000;   /* CC91, CC93: full send */
-  n = sf_merge_mods(list, SF_NDEFMOD, a->mods, a->nmods);
+  const SmpSfMod *def = sf_default_mods();
+  n = 0;
+  for (i = 0; i < SF_NDEFMOD; i++) {
+    int k, same = 0;
+    /* a default the articulation replaces: the same source, amount source and destination, whatever the curves */
+    for (k = 0; k < a->nmods && !same; k++)
+      same = (a->mods[k].src & 0xFF) == (def[i].src & 0xFF) && (a->mods[k].amt_src & 0xFF) == (def[i].amt_src & 0xFF) &&
+             a->mods[k].dest == def[i].dest;
+    if (same) continue;
+    list[n] = def[i];
+    if (list[n].src == 0x00DB || list[n].src == 0x00DD) list[n].amount = 1000;   /* CC91, CC93: full send */
+    n++;
+  }
+  n = sf_merge_mods(list, n, a->mods, a->nmods);
   *n_out = n;
   return out_mods(o, list, n);
 }
@@ -617,11 +651,15 @@ static void region_gens(SmpSfRegion *r, const ArtOut *a, const Wsmp *ws, const S
   int i, tune, mode;
   int v[SMP_SF_NGEN];
   memcpy(v, a->v, sizeof v);
-  tune = (int)floor(ws->fine + a->tune + 0.5);
+  {
+    double t = ws->fine + a->tune, at = -scale_of(ws->gain) / 0.4 + a->atten;
+    t = t < -100000 ? -100000 : t > 100000 ? 100000 : t;            /* held before the casts */
+    at = at < -32768 ? -32768 : at > 32767 ? 32767 : at;
+    tune = (int)floor(t + 0.5);
+    v[G_ATTEN] = (int)floor(at + 0.5);
+  }
   v[G_COARSE] = clampi(tune / 100, -120, 120);
   v[G_FINE] = tune - 100 * (tune / 100);
-  v[G_ATTEN] = (int)floor(-scale_of(ws->gain) / 0.4 + a->atten + 0.5);
-  v[G_ATTEN] = clampi(v[G_ATTEN], -32768, 32767);
   v[G_ROOTKEY] = ws->unity;
   v[G_EXCLUSIVE] = keygroup;
   v[G_PAN] += pan;
@@ -657,6 +695,7 @@ static int wave_of(uint32_t idx, const uint32_t *cue, uint32_t ncue, const Wave 
   return idx < (uint32_t)nw ? (int)idx : -1;
 }
 
+/* 1 when f is filled; 0 with why when the file can't be read; -1 for a GigaStudio file (refused for now) */
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap) {
   Rd s; uint8_t hd[12];
   uint64_t pos, end, lins_off = 0, wvpl_off = 0; uint32_t lins_n = 0, wvpl_n = 0;
@@ -676,13 +715,17 @@ int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *wh
     if (n > end - pos - 8) { snprintf(why, wcap, "it is cut short"); goto fail; }
     if (!memcmp(c, "LIST", 4) && n >= 4) {
       if (!rd(&s, pos + 8, c + 8, 4)) { snprintf(why, wcap, "it can't be read"); goto fail; }
+      if (!memcmp(c + 8, "3gri", 4) || !memcmp(c + 8, "3gnl", 4)) goto giga;
       if (!memcmp(c + 8, "lins", 4) && !have_lins) { lins_off = pos + 12; lins_n = n - 4; have_lins = 1; }
       else if (!memcmp(c + 8, "wvpl", 4) && !have_wvpl) { wvpl_off = pos + 12; wvpl_n = n - 4; have_wvpl = 1; }
+    } else if (!memcmp(c, "einf", 4)) {
+      goto giga;
     } else if (!memcmp(c, "ptbl", 4) && !cue && n >= 8) {
       uint8_t t[8]; uint32_t cb, k;
       if (!rd(&s, pos + 8, t, 8)) { snprintf(why, wcap, "it can't be read"); goto fail; }
       cb = u32(t); ncue = u32(t + 4);
       if (cb < 8 || cb > n) cb = 8;
+      if (ncue > 0 && (uint64_t)(n - cb) == (uint64_t)ncue * 8) goto giga;   /* Giga's 8-byte entries */
       if (ncue > (n - cb) / 4) ncue = (n - cb) / 4;
       if (ncue > MAX_CUES) { snprintf(why, wcap, "its wave table is too long"); goto fail; }
       if (!(cue = malloc((size_t)(ncue ? ncue : 1) * 4))) { snprintf(why, wcap, "out of memory"); goto fail; }
@@ -709,6 +752,7 @@ int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *wh
         waves = g; capw = cap;
       }
       read_wave(&s, &waves[nw], pos, n);
+      if (waves[nw].giga) goto giga;
       if (!waves[nw].name[0]) snprintf(waves[nw].name, sizeof waves[nw].name, "Wave %d", nw + 1);
       nw++;
     }
@@ -828,8 +872,10 @@ int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *wh
           memset(&r, 0, sizeof r);
           r.lokey = (uint8_t)lo; r.hikey = (uint8_t)hi; r.lovel = (uint8_t)vlo; r.hivel = (uint8_t)vhi;
           r.sample = w->first + chans[k];
-          /* a stereo wave's left and right channels sit at the left and right */
-          region_gens(&r, a, &ws, &f->shdr[r.sample], keygroup, w->channels == 2 ? (chans[k] ? 500 : -500) : 0);
+          /* a stereo wave's left and right channels, when the region plays both, sit at the left and right; one
+             channel alone stays in the centre */
+          region_gens(&r, a, &ws, &f->shdr[r.sample], keygroup, w->channels == 2 && nch == 2 ? (chans[k] ? 500 : -500) : 0);
+          if (r.gen[G_ATTEN] < 0) f->dls_boosts++;
           r.nimod = nmods; r.npmod = 0;
           e = add_region(&o, &r, moff);
           if (e == -2) { free(rstart); snprintf(why, wcap, "it has too many regions"); goto fail; }
@@ -860,6 +906,9 @@ int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *wh
   }
   if (!sf_build_order(f)) { snprintf(why, wcap, "out of memory"); goto fail; }
   ok = 1;
+  goto fail;
+giga:
+  ok = -1;
 fail:
   free(lins); free(cue); free(waves); free(ins); free(ia); free(ra); free(rg);
   free(o.reg); free(o.moff); free(o.mods);
