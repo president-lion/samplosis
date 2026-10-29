@@ -677,7 +677,10 @@ def test_gui_settings_page(P, tmp_path, settings_file):
                                       "key tab", "key tab", "key tab",
                                       "key tab shift", "key tab shift", "key tab shift", "focus Back", "key tab",
                                       "focus Browse for FFmpeg", "dialog pick %s" % fake, "key enter", "read FFmpeg",
-                                      "focus Back", "key enter", "read Status", "focus Back", "say"])
+                                      "focus Back", "key enter", "read Status", "focus Back", "say",
+                                      # the Settings page twice more: FFmpeg isn't searched for again
+                                      "ffsearches", "focus Settings", "key enter", "focus Back", "key enter",
+                                      "focus Settings", "key enter", "ffsearches"])
         f = got(out, "focus")
         assert f[0] == ["ComboBox", "Stretcher", "Signalsmith Stretch, fast"]
         assert f[1] == f[2] == ["ComboBox", "Stretcher", "Rubber Band, slower"]   # Down stops at the last
@@ -705,6 +708,8 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert got(out, "read")[1] == ["Status", "Raw settings apply the next time a raw file loads"]
         assert f[32][:2] == ["Button", "Settings"]           # Back: on the Settings button again
         assert f[33][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+        n = [int(x[0]) for x in got(out, "ffsearches")]
+        assert len(n) == 2 and n[0] >= 1 and n[1] == n[0], n               # searched on the first visit and after Browse only
         with open(settings_file) as fh:
             saved = fh.read()
         assert "raw_rate 192000\n" in saved and "raw_channels 1\n" in saved and "raw_endian big\n" in saved

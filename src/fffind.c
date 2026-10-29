@@ -77,8 +77,12 @@ int smp_ffmpeg_find_w(wchar_t *out, int cap) {
   return on_path(out, cap) || in_winget(out, cap);
 }
 
+static volatile LONG g_searches;           /* tests: the Settings page's searches (smp_ffmpeg_find) */
+SMP_API long smp_test_ffmpeg_searches(void) { return g_searches; }
+
 int smp_ffmpeg_find(char *out, int cap) {
   wchar_t w[1100];
+  InterlockedIncrement(&g_searches);
   if (cap > 0) out[0] = 0;
   if (!smp_ffmpeg_find_w(w, 1100)) return 0;
   return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL) > 0;

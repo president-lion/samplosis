@@ -48,6 +48,7 @@
      clock                   "clock: <n> ms" since the last clock
      status                  "status: <text>", the plugin's own status (smp_plugin_status)
      pids <file>             "pids: <running> of <all> running" for the process ids listed in the file
+     ffsearches              "ffsearches: N", how many times the plugin has searched for FFmpeg (PATH, WinGet)
    SAMPLOSIS_TEST_DECODE_FLAGS passes its number to smp_test_only_decode_flags. */
 #include <windows.h>
 #include <oleacc.h>
@@ -631,6 +632,11 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     else if (!strcmp(a, "async")) async_loads = !strcmp(arg, "on");
     else if (!strcmp(a, "wait")) settle(p, 1);
     else if (!strcmp(a, "status")) status_line(p);   /* the plugin's own status (what a window opened later shows) */
+    else if (!strcmp(a, "ffsearches")) {
+      typedef long (*CountFn)(void);
+      CountFn fc = (CountFn)GetProcAddress(dll, "smp_test_ffmpeg_searches");
+      printf("ffsearches: %ld\n", fc ? fc() : -1L);
+    }
     else if (!strcmp(a, "clock")) {           /* milliseconds since the last clock */
       static DWORD last; DWORD now = GetTickCount();
       printf("clock: %lu ms\n", last ? now - last : 0); last = now;

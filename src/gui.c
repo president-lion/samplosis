@@ -90,6 +90,7 @@ typedef struct Gui {
   char dir_shown[1024], used_text[700];
   HWND rawrate, rawch, rawfmt, rawend, ffmpeg, ffbrowse;  /* how raw files read; where FFmpeg is */
   char ff_text[1100];                         /* FFmpeg's path as found, or "Not found" */
+  char ff_for[1024]; int ff_searched;         /* the Settings path ff_text was found for (searched once per path) */
   /* the SoundFont page */
   HWND sffile, sfbrowse, sfmode, sfpreset, sfchannel, chan[NCH], out[NCH], sfstatus, sfsettings;
   HWND mode_one[4], mode_all[4 * NCH];        /* each mode's own controls with their labels: shown in that mode only */
@@ -300,8 +301,16 @@ static void rescan_used(Gui *g) {             /* scans the folder: on opening th
   if (b < (1ull << 30)) snprintf(g->used_text, sizeof g->used_text, "%.0f MB of %s", b / 1048576.0, lim);
   else snprintf(g->used_text, sizeof g->used_text, "%.1f GB of %s", b / 1073741824.0, lim);
 }
-static void find_ffmpeg(Gui *g) {            /* searches: on opening the page and after Browse for FFmpeg */
+/* FFmpeg's place for the Settings page. PATH and the WinGet folders are searched the first time the page opens,
+   after Browse for FFmpeg (force), and when the saved path has changed (another instance's Settings); a page switch
+   otherwise shows what was found before, so it never walks the disk. */
+static void find_ffmpeg(Gui *g, int force) {
+  SmpSettings s;
+  smp_settings_get(&s);
+  if (!force && g->ff_searched && !strcmp(g->ff_for, s.ffmpeg_path)) return;
   if (!smp_ffmpeg_find(g->ff_text, sizeof g->ff_text)) snprintf(g->ff_text, sizeof g->ff_text, "Not found");
+  snprintf(g->ff_for, sizeof g->ff_for, "%s", s.ffmpeg_path);
+  g->ff_searched = 1;
 }
 static int rate_index(int rate) {             /* the Raw sample rate entry for a rate */
   const int *r; int n = smp_raw_rates(&r), i;
@@ -455,7 +464,7 @@ static void browse_ffmpeg(Gui *g) {
     if (WideCharToMultiByte(CP_UTF8, 0, file, -1, u, sizeof u, NULL, NULL) > 0) {
       strcpy(s.ffmpeg_path, u);
       if (smp_settings_set(&s)) beep();
-      find_ffmpeg(g);
+      find_ffmpeg(g, 1);
       show_settings(g);
     } else beep();
   }
@@ -670,15 +679,12 @@ enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
    a failure is told when it comes, in refresh); so does a SoundFont ("Loading x.sfz": an SFZ reads every sample
    file's header), which then plays. */
 static void load_path_w(Gui *g, const wchar_t *w, int how) {
-  char u[1100], err[700], msg[1900], still[400]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT;
+  char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT;
   int ok;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
   ok = sf ? smp_plug_load_font_start(g->P, u, err, sizeof err) : smp_plug_load_start(g->P, u, how == LOAD_DROPPED, err, sizeof err);
   if (!ok) {                                  /* refused at once: "Can't load x: why. Still playing y." */
-    const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
-    if (b2 > base) base = b2;
-    smp_plug_still_playing(g->P, still, sizeof still);
-    snprintf(msg, sizeof msg, "Can't load %s: %s%s%s", base ? base + 1 : u, err, still[0] ? "." : "", still);
+    smp_plug_cant_load(g->P, u, err, msg, sizeof msg);   /* one full stop between, as the background failure */
     say_note(g, msg); beep();
   } else g->note[0] = 0;
   refresh(g);
@@ -908,7 +914,7 @@ static bool shows_on(Gui *g, int page, HWND h) {
    one hides, so the focus never falls to nothing. */
 static void show_page(Gui *g, int page, HWND to) {
   HWND f = GetFocus(); int i, q;
-  if (page == PG_SETTINGS) { rescan_used(g); find_ffmpeg(g); show_settings(g); }
+  if (page == PG_SETTINGS) { rescan_used(g); find_ffmpeg(g, 0); show_settings(g); }
   if (page == PG_FONT) { SfCfg c; sf_cfg(g, &c); g->sf_one = c.one != 0; }
   g->page = page;
   if (page != PG_SETTINGS) {                  /* the tab control shows the page's tab */

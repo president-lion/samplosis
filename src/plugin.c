@@ -799,10 +799,13 @@ static int told_now(Plug *P) {            /* a failed or stopped window load is 
   return 0;
 }
 
+static int loading_text(Plug *P, char *out, int cap);
+
 SMP_API int smp_plugin_status(const clap_plugin_t *p, char *out, int cap) {
   Plug *P = plug_of(p);
   if (!P || !out || cap <= 0) return 0;
-  if (told_now(P)) snprintf(out, (size_t)cap, "%s", P->told);
+  if (loading_text(P, out, cap)) {}
+  else if (told_now(P)) snprintf(out, (size_t)cap, "%s", P->told);
   else if (P->plays && !P->bad && P->e && P->s) sf_status(P, out, cap);
   else snprintf(out, (size_t)cap, "%s", P->status);
   return 1;
@@ -876,6 +879,17 @@ struct Loader {
   HMODULE self;
   HANDLE thread;
 };
+
+/* a background load in progress: what it's doing ("Loading x.sfz", "Decoding x.dsf with FFmpeg"); 0 when none.
+   Both statuses say this first, so they agree during a load. */
+static int loading_text(Plug *P, char *out, int cap) {
+  int ff;
+  if (!P->loading || !P->loader) return 0;
+  ff = !P->loading_font && InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
+  snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
+  return 1;
+}
+
 static void job_free(Job *j) { if (j) { smp_sample_free(j->s); smp_sf_discard(j->f); free(j); } }
 static void loader_release(Loader *L) { if (!InterlockedDecrement(&L->refs)) free(L); }
 static int job_cancelled(void *a) { return InterlockedCompareExchange(&((Job *)a)->cancel, 0, 0) != 0; }
@@ -980,12 +994,17 @@ void smp_plug_still_playing(Plug *P, char *out, int cap) {
   if (name && name[0]) snprintf(out, (size_t)cap, " Still playing %s.", name);
 }
 
-/* "Can't load x: why." and, when something still plays, " Still playing y." */
-static void load_failed(Plug *P, const char *path, const char *why) {
+/* "Can't load x: why." and, when something still plays, " Still playing y." (a why that ends in a full stop
+   doesn't get a second one). The window's own refusals use it too. */
+void smp_plug_cant_load(Plug *P, const char *path, const char *why, char *out, int cap) {
   char still[400]; size_t n = strlen(why);
   smp_plug_still_playing(P, still, sizeof still);
-  snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s%s%s", base_name(path), why,
+  snprintf(out, (size_t)cap, "Can't load %s: %s%s%s", base_name(path), why,
            still[0] && n && why[n - 1] != '.' ? "." : "", still);
+}
+
+static void load_failed(Plug *P, const char *path, const char *why) {
+  smp_plug_cant_load(P, path, why, P->load_err, sizeof P->load_err);
   tell(P, P->load_err);
   P->load_failed++;
 }
@@ -1088,11 +1107,7 @@ void smp_plug_sample_text(Plug *P, char *out, int cap) {
 
 void smp_plug_status_text(Plug *P, char *out, int cap) {
   int ready = 0, total = 0; char why[600] = "";
-  if (P->loading && P->loader) {         /* a background load: what it's doing */
-    int ff = !P->loading_font && InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
-    snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
-    return;
-  }
+  if (loading_text(P, out, cap)) return;  /* a background load: what it's doing */
   if (told_now(P)) { snprintf(out, (size_t)cap, "%s", P->told); return; }
   if (P->plays && !P->bad && P->e && P->s) { sf_status(P, out, cap); return; }
   if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }

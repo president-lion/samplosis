@@ -81,6 +81,8 @@ SmpSynth *smp_plug_synth(Plug *P);                 /* ask each time: activate at
 void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "Piano.sfz, SFZ, 1 preset",
                                     "GM.dls, DLS, 235 presets", "No SoundFont loaded" or "Missing: <path>" (SF2 and SF3
                                     have no format word, as before; every other format names itself) */
+void smp_plug_cant_load(Plug *P, const char *path, const char *why, char *out, int cap);   /* "Can't load x: why."
+                                    plus " Still playing y." when something plays (one full stop between) */
 void smp_plug_still_playing(Plug *P, char *out, int cap);   /* " Still playing y." (with its leading space) after a
                                     load that failed, when something plays (the font or sample that plays); else "" */
 int smp_plug_sf_set(Plug *P, const char *line);    /* 1 taken; 0 the line didn't read (nothing changed: beep).
