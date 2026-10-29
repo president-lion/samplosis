@@ -648,14 +648,15 @@ static void refresh(Gui *g) {
 
 static bool font_name(const wchar_t *n) {
   const wchar_t *dot = wcsrchr(n, L'.');
-  return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3"));
+  return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3") || !_wcsicmp(dot, L".sfz"));
 }
 /* a file to load: LOAD_SAMPLE or LOAD_FONT (as the page's Browse or File combo box asks: a file of the
    other kind gives that player's error), or LOAD_DROPPED: by its extension, a .sf2 or .sf3 as the SoundFont
    (which then plays), anything else as the sample (which then plays) */
 enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
 /* A sample loads in the background (the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" meanwhile, and
-   a failure is told when it comes, in refresh); a SoundFont loads here (it reads only its headers). */
+   a failure is told when it comes, in refresh); so does a SoundFont ("Loading x.sfz": an SFZ reads every sample
+   file's header), which then plays. */
 static void load_path_w(Gui *g, const wchar_t *w, int how) {
   char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT, dropped = how == LOAD_DROPPED;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
@@ -669,7 +670,7 @@ static void load_path_w(Gui *g, const wchar_t *w, int how) {
     refresh(g);
     return;
   }
-  if (!smp_plug_load_font(g->P, u, err, sizeof err)) {
+  if (!smp_plug_load_font_start(g->P, u, err, sizeof err)) {
     const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
     if (b2 > base) base = b2;
     snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
@@ -710,7 +711,7 @@ typedef struct {
 } FileKind;
 static const FileKind kinds[2] = {
   {smp_plug_sample_path, audio_name, NULL, L"Load a sample"},             /* filter: audio_filter() */
-  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3\0All files\0*.*\0", L"Load a SoundFont"},
+  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3;*.sfz\0All files\0*.*\0", L"Load a SoundFont"},
 };
 
 /* The File combo box: the files of its kind in the loaded file's folder, by name (alphabetical, ignoring case),

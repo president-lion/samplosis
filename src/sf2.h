@@ -133,6 +133,10 @@ struct SmpFont {
      then has_problem is set */
   volatile LONG has_problem;
   char problem[300];
+  /* a second problem found later (an SFZ sample that doesn't decode, after the open's own problem): problem2 holds
+     both, written once, then has_problem2 is set */
+  volatile LONG has_problem2;
+  char problem2[620];
 };
 
 enum { SF_PACK_NONE, SF_PACK_READY, SF_PACK_BROKEN };
@@ -154,6 +158,7 @@ typedef struct SfPcm {
   uint8_t enc, channels, channel;       /* PCM_FILE */
   SmpEntry *entry;                      /* DECODED: the mono float cache file, open while the sample is loaded */
   uint32_t skip;                        /* DECODED: frame 0 is this frame of the cache file */
+  uint32_t rate;                        /* the rate as loaded: a decoded file's own, else the sample header's */
   void *tail;                           /* the post-loop head: tail_frames frames from frame tail_start (its own
                                            allocation, with pads), or NULL */
   uint32_t tail_start, tail_frames;
@@ -161,8 +166,10 @@ typedef struct SfPcm {
 
 enum { SF_ST_NONE, SF_ST_PUBLISHED, SF_ST_RETIRED, SF_ST_BROKEN };
 
-/* sf2.c: parse a font's headers into a new SmpFont, and free one */
+/* sf2.c: parse a font's headers into a new SmpFont, and free one. sf_parse_ex may run on any thread (it touches no
+   registry); cancel (may be NULL) is asked now and then while an SFZ's files are read, and stops it ("cancelled"). */
 SmpFont *sf_parse(const char *path, char *err, int cap);
+SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *err, int cap);
 void sf_free(SmpFont *f);
 /* sf2.c, for the other loaders that build SF2's model themselves: every generator's default; a value held to its
    generator's range; SF2's ten default modulators; merging a zone's modulators into a list (identical ones
@@ -199,7 +206,9 @@ wchar_t *sf_full_path(const char *path);
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
 /* sfsfz.c: fills f from an SFZ file (f->size, mtime and path set): 1 when it did; 0 with why (a reason to put in
    brackets) or -1 with why (the whole reason) when it can't. Main thread (it reads every sample file's header). */
-int sf_parse_sfz(SmpFont *f, const char *path, char *why, int wcap);
+int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
+/* an SFZ sample whose length isn't known until the loader decodes it (that length then counts) */
+#define SF_UNKNOWN_FRAMES (1u << 26)
 /* sfsfz.c: 1 when a file should be read as SFZ: its name ends .sfz, or its first bytes (head, n of them) are text with
    an SFZ header in them */
 int sf_is_sfz(const char *path, const uint8_t *head, size_t n);

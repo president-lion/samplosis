@@ -5,7 +5,7 @@
    The text. Comments (// to the line's end and block comments) are blanked first. #define $NAME value is a textual
    replacement on every later line (a value may use earlier defines, expanded when it is defined); #include "file"
    reads another file in place, relative to the including file, at most 16 deep, never one already being read (so a
-   cycle stops), at most 4096 includes and 256 MB of text in all. Headers are <control>, <global>, <master>,
+   cycle stops), at most 4096 includes and 64 MB of text in all. Headers are <control>, <global>, <master>,
    <group> and <region>, inheriting in that order (a <global> starts the master and group again from it, a
    <master> the group, and each <region> starts from the group); <curve>, <effect> and <midi> are read past (their
    opcodes do nothing here). An opcode is name=value, and a value runs to the next name= or header or the line's
@@ -15,24 +15,36 @@
    octave_offset add to every key value after them. Damaged text never crashes: the reads are bounded, NUL bytes
    count as spaces, a line is expanded to at most 64 KB, and what can't be read is skipped.
 
+   Two passes. The text is read twice: the first pass only collects the sample files the regions name; then every
+   file is probed, on up to four threads; the second pass builds the regions from the probed files. The text is
+   cheap to read again; the files are what cost (a big library on a USB disk is thousands of opens and seeks).
+
    Sample files. A sample path is relative to the root .sfz's folder (not an included file's), after <control>'s
-   default_path; slashes either way. Every file is opened once at load (here, on the main thread) to learn its
-   format:
+   default_path; slashes either way. Each file is probed once, from its header only, never decoded here:
    - PCM WAV (8-bit unsigned, 16-, 24- and 32-bit integer, 32-bit float; WAVE_FORMAT_EXTENSIBLE too) and AIFF or
      AIFF-C (16- and 24-bit big-endian, and 16-bit "sowt") stream straight from the file (SMP_SRC_PCM_FILE: the
      data chunk's offset, encoding and channel count). A WAV's smpl chunk gives the first loop and the unity note.
-   - Everything else the decode layer reads (FLAC, Ogg Vorbis, Opus, MP3, other WAV encodings, and so on) is
-     SMP_SRC_DECODED: the loader thread decodes the file once into the disk cache, keyed by the sample file's own
-     path, size and modified time, and streams it from there. FLAC and Ogg headers give the length and rate here;
-     any other format is decoded once now just to learn them.
-   - A file that can't be opened is missing; one that can't be read is unreadable. Their regions are skipped, and
-     the font's problem says "Missing N samples (first: name)" (and "N samples can't be read (first: name)"). With
-     no region left, the file doesn't open, with that as the reason.
+   - Everything else is SMP_SRC_DECODED: the loader thread decodes the file once into the disk cache, keyed by the
+     sample file's own path, size and modified time, and streams it from there. The header gives what it can:
+     FLAC's STREAMINFO, Ogg Vorbis' and Opus' identification header and last page, MP3's first frame header,
+     WavPack's block header, and a compressed WAV's fmt and fact chunks or an AIFF-C's COMM. What it can't give
+     is left for the loader: an unknown length (SF_UNKNOWN_FRAMES; the loaded length counts, and the region's end is
+     an absolute frame, cond.end_frame), an unknown rate (the loaded rate counts: SmpSfView.rate), and unknown
+     channels, taken as two (a mono file then plays the same in both ears).
+   - Probe results (length, rate, channels, loop, unity note, data offset and encoding) are kept in a small file
+     next to the decode cache, one per .sfz (sfzprobe1|its path), each entry with its file's size and modified
+     time; the next open only looks at each file's size and time and reuses the entry when both match.
+   - A file that can't be found is missing; one that can't be read, or whose path can't be made, is unreadable.
+     Their regions are skipped, and the font's problem says "Missing N samples (first: name)" (and "N samples can't
+     be read (first: name)"). With no region left, the file doesn't open, with that as the reason. After a network
+     error on a share (or a drive that isn't ready), no other file under that root is tried: each would wait for
+     the same timeout.
    - *sine, *silence and *noise are made in memory (sf2.h's SF_GEN_*), looping whole.
    - Stereo. The voices are mono, so a stereo sample makes two regions, one per channel, like an SF2 stereo pair:
      the left channel panned to (pan - width) and the right to (pan + width), in SF2 pan units (pan and width are
      SFZ percent; width 100, the default, puts the channels hard left and right, so a centred stereo sample plays
-     at its own level in each ear). A file with more channels plays its first two.
+     at its own level in each ear). The right one is marked as the pair's follower (cond.pair), so the player counts
+     and stops the two as one voice. A file with more channels plays its first two.
 
    Start heads. A region's offset is its first frame. The loader keeps only a sample's first quarter second in
    memory, so a note starting far into a long sample would have nothing to play until the streamer read it. So a
@@ -55,7 +67,7 @@
 #include "decode.h"
 
 #define MAX_TEXT (32u << 20)             /* the largest .sfz (or included file) read */
-#define MAX_ALL_TEXT (256ull << 20)      /* all the text read through includes */
+#define MAX_ALL_TEXT (64ull << 20)       /* all the text read through includes, in one pass */
 #define MAX_INCLUDES 4096
 #define MAX_DEPTH 16
 #define MAX_DEFINES 4096
@@ -66,14 +78,17 @@
 #define MAX_NAME 128
 #define MAX_SPATH 1024                   /* a sample opcode's value, and default_path */
 #define MAX_SAMPLES (1 << 20)
-#define SEEN_SLOTS 4096                  /* the ignored-name set */
+#define MAX_SET (1 << 16)                /* names a string set holds, at most */
 #define MAX_CHUNKS 4096                  /* chunks walked in one WAV or AIFF header */
+#define PROBE_THREADS 4
+#define MAX_DEAD 64                      /* share roots given up on */
+#define WPATH (MAX_PATH * 4)
 
 /* the SF2 generators set here (SF2.04 section 8.1.2) */
 enum {
-  G_START = 0, G_END = 1, G_LOOPSTART = 2, G_LOOPEND = 3, G_STARTCOARSE = 4, G_MODLFO_PITCH = 5,
+  G_START = 0, G_LOOPSTART = 2, G_LOOPEND = 3, G_STARTCOARSE = 4, G_MODLFO_PITCH = 5,
   G_VIBLFO_PITCH = 6, G_MODENV_PITCH = 7, G_FC = 8, G_Q = 9, G_MODLFO_FC = 10, G_MODENV_FC = 11,
-  G_ENDCOARSE = 12, G_MODLFO_VOL = 13, G_PAN = 17, G_DELAY_MODLFO = 21, G_FREQ_MODLFO = 22,
+  G_MODLFO_VOL = 13, G_PAN = 17, G_DELAY_MODLFO = 21, G_FREQ_MODLFO = 22,
   G_DELAY_VIBLFO = 23, G_FREQ_VIBLFO = 24, G_DELAY_MODENV = 25, G_DELAY_VOLENV = 33,
   G_LOOPSTARTCOARSE = 45, G_ATTEN = 48, G_LOOPENDCOARSE = 50, G_COARSE = 51, G_FINE = 52, G_MODES = 54,
   G_SCALE = 56, G_ROOTKEY = 58
@@ -81,7 +96,7 @@ enum {
 
 enum { LOOP_NONE, LOOP_ONESHOT, LOOP_CONT, LOOP_SUSTAIN };   /* SFZ loop_mode */
 enum { LV_NONE, LV_CONTROL, LV_GLOBAL, LV_MASTER, LV_GROUP, LV_REGION, LV_OTHER };
-enum { F_OK, F_MISSING, F_UNREADABLE };
+enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -116,28 +131,44 @@ typedef struct {
 /* where a sample start head begins, and its sample per channel */
 typedef struct Head { uint32_t at; int id[2]; struct Head *next; } Head;
 
-/* a sample file (or a made sample), probed once */
+/* what a probe learns about a file, and what the probe cache keeps of it */
 typedef struct {
-  wchar_t *wpath;                    /* the full path (NULL for a made sample) */
-  int status;                        /* F_* */
-  int gen;                           /* SF_GEN_*: a made sample */
-  SmpSrcKind kind; int enc, channels, block;   /* block: bytes a frame, for PCM_FILE */
-  uint32_t rate, frames, ls, le;     /* the file's first loop, le exclusive; 0, 0 when none */
+  int kind, enc, channels, block, pitch;
+  uint32_t rate, frames, ls, le;     /* rate 0: unknown; frames SF_UNKNOWN_FRAMES: unknown; le exclusive, 0 0: none */
   uint64_t offset;                   /* PCM_FILE: the first frame's byte offset */
-  int pitch;                         /* the unity note from a smpl chunk, else 60 */
+} Info;
+
+/* a sample file (or a made sample) */
+typedef struct {
+  wchar_t *wpath, *lw;               /* the full path and its lower-case form (NULL for a made sample) */
+  char *as_written;                  /* the sample opcode's value that first named it, for messages */
+  volatile LONG status;              /* F_* */
+  int noted;                         /* its missing or unreadable state is counted */
+  int from_cache;                    /* its probe came from the probe cache */
+  uint64_t size, mtime;
+  int gen;                           /* SF_GEN_*: a made sample */
+  Info in;
   int path_id;
   int base[2];                       /* its samples from frame 0, per channel (-1 until made) */
   Head *heads;
 } File;
 
+/* a set of strings (open addressing; full compares, so distinct names are counted exactly) */
+typedef struct { char **s; int n, cap; } StrSet;
+
+/* a probe cache entry as read back */
+typedef struct { wchar_t *lw; uint64_t size, mtime; Info in; } Cached;
+
 /* a region being built: its modulators (an offset into the pool) and its velocity curve (index, or -1) */
 typedef struct { SmpSfRegion r; int mod_off, nmod, curve; } Reg;
 
-typedef struct {
+typedef struct P {
   SmpFont *f;
   const char *root_name;             /* the .sfz's file name, for messages */
-  wchar_t root_dir[MAX_PATH * 4];    /* its folder, with a trailing backslash */
-  Opts global, master, group, region, base;
+  wchar_t root_dir[WPATH];           /* its folder, with a trailing backslash */
+  int collect;                       /* the first pass: only collect the files */
+  int (*cancel)(void *); void *carg; volatile LONG cancelled;
+  Opts global, master, group, region;
   int level;
   char default_path[MAX_SPATH];
   int note_offset, octave_offset;
@@ -146,12 +177,16 @@ typedef struct {
   /* includes */
   const wchar_t *stack[MAX_DEPTH + 1]; int nincludes; uint64_t text_bytes;
   char *line, *val, *tmp;            /* MAX_LINE + 1 each */
-  /* ignored names */
-  uint64_t *seen; int nseen;
+  StrSet ign, badpath;               /* ignored names; sample paths that couldn't be made */
   /* files */
   File *files; int nfiles, capfiles; int *fslot; int capslot;
   int made[4];                       /* the made samples' files by SF_GEN_*, -1 until used */
   int missing, unreadable; char first_missing[160], first_unreadable[160];
+  /* probing: the probe cache read back, share roots given up on */
+  Cached *cache; int ncache; int *cslot; int capcslot;
+  int probed;                        /* files probed now (not from the cache) */
+  SRWLOCK dead_lock; wchar_t dead[MAX_DEAD][WPATH / 4]; int ndead;
+  volatile LONG next_probe;
   /* the model being built */
   SmpSfSample *shdr; SmpSrc *src; int ns, caps;
   char **paths; int npaths, cappaths;
@@ -197,15 +232,46 @@ static const char *base_name(const char *path) {
   return b;
 }
 
-/* an opcode (or header, as "<name>") this can't play: counted once per distinct name, the first kept */
-static void ignored(P *p, const char *name) {
-  uint64_t h = fnv(name, strlen(name));
-  unsigned i = (unsigned)h & (SEEN_SLOTS - 1), k;
-  for (k = 0; k < SEEN_SLOTS; k++, i = (i + 1) & (SEEN_SLOTS - 1)) {
-    if (p->seen[i] == h) return;
-    if (!p->seen[i]) break;
+static int cancelled(P *p) {
+  if (p->cancelled) return 1;
+  if (p->cancel && p->cancel(p->carg)) { InterlockedExchange(&p->cancelled, 1); return 1; }
+  return 0;
+}
+
+/* adds x: 1 when it is new, 0 when it was there, -1 when the set is full or memory ran out (x isn't counted) */
+static int strset_add(StrSet *t, const char *x) {
+  unsigned i;
+  if (t->n * 2 >= t->cap) {
+    int nc = t->cap ? t->cap * 2 : 64, k;
+    char **ns;
+    if (t->n >= MAX_SET || !(ns = calloc((size_t)nc, sizeof *ns))) return -1;
+    for (k = 0; k < t->cap; k++) if (t->s[k]) {
+      unsigned j = (unsigned)fnv(t->s[k], strlen(t->s[k])) & (unsigned)(nc - 1);
+      while (ns[j]) j = (j + 1) & (unsigned)(nc - 1);
+      ns[j] = t->s[k];
+    }
+    free(t->s); t->s = ns; t->cap = nc;
   }
-  if (k < SEEN_SLOTS && p->nseen < SEEN_SLOTS / 2) { p->seen[i] = h; p->nseen++; }
+  i = (unsigned)fnv(x, strlen(x)) & (unsigned)(t->cap - 1);
+  while (t->s[i]) {
+    if (!strcmp(t->s[i], x)) return 0;
+    i = (i + 1) & (unsigned)(t->cap - 1);
+  }
+  if (!(t->s[i] = _strdup(x))) return -1;
+  t->n++;
+  return 1;
+}
+
+static void strset_free(StrSet *t) {
+  int k;
+  for (k = 0; k < t->cap; k++) free(t->s[k]);
+  free(t->s); t->s = NULL; t->n = t->cap = 0;
+}
+
+/* an opcode (or header, as "<name>") this can't play: counted once per distinct name, the first kept (second pass
+   only, so nothing counts twice) */
+static void ignored(P *p, const char *name) {
+  if (p->collect || strset_add(&p->ign, name) != 1) return;
   if (!p->f->sfz_ignored++) snprintf(p->f->sfz_first_ignored, sizeof p->f->sfz_first_ignored, "%s", name);
 }
 
@@ -249,7 +315,7 @@ static int key(P *p, const char *v, int *out) {
   return 1;
 }
 
-static int seconds_tc(double s, int hi) {      /* seconds to SF2 timecents (0 and less: the shortest) */
+static int seconds_tc(double s, int hi) {      /* seconds to SF2 timecents (1 ms and less: the shortest) */
   if (!(s > 0.001)) return -12000;
   return clampi((int)floor(1200.0 * log2(s) + 0.5), -12000, hi);
 }
@@ -291,7 +357,7 @@ static int env_stage(const char *s) {
   return -1;
 }
 
-/* an LFO opcode's last part: freq, delay, pitch (or depth for pitchlfo), volume, cutoff */
+/* an LFO opcode's last part: freq, delay, pitch, volume, cutoff */
 static double *lfo_field(Lfo *l, const char *s) {
   if (!strcmp(s, "freq")) return &l->freq;
   if (!strcmp(s, "delay")) return &l->delay;
@@ -321,6 +387,7 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
     memcpy(o->sample, v, n); o->sample[n] = 0;
     return;
   }
+  if (p->collect) return;                          /* the first pass only wants the samples */
   /* key and velocity ranges, pitch */
   if (IS("lokey")) { key(p, v, &o->lokey); return; }
   if (IS("hikey")) { key(p, v, &o->hikey); return; }
@@ -484,7 +551,7 @@ static void control_opcode(P *p, const char *nm, const char *v) {
   }
 }
 
-/* ---- sample files ---- */
+/* ---- sample files: probing ---- */
 
 static int rd_at(HANDLE h, uint64_t off, void *buf, DWORD n) {
   LARGE_INTEGER li; DWORD got = 0;
@@ -493,13 +560,19 @@ static int rd_at(HANDLE h, uint64_t off, void *buf, DWORD n) {
   return ReadFile(h, buf, n, &got, NULL) && got == n;
 }
 
-/* RIFF WAVE: 1 when it is plain PCM (fl filled for PCM_FILE), 0 when it needs the decoder */
-static int probe_wav(HANDLE h, uint64_t size, File *fl) {
+static void unknown_info(Info *in) {
+  in->kind = SMP_SRC_DECODED; in->channels = 2; in->rate = 0; in->frames = SF_UNKNOWN_FRAMES;
+  in->ls = in->le = 0; in->offset = 0; in->enc = 0; in->block = 0;
+}
+
+/* RIFF WAVE: 1 when it is plain PCM (in filled for PCM_FILE); 2 when it needs the decoder, with the channels and
+   rate from its fmt chunk (and its length from a fact chunk when there is one); 0 when it can't be read this way */
+static int probe_wav(HANDLE h, uint64_t size, Info *in) {
   uint8_t c[8], b[64];
   uint64_t pos = 12, doff = 0, dsize = 0;
   int have_fmt = 0, have_data = 0, k;
   unsigned tag = 0, ch = 0, block = 0, bits = 0, sub = 0;
-  uint32_t rate = 0, unity = 60, lstart = 0, lend = 0; int have_loop = 0;
+  uint32_t rate = 0, unity = 60, lstart = 0, lend = 0, fact = 0; int have_loop = 0, have_fact = 0;
   for (k = 0; k < MAX_CHUNKS && pos + 8 <= size; k++) {
     uint32_t n;
     if (!rd_at(h, pos, c, 8)) break;
@@ -514,6 +587,8 @@ static int probe_wav(HANDLE h, uint64_t size, File *fl) {
       doff = pos + 8;
       dsize = (n == 0xFFFFFFFFu || n == 0 || n > size - doff) ? size - doff : n;
       have_data = 1;
+    } else if (!memcmp(c, "fact", 4) && n >= 4 && pos + 12 <= size) {
+      if (rd_at(h, pos + 8, b, 4)) { fact = le32(b); have_fact = 1; }
     } else if (!memcmp(c, "smpl", 4) && n >= 36 && pos + 8 + 36 <= size) {
       DWORD m = n < 60 ? n : 60;
       if (pos + 8 + m <= size && rd_at(h, pos + 8, b, m)) {
@@ -524,26 +599,32 @@ static int probe_wav(HANDLE h, uint64_t size, File *fl) {
     pos += 8 + (uint64_t)n + (n & 1);
   }
   if (!have_fmt || !have_data || !ch || !rate) return 0;
+  in->pitch = (int)unity;
   if (tag == 0xFFFE) tag = sub;
-  fl->channels = (int)ch; fl->rate = rate; fl->pitch = (int)unity; fl->offset = doff;
-  if (tag == 1 && bits == 8 && block == ch) fl->enc = SMP_PCM_U8;
-  else if (tag == 1 && bits == 16 && block == 2 * ch) fl->enc = SMP_PCM_S16LE;
-  else if (tag == 1 && bits == 24 && block == 3 * ch) fl->enc = SMP_PCM_S24LE;
-  else if (tag == 1 && bits == 32 && block == 4 * ch) fl->enc = SMP_PCM_S32LE;
-  else if (tag == 3 && bits == 32 && block == 4 * ch) fl->enc = SMP_PCM_F32LE;
-  else return 0;
-  fl->block = (int)block;
-  if (dsize / block > 0xFFFFFFF0u) return 0;                  /* past 4 G frames: the decoder's business */
-  fl->frames = (uint32_t)(dsize / block);
-  if (have_loop && lend >= lstart && lstart < fl->frames) {
-    fl->ls = lstart; fl->le = lend + 1 < fl->frames ? lend + 1 : fl->frames;   /* smpl's end is the last frame */
+  in->channels = (int)ch; in->rate = rate; in->offset = doff;
+  if (tag == 1 && bits == 8 && block == ch) in->enc = SMP_PCM_U8;
+  else if (tag == 1 && bits == 16 && block == 2 * ch) in->enc = SMP_PCM_S16LE;
+  else if (tag == 1 && bits == 24 && block == 3 * ch) in->enc = SMP_PCM_S24LE;
+  else if (tag == 1 && bits == 32 && block == 4 * ch) in->enc = SMP_PCM_S32LE;
+  else if (tag == 3 && bits == 32 && block == 4 * ch) in->enc = SMP_PCM_F32LE;
+  else {                                                        /* compressed (ADPCM and the like): the decoder's */
+    in->kind = SMP_SRC_DECODED; in->offset = 0; in->enc = 0;
+    in->frames = have_fact && fact > 0 && fact < SF_UNKNOWN_FRAMES ? fact : SF_UNKNOWN_FRAMES;
+    return 2;
   }
-  fl->kind = SMP_SRC_PCM_FILE;
-  return fl->frames > 0;
+  in->block = (int)block;
+  if (dsize / block >= SF_UNKNOWN_FRAMES) return 0;             /* very long: the decoder's business (it refuses) */
+  in->frames = (uint32_t)(dsize / block);
+  if (have_loop && lend >= lstart && lstart < in->frames) {
+    in->ls = lstart; in->le = lend + 1 < in->frames ? lend + 1 : in->frames;   /* smpl's end is the last frame */
+  }
+  in->kind = SMP_SRC_PCM_FILE;
+  return in->frames > 0;
 }
 
-/* AIFF and AIFF-C: 1 when its data can stream as PCM_FILE */
-static int probe_aiff(HANDLE h, uint64_t size, File *fl, int aifc) {
+/* AIFF and AIFF-C: 1 when its data can stream as PCM_FILE; 2 for a compressed AIFF-C (the decoder's), with what
+   COMM says; 0 when it can't be read this way */
+static int probe_aiff(HANDLE h, uint64_t size, Info *in, int aifc) {
   uint8_t c[8], b[26];
   uint64_t pos = 12, doff = 0, dsize = 0;
   int have_comm = 0, have_data = 0, k;
@@ -573,112 +654,335 @@ static int probe_aiff(HANDLE h, uint64_t size, File *fl, int aifc) {
     }
     pos += 8 + (uint64_t)n + (n & 1);
   }
-  if (!have_comm || !have_data || !ch || !(rate >= 1 && rate < 4e6)) return 0;
-  fl->channels = (int)ch; fl->rate = (uint32_t)(rate + 0.5); fl->pitch = 60; fl->offset = doff;
-  if (bits == 16 && (!memcmp(comp, "NONE", 4) || !memcmp(comp, "twos", 4))) fl->enc = SMP_PCM_S16BE;
-  else if (bits == 24 && (!memcmp(comp, "NONE", 4) || !memcmp(comp, "twos", 4))) fl->enc = SMP_PCM_S24BE;
-  else if (bits == 16 && !memcmp(comp, "sowt", 4)) fl->enc = SMP_PCM_S16LE;
-  else return 0;
-  fl->block = (int)ch * (bits / 8);
-  fl->frames = (uint32_t)(dsize / (uint64_t)fl->block < frames ? dsize / (uint64_t)fl->block : frames);
-  fl->kind = SMP_SRC_PCM_FILE;
-  return fl->frames > 0;
+  if (!have_comm || !ch || !(rate >= 1 && rate < 4e6)) return 0;
+  in->channels = (int)ch; in->rate = (uint32_t)(rate + 0.5); in->pitch = 60; in->offset = doff;
+  if (bits == 16 && (!memcmp(comp, "NONE", 4) || !memcmp(comp, "twos", 4))) in->enc = SMP_PCM_S16BE;
+  else if (bits == 24 && (!memcmp(comp, "NONE", 4) || !memcmp(comp, "twos", 4))) in->enc = SMP_PCM_S24BE;
+  else if (bits == 16 && !memcmp(comp, "sowt", 4)) in->enc = SMP_PCM_S16LE;
+  else {
+    in->kind = SMP_SRC_DECODED; in->offset = 0; in->enc = 0;
+    in->frames = frames > 0 && frames < SF_UNKNOWN_FRAMES ? frames : SF_UNKNOWN_FRAMES;
+    return 2;
+  }
+  if (!have_data) return 0;
+  in->block = (int)ch * (bits / 8);
+  in->frames = (uint32_t)(dsize / (uint64_t)in->block < frames ? dsize / (uint64_t)in->block : frames);
+  in->kind = SMP_SRC_PCM_FILE;
+  return in->frames > 0;
 }
 
-/* FLAC: STREAMINFO's rate, channels and length (skipping an ID3 tag); 0 when they can't be had this way */
-static int probe_flac(HANDLE h, uint64_t size, File *fl) {
+/* the size of an ID3v2 tag at the file's start (0 without one) */
+static uint64_t id3_size(const uint8_t *b) {
+  if (memcmp(b, "ID3", 3)) return 0;
+  return 10 + ((uint64_t)(b[6] & 127) << 21 | (b[7] & 127) << 14 | (b[8] & 127) << 7 | (b[9] & 127));
+}
+
+/* FLAC: STREAMINFO's rate, channels and length (skipping an ID3 tag); 0 when it isn't FLAC */
+static int probe_flac(HANDLE h, uint64_t size, Info *in) {
   uint8_t b[42];
-  uint64_t at = 0, total;
+  uint64_t at, total;
   if (!rd_at(h, 0, b, 10)) return 0;
-  if (!memcmp(b, "ID3", 3)) at = 10 + ((uint64_t)(b[6] & 127) << 21 | (b[7] & 127) << 14 | (b[8] & 127) << 7 | (b[9] & 127));
+  at = id3_size(b);
   if (at + 42 > size || !rd_at(h, at, b, 42) || memcmp(b, "fLaC", 4) || (b[4] & 127) != 0) return 0;
-  fl->rate = (uint32_t)b[18] << 12 | (uint32_t)b[19] << 4 | b[20] >> 4;
-  fl->channels = ((b[20] >> 1) & 7) + 1;
+  in->rate = (uint32_t)b[18] << 12 | (uint32_t)b[19] << 4 | b[20] >> 4;
+  in->channels = ((b[20] >> 1) & 7) + 1;
   total = (uint64_t)(b[21] & 15) << 32 | (uint64_t)be32(b + 22);
-  if (!fl->rate || !total || total > 0xFFFFFFF0u) return 0;
-  fl->frames = (uint32_t)total;
+  in->frames = total && total < SF_UNKNOWN_FRAMES ? (uint32_t)total : SF_UNKNOWN_FRAMES;
+  return 1;
+}
+
+/* MP3: the first frame header's channel mode and rate (after an ID3 tag); the length stays unknown */
+static int probe_mp3(HANDLE h, uint64_t size, Info *in) {
+  static const uint32_t rates[3] = {44100, 48000, 32000};
+  uint8_t b[4096];
+  uint64_t at;
+  DWORD n, i;
+  if (!rd_at(h, 0, b, 10)) return 0;
+  at = id3_size(b);
+  if (at >= size) return 0;
+  n = size - at < sizeof b ? (DWORD)(size - at) : (DWORD)sizeof b;
+  if (n < 4 || !rd_at(h, at, b, n)) return 0;
+  for (i = 0; i + 4 <= n; i++) {
+    unsigned ver = (b[i + 1] >> 3) & 3, layer = (b[i + 1] >> 1) & 3, ri = (b[i + 2] >> 2) & 3, bi = b[i + 2] >> 4;
+    if (b[i] != 0xFF || (b[i + 1] & 0xE0) != 0xE0 || ver == 1 || !layer || ri == 3 || !bi || bi == 15) continue;
+    in->rate = rates[ri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
+    in->channels = (b[i + 3] >> 6) == 3 ? 1 : 2;
+    return 1;
+  }
+  return 0;
+}
+
+/* WavPack: the first block header's flags (mono, rate index) and total samples */
+static int probe_wv(HANDLE h, Info *in) {
+  static const uint32_t rates[15] = {6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
+                                     64000, 88200, 96000, 192000};
+  uint8_t b[32];
+  uint32_t flags, total, ri;
+  if (!rd_at(h, 0, b, 32) || memcmp(b, "wvpk", 4)) return 0;
+  total = le32(b + 12); flags = le32(b + 24); ri = (flags >> 23) & 15;
+  in->channels = (flags & 4) ? 1 : 2;
+  in->rate = ri < 15 ? rates[ri] : 0;
+  in->frames = total && total != 0xFFFFFFFFu && total < SF_UNKNOWN_FRAMES ? total : SF_UNKNOWN_FRAMES;
   return 1;
 }
 
 /* Ogg Vorbis or Opus: the first page's identification header, and the length from the last page's granule */
-static int probe_ogg(HANDLE h, uint64_t size, File *fl) {
+static int probe_ogg(HANDLE h, uint64_t size, Info *in) {
   uint8_t b[64], *t;
-  DWORD n = size < 65536 ? (DWORD)size : 65536;
-  int64_t gran = -1; int preskip = 0; DWORD i;
+  DWORD n = size < 65536 ? (DWORD)size : 65536, i;
+  int64_t gran = -1; int preskip = 0;
   if (size < 64 || !rd_at(h, 0, b, 64) || memcmp(b, "OggS", 4) || 27u + b[26] + 19 > 64) return 0;
   t = b + 27 + b[26];
-  if (!memcmp(t, "\x01vorbis", 7)) { fl->channels = t[11]; fl->rate = le32(t + 12); }
-  else if (!memcmp(t, "OpusHead", 8)) { fl->channels = t[9]; preskip = le16(t + 10); fl->rate = 48000; }
+  if (!memcmp(t, "\x01vorbis", 7)) { in->channels = t[11]; in->rate = le32(t + 12); }
+  else if (!memcmp(t, "OpusHead", 8)) { in->channels = t[9]; preskip = le16(t + 10); in->rate = 48000; }
   else return 0;
-  if (!fl->channels || !fl->rate) return 0;
-  if (!(t = malloc(n))) return 0;
-  if (rd_at(h, size - n, t, n)) {
-    for (i = n >= 27 ? n - 27 : 0; i + 1 > 0; i--) {
-      if (!memcmp(t + i, "OggS", 4) && t[i + 4] == 0) {
-        int64_t g = (int64_t)((uint64_t)le32(t + i + 6) | (uint64_t)le32(t + i + 10) << 32);
-        if (g >= 0) { gran = g; break; }
-      }
-      if (!i) break;
-    }
+  if (!in->channels) in->channels = 2;
+  if (n >= 27 && (t = malloc(n)) != NULL) {
+    if (rd_at(h, size - n, t, n))
+      for (i = n - 27 + 1; i-- > 0;)
+        if (!memcmp(t + i, "OggS", 4) && t[i + 4] == 0) {
+          int64_t g = (int64_t)((uint64_t)le32(t + i + 6) | (uint64_t)le32(t + i + 10) << 32);
+          if (g >= 0) { gran = g; break; }
+        }
+    free(t);
   }
-  free(t);
   gran -= preskip;
-  if (gran <= 0 || gran > 0xFFFFFFF0ll) return 0;
-  fl->frames = (uint32_t)gran;
+  in->frames = gran > 0 && gran < SF_UNKNOWN_FRAMES ? (uint32_t)gran : SF_UNKNOWN_FRAMES;
   return 1;
 }
 
-/* A sample file's format, once: PCM_FILE when it streams as it is, else DECODED with its length and rate from its
-   header (FLAC, Ogg) or from decoding it once now. Sets status. */
-static void probe(P *p, File *fl, const char *upath) {
-  HANDLE h = CreateFileW(fl->wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  LARGE_INTEGER sz; uint8_t b[12]; int ok = 0;
-  (void)p;
-  fl->pitch = 60;
-  if (h == INVALID_HANDLE_VALUE) {
+/* a path's root: "\\server\share\" for a share, "X:\" for a drive (empty when neither) */
+static void path_root(const wchar_t *w, wchar_t *out, int cap) {
+  int n = 0, slashes = 0;
+  out[0] = 0;
+  if (w[0] == L'\\' && w[1] == L'\\') {
+    for (n = 0; w[n] && n < cap - 1; n++) { if (w[n] == L'\\' && ++slashes == 4) { n++; break; } }
+  } else if (w[0] && w[1] == L':') n = 2;
+  if (n >= cap) n = cap - 1;
+  memcpy(out, w, (size_t)n * sizeof(wchar_t)); out[n] = 0;
+}
+
+static int dead_root(P *p, const wchar_t *root) {
+  int k, dead = 0;
+  if (!root[0]) return 0;
+  AcquireSRWLockShared(&p->dead_lock);
+  for (k = 0; k < p->ndead && !dead; k++) dead = !_wcsicmp(p->dead[k], root);
+  ReleaseSRWLockShared(&p->dead_lock);
+  return dead;
+}
+
+/* errors that say the file isn't there (or can't be opened) rather than that its share or drive can't be reached */
+static int local_error(DWORD e) {
+  return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND || e == ERROR_INVALID_NAME || e == ERROR_ACCESS_DENIED ||
+         e == ERROR_SHARING_VIOLATION || e == ERROR_DIRECTORY || e == ERROR_FILENAME_EXCED_RANGE;
+}
+
+static void give_up_root(P *p, const wchar_t *root) {
+  if (!root[0]) return;
+  AcquireSRWLockExclusive(&p->dead_lock);
+  if (p->ndead < MAX_DEAD) { wcsncpy(p->dead[p->ndead], root, WPATH / 4 - 1); p->dead[p->ndead][WPATH / 4 - 1] = 0; p->ndead++; }
+  ReleaseSRWLockExclusive(&p->dead_lock);
+}
+
+static const Cached *cache_find(P *p, const wchar_t *lw) {
+  unsigned i;
+  if (!p->capcslot) return NULL;
+  i = (unsigned)fnv(lw, wcslen(lw) * sizeof(wchar_t)) & (unsigned)(p->capcslot - 1);
+  while (p->cslot[i] >= 0) {
+    if (!wcscmp(p->cache[p->cslot[i]].lw, lw)) return &p->cache[p->cslot[i]];
+    i = (i + 1) & (unsigned)(p->capcslot - 1);
+  }
+  return NULL;
+}
+
+/* A sample file's format, from its header (never decoded here): its size and time first, which may find it in the
+   probe cache; then PCM_FILE when it streams as it is, else DECODED with what the header says. Sets status. Any
+   thread (the probe workers): it touches only fl, and the dead roots under their lock. */
+static void probe(P *p, File *fl) {
+  WIN32_FILE_ATTRIBUTE_DATA a;
+  wchar_t root[WPATH / 4];
+  const Cached *c;
+  HANDLE h;
+  uint8_t b[12];
+  int ok = 0;
+  path_root(fl->wpath, root, WPATH / 4);
+  if (dead_root(p, root)) { fl->status = F_MISSING; return; }
+  if (!GetFileAttributesExW(fl->wpath, GetFileExInfoStandard, &a)) {
     DWORD e = GetLastError();
-    fl->status = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND || e == ERROR_INVALID_NAME ||
-                  e == ERROR_BAD_NETPATH || e == ERROR_INVALID_DRIVE) ? F_MISSING : F_UNREADABLE;
+    if (!local_error(e)) give_up_root(p, root);
+    fl->status = e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION ? F_UNREADABLE : F_MISSING;
     return;
   }
-  if (GetFileSizeEx(h, &sz) && sz.QuadPart >= 12 && rd_at(h, 0, b, 12)) {
-    uint64_t size = (uint64_t)sz.QuadPart;
-    if (!memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WAVE", 4)) ok = probe_wav(h, size, fl);
-    else if (!memcmp(b, "FORM", 4) && (!memcmp(b + 8, "AIFF", 4) || !memcmp(b + 8, "AIFC", 4))) ok = probe_aiff(h, size, fl, b[11] == 'C');
-    if (!ok) {
-      fl->ls = fl->le = 0;
-      fl->kind = SMP_SRC_DECODED;
-      if (!memcmp(b, "fLaC", 4) || !memcmp(b, "ID3", 3)) ok = probe_flac(h, size, fl);
-      else if (!memcmp(b, "OggS", 4)) ok = probe_ogg(h, size, fl);
-    }
+  if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { fl->status = F_UNREADABLE; return; }
+  fl->size = (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+  fl->mtime = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+  if ((c = cache_find(p, fl->lw)) != NULL && c->size == fl->size && c->mtime == fl->mtime) {
+    fl->in = c->in; fl->from_cache = 1; fl->status = F_OK;
+    return;
+  }
+  h = CreateFileW(fl->wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) {
+    DWORD e = GetLastError();
+    if (!local_error(e)) give_up_root(p, root);
+    fl->status = e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? F_MISSING : F_UNREADABLE;
+    return;
+  }
+  fl->in.pitch = 60;
+  unknown_info(&fl->in);
+  fl->in.pitch = 60;
+  if (fl->size >= 12 && rd_at(h, 0, b, 12)) {
+    uint64_t size = fl->size;
+    if (!memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WAVE", 4)) ok = probe_wav(h, size, &fl->in);
+    else if (!memcmp(b, "FORM", 4) && (!memcmp(b + 8, "AIFF", 4) || !memcmp(b + 8, "AIFC", 4))) ok = probe_aiff(h, size, &fl->in, b[11] == 'C');
+    else if (!memcmp(b, "fLaC", 4) || !memcmp(b, "ID3", 3)) { ok = probe_flac(h, size, &fl->in); if (!ok) ok = probe_mp3(h, size, &fl->in); }
+    else if (!memcmp(b, "OggS", 4)) ok = probe_ogg(h, size, &fl->in);
+    else if (!memcmp(b, "wvpk", 4)) ok = probe_wv(h, &fl->in);
+    else if (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) ok = probe_mp3(h, size, &fl->in);
+    if (!ok) { int pitch = fl->in.pitch; unknown_info(&fl->in); fl->in.pitch = pitch; }
+    if (fl->in.kind != SMP_SRC_PCM_FILE) fl->in.kind = SMP_SRC_DECODED;
+    if (fl->in.channels <= 0) fl->in.channels = 2;
+    fl->status = F_OK;   /* any other format is left to the loader's decoder, which says if it can't */
+  } else {
+    fl->status = F_UNREADABLE;                                  /* empty, or it can't be read */
   }
   CloseHandle(h);
-  if (!ok) {
-    /* any other format the decode layer reads: decoded once now to learn it (the loader decodes it again into the
-       cache when a preset needs it) */
-    int ch = 0, rate = 0; long frames = 0; char err[256];
-    float *x = decode_audio(upath, &ch, &frames, &rate, err, sizeof err);
-    if (!x) { fl->status = F_UNREADABLE; return; }
-    free(x);
-    if (ch <= 0 || frames <= 0 || rate <= 0) { fl->status = F_UNREADABLE; return; }
-    fl->kind = SMP_SRC_DECODED; fl->channels = ch; fl->frames = (uint32_t)frames; fl->rate = (uint32_t)rate;
-    fl->ls = fl->le = 0;
-  }
-  fl->status = F_OK;
+  if (fl->status == F_OK) InterlockedIncrement((volatile LONG *)&p->probed);
 }
+
+static DWORD WINAPI probe_worker(void *arg) {
+  P *p = arg;
+  for (;;) {
+    LONG i = InterlockedIncrement(&p->next_probe) - 1;
+    if (i >= p->nfiles || cancelled(p)) break;
+    if (p->files[i].status == F_PENDING && p->files[i].wpath) probe(p, &p->files[i]);
+  }
+  return 0;
+}
+
+/* every file the first pass found, probed on up to PROBE_THREADS threads (this one among them) */
+static void probe_all(P *p) {
+  HANDLE t[PROBE_THREADS - 1]; int nt = 0, k, pending = 0;
+  for (k = 0; k < p->nfiles; k++) if (p->files[k].status == F_PENDING) pending++;
+  p->next_probe = 0;
+  for (k = 0; k < PROBE_THREADS - 1 && pending > 8 * (k + 1); k++)
+    if ((t[nt] = CreateThread(NULL, 0, probe_worker, p, 0, NULL)) != NULL) nt++;
+  probe_worker(p);
+  if (nt) WaitForMultipleObjects((DWORD)nt, t, TRUE, INFINITE);
+  for (k = 0; k < nt; k++) CloseHandle(t[k]);
+}
+
+/* ---- the probe cache: one small file per .sfz next to the decode cache ----
+   "SFZP" u32 version (1), u32 count, then per entry: u16 path length (wchar_t), the lower-case path, u64 size,
+   u64 mtime, and Info's fields (i32 kind, enc, channels, block, pitch; u32 rate, frames, ls, le; u64 offset). */
+
+#define PCACHE_MAX_ENTRIES (1 << 20)
+
+static int pcache_path(const wchar_t *sfz, wchar_t *out, int cap) {
+  char u[WPATH * 3], d[WPATH * 3 + 16], file[WPATH * 3];
+  wchar_t lw[WPATH];
+  size_t n;
+  wcsncpy(lw, sfz, WPATH - 1); lw[WPATH - 1] = 0;
+  CharLowerBuffW(lw, (DWORD)wcslen(lw));
+  if (!WideCharToMultiByte(CP_UTF8, 0, lw, -1, u, (int)sizeof u, NULL, NULL)) return 0;
+  snprintf(d, sizeof d, "sfzprobe1|%s", u);
+  if (!smp_cache_path(smp_key(d), file, (int)sizeof file)) return 0;
+  n = strlen(file);
+  if (n < 5 || strcmp(file + n - 5, ".smpc")) return 0;
+  memcpy(file + n - 5, ".sfzp", 6);                             /* not a .smpc: the cache's own reads skip it */
+  return MultiByteToWideChar(CP_UTF8, 0, file, -1, out, cap) > 0;
+}
+
+static void pcache_read(P *p, const wchar_t *sfz) {
+  wchar_t path[WPATH]; HANDLE h; LARGE_INTEGER sz; uint8_t *b = NULL; DWORD got = 0; uint64_t at = 12; uint32_t n, k;
+  if (!pcache_path(sfz, path, WPATH)) return;
+  h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return;
+  if (GetFileSizeEx(h, &sz) && sz.QuadPart >= 12 && sz.QuadPart < (256 << 20) && (b = malloc((size_t)sz.QuadPart)) != NULL &&
+      ReadFile(h, b, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart && !memcmp(b, "SFZP", 4) && le32(b + 4) == 1 &&
+      (n = le32(b + 8)) <= PCACHE_MAX_ENTRIES && (p->cache = calloc(n ? n : 1, sizeof *p->cache)) != NULL) {
+    for (k = 0; k < n; k++) {
+      Cached *c = &p->cache[k]; unsigned L; const uint8_t *q;
+      if (at + 2 > got) break;
+      L = le16(b + at);
+      if (!L || at + 2 + (uint64_t)L * 2 + 16 + 40 + 8 > got || !(c->lw = malloc(((size_t)L + 1) * sizeof(wchar_t)))) break;
+      memcpy(c->lw, b + at + 2, (size_t)L * 2); c->lw[L] = 0;
+      q = b + at + 2 + (size_t)L * 2;
+      memcpy(&c->size, q, 8); memcpy(&c->mtime, q + 8, 8); q += 16;
+      c->in.kind = (int)le32(q); c->in.enc = (int)le32(q + 4); c->in.channels = (int)le32(q + 8);
+      c->in.block = (int)le32(q + 12); c->in.pitch = (int)le32(q + 16); c->in.rate = le32(q + 20);
+      c->in.frames = le32(q + 24); c->in.ls = le32(q + 28); c->in.le = le32(q + 32); memcpy(&c->in.offset, q + 36, 8);
+      /* a damaged entry ends the reading: what it says could make a sample read past its file */
+      if ((c->in.kind != SMP_SRC_PCM_FILE && c->in.kind != SMP_SRC_DECODED) || c->in.channels < 1 || c->in.channels > 255 ||
+          c->in.enc < 0 || c->in.enc > SMP_PCM_S24BE || c->in.block < 0 || c->in.block > 255 * 4 || !c->in.frames ||
+          c->in.le > c->in.frames || c->in.ls > c->in.le || c->in.pitch < 0 || c->in.pitch > 127 ||
+          (c->in.kind == SMP_SRC_PCM_FILE && (!c->in.block || !c->in.rate ||
+           c->in.offset + (uint64_t)c->in.frames * (uint64_t)c->in.block > c->size))) { free(c->lw); c->lw = NULL; break; }
+      at += 2 + (uint64_t)L * 2 + 16 + 44;
+      p->ncache++;
+    }
+  }
+  free(b);
+  CloseHandle(h);
+  if (p->ncache) {
+    int cap = 64, i;
+    while (cap < 2 * p->ncache) cap *= 2;
+    if (!(p->cslot = malloc((size_t)cap * sizeof(int)))) return;
+    for (i = 0; i < cap; i++) p->cslot[i] = -1;
+    p->capcslot = cap;
+    for (i = 0; i < p->ncache; i++) {
+      unsigned j = (unsigned)fnv(p->cache[i].lw, wcslen(p->cache[i].lw) * sizeof(wchar_t)) & (unsigned)(cap - 1);
+      while (p->cslot[j] >= 0) j = (j + 1) & (unsigned)(cap - 1);
+      p->cslot[j] = i;
+    }
+  }
+}
+
+/* written again only when a file had to be probed; to a temporary name, then moved over the old one */
+static void pcache_write(P *p, const wchar_t *sfz) {
+  wchar_t path[WPATH], part[WPATH + 40]; char why[200];
+  uint8_t *b; size_t cap = 12, at = 12; uint32_t n = 0; int k;
+  HANDLE h; DWORD w = 0;
+  if (!p->probed || !pcache_path(sfz, path, WPATH) || !smp_cache_ok(why, (int)sizeof why)) return;
+  for (k = 0; k < p->nfiles; k++) if (p->files[k].status == F_OK && p->files[k].lw) cap += 2 + wcslen(p->files[k].lw) * 2 + 60;
+  if (!(b = malloc(cap))) return;
+  for (k = 0; k < p->nfiles && n < PCACHE_MAX_ENTRIES; k++) {
+    const File *fl = &p->files[k]; size_t L; uint8_t *q;
+    if (fl->status != F_OK || !fl->lw || (L = wcslen(fl->lw)) == 0 || L > 65535) continue;
+    q = b + at;
+    q[0] = (uint8_t)L; q[1] = (uint8_t)(L >> 8);
+    memcpy(q + 2, fl->lw, L * 2);
+    q += 2 + L * 2;
+    memcpy(q, &fl->size, 8); memcpy(q + 8, &fl->mtime, 8); q += 16;
+    {
+      int32_t iv[5] = {fl->in.kind, fl->in.enc, fl->in.channels, fl->in.block, fl->in.pitch};
+      uint32_t uv[4] = {fl->in.rate, fl->in.frames, fl->in.ls, fl->in.le};
+      memcpy(q, iv, 20); memcpy(q + 20, uv, 16); memcpy(q + 36, &fl->in.offset, 8);
+    }
+    at += 2 + L * 2 + 16 + 44;
+    n++;
+  }
+  memcpy(b, "SFZP", 4);
+  { uint32_t v = 1; memcpy(b + 4, &v, 4); memcpy(b + 8, &n, 4); }
+  _snwprintf(part, WPATH + 39, L"%s.%lu.part", path, GetCurrentThreadId());
+  part[WPATH + 39] = 0;
+  h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h != INVALID_HANDLE_VALUE) {
+    int ok = WriteFile(h, b, (DWORD)at, &w, NULL) && w == (DWORD)at;
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(part, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part);
+  }
+  free(b);
+}
+
+/* ---- sample files: the table ---- */
 
 /* the file table's slot for a lower-cased full path (open addressing on its hash) */
 static int *file_slot(P *p, const wchar_t *lw) {
-  uint64_t hsh = fnv(lw, wcslen(lw) * sizeof(wchar_t));
-  unsigned i = (unsigned)hsh & (unsigned)(p->capslot - 1);
+  unsigned i = (unsigned)fnv(lw, wcslen(lw) * sizeof(wchar_t)) & (unsigned)(p->capslot - 1);
   for (;;) {
     int *s = &p->fslot[i];
-    wchar_t tmp[MAX_PATH * 4];
-    if (*s < 0) return s;
-    wcsncpy(tmp, p->files[*s].wpath, MAX_PATH * 4 - 1); tmp[MAX_PATH * 4 - 1] = 0;
-    CharLowerBuffW(tmp, (DWORD)wcslen(tmp));
-    if (!wcscmp(tmp, lw)) return s;
+    if (*s < 0 || !wcscmp(p->files[*s].lw, lw)) return s;
     i = (i + 1) & (unsigned)(p->capslot - 1);
   }
 }
@@ -700,32 +1004,34 @@ static int new_file(P *p) {
   return p->nfiles++;
 }
 
-static void note_bad(P *p, File *fl, const char *as_written) {
-  if (fl->status == F_MISSING) {
-    if (!p->missing++) snprintf(p->first_missing, sizeof p->first_missing, "%s", as_written);
-  } else if (fl->status == F_UNREADABLE) {
-    if (!p->unreadable++) snprintf(p->first_unreadable, sizeof p->first_unreadable, "%s", as_written);
+static void count_bad(P *p, int status, const char *name) {
+  if (status == F_MISSING) {
+    if (!p->missing++) snprintf(p->first_missing, sizeof p->first_missing, "%s", name);
+  } else {
+    if (!p->unreadable++) snprintf(p->first_unreadable, sizeof p->first_unreadable, "%s", name);
   }
 }
 
-/* the file a sample opcode names (index), or -1 when its regions are skipped (missing, unreadable, unknown) */
+/* The file a sample opcode names (index), or -1 when its regions are skipped (missing, unreadable, unknown). The
+   first pass only adds files to the table; the second finds them probed (or probes one the first didn't see). */
 static int sample_file(P *p, const char *name) {
-  wchar_t w[MAX_PATH * 4], full[MAX_PATH * 4], lw[MAX_PATH * 4];
-  char joined[MAX_SPATH * 2 + 4], u[MAX_PATH * 12];
+  wchar_t w[WPATH], full[WPATH], lw[WPATH], rel[WPATH];
+  char joined[MAX_SPATH * 2 + 4], u[WPATH * 3];
   int *slot, i, absolute;
   size_t k;
+  File *fl;
   if (name[0] == '*') {                                       /* made in memory */
     int g = !_stricmp(name, "*sine") ? SF_GEN_SINE : !_stricmp(name, "*silence") ? SF_GEN_SILENCE :
             !_stricmp(name, "*noise") ? SF_GEN_NOISE : 0;
-    File *fl;
+    if (p->collect) return -1;
     if (!g) { char t[80]; snprintf(t, sizeof t, "sample=%.60s", name); ignored(p, t); return -1; }
     if (p->made[g] >= 0) return p->made[g];
     if ((i = new_file(p)) < 0) return -1;
     fl = &p->files[i];
-    fl->gen = g; fl->status = F_OK; fl->kind = SMP_SRC_PCM_FILE; fl->channels = 1; fl->pitch = 60; fl->path_id = 0;
-    fl->rate = g == SF_GEN_SINE ? SF_GEN_SINE_RATE : 44100;
-    fl->frames = g == SF_GEN_NOISE ? SF_GEN_NOISE_FRAMES : SF_GEN_FRAMES;
-    fl->ls = 0; fl->le = fl->frames;
+    fl->gen = g; fl->status = F_OK; fl->in.kind = SMP_SRC_PCM_FILE; fl->in.channels = 1; fl->in.pitch = 60; fl->path_id = 0;
+    fl->in.rate = g == SF_GEN_SINE ? SF_GEN_SINE_RATE : 44100;
+    fl->in.frames = g == SF_GEN_NOISE ? SF_GEN_NOISE_FRAMES : SF_GEN_FRAMES;
+    fl->in.ls = 0; fl->in.le = fl->in.frames;
     p->made[g] = i;
     return i;
   }
@@ -734,15 +1040,14 @@ static int sample_file(P *p, const char *name) {
   if (absolute) snprintf(joined, sizeof joined, "%s", name);
   else snprintf(joined, sizeof joined, "%s%s", p->default_path, name);
   for (k = 0; joined[k]; k++) if (joined[k] == '/') joined[k] = '\\';
-  {
-    wchar_t rel[MAX_PATH * 4];
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, joined, -1, rel, MAX_PATH * 4) &&
-        !MultiByteToWideChar(CP_ACP, 0, joined, -1, rel, MAX_PATH * 4)) return -1;
-    if (absolute || (rel[0] && rel[1] == L':') || rel[0] == L'\\') wcsncpy(w, rel, MAX_PATH * 4 - 1);
-    else _snwprintf(w, MAX_PATH * 4 - 1, L"%s%s", p->root_dir, rel);
-    w[MAX_PATH * 4 - 1] = 0;
-  }
-  if (!GetFullPathNameW(w, MAX_PATH * 4, full, NULL)) return -1;
+  if ((!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, joined, -1, rel, WPATH) &&
+       !MultiByteToWideChar(CP_ACP, 0, joined, -1, rel, WPATH)) || !rel[0]) goto bad_path;
+  if (absolute || (rel[0] && rel[1] == L':') || rel[0] == L'\\') {
+    if (wcslen(rel) >= WPATH) goto bad_path;
+    wcscpy(w, rel);
+  } else if (_snwprintf(w, WPATH - 1, L"%s%s", p->root_dir, rel) < 0) goto bad_path;   /* too long: never cut short */
+  w[WPATH - 1] = 0;
+  { DWORD n = GetFullPathNameW(w, WPATH, full, NULL); if (!n || n >= WPATH) goto bad_path; }
   wcscpy(lw, full);
   CharLowerBuffW(lw, (DWORD)wcslen(lw));
   if (p->nfiles + 1 > p->capslot / 2) {                       /* the table at most half full */
@@ -750,23 +1055,33 @@ static int sample_file(P *p, const char *name) {
     if (!ns) { p->oom = 1; return -1; }
     for (j = 0; j < nc; j++) ns[j] = -1;
     p->fslot = ns; p->capslot = nc;
-    for (j = 0; j < oc; j++) if (old[j] >= 0 && p->files[old[j]].wpath) {
-      wchar_t t[MAX_PATH * 4];
-      wcscpy(t, p->files[old[j]].wpath); CharLowerBuffW(t, (DWORD)wcslen(t));
-      *file_slot(p, t) = old[j];
-    }
+    for (j = 0; j < oc; j++) if (old[j] >= 0) *file_slot(p, p->files[old[j]].lw) = old[j];
     free(old);
   }
   slot = file_slot(p, lw);
-  if (*slot >= 0) return p->files[*slot].status == F_OK ? *slot : -1;
-  if ((i = new_file(p)) < 0) return -1;
-  if (!(p->files[i].wpath = _wcsdup(full))) { p->oom = 1; return -1; }
-  *slot = i;
-  if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, u, (int)sizeof u, NULL, NULL)) { p->files[i].status = F_UNREADABLE; note_bad(p, &p->files[i], name); return -1; }
-  probe(p, &p->files[i], u);
-  if (p->files[i].status != F_OK) { note_bad(p, &p->files[i], name); return -1; }
-  if ((p->files[i].path_id = add_path(p, u)) < 0) { p->files[i].status = F_UNREADABLE; return -1; }
+  if (*slot < 0) {
+    if ((i = new_file(p)) < 0) return -1;
+    fl = &p->files[i];
+    if (!(fl->wpath = _wcsdup(full)) || !(fl->lw = _wcsdup(lw)) || !(fl->as_written = _strdup(name))) { p->oom = 1; return -1; }
+    *slot = i;
+  }
+  i = *slot;
+  if (p->collect) return -1;                                  /* probed between the passes */
+  fl = &p->files[i];
+  if (fl->status == F_PENDING) probe(p, fl);                  /* named only now (the text changed?): probed here */
+  if (fl->status != F_OK) {
+    if (!fl->noted) { fl->noted = 1; count_bad(p, fl->status, fl->as_written); }
+    return -1;
+  }
+  if (fl->path_id < 0) {
+    if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, u, (int)sizeof u, NULL, NULL)) { fl->status = F_UNREADABLE; fl->noted = 1; count_bad(p, F_UNREADABLE, name); return -1; }
+    if ((fl->path_id = add_path(p, u)) < 0) return -1;
+  }
   return i;
+bad_path:
+  /* a path that can't be made (bad text, too long): unreadable, counted once per name */
+  if (!p->collect && strset_add(&p->badpath, name) == 1) count_bad(p, F_UNREADABLE, name);
+  return -1;
 }
 
 /* a sample for channel ch of a file, starting at frame at (0: the file's own start); -1 when no more can be made */
@@ -788,12 +1103,13 @@ static int new_sample(P *p, File *fl, int ch, uint32_t at) {
   } else {
     snprintf(h->name, sizeof h->name, "%s", fl->gen == SF_GEN_SINE ? "*sine" : fl->gen == SF_GEN_NOISE ? "*noise" : "*silence");
   }
-  h->start = 0; h->end = fl->frames - at;
-  if (fl->le > fl->ls && fl->le > at) { h->loop_start = fl->ls > at ? fl->ls - at : 0; h->loop_end = fl->le - at; }
-  h->rate = fl->rate; h->pitch = (uint8_t)clampi(fl->pitch, 0, 127); h->type = SF_MONO;
-  c->kind = fl->kind; c->path_id = fl->path_id; c->gen = (uint8_t)fl->gen;
-  c->channels = (uint8_t)clampi(fl->channels, 1, 255); c->channel = (uint8_t)ch;
-  if (fl->kind == SMP_SRC_PCM_FILE) { c->offset = fl->offset + (uint64_t)at * (uint64_t)fl->block; c->enc = (uint8_t)fl->enc; }
+  h->start = 0; h->end = fl->in.frames - at;
+  if (fl->in.le > fl->in.ls && fl->in.le > at) { h->loop_start = fl->in.ls > at ? fl->in.ls - at : 0; h->loop_end = fl->in.le - at; }
+  h->rate = fl->in.rate ? fl->in.rate : 44100;   /* unknown: the loaded rate counts (SmpSfView.rate) */
+  h->pitch = (uint8_t)clampi(fl->in.pitch, 0, 127); h->type = SF_MONO;
+  c->kind = (SmpSrcKind)fl->in.kind; c->path_id = fl->path_id; c->gen = (uint8_t)fl->gen;
+  c->channels = (uint8_t)clampi(fl->in.channels, 1, 255); c->channel = (uint8_t)ch;
+  if (fl->in.kind == SMP_SRC_PCM_FILE) { c->offset = fl->in.offset + (uint64_t)at * (uint64_t)fl->in.block; c->enc = (uint8_t)fl->in.enc; }
   else c->skip = at;
   if (h->end - h->start >= h->rate) p->f->has_long = 1;
   return p->ns++;
@@ -830,13 +1146,11 @@ static void env_gens(int16_t *gen, int base, const double *e, int vol) {
   }
 }
 
-/* the region's modulators into the pool (sharing an identical list made just before); returns its offset */
+/* the region's modulators into the pool (sharing an identical list among the last few made); returns its offset */
 static int add_mods(P *p, const SmpSfMod *m, int n) {
   int k;
-  for (k = p->nm - n; k >= 0 && k >= p->nm - 64 * n; k -= n ? n : 1) {   /* the last few lists */
+  for (k = p->nm - n; k >= 0 && k >= p->nm - 64 * n; k -= n)
     if (!memcmp(p->mods + k, m, (size_t)n * sizeof *m)) return k;
-    if (!n) return k;
-  }
   if (!grow((void **)&p->mods, &p->capm, p->nm + n, sizeof *p->mods)) { p->oom = 1; return -1; }
   memcpy(p->mods + p->nm, m, (size_t)n * sizeof *m);
   p->nm += n;
@@ -847,6 +1161,7 @@ static int add_mods(P *p, const SmpSfMod *m, int n) {
 static int add_curve(P *p, const Opts *o) {
   float c[128]; int i, last = 0;
   float lv = o->velset[0] ? o->velcurve[0] : 0;
+  c[0] = lv;
   for (i = 1; i < 128; i++) {
     if (o->velset[i] || i == 127) {
       float v = o->velset[i] ? o->velcurve[i] : 1;
@@ -862,16 +1177,17 @@ static int add_curve(P *p, const Opts *o) {
 }
 
 /* The region now complete in p->region: its sample, its generators (SF2 units; each conversion below) and
-   conditions, as one region, or two for a stereo sample. */
+   conditions, as one region, or two for a stereo sample. The first pass only notes its sample file. */
 static void finish_region(P *p) {
   const Opts *o = &p->region;
   File *fl; int fi, nch, ch, lm, uses_loop, nmod = 0, moff, curve = -1;
   int lokey, hikey, lovel, hivel;
   int64_t start, endx, ls_abs, le_abs;
-  uint32_t at = 0, hf;
+  uint32_t at = 0, hf, rate;
   SmpSfRegion r;
   SmpSfMod m[12];
   double db;
+  if (p->collect) { if (o->sample[0]) sample_file(p, o->sample); return; }
   if (o->sw_default >= 0) p->swdef = o->sw_default;
   if (!o->sample[0] || p->too_many || p->oom) return;
   if (o->hikey < 0 || o->lokey > 127 || o->hivel < 0 || o->lovel > 127) return;   /* never plays */
@@ -880,24 +1196,27 @@ static void finish_region(P *p) {
   if (lokey > hikey || lovel > hivel) return;
   if ((fi = sample_file(p, o->sample)) < 0) return;
   fl = &p->files[fi];
-  nch = fl->channels >= 2 ? 2 : 1;
+  nch = fl->in.channels >= 2 ? 2 : 1;
+  rate = fl->in.rate ? fl->in.rate : 44100;
 
   /* Sample playback, in frames of the file. offset is the first frame; end the last one played (inclusive, as
-     sfzformat.com has it), so the region plays [offset, end + 1); loop_start and loop_end likewise (loop_end
-     inclusive), defaulting to the file's own loop. loop_mode defaults to loop_continuous when the file has a loop,
-     else no_loop (sfzformat.com): no_loop is sampleModes 0, loop_continuous 1, loop_sustain 3 (loop until release,
-     then on to the end), and one_shot is sampleModes 0 with the one_shot condition (note-offs don't release it). */
-  start = (int64_t)clampd(floor(o->offset + 0.5), 0, fl->frames ? fl->frames - 1 : 0);
-  endx = o->end >= 0 ? (int64_t)clampd(floor(o->end + 0.5) + 1, 0, fl->frames) : (int64_t)fl->frames;
+     sfzformat.com has it), so the region plays [offset, end + 1), given as an absolute frame (cond.end_frame), so
+     it holds even when the file's length is only known once it is decoded; loop_start and loop_end likewise
+     (loop_end inclusive), defaulting to the file's own loop. loop_mode defaults to loop_continuous when the file
+     has a loop, else no_loop (sfzformat.com): no_loop is sampleModes 0, loop_continuous 1, loop_sustain 3 (loop
+     until release, then on to the end), and one_shot is sampleModes 0 with the one_shot condition (note-offs don't
+     release it). */
+  start = (int64_t)clampd(floor(o->offset + 0.5), 0, fl->in.frames ? fl->in.frames - 1 : 0);
+  endx = o->end >= 0 ? (int64_t)clampd(floor(o->end + 0.5) + 1, 0, fl->in.frames) : (int64_t)fl->in.frames;
   if (endx <= start) return;
-  ls_abs = o->loop_start >= 0 ? (int64_t)clampd(floor(o->loop_start + 0.5), 0, fl->frames) : fl->ls;
-  le_abs = o->loop_end >= 0 ? (int64_t)clampd(floor(o->loop_end + 0.5) + 1, 0, fl->frames) : fl->le;
-  lm = o->loop_mode >= 0 ? o->loop_mode : (fl->le > fl->ls ? LOOP_CONT : LOOP_NONE);
+  ls_abs = o->loop_start >= 0 ? (int64_t)clampd(floor(o->loop_start + 0.5), 0, fl->in.frames) : fl->in.ls;
+  le_abs = o->loop_end >= 0 ? (int64_t)clampd(floor(o->loop_end + 0.5) + 1, 0, fl->in.frames) : fl->in.le;
+  lm = o->loop_mode >= 0 ? o->loop_mode : (fl->in.le > fl->in.ls ? LOOP_CONT : LOOP_NONE);
   uses_loop = (lm == LOOP_CONT || lm == LOOP_SUSTAIN) && le_abs > ls_abs;
   if (!uses_loop && lm != LOOP_ONESHOT) lm = LOOP_NONE;
   /* a start head when the offset is past half the head the loader keeps (see the top) */
-  hf = fl->rate / 4 > 1024 ? fl->rate / 4 : 1024;
-  if (start > 0 && !fl->gen && fl->frames >= fl->rate && hf < fl->frames && start > hf / 2 && (!uses_loop || ls_abs >= start))
+  hf = rate / 4 > 1024 ? rate / 4 : 1024;
+  if (start > 0 && !fl->gen && fl->in.frames >= rate && hf < fl->in.frames && start > hf / 2 && (!uses_loop || ls_abs >= start))
     at = (uint32_t)start;
 
   memset(&r, 0, sizeof r);
@@ -907,12 +1226,14 @@ static void finish_region(P *p) {
   r.gen[43] = (int16_t)(lokey | hikey << 8);
   r.gen[44] = (int16_t)(lovel | hivel << 8);
   r.gen[G_MODES] = (int16_t)(lm == LOOP_CONT ? 1 : lm == LOOP_SUSTAIN ? 3 : 0);
+  if (o->end >= 0) r.cond.end_frame = (uint32_t)(endx - at > 0 ? endx - at : 1);
 
   /* Pitch. pitch_keycenter is overridingRootKey (=sample leaves it unset, so the file's smpl unity note counts);
-     pitch_keytrack (cents per key) is scaleTuning, 0..1200; transpose (semitones) and tune (cents) together are
-     coarseTune and fineTune. */
+     pitch_keytrack (cents per key) is scaleTuning, -1200..1200 as SFZ allows (the voice takes it as it is, so a
+     negative one plays lower going up); transpose (semitones) and tune (cents) together are coarseTune and
+     fineTune. */
   r.gen[G_ROOTKEY] = (int16_t)(o->keycenter == -2 ? -1 : clampi(o->keycenter, 0, 127));
-  r.gen[G_SCALE] = (int16_t)clampi((int)floor(o->keytrack + 0.5), 0, 1200);
+  r.gen[G_SCALE] = (int16_t)clampi((int)floor(o->keytrack + 0.5), -1200, 1200);
   {
     int cents = (int)clampd(floor(o->transpose * 100 + o->tune + 0.5), -12099, 12099);
     int semis = cents / 100;
@@ -944,12 +1265,14 @@ static void finish_region(P *p) {
 
   /* The filter: only with a cutoff (Hz to absolute cents, 1500..13500 as SF2 allows) and a kind the voice has
      (lpf_2p, the default, hpf_2p, bpf_2p, brf_2p; others were counted as ignored and get no filter). resonance
-     (dB) is initialFilterQ (cB), which the voice reads as the peak's height above the passband, as SFZ means it.
-     fil_veltrack (cents at full velocity) is a velocity-to-cutoff modulator; fil_keytrack (cents per key from
-     fil_keycenter) a key-to-cutoff modulator, its centre taken off the cutoff. */
+     (dB) is initialFilterQ (cB): the peak's height above the passband, which stays at unity (cond.fil_unity, as
+     sfizz and sforzando have it; SF2.04 lowers the passband instead). fil_veltrack (cents at full velocity) is a
+     velocity-to-cutoff modulator; fil_keytrack (cents per key from fil_keycenter) a key-to-cutoff modulator, its
+     centre taken off the cutoff. */
   if (o->cutoff > 0 && o->fil_type >= 0) {
     double kt = clampd(o->fil_keytrack, -255, 255);
     r.cond.fil_type = (uint8_t)o->fil_type;
+    r.cond.fil_unity = 1;
     r.gen[G_FC] = (int16_t)clampi((int)floor(1200.0 * log2(o->cutoff / 8.176) - kt * o->fil_keycenter + 0.5), 1500, 13500);
     r.gen[G_Q] = (int16_t)clampi((int)floor(o->resonance * 10 + 0.5), 0, 960);
   }
@@ -999,7 +1322,7 @@ static void finish_region(P *p) {
       m[nmod++] = w;
       if (B) m[nmod++] = x;
     }
-    if (r.cond.fil_type == o->fil_type && o->cutoff > 0 && o->fil_type >= 0) {
+    if (o->cutoff > 0 && o->fil_type >= 0) {
       if (o->fil_veltrack != 0) { SmpSfMod w = {0x0002, 8, (int16_t)clampi((int)floor(o->fil_veltrack + 0.5), -12000, 12000), 0, 0}; m[nmod++] = w; }
       if (o->fil_keytrack != 0) { SmpSfMod w = {0x0003, 8, (int16_t)clampi((int)floor(clampd(o->fil_keytrack, -255, 255) * 128 + 0.5), -32768, 32767), 0, 0}; m[nmod++] = w; }
     }
@@ -1046,7 +1369,7 @@ static void finish_region(P *p) {
   }
 
   /* one region a channel: the sample from frame `at`, the address offsets relative to that sample (fine plus
-     coarse, as the voice reads them), and the channel's pan */
+     coarse, as the voice reads them), and the channel's pan; the second is the pair's follower */
   for (ch = 0; ch < nch; ch++) {
     int sid = get_sample(p, fl, ch, at);
     const SmpSfSample *sh;
@@ -1059,9 +1382,9 @@ static void finish_region(P *p) {
     g = &p->regs[p->nr++];
     g->r = r; g->mod_off = moff; g->nmod = nmod; g->curve = curve;
     g->r.sample = sid;
+    g->r.cond.pair = (uint8_t)(ch == 1);
     g->r.gen[53] = (int16_t)(sid < 32767 ? sid : 32767);
     addr(g->r.gen, G_START, G_STARTCOARSE, start - at);
-    addr(g->r.gen, G_END, 12, endx - (int64_t)at - (int64_t)sh->end);
     if (uses_loop) {
       addr(g->r.gen, G_LOOPSTART, G_LOOPSTARTCOARSE, ls_abs - at - sh->loop_start);
       addr(g->r.gen, G_LOOPEND, G_LOOPENDCOARSE, le_abs - at - sh->loop_end);
@@ -1168,20 +1491,21 @@ static void define(P *p, const char *s, size_t n) {
 static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wcap);
 
 static void include(P *p, const char *s, size_t n, const wchar_t *dir, int depth) {
-  char name[MAX_SPATH]; wchar_t w[MAX_PATH * 4], rel[MAX_PATH * 4], full[MAX_PATH * 4];
-  size_t a = 0, b, k; char why[8];
+  char name[MAX_SPATH]; wchar_t w[WPATH], rel[WPATH], full[WPATH];
+  size_t a = 0, b, k; char why[8]; DWORD fn;
   while (a < n && ws(s[a])) a++;
   if (a < n && s[a] == '"') { a++; for (b = a; b < n && s[b] != '"'; b++) {} }
   else for (b = a; b < n && !ws(s[b]); b++) {}
   if (b <= a || b - a >= sizeof name) return;
   memcpy(name, s + a, b - a); name[b - a] = 0;
   for (k = 0; name[k]; k++) if (name[k] == '/') name[k] = '\\';
-  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, rel, MAX_PATH * 4) &&
-      !MultiByteToWideChar(CP_ACP, 0, name, -1, rel, MAX_PATH * 4)) return;
-  if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') wcsncpy(w, rel, MAX_PATH * 4 - 1);
-  else _snwprintf(w, MAX_PATH * 4 - 1, L"%s%s", dir, rel);
-  w[MAX_PATH * 4 - 1] = 0;
-  if (!GetFullPathNameW(w, MAX_PATH * 4, full, NULL)) return;
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, rel, WPATH) &&
+      !MultiByteToWideChar(CP_ACP, 0, name, -1, rel, WPATH)) return;
+  if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') { if (wcslen(rel) >= WPATH) return; wcscpy(w, rel); }
+  else if (_snwprintf(w, WPATH - 1, L"%s%s", dir, rel) < 0) return;   /* too long: never cut short */
+  w[WPATH - 1] = 0;
+  fn = GetFullPathNameW(w, WPATH, full, NULL);
+  if (!fn || fn >= WPATH) return;
   process_file(p, full, depth + 1, why, (int)sizeof why);   /* a missing or bad include is skipped */
 }
 
@@ -1250,9 +1574,9 @@ static void strip_comments(char *t, size_t n) {
 /* reads and processes one file (the root at depth 0); 0 with why when the root can't be read */
 static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wcap) {
   HANDLE h; LARGE_INTEGER sz; DWORD got = 0; char *t; size_t n, i, a;
-  wchar_t dir[MAX_PATH * 4], *slash;
+  wchar_t dir[WPATH], *slash;
   int k;
-  if (depth > MAX_DEPTH || (depth > 0 && p->nincludes >= MAX_INCLUDES)) return 0;
+  if (depth > MAX_DEPTH || (depth > 0 && p->nincludes >= MAX_INCLUDES) || cancelled(p)) return 0;
   for (k = 0; k < depth; k++) if (CompareStringOrdinal(p->stack[k], -1, wpath, -1, TRUE) == CSTR_EQUAL) return 0;   /* a cycle */
   if (depth > 0) p->nincludes++;
   h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
@@ -1269,13 +1593,17 @@ static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wc
   CloseHandle(h);
   p->text_bytes += n;
   t[n] = 0;
-  wcsncpy(dir, wpath, MAX_PATH * 4 - 1); dir[MAX_PATH * 4 - 1] = 0;
+  wcsncpy(dir, wpath, WPATH - 1); dir[WPATH - 1] = 0;
   slash = wcsrchr(dir, L'\\');
   if (slash) slash[1] = 0; else dir[0] = 0;
   p->stack[depth] = wpath;
   strip_comments(t, n);
   for (a = i = 0; i <= n && !p->oom; i++) {
-    if (i == n || t[i] == '\n') { do_line(p, t + a, i - a, dir, depth); a = i + 1; }
+    if (i == n || t[i] == '\n') {
+      do_line(p, t + a, i - a, dir, depth);
+      a = i + 1;
+      if ((i & 0xFFF) == 0 && p->cancel && cancelled(p)) break;
+    }
   }
   free(t);
   return 1;
@@ -1286,7 +1614,12 @@ static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wc
 int sf_is_sfz(const char *path, const uint8_t *head, size_t n) {
   static const char *hdr[] = {"<region>", "<group>", "<control>", "<global>", "<master>"};
   const char *dot = path ? strrchr(path, '.') : NULL;
-  size_t i, k;
+  size_t i, k, a = 0;
+  /* XML (a Decent Sampler preset, say) is never SFZ, whatever its name */
+  if (n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF) a = 3;   /* a UTF-8 byte order mark */
+  while (a < n && (head[a] == ' ' || head[a] == '\t' || head[a] == '\r' || head[a] == '\n')) a++;
+  if (n - a >= 5 && !memcmp(head + a, "<?xml", 5)) return 0;
+  for (i = 0; i + 14 <= n; i++) if (!memcmp(head + i, "<DecentSampler", 14)) return 0;
   if (dot && !_stricmp(dot, ".sfz")) return 1;
   for (k = 0; k < sizeof hdr / sizeof *hdr; k++) {
     size_t L = strlen(hdr[k]);
@@ -1295,22 +1628,38 @@ int sf_is_sfz(const char *path, const uint8_t *head, size_t n) {
   return 0;
 }
 
+/* back to the state at the text's start, for the second pass (the files and the defines' table stay) */
+static void restart_text(P *p) {
+  int i;
+  for (i = 0; i < p->ndef; i++) { free(p->def_name[i]); free(p->def_val[i]); p->def_name[i] = p->def_val[i] = NULL; }
+  p->ndef = 0;
+  for (i = 0; i < DEF_SLOTS; i++) p->def_slot[i] = -1;
+  opts_default(&p->global); p->master = p->group = p->region = p->global;
+  p->level = LV_NONE;
+  p->default_path[0] = 0; p->note_offset = p->octave_offset = 0;
+  p->nincludes = 0; p->text_bytes = 0;
+  p->swdef = -1;
+}
+
 static void free_parser(P *p) {
   int i;
   for (i = 0; i < p->ndef; i++) { free(p->def_name[i]); free(p->def_val[i]); }
   free(p->def_name); free(p->def_val); free(p->def_slot);
-  free(p->line); free(p->val); free(p->tmp); free(p->seen);
+  free(p->line); free(p->val); free(p->tmp);
+  strset_free(&p->ign); strset_free(&p->badpath);
   for (i = 0; i < p->nfiles; i++) {
     Head *h = p->files[i].heads;
     while (h) { Head *nx = h->next; free(h); h = nx; }
-    free(p->files[i].wpath);
+    free(p->files[i].wpath); free(p->files[i].lw); free(p->files[i].as_written);
   }
   free(p->files); free(p->fslot);
+  for (i = 0; i < p->ncache; i++) free(p->cache[i].lw);
+  free(p->cache); free(p->cslot);
   if (p->paths) for (i = 0; i < p->npaths; i++) free(p->paths[i]);
   free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves);
 }
 
-int sf_parse_sfz(SmpFont *f, const char *path, char *why, int wcap) {
+int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   P *p = calloc(1, sizeof *p);
   wchar_t *full = NULL;
   int ok = 0, i;
@@ -1318,29 +1667,40 @@ int sf_parse_sfz(SmpFont *f, const char *path, char *why, int wcap) {
   if (!p) { snprintf(why, (size_t)wcap, "out of memory"); return 0; }
   p->f = f;
   p->root_name = base_name(path);
-  p->swdef = -1;
+  p->cancel = cancel; p->carg = carg;
+  InitializeSRWLock(&p->dead_lock);
   for (i = 0; i < 4; i++) p->made[i] = -1;
-  opts_default(&p->global); p->master = p->group = p->region = p->global;
   p->def_name = calloc(MAX_DEFINES, sizeof(char *)); p->def_val = calloc(MAX_DEFINES, sizeof(char *));
   p->def_slot = malloc(DEF_SLOTS * sizeof(int));
   p->line = malloc(MAX_LINE + 1); p->val = malloc(MAX_LINE + 1); p->tmp = malloc(MAX_LINE + 1);
-  p->seen = calloc(SEEN_SLOTS, sizeof(uint64_t));
   full = sf_full_path(path);
-  if (!p->def_name || !p->def_val || !p->def_slot || !p->line || !p->val || !p->tmp || !p->seen || !full) {
+  if (!p->def_name || !p->def_val || !p->def_slot || !p->line || !p->val || !p->tmp || !full) {
     snprintf(why, (size_t)wcap, "out of memory");
     goto done;
   }
-  for (i = 0; i < DEF_SLOTS; i++) p->def_slot[i] = -1;
+  restart_text(p);
   {
     wchar_t *slash;
-    wcsncpy(p->root_dir, full, MAX_PATH * 4 - 1); p->root_dir[MAX_PATH * 4 - 1] = 0;
+    wcsncpy(p->root_dir, full, WPATH - 1); p->root_dir[WPATH - 1] = 0;
     slash = wcsrchr(p->root_dir, L'\\');
     if (slash) slash[1] = 0; else p->root_dir[0] = 0;
   }
   if (add_path(p, path) != 0) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }   /* paths[0]: the .sfz */
+
+  /* the first pass collects the files, which are probed (the probe cache first) before the second builds */
+  p->collect = 1;
   if (!process_file(p, full, 0, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
+  pcache_read(p, full);
+  probe_all(p);
+  if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
+  restart_text(p);
+  p->collect = 0;
+  if (!process_file(p, full, 0, why, wcap)) goto done;
+  if (p->level == LV_REGION) finish_region(p);
+  if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
   if (p->oom) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+  pcache_write(p, full);
 
   /* what was missing or unreadable, for the font's problem (or the whole reason when nothing is left) */
   problem[0] = 0;

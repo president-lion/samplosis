@@ -891,7 +891,9 @@ int sf_key_regions(const SmpFont *f, int preset, int key, const SmpSfRegion **re
 }
 
 /* parses a font's headers into a new SmpFont (sffont.c's smp_sf_open shares it through the registry) */
-SmpFont *sf_parse(const char *path, char *err, int cap) {
+SmpFont *sf_parse(const char *path, char *err, int cap) { return sf_parse_ex(path, NULL, NULL, err, cap); }
+
+SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *err, int cap) {
   wchar_t w[2048]; Src s; LARGE_INTEGER sz; FILETIME mt; uint8_t h[12];
   uint64_t pos, end, pdta_off = 0, snam_off = 0; uint32_t pdta_size = 0, snam_size = 0;
   int have_pdta = 0, have_smpl = 0, ok = 0;
@@ -931,7 +933,7 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
       f->path = _strdup(path);
       if (!f->path) snprintf(why, sizeof why, "out of memory");
       else {
-        int r = sf_parse_sfz(f, path, why, sizeof why);
+        int r = sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
         if (r > 0) return f;
         if (r < 0) {                         /* why is the whole reason (every sample missing, say) */
           if (err && cap > 0) snprintf(err, cap, "%s", why);

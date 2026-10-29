@@ -859,6 +859,34 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     assert st[4] == "plays sampler" and c[2] == "beeps 2"
 
 
+def test_gui_sfz_loads_in_background(P, tmp_path):
+    # A dropped .sfz loads on the window's worker (it probes every sample file's header): the drop returns at once
+    # with "Loading big.sfz", and the instrument is swapped in on the main thread and plays
+    import struct
+    d = tmp_path / "big"
+    d.mkdir()
+    lines = []
+    for i in range(2000):
+        data = struct.pack("<4h", 0, 1000, 0, -1000)
+        fmt = struct.pack("<HHIIHH", 1, 1, 44100, 88200, 2, 16)
+        body = b"WAVE" + b"fmt " + struct.pack("<I", 16) + fmt + b"data" + struct.pack("<I", len(data)) + data
+        (d / ("s%04d.wav" % i)).write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+        lines.append("<region> sample=big/s%04d.wav key=%d lovel=%d hivel=%d" % (i, 20 + i % 80, i // 80, i // 80))
+    sfz = tmp_path / "big.sfz"
+    sfz.write_text("\n".join(lines) + "\n")
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["async on", "clock", "drop %s" % sfz, "clock", "read Status", "wait", "say",
+                                  "read SoundFont", "read Status", "state plays", "state soundfont", "counts"])
+    r = [x[1] for x in got(out, "read")]
+    ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
+    assert ms[1] < 500, out                                          # the drop returned at once
+    assert r[0] == "Loading big.sfz", out
+    assert r[1] == "big.sfz, 1 preset", out
+    assert r[2].startswith("Ready: big.sfz") or r[2].startswith("Loading samples for "), out
+    assert "state: plays soundfont" in out and ('state: soundfont "%s"' % sfz) in out
+    assert got(out, "counts")[0][0] == "beeps 0"
+
+
 def test_gui_channel_from_song(P, tmp_path):
     font = P.font()
     other = P.font("other.sf2")

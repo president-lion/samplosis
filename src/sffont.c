@@ -200,6 +200,9 @@ static HANDLE font_handle(SmpFont *f, int path_id) {
   return h;
 }
 
+static void set_problem(SmpFont *f, const char *fmt, const char *a, const char *b);
+static const char *font_name(const SmpFont *f);
+
 /* A DECODED sample: its head from its cache file when there is one; else decoded now (once) and written there.
    When the cache can't be written, the whole decoded sample is held in memory instead. NULL with *broken set when
    the data can never decode; NULL without it when memory ran out or the file can't be opened for now. */
@@ -250,9 +253,18 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
       }
     }
     if (skip >= n) { free(x); if (e) smp_cache_close(e); *broken = 1; return NULL; }
+    if (!e && skip) {
+      /* No cache: a base sample is held whole, but a start head (an SFZ offset into the same file) would hold a
+         second copy of nearly all of it, one per offset. Refused instead, with the reason. */
+      free(x);
+      set_problem(f, "the cache folder can't hold %s's decoded samples, so regions with offsets are silent%s", font_name(f), "");
+      *broken = 1;
+      return NULL;
+    }
     hf = e ? head_of(n - skip, rate) : n - skip;                    /* no cache: held whole */
     p = new_pcm(n - skip, hf, 1);
     if (!p) { free(x); if (e) smp_cache_close(e); return NULL; }
+    p->rate = r > 0 ? (uint32_t)r : rate;
     memcpy(p->data, mono + skip, (size_t)hf * sizeof(float));
     free(x);
     if (hf < n - skip) { p->entry = e; p->skip = skip; }
@@ -267,6 +279,7 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
   p = new_pcm(n, hf, 1);
   if (!p) { smp_cache_close(e); return NULL; }
   if (smp_entry_read_mono(e, skip, (float *)p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
+  p->rate = smp_entry_rate(e) > 0 ? (uint32_t)smp_entry_rate(e) : rate;
   if (hf < n) { p->entry = e; p->skip = skip; }
   else smp_cache_close(e);
   return p;
@@ -373,7 +386,9 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
     ls = sh->loop_start > sh->start ? sh->loop_start - sh->start : 0;
     le = sh->loop_end > sh->start ? sh->loop_end - sh->start : 0;
   }
-  /* the loop inside the data; a backwards loop becomes an empty one at its end */
+  if (!p->rate) p->rate = rate;
+  /* the loop inside the data (a decode shorter than its header said clamps it here too); a backwards loop becomes
+     an empty one at its end */
   if (ls > p->frames) ls = p->frames;
   if (le > p->frames) le = p->frames;
   if (ls > le) ls = le;
@@ -384,7 +399,17 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
 
 /* the font's problem, said once: written before has_problem is set, so a reader that sees the flag sees the text */
 static void set_problem(SmpFont *f, const char *fmt, const char *a, const char *b) {
-  if (InterlockedCompareExchange(&f->has_problem, 0, 0)) return;
+  if (InterlockedCompareExchange(&f->has_problem2, 0, 0)) return;
+  if (InterlockedCompareExchange(&f->has_problem, 0, 0)) {
+    /* the open already said one (an SFZ's missing samples): both, in the second buffer, once */
+    size_t L;
+    if (!f->is_sfz) return;
+    snprintf(f->problem2, sizeof f->problem2, "%s; ", f->problem);
+    L = strlen(f->problem2);
+    snprintf(f->problem2 + L, sizeof f->problem2 - L, fmt, a, b ? b : "");
+    InterlockedExchange(&f->has_problem2, 1);
+    return;
+  }
   snprintf(f->problem, sizeof f->problem, fmt, a, b ? b : "");
   InterlockedExchange(&f->has_problem, 1);
 }
@@ -553,6 +578,9 @@ static DWORD pass(SmpFont *f) {
           f->state[s] = SF_ST_PUBLISHED;
         } else if (broken) {
           f->state[s] = SF_ST_BROKEN;                /* never tried again */
+          /* an SFZ's sample files are only probed at open; one that turns out not to decode is said here */
+          if (f->is_sfz && f->src[s].kind == SMP_SRC_DECODED && !f->src[s].gen)
+            set_problem(f, "%s can't be decoded (it may be damaged or in a format this can't read)%s", f->shdr[s].name, "");
         } else {
           retry = 1;                                 /* no file or no memory: tried again in RETRY_MS */
         }
@@ -702,6 +730,20 @@ wchar_t *sf_full_path(const char *path) {
   return full;
 }
 
+/* the font already open for this full path with this size and time, with one more reference; or NULL */
+static SmpFont *find_open(const wchar_t *full, uint64_t size, uint64_t mt) {
+  SmpFont *found = NULL;
+  int i;
+  AcquireSRWLockExclusive(&g_lock);
+  for (i = 0; i < g_nfonts; i++) {
+    SmpFont *g = g_fonts[i];
+    if (g->wpath && g->size == size && g->mtime == mt &&
+        CompareStringOrdinal(g->wpath, -1, full, -1, TRUE) == CSTR_EQUAL) { found = g; found->refs++; break; }
+  }
+  ReleaseSRWLockExclusive(&g_lock);
+  return found;
+}
+
 SmpFont *smp_sf_open(const char *path, char *err, int cap) {
   wchar_t *full = sf_full_path(path);
   WIN32_FILE_ATTRIBUTE_DATA a;
@@ -714,21 +756,33 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
     if (err && cap > 0) snprintf(err, cap, "can't open %s", b);
     return NULL;
   }
+  (void)i;
   if (GetFileAttributesExW(full, GetFileExInfoStandard, &a)) {
-    uint64_t size = (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
-    uint64_t mt = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
-    SmpFont *found = NULL;
-    AcquireSRWLockExclusive(&g_lock);
-    for (i = 0; i < g_nfonts; i++) {
-      SmpFont *g = g_fonts[i];
-      if (g->wpath && g->size == size && g->mtime == mt &&
-          CompareStringOrdinal(g->wpath, -1, full, -1, TRUE) == CSTR_EQUAL) { found = g; found->refs++; break; }
-    }
-    ReleaseSRWLockExclusive(&g_lock);
+    SmpFont *found = find_open(full, (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow,
+                               (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime);
     if (found) { free(full); return found; }
   }
   f = sf_parse(path, err, cap);
   if (!f) { free(full); return NULL; }
+  return sf_register(f, full, err, cap);
+}
+
+/* the window's background loads: the parse on a worker, the registration on the main thread */
+SmpFont *smp_sf_parse_detached(const char *path, int (*cancel)(void *), void *arg, char *err, int cap) {
+  if (err && cap > 0) err[0] = 0;
+  return sf_parse_ex(path, cancel, arg, err, cap);
+}
+
+void smp_sf_discard(SmpFont *f) { if (f) sf_free(f); }
+
+SmpFont *smp_sf_adopt(SmpFont *f, char *err, int cap) {
+  wchar_t *full;
+  SmpFont *found;
+  if (err && cap > 0) err[0] = 0;
+  if (!f) return NULL;
+  if (!(full = sf_full_path(f->path))) { sf_free(f); if (err && cap > 0) snprintf(err, cap, "out of memory"); return NULL; }
+  /* the same file opened meanwhile (by a project, or another instance): that one is shared */
+  if ((found = find_open(full, f->size, f->mtime)) != NULL) { free(full); sf_free(f); return found; }
   return sf_register(f, full, err, cap);
 }
 
@@ -815,6 +869,7 @@ int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view) {
     view->loop_start = p->loop_start; view->loop_end = p->loop_end;
     view->stream = p->head_frames < p->frames ? p : NULL;
     view->tail = p->tail; view->tail_start = p->tail_start; view->tail_frames = p->tail_frames;
+    view->rate = p->rate;
   }
   return 1;
 }
@@ -872,6 +927,7 @@ int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
 int smp_sf_loaded_samples(const SmpFont *f) { return f ? (int)f->nloaded : 0; }
 
 const char *smp_sf_problem(const SmpFont *f) {
+  if (f && InterlockedCompareExchange((volatile LONG *)&f->has_problem2, 0, 0)) return f->problem2;
   if (!f || !InterlockedCompareExchange((volatile LONG *)&f->has_problem, 0, 0)) return "";
   return f->problem;
 }

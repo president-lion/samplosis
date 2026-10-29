@@ -146,6 +146,9 @@ typedef struct {
   uint64_t age;                   /* when it started; smaller is older */
   const SmpSfRegion *reg;         /* the region a pending voice waits to start */
   ULONGLONG since;                 /* when a pending voice began to wait (GetTickCount64, real time) */
+  uint64_t vid;                   /* this start's own number, so a partner link can be checked */
+  int partner; uint64_t partner_vid;   /* the other half of a stereo pair (SmpSfCond.pair), -1 none */
+  uint32_t ev;                    /* the note event (serial) that started it */
 } Slot;
 
 typedef struct { SmpFont *f; LONG64 a0; } Retired;
@@ -182,6 +185,8 @@ struct SmpSynth {
   uint64_t now;                   /* the frame of the event being handled, on that clock */
   uint32_t rng;                   /* xorshift32 state for the random draw */
   uint32_t serial;                /* note events so far: a round-robin set advances once per event */
+  uint64_t vid;                   /* voice starts so far (Slot.vid) */
+  const SmpSfRegion *last_reg; int last_slot; uint64_t last_vid;   /* this event's last start, for stereo pairs */
   Seq *sq;                        /* the counters the audio thread uses (taken with the font), or NULL */
   Seq *volatile sq_want;          /* the newest counters smp_synth_load made (main thread writes) */
   Seq **sq_all; int nsq;          /* every Seq made, freed by smp_synth_free (main thread) */
@@ -350,6 +355,13 @@ static void kill_voice(SmpSynth *s, int i, double ms) {
   if (!s->v[i].live) slot_free(s, i);
 }
 
+/* the other half of slot i's stereo pair, while it is still that voice; -1 when there is none */
+static int partner_of(const SmpSynth *s, int i) {
+  int k = s->sl[i].partner;
+  if (k < 0 || k >= MAXV || s->sl[k].st == V_FREE || s->sl[k].vid != s->sl[i].partner_vid) return -1;
+  return k;
+}
+
 /* a note-off or a pedal's let-go: a one-shot region (SFZ loop_mode=one_shot) ignores it, even while pending */
 static void release_voice(SmpSynth *s, int i) {
   if (s->sl[i].reg && s->sl[i].reg->cond.one_shot) return;
@@ -390,10 +402,12 @@ static void limit(SmpSynth *s, int except) {
   int i, n = 0, lim = (int)param(s, SMP_P_SF_VOICES);
   for (i = 0; i < MAXV; i++) if (sounding(s, i)) n++;
   while (n > lim) {
-    int k = victim(s, except);
+    int k = victim(s, except), pk;
     if (k < 0) break;
+    pk = partner_of(s, k);
     kill_voice(s, k, KILL_MS);
     n--;
+    if (pk >= 0 && pk != except && sounding(s, pk)) { kill_voice(s, pk, KILL_MS); n--; }   /* a pair goes together */
   }
   if (n > s->peak) s->peak = n;
 }
@@ -407,6 +421,10 @@ static int free_slot(SmpSynth *s) {
   if (k < 0) for (i = 0; i < MAXV; i++) if (s->sl[i].st == V_PENDING) { k = i; break; }
   if (k < 0) k = victim(s, -1);
   if (k < 0) return -1;
+  {
+    int pk = partner_of(s, k);
+    if (pk >= 0) kill_voice(s, pk, KILL_MS);              /* its other half fades with it */
+  }
   kill_voice(s, k, 0);
   slot_free(s, k);
   return k;
@@ -428,30 +446,40 @@ static int try_start(SmpSynth *s, int i) {
   return 1;
 }
 
+/* one voice stopped by another region (a polyphony limit), by its own off_mode (fast: the 5 ms kill; normal: its
+   release), so that it no longer counts as sounding */
+static void stop_by_mode(SmpSynth *s, int i) {
+  if (s->sl[i].reg && s->sl[i].reg->cond.off_mode == 1 && s->sl[i].st == V_LIVE) {
+    smp_sfv_off(&s->v[i]);
+    if (!s->v[i].released) kill_voice(s, i, KILL_MS);       /* never loop forever on one that can't release */
+  } else kill_voice(s, i, KILL_MS);
+  if (s->sl[i].st == V_PENDING) slot_free(s, i);
+}
+
 /* SFZ's polyphony and note_polyphony, before region r starts on channel c: while the channel already has that
    many voices of r's group sounding (not released or fading), or that many of r's group on this key, the oldest
-   of them stops, by its own off_mode (fast: the 5 ms kill; normal: its release). */
+   of them stops (stop_by_mode). A stereo pair counts once (its follower isn't counted) and stops together; voices
+   the current note event started are never counted or stopped, so a layered or stereo note keeps every voice. */
 static void poly_limit(SmpSynth *s, int c, int key, const SmpSfRegion *r) {
   int pass;
   for (pass = 0; pass < 2; pass++) {
     int lim = pass ? r->cond.note_polyphony : r->cond.polyphony;
     if (!lim) continue;
     for (;;) {
-      int i, n = 0, old = -1;
+      int i, n = 0, old = -1, pk;
       for (i = 0; i < MAXV; i++) {
         Slot *t = &s->sl[i];
         if (t->st == V_FREE || t->chan != c || !t->reg || t->reg->cond.group != r->cond.group) continue;
+        if (t->reg->cond.pair || t->ev == s->serial) continue;
         if (pass && t->key != key) continue;
         if (t->st == V_LIVE && (s->v[i].released || s->v[i].killing)) continue;
         n++;
         if (old < 0 || t->age < s->sl[old].age) old = i;
       }
       if (n < lim || old < 0) break;
-      if (s->sl[old].reg->cond.off_mode == 1 && s->sl[old].st == V_LIVE) {
-        smp_sfv_off(&s->v[old]);
-        if (!s->v[old].released) kill_voice(s, old, KILL_MS);   /* never loop forever on one that can't release */
-      } else kill_voice(s, old, KILL_MS);
-      if (s->sl[old].st == V_PENDING) slot_free(s, old);
+      pk = partner_of(s, old);
+      stop_by_mode(s, old);
+      if (pk >= 0) stop_by_mode(s, pk);
     }
   }
 }
@@ -466,6 +494,14 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   memset(t, 0, sizeof *t);
   t->chan = c; t->key = key; t->vel = vel; t->keydown = held < 0; t->reg = r; t->excl = r->gen[G_EXCL];
   t->rt = held >= 0; t->held = held;
+  t->vid = ++s->vid; t->ev = s->serial; t->partner = -1;
+  /* a stereo pair's follower links with its leader, the region just before it, started by this same event */
+  if (r->cond.pair && s->last_reg == r - 1 && s->last_slot >= 0 && s->last_slot != i && s->sl[s->last_slot].vid == s->last_vid &&
+      s->sl[s->last_slot].st != V_FREE) {
+    t->partner = s->last_slot; t->partner_vid = s->last_vid;
+    s->sl[s->last_slot].partner = i; s->sl[s->last_slot].partner_vid = t->vid;
+  }
+  s->last_reg = r; s->last_slot = i; s->last_vid = t->vid;
   t->st = V_PENDING;
   t->since = GetTickCount64();
   if (try_start(s, i)) return;
@@ -544,6 +580,7 @@ static void start_event(SmpSynth *s, int c, int key, int vel, int release, float
                         const SmpSfRegion *regs, const uint32_t *idx, int n, int flags) {
   int k;
   s->serial++;
+  s->last_reg = NULL; s->last_slot = -1;
   if (flags & SF_PF_ROOM)
     for (k = 0; k < n; k++) {
       const SmpSfRegion *r = &regs[idx ? idx[k] : k];
@@ -818,12 +855,20 @@ SMP_API int smp_synth_collect(SmpSynth *s) {
 SMP_API SmpFont *smp_synth_font(const SmpSynth *s) { return s ? s->font : NULL; }
 
 SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap) {
-  SmpFont *f, *old;
+  SmpFont *f;
   if (err && cap > 0) err[0] = 0;
   if (!s || !path) { if (err && cap > 0) snprintf(err, (size_t)cap, "no player or no path"); return 0; }
   if (strlen(path) >= sizeof s->path) { if (err && cap > 0) snprintf(err, (size_t)cap, "the path is too long"); return 0; }
   f = smp_sf_open(path, err, cap);
   if (!f) return 0;
+  return smp_synth_load_font(s, f, path, err, cap);
+}
+
+SMP_API int smp_synth_load_font(SmpSynth *s, SmpFont *f, const char *path, char *err, int cap) {
+  SmpFont *old;
+  if (!s || !f) { if (f) smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "no player or no font"); return 0; }
+  if (!path) path = f->path;
+  if (strlen(path) >= sizeof s->path) { smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "the path is too long"); return 0; }
   if (f->has_long && !s->st) {                 /* long samples stream: the streamer starts now, before any note */
     SfStream *st = sfs_new(MAXV);
     if (!st) { smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "out of memory"); return 0; }

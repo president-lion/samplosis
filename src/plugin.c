@@ -52,6 +52,7 @@ static const clap_plugin_descriptor_t desc = {
 
 static Plug *plug_of(const clap_plugin_t *p) { return p && p->desc == &desc ? (Plug *)p->plugin_data : NULL; }
 static void loader_cancel(Plug *P);      /* the window's background loads (below) */
+static int take_font(Plug *P, SmpFont *f, const char *path, char *err, int cap);
 static void loader_stop(Plug *P);
 
 /* ---- the instrument as text ---- */
@@ -850,8 +851,10 @@ typedef struct Job {
   volatile LONG cancel;                  /* a newer load, a state load or destroy: stop */
   long serial;
   int dropped;
+  int font;                              /* a SoundFont: parsed (not yet shared) into f */
   char path[1100];
   SmpSample *s;
+  SmpFont *f;
   char err[700];
 } Job;
 struct Loader {
@@ -865,7 +868,7 @@ struct Loader {
   HMODULE self;
   HANDLE thread;
 };
-static void job_free(Job *j) { if (j) { smp_sample_free(j->s); free(j); } }
+static void job_free(Job *j) { if (j) { smp_sample_free(j->s); smp_sf_discard(j->f); free(j); } }
 static void loader_release(Loader *L) { if (!InterlockedDecrement(&L->refs)) free(L); }
 static int job_cancelled(void *a) { return InterlockedCompareExchange(&((Job *)a)->cancel, 0, 0) != 0; }
 static void job_at_ffmpeg(void *a) { Job *j = a; InterlockedExchange(&j->L->ffmpeg, j->serial); }
@@ -879,7 +882,8 @@ static DWORD WINAPI load_worker(void *arg) {
     if (L->quit) break;
     j = L->want; L->want = NULL; L->busy = j;
     ReleaseSRWLockExclusive(&L->lock);
-    j->s = smp_sample_load_ex(j->path, job_cancelled, job_at_ffmpeg, j, j->err, sizeof j->err);
+    if (j->font) j->f = smp_sf_parse_detached(j->path, job_cancelled, j, j->err, sizeof j->err);
+    else j->s = smp_sample_load_ex(j->path, job_cancelled, job_at_ffmpeg, j, j->err, sizeof j->err);
     AcquireSRWLockExclusive(&L->lock);
     L->busy = NULL;
     if (j->cancel || L->quit) job_free(j);   /* nobody wants it now */
@@ -945,12 +949,23 @@ static const char *base_name(const char *path) {
   return b;
 }
 
+static int load_job(Plug *P, const char *path, int dropped, int font, char *err, int cap);
+
 int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap) {
+  return load_job(P, path, dropped, 0, err, cap);
+}
+
+int smp_plug_load_font_start(Plug *P, const char *path, char *err, int cap) {
+  if (!P->s) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  return load_job(P, path, 0, 1, err, cap);
+}
+
+static int load_job(Plug *P, const char *path, int dropped, int font, char *err, int cap) {
   Loader *L; Job *j;
-  if (!P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  if (!font && !P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
   if (strlen(path) >= sizeof j->path) { snprintf(err, (size_t)cap, "its path is too long"); return 0; }
   if (!(L = loader_of(P)) || !(j = calloc(1, sizeof *j))) { snprintf(err, (size_t)cap, "out of memory"); return 0; }
-  j->L = L; j->dropped = dropped;
+  j->L = L; j->dropped = dropped; j->font = font;
   strcpy(j->path, path);
   AcquireSRWLockExclusive(&L->lock);
   job_free(L->want);
@@ -961,6 +976,7 @@ int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int c
   ReleaseSRWLockExclusive(&L->lock);
   WakeConditionVariable(&L->cv);
   P->loading = 1;
+  P->loading_font = font;
   snprintf(P->loading_path, sizeof P->loading_path, "%s", path);
   snprintf(P->loading_name, sizeof P->loading_name, "%s", base_name(path));
   return 1;
@@ -974,7 +990,17 @@ int smp_plug_poll_load(Plug *P) {
   ReleaseSRWLockExclusive(&L->lock);
   if (!j) return 0;
   P->loading = 0;
-  if (j->s && P->e) {
+  if (j->font) {
+    char err[700] = "";
+    SmpFont *f = j->f ? smp_sf_adopt(j->f, err, sizeof err) : NULL;
+    j->f = NULL;                         /* adopted (or freed by adopt) */
+    if (f && take_font(P, f, j->path, err, sizeof err)) r = 1;
+    else {
+      snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path), err[0] ? err : j->err);
+      P->load_failed++;
+      r = -1;
+    }
+  } else if (j->s && P->e) {
     take_sample(P, j->s);
     j->s = NULL;
     if (j->dropped) smp_plug_set_plays(P, 0);   /* a dropped sample: the sampler plays */
@@ -999,7 +1025,7 @@ SMP_API int smp_test_plugin_loading(const clap_plugin_t *p) {   /* tests: a wind
 int smp_plug_sample_path(Plug *P, char *path, int cap) {
   const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
   char line[1200];
-  if (P->loading) { snprintf(path, (size_t)cap, "%s", P->loading_path); return 1; }
+  if (P->loading && !P->loading_font) { snprintf(path, (size_t)cap, "%s", P->loading_path); return 1; }
   if (s) { snprintf(path, (size_t)cap, "%s", s->path); return 1; }
   if (P->missing && P->text && sample_line(P->text, line, sizeof line, path, cap) == 2) return 2;
   if (cap > 0) path[0] = 0;
@@ -1021,7 +1047,7 @@ void smp_plug_sample_text(Plug *P, char *out, int cap) {
 void smp_plug_status_text(Plug *P, char *out, int cap) {
   int ready = 0, total = 0; char why[600] = "";
   if (P->loading && P->loader) {         /* a background load: what it's doing */
-    int ff = InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
+    int ff = !P->loading_font && InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
     snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
     return;
   }
@@ -1074,8 +1100,16 @@ static void sf_status(Plug *P, char *out, int cap) {
 }
 
 int smp_plug_load_font(Plug *P, const char *path, char *err, int cap) {
+  SmpFont *f;
   if (!P->s) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
-  if (!smp_synth_load(P->s, path, err, cap)) return 0;
+  if (!(f = smp_sf_open(path, err, cap))) return 0;
+  return take_font(P, f, path, err, cap);
+}
+
+/* a font opened (or adopted from a background load) goes into the player, which then plays (main thread) */
+static int take_font(Plug *P, SmpFont *f, const char *path, char *err, int cap) {
+  if (!P->s) { smp_sf_close(f); snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  if (!smp_synth_load_font(P->s, f, path, err, cap)) return 0;
   free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
   set_plays(P, 1);
   P->bad = 0;
@@ -1137,6 +1171,7 @@ int smp_plug_sf_set(Plug *P, const char *line) {
 int smp_plug_font_path(Plug *P, char *path, int cap) {
   SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
   char line[1200];
+  if (P->loading && P->loading_font) { snprintf(path, (size_t)cap, "%s", P->loading_path); return 1; }
   if (P->sf_missing && P->sf_line && font_line(P->sf_line, line, sizeof line, path, cap) == 2) return 2;
   if (f) { snprintf(path, (size_t)cap, "%s", f->path); return 1; }
   if (cap > 0) path[0] = 0;

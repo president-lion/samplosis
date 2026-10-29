@@ -168,7 +168,7 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   q_db = clampd(g[G_Q], 0, 960) / 10.0;
   peak = pow(10.0, q_db / 20.0);
   v->q_lin = sqrt((peak * peak + peak * sqrt(peak * peak - 1)) / 2);
-  v->q_gain = 1.0 / sqrt(peak);
+  v->q_gain = r->cond.fil_unity ? 1.0 : 1.0 / sqrt(peak);   /* SFZ: the passband stays at unity, the peak at +Q */
 
   /* LFOs */
   v->modlfo.delay = tc_samples(g[G_DELAY_MODLFO], -12000, 5000, rate);
@@ -483,13 +483,14 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   if (gen[G_VELOCITY] >= 0) v->vel = gen[G_VELOCITY] & 127;
   v->pkey = gen[G_KEYNUM] >= 0 ? (gen[G_KEYNUM] & 127) : v->key;
   v->rate = rate; v->transpose = transpose;
-  v->srate = sh->rate > 0 ? sh->rate : 44100;
+  v->srate = vw.rate > 0 ? vw.rate : sh->rate > 0 ? sh->rate : 44100;   /* a decoded file's own rate wins */
   v->root = gen[G_ROOTKEY] >= 0 ? gen[G_ROOTKEY] : (sh->pitch <= 127 ? sh->pitch : 60);
   v->correction = sh->correction;
 
   /* the address offsets, fine plus coarse (32768 frames), kept inside the sample */
   start = (int64_t)gen[G_START] + 32768 * (int64_t)gen[G_STARTCOARSE];
   end = (int64_t)frames + gen[G_END] + 32768 * (int64_t)gen[G_ENDCOARSE];
+  if (r->cond.end_frame) end = r->cond.end_frame;                /* SFZ's end, as a frame of the sample */
   lps = (int64_t)ls + gen[G_LOOPSTART] + 32768 * (int64_t)gen[G_LOOPSTARTCOARSE];
   lpe = (int64_t)le + gen[G_LOOPEND] + 32768 * (int64_t)gen[G_LOOPENDCOARSE];
   if (start < 0) start = 0;

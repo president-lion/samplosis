@@ -92,6 +92,8 @@ def walk(lib, f):
             assert 0 <= r.sample < ns
             assert len(mods(r.imod, r.nimod)) == r.nimod
             for g, (lo, hi) in CLAMPS.items():
+                if g == 56:
+                    lo = -1200                                               # SFZ's pitch_keytrack may be negative
                 assert lo <= r.gen[g] <= hi, (g, r.gen[g])
 
 
@@ -261,7 +263,7 @@ def test_sfz_loop_modes(lib, tmp_path):
         assert [x.gen[54] for x in r] == [1, 0, 0, 3, 0, 1]
         assert r[2].cond.one_shot == 1 and r[0].cond.one_shot == 0
         assert (r[3].gen[2], r[3].gen[3]) == (-500, -500)                 # against the file's loop 1000..2000
-        assert (r[4].gen[0], r[4].gen[1]) == (100, 20100 - RATE // 2)      # end is the last frame played
+        assert r[4].gen[0] == 100 and r[4].gen[1] == 0 and r[4].cond.end_frame == 20100   # end: the last frame played
         assert (r[5].gen[2], r[5].gen[3]) == (200, 1200)                   # no file loop: from frame 0
         n = int(1.2 * OUT)
         held = lambda k, rel=-1: note(lib, f, k, n=n, release_at=rel)[0][:, 0]
@@ -434,25 +436,35 @@ def test_sfz_polyphony_and_one_shot_choke(lib, tmp_path):
 
 def test_sfz_missing_sample(lib, tmp_path):
     """Missing samples skip their regions; the font opens with the rest and its problem names the first missing
-    file and the count. With every sample missing it doesn't open, and the reason says so."""
+    file and the count; a path that can't be made counts as unreadable. A file of no format the header probe knows
+    is left to the loader (never decoded at open), which says so when it can't decode it. With every sample missing
+    the file doesn't open, and the reason says so."""
     write_wav(tmp_path / "a.wav", sine(RATE // 4, 440.0))
     (tmp_path / "junk.wav").write_bytes(b"RIFF\x10\0\0\0WAVEjunkjunkjunk")
+    long_name = "y" * 1000 + ".wav"
     path = write_sfz(tmp_path / "m.sfz", """
 <region> sample=a.wav key=60
 <region> sample=b.wav key=61
 <region> sample=c.wav key=62
 <region> sample=b.wav key=63
 <region> sample=junk.wav key=64
-""")
+<region> sample=%s key=65
+<region> sample=%s key=66
+""" % (long_name, long_name))
     f = opened(lib, path)
     try:
         r = regions(lib, f, 0)
-        assert [x.lokey for x in r] == [60]
+        assert [x.lokey for x in r] == [60, 64, 64]      # junk.wav: unknown, so taken as stereo until decoded
         prob = lib.smp_sf_problem(f).decode()
         assert "Missing 2 samples (first: b.wav)" in prob
-        assert "1 sample can't be read (first: junk.wav)" in prob
+        assert "1 sample can't be read (first: yyyy" in prob
         x, nv = note(lib, f, 60)
         assert nv == 1 and rms(x) > 0.01
+        load_all(lib, f)
+        prob = lib.smp_sf_problem(f).decode()
+        assert prob.startswith("Missing 2 samples (first: b.wav)") and "junk.wav can't be decoded" in prob
+        x, nv = note(lib, f, 64)
+        assert nv == 0
     finally:
         lib.smp_sf_close(f)
     gone = write_sfz(tmp_path / "gone.sfz", "<region> sample=nothere.wav key=60\n")
@@ -558,5 +570,130 @@ def test_sfz_paths_with_spaces_and_backslashes(lib, tmp_path):
         assert lib.smp_sf_test_decodes() - before <= 2                       # the FLAC's channels from one decode
         o, nv = note(lib, f, 66)
         assert nv == 1 and abs(peak_hz(o[2000:20000, 0], OUT) - 440) < 2   # Ogg Vorbis, length from its last page
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_stereo_pairs_count_once(lib, tmp_path):
+    """A stereo sample's two regions count as one voice: note_polyphony=1 keeps both halves (centred, not hard
+    right), and polyphony=1 on a group stops both halves of the older note together."""
+    write_wav(tmp_path / "st300.wav", np.stack([sine(RATE, 300.0), sine(RATE, 300.0)], 1))
+    write_wav(tmp_path / "st500.wav", np.stack([sine(RATE, 500.0), sine(RATE, 500.0)], 1))
+    path = write_sfz(tmp_path / "sp.sfz", """
+<region> sample=st300.wav key=60 pitch_keycenter=60 note_polyphony=1
+<group> group=3 polyphony=1
+<region> sample=st300.wav key=62 pitch_keycenter=62
+<region> sample=st500.wav key=64 pitch_keycenter=64
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.cond.pair for x in r] == [0, 1, 0, 1, 0, 1]
+    finally:
+        lib.smp_sf_close(f)
+    p = Player(lib, tmp_path, path)
+    try:
+        out = tmp_path / "st.wav"
+        assert lib.smp_synth_render_test(p.s, "\n".join([on(60, 100, 0), off(60, 0.4)]).encode(), int(0.5 * OUT), 256,
+                                         str(out).encode(), 0) == 0
+        x, _ = sf.read(str(out), dtype="float32", always_2d=True)
+        w = x[int(0.1 * OUT):int(0.3 * OUT)]
+        assert rms(w[:, 0]) > 0.05 and abs(db(rms(w[:, 0]), rms(w[:, 1]))) < 0.5      # both halves: centred
+        y = p.render([on(62, 100, 0), on(64, 100, 0.2), off(62, 0.5), off(64, 0.5)], 0.6)
+        assert tone(y[int(0.05 * OUT):int(0.18 * OUT)], 300.0) > 0.05
+        late = y[int(0.3 * OUT):int(0.45 * OUT)]
+        assert tone(late, 300.0) < 0.005 and tone(late, 500.0) > 0.05          # both halves of 62 stopped
+    finally:
+        p.free()
+
+
+def test_sfz_made_samples_and_velcurve(lib, tmp_path):
+    """*sine plays a sine at the region's pitch (C4 at pitch_keycenter) at full level; *noise is broadband;
+    *silence is silent. amp_velcurve_N sets the velocity curve: with 64 at 1, velocity 64 is as loud as 127."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    path = write_sfz(tmp_path / "mk.sfz", """
+<region> sample=*sine key=69 pitch_keycenter=60
+<region> sample=*noise key=70
+<region> sample=*silence key=71
+<region> sample=a.wav key=72 pitch_keycenter=72 amp_velcurve_64=1
+<region> sample=a.wav key=73 pitch_keycenter=73
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.gen[54] for x in r[:3]] == [1, 1, 1]                        # made samples loop
+        x, _ = note(lib, f, 69, vel=127)
+        assert abs(peak_hz(x[2000:20000, 0], OUT) - 261.6256 * 2 ** (9 / 12)) < 1
+        cc7 = (100 / 127) ** 2                                               # the channel's CC7 at its reset value
+        assert abs(np.abs(x[4000:20000, 0]).max() - cc7 * math.sqrt(0.5)) < 0.02
+        n, _ = note(lib, f, 70, vel=127)
+        sig = n[4000:20000, 0]
+        assert rms(sig) > 0.1 and np.mean(np.abs(np.diff(np.sign(sig))) > 0) > 0.2   # many zero crossings
+        z, _ = note(lib, f, 71, vel=127)
+        assert rms(z) < 1e-7
+        a64, _ = note(lib, f, 72, vel=64)
+        a127, _ = note(lib, f, 72, vel=127)
+        b64, _ = note(lib, f, 73, vel=64)
+        b127, _ = note(lib, f, 73, vel=127)
+        assert abs(db(rms(a64[2000:20000]), rms(a127[2000:20000]))) < 0.1
+        assert abs(db(rms(b64[2000:20000]), rms(b127[2000:20000])) - 40 * math.log10(64 / 127)) < 0.2
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_filter_unity_keytrack_and_xml(lib, tmp_path):
+    """SFZ's resonant lowpass keeps its passband at unity (SF2.04 would lower it by half the peak); a negative
+    pitch_keytrack plays lower going up; XML (a Decent Sampler preset with <group> tags) isn't taken as SFZ."""
+    write_wav(tmp_path / "s100.wav", sine(RATE, 100.0))
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    path = write_sfz(tmp_path / "fu.sfz", """
+<region> sample=s100.wav key=60 cutoff=5000 resonance=12
+<region> sample=s100.wav key=61 pitch_keycenter=61
+<region> sample=a.wav lokey=40 hikey=50 pitch_keycenter=45 pitch_keytrack=-100
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert r[0].cond.fil_unity == 1 and r[0].gen[9] == 120 and r[2].gen[56] == -100
+        a, _ = note(lib, f, 60)
+        b, _ = note(lib, f, 61)
+        assert abs(db(rms(a[4000:]), rms(b[4000:]))) < 0.5
+        c, _ = note(lib, f, 47)
+        assert abs(peak_hz(c[2000:20000, 0], OUT) - 440 * 2 ** (-2 / 12)) < 2
+    finally:
+        lib.smp_sf_close(f)
+    xml = tmp_path / "p.dspreset"
+    xml.write_text('<?xml version="1.0"?>\n<DecentSampler><groups><group><sample path="a.wav"/></group></groups>'
+                   '</DecentSampler>\n')
+    f, err = sf_open(lib, xml)
+    assert not f and "SFZ" not in err
+
+
+def test_sfz_decoded_lengths(lib, tmp_path):
+    """A FLAC whose header claims twice its real length: end and loops clamp to the decoded length and the note
+    plays the real sound; an IMA ADPCM WAV (no cheap length) is decoded by the loader with its own length and
+    rate."""
+    flac = tmp_path / "liar.flac"
+    sf.write(str(flac), sine(RATE // 2, 440.0), RATE)
+    b = bytearray(flac.read_bytes())
+    assert b[:4] == b"fLaC"
+    total = int.from_bytes(b[22:26], "big") | (b[21] & 15) << 32
+    total2 = total * 2
+    b[21] = (b[21] & 0xF0) | ((total2 >> 32) & 15)
+    b[22:26] = (total2 & 0xFFFFFFFF).to_bytes(4, "big")
+    flac.write_bytes(bytes(b))
+    sf.write(str(tmp_path / "ad.wav"), sine(11025, 440.0, rate=22050), 22050, subtype="IMA_ADPCM")
+    path = write_sfz(tmp_path / "dl.sfz", """
+<region> sample=liar.flac key=60 end=40000 loop_mode=loop_continuous loop_start=10000 loop_end=39999
+<region> sample=ad.wav key=62 pitch_keycenter=62
+""")
+    f = opened(lib, path)
+    try:
+        x, nv = note(lib, f, 60, n=int(1.5 * OUT))
+        assert nv == 1 and np.all(np.isfinite(x))
+        assert abs(peak_hz(x[2000:20000, 0], OUT) - 440) < 2
+        y, nv = note(lib, f, 62)
+        assert nv == 1 and abs(peak_hz(y[2000:12000, 0], OUT) - 440) < 3      # its own 22050 Hz rate
+        walk(lib, f)
     finally:
         lib.smp_sf_close(f)

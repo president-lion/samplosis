@@ -188,6 +188,12 @@ typedef struct {
   uint16_t note_polyphony;      /* and at most this many of one key of that group; 0 none */
   uint8_t one_shot;             /* note-offs and the pedals don't release it: it plays its sample to the end */
   uint8_t fil_type;             /* SMP_FIL_*: the kind of filter initialFilterFc and Q set */
+  uint8_t fil_unity;            /* the resonant filter keeps its passband at unity, the peak at +Q (SFZ, as sfizz and
+                                   sforzando do); 0: SF2.04's mapping (the passband lowered by half the peak) */
+  uint8_t pair;                 /* the second (right) channel of a stereo sample: its region follows the one before
+                                   it, and the player counts and stops the two as one voice */
+  uint32_t end_frame;           /* the region ends at this frame of its sample (clamped to the loaded length); 0: the
+                                   end generators say (SFZ's end, so a decode shorter than its header still fits) */
 } SmpSfCond;
 enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3 };   /* 2-pole lowpass, highpass, bandpass, notch */
 typedef struct {
@@ -201,6 +207,13 @@ typedef struct {
 typedef struct SmpFont SmpFont;
 SMP_API SmpFont *smp_sf_open(const char *path, char *err, int cap);  /* headers only; NULL and a plain reason */
 SMP_API void smp_sf_close(SmpFont *f);
+/* The window's background loads. smp_sf_parse_detached reads a font's headers (an SFZ's sample file headers too)
+   on any thread, into a font not yet shared; cancel (may be NULL) stops an SFZ's reading ("cancelled"). The main
+   thread then either adopts it (smp_sf_adopt: it joins the registry with one reference, as smp_sf_open's result,
+   or is freed for the same file already open, whose reference is returned; NULL and a reason) or discards it. */
+SMP_API SmpFont *smp_sf_parse_detached(const char *path, int (*cancel)(void *), void *arg, char *err, int cap);
+SMP_API SmpFont *smp_sf_adopt(SmpFont *f, char *err, int cap);
+SMP_API void smp_sf_discard(SmpFont *f);
 SMP_API int smp_sf_preset_count(const SmpFont *f);
 SMP_API int smp_sf_preset_info(const SmpFont *f, int i, int *bank, int *program, char *name, int cap); /* sorted by
                                     bank, then program; 1 ok, 0 when i is out of range. Any pointer may be NULL */
@@ -228,6 +241,7 @@ typedef struct {
   uint32_t head_frames, frames, loop_start, loop_end;
   const void *stream;
   const void *tail; uint32_t tail_start, tail_frames;
+  uint32_t rate;                /* the sample's rate as loaded (a decoded file's own rate), 0 when unknown */
 } SmpSfView;
 SMP_API int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view);   /* any thread, audio too: 1 and the view
                                     when the sample is loaded (held until release); 0 (nothing to release, view
@@ -243,7 +257,8 @@ SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 /* a problem found after the font opened, in plain words (an SF2Pack that can't be unpacked: "can't unpack
    x.sf2pack (it may be damaged)", "the cache folder can't hold x.sf2pack's unpacked samples"), or "" when there is
-   none. Any thread; the text doesn't change once set. */
+   none. Any thread; a text once given stays valid (an SFZ's may later be replaced, once, by a longer one that adds a
+   sample that doesn't decode). */
 SMP_API const char *smp_sf_problem(const SmpFont *f);
 /* SFZ: how many different opcodes (and headers, as "<name>") the file used that this can't play, and the first of
    them in first (may be NULL); 0 for every other format. Any thread. */
@@ -277,6 +292,10 @@ SMP_API SmpFont *smp_sf_test_font(const char *desc, const char *path, char *err,
 typedef struct SmpSynth SmpSynth;
 SMP_API SmpSynth *smp_synth_new(double rate, int max_block);
 SMP_API void smp_synth_free(SmpSynth *s);   /* main thread, while nothing processes */
+SMP_API int smp_synth_load_font(SmpSynth *s, SmpFont *f, const char *path, char *err, int cap);  /* smp_synth_load
+                                    for a font already opened (smp_sf_open or smp_sf_adopt), under path (NULL: the
+                                    font's own): the player takes its reference, also on failure (0 and a reason).
+                                    Main thread */
 SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap); /* 1 ok; the audio thread switches
                                     at its next block, and the old font is closed once it has (smp_synth_collect) */
 SMP_API void smp_synth_midi(SmpSynth *s, const uint8_t *msg, int len, int at);  /* audio thread, queued like

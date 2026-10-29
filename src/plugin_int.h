@@ -37,6 +37,7 @@ typedef struct Plug {
   struct Gui *gui;
   struct Loader *loader;             /* the window's sample loads, on a worker thread (made at the first) */
   int loading;                       /* one of them is under way: its file is loading_path */
+  int loading_font;                  /* and it is a SoundFont (the SoundFont page's), not a sample */
   char loading_path[1100], loading_name[256];
   long load_failed;                  /* how many have failed; the last one's "Can't load x: why" is load_err */
   char load_err[1900];
@@ -63,6 +64,10 @@ void smp_plug_status_text(Plug *P, char *out, int cap);  /* "Keep length: 40 of 
 int smp_plug_plays(Plug *P);                       /* 0 the sampler, 1 the SoundFont player */
 void smp_plug_set_plays(Plug *P, int which);       /* marks the project dirty and silences the other player */
 int smp_plug_load_font(Plug *P, const char *path, char *err, int cap);  /* 1 loaded (and plays it); 0 and a reason */
+/* The SoundFont page's loads: in the background like a sample's (an SFZ reads every sample file's header). 1
+   started, 0 and a plain reason; the status says "Loading x.sfz" until smp_plug_poll_load swaps it in on the main
+   thread (then it plays). A newer load, or a project's state, cancels it. */
+int smp_plug_load_font_start(Plug *P, const char *path, char *err, int cap);
 SmpSynth *smp_plug_synth(Plug *P);                 /* ask each time: activate at a new rate replaces the player,
                                                       so a pointer kept from before may have been freed */
 void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "No SoundFont loaded" or

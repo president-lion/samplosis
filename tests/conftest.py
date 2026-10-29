@@ -61,7 +61,8 @@ class SmpSfCond(ctypes.Structure):
                 ("rt_decay", ctypes.c_float), ("amp_veltrack", ctypes.c_float),
                 ("gain", ctypes.c_float), ("amp_velcurve", ctypes.POINTER(ctypes.c_float)),
                 ("polyphony", ctypes.c_uint16), ("note_polyphony", ctypes.c_uint16),
-                ("one_shot", u8), ("fil_type", u8)]
+                ("one_shot", u8), ("fil_type", u8), ("fil_unity", u8), ("pair", u8),
+                ("end_frame", ctypes.c_uint32)]
 
 
 class SmpSfRegion(ctypes.Structure):
@@ -77,7 +78,8 @@ class SmpSfView(ctypes.Structure):
                 ("head_frames", ctypes.c_uint32), ("frames", ctypes.c_uint32),
                 ("loop_start", ctypes.c_uint32), ("loop_end", ctypes.c_uint32),
                 ("stream", ctypes.c_void_p),
-                ("tail", ctypes.c_void_p), ("tail_start", ctypes.c_uint32), ("tail_frames", ctypes.c_uint32)]
+                ("tail", ctypes.c_void_p), ("tail_start", ctypes.c_uint32), ("tail_frames", ctypes.c_uint32),
+                ("rate", ctypes.c_uint32)]
 
 
 def write_wav(path, data, rate):
