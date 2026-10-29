@@ -11,7 +11,10 @@
    3. raw PCM, for files ending .raw or .pcm: headerless samples read as the Settings say (rate, channels, format,
       byte order).
    4. when the first bytes say nothing, the built-in decoders are tried one after another (MP3 last: it finds frames
-      in nearly anything).
+      in nearly anything). First bytes that name a container only Windows reads (MPEG-4 and 3GP "ftyp", ASF, AMR,
+      ADTS AAC) skip this, so MP3 can't find false frames in them.
+   5. a file (never bytes in memory) that nothing above read, and that isn't a raw name, goes to Windows Media
+      Foundation (mfdecode.c): AAC, WMA, and whatever else this machine's Windows decodes. by says Windows.
    Later stages add decoders after these. Whatever decodes a file, its result passes one place (finish): a sample
    that isn't finite, or is absurdly large (a damaged file), becomes silence. Never called on the audio thread. */
 #include <stdio.h>
@@ -34,12 +37,14 @@
 #include <opusfile.h>
 #include <wavpack.h>
 #include "decode.h"
+#include "mfdecode.h"
 
 /* The size limit, in one place for every decoder: 2 GiB of decoded float. A long recording still fits; anything
    bigger is refused with TOO_LONG. */
 static size_t dec_max_floats = (size_t)1 << 29;            /* tests may lower it (flag 2) */
 #define DEC_MAX_FLOATS dec_max_floats
 #define TOO_LONG "it's too long to load (over 2 GB decoded)"
+#define NOT_SOUND "it isn't a sound file Samplosis can read"
 
 /* codecs/mac_shim.cpp: open (a handle, or NULL and a message), read up to 4096 interleaved float frames (how many,
    0 at the end, -1 on a decoder failure), close */
@@ -412,9 +417,9 @@ static float *vorbis_read(const unsigned char *b, size_t len, unsigned *ch, unsi
   return g.x;
 }
 
-/* the built-in decoders, then the library ones */
-enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF, D_OPUS, D_WAVPACK, D_APE };
-#define D_IS_LIBRARY(d) ((d) >= D_OPUS)
+/* the built-in decoders, then the library ones; D_WINDOWS is a container only Windows reads (from a file) */
+enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF, D_OPUS, D_WAVPACK, D_APE, D_WINDOWS };
+#define D_IS_LIBRARY(d) ((d) >= D_OPUS && (d) <= D_APE)
 
 /* an Ogg file whose first packet is OpusHead: the first page's header is 27 bytes, then its segment table */
 static int is_ogg_opus(const unsigned char *b, size_t len) {
@@ -428,6 +433,7 @@ static int is_ogg_opus(const unsigned char *b, size_t len) {
    look like an MPEG frame sync or "ID3" by chance) */
 static int sniff(const unsigned char *b, size_t len, int strict) {
   static const unsigned char w64[16] = {'r', 'i', 'f', 'f', 0x2E, 0x91, 0xCF, 0x11, 0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00};
+  static const unsigned char asf[16] = {0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
   if (len >= 12 && (!memcmp(b, "RIFF", 4) || !memcmp(b, "RIFX", 4) || !memcmp(b, "RF64", 4) || !memcmp(b, "BW64", 4) ||
                     !memcmp(b, "FORM", 4))) return D_WAV;
   if (len >= 16 && !memcmp(b, w64, 16)) return D_WAV;
@@ -437,6 +443,8 @@ static int sniff(const unsigned char *b, size_t len, int strict) {
   if (len >= 4 && !memcmp(b, "OggS", 4)) return D_VORBIS;
   if (len >= 32 && !memcmp(b, "wvpk", 4)) return D_WAVPACK;
   if (len >= 32 && !memcmp(b, "MAC ", 4)) return D_APE;
+  if ((len >= 12 && !memcmp(b + 4, "ftyp", 4)) || (len >= 16 && !memcmp(b, asf, 16)) || (len >= 6 && !memcmp(b, "#!AMR", 5)))
+    return D_WINDOWS;                                       /* MPEG-4 and 3GP, ASF (WMA), AMR */
   if (strict) return D_NONE;
   if (len >= 10 && !memcmp(b, "ID3", 3)) {                 /* an ID3 tag first: FLAC, Monkey's Audio or MP3 after it */
     size_t skip = 10 + ((size_t)(b[6] & 127) << 21 | (size_t)(b[7] & 127) << 14 | (size_t)(b[8] & 127) << 7 | (b[9] & 127));
@@ -444,6 +452,7 @@ static int sniff(const unsigned char *b, size_t len, int strict) {
     if (skip + 4 <= len && !memcmp(b + skip, "MAC ", 4)) return D_APE;
     return skip + 4 <= len && !memcmp(b + skip, "fLaC", 4) ? D_FLAC : D_MP3;
   }
+  if (len >= 7 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0) return D_WINDOWS;   /* ADTS AAC: an MPEG sync with layer 0 */
   if (len >= 2 && b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) return D_MP3;
   return D_NONE;
 }
@@ -490,13 +499,14 @@ static float *chain(const unsigned char *b, size_t len, const char *raw_name, un
     return NULL;
   }
   if (first == D_CAF || D_IS_LIBRARY(first)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
+  if (first == D_WINDOWS) { snprintf(err, (size_t)cap, NOT_SOUND); return NULL; }   /* only Windows reads it */
   for (i = 0; i < 4; i++) {
     if (order[i] == first) continue;
     why[0] = 0;
     if ((x = run(order[i], b, len, ch, sr, n, why, sizeof why))) return x;
     if (!strcmp(why, TOO_LONG)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
   }
-  snprintf(err, (size_t)cap, "it isn't a sound file Samplosis can read");
+  snprintf(err, (size_t)cap, NOT_SOUND);
   return NULL;
 }
 
@@ -523,16 +533,60 @@ float *smp_decode_memory(const void *bytes, size_t len, int *chans, long *frames
   return decode_memory(bytes, len, chans, frames, rate, err, cap);
 }
 
+/* Media Foundation's floats into a Grow (mfdecode.c's put) */
+static int mf_put(void *ctx, const float *x, size_t k) {
+  Grow *g = ctx;
+  if (!grow_need(g, k)) return 0;
+  memcpy(g->x + g->n, x, k * sizeof(float));
+  g->n += k;
+  return 1;
+}
+
+/* The Windows stage on a file the chain refused. Its result, channel after channel, or NULL; err keeps the chain's
+   message unless that was only "not a sound file" and Windows knows better (no decoder for it, damaged). */
+static float *windows_stage(const char *path, int edit, double start, double dur, unsigned *ch, unsigned *sr,
+                            unsigned long long *n, int (*cancel)(void *), void *arg, char *err, int cap) {
+  Grow g = {0}; char why[300] = ""; float *x = NULL; int trimmed = 0;
+  int r = smp_mf_decode(path, ch, sr, mf_put, &g, cancel, arg, &trimmed, why, sizeof why);
+  if (r == SMP_MF_OK) {
+    *n = g.n / *ch;
+    if (edit && !trimmed && start >= 0 && start < 1e6 && dur >= 0 && dur < 1e7) {
+      /* an MPEG-4 edit list (absurd values ignored): the coder's start delay, and the length */
+      unsigned long long cut = (unsigned long long)(start * *sr + 0.5), keep = (unsigned long long)(dur * *sr + 0.5);
+      if (cut < *n) {
+        memmove(g.x, g.x + (size_t)cut * *ch, (size_t)(*n - cut) * *ch * sizeof(float));
+        *n -= cut;
+        if (keep && keep < *n) *n = keep;
+      }
+    }
+    if (!(x = planar(g.x, *n, *ch))) snprintf(err, (size_t)cap, "out of memory");
+  } else if (r == SMP_MF_STOPPED) {
+    snprintf(err, (size_t)cap, "%s", g.too_long ? TOO_LONG : why[0] ? why : "out of memory");
+  } else if (r == SMP_MF_FAILED && !strcmp(err, NOT_SOUND)) {
+    snprintf(err, (size_t)cap, "%s", why);
+  }
+  free(g.x);
+  return x;
+}
+
 float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
                        int (*cancel)(void *), void *arg, char *err, int cap) {
   size_t len = 0; unsigned char *b; float *x;
-  unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0;
+  unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0, raw = smp_is_raw_name(path);
   if (by) *by = SMP_DEC_BUILTIN;
   if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
   b = slurp(path, &len);
   if (!b) { snprintf(err, (size_t)cap, "can't open %s", path); return NULL; }
-  x = chain(b, len, smp_is_raw_name(path) ? path : NULL, &ch, &sr, &n, &lib, err, cap);
-  free(b);
+  x = chain(b, len, raw ? path : NULL, &ch, &sr, &n, &lib, err, cap);
+  if (!x && !raw && len && strcmp(err, TOO_LONG)) {         /* the Windows stage, after everything of our own */
+    double start = 0, dur = 0;
+    int edit = smp_mp4_edit(b, len, &start, &dur);
+    free(b);
+    if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
+    if (!(x = windows_stage(path, edit, start, dur, &ch, &sr, &n, cancel, arg, err, cap))) return NULL;
+    if (cap > 0) err[0] = 0;                                /* the chain's refusal no longer applies */
+    if (by) *by = SMP_DEC_WINDOWS;
+  } else free(b);
   if (!x) return NULL;
   if (by && lib) *by = SMP_DEC_LIBRARY;
   return finish(x, ch, sr, n, chans, frames, rate, err, cap);

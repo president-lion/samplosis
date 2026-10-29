@@ -584,3 +584,208 @@ def test_float_wav_non_finite_is_silence(lib, tmp_path):
     got = whole(lib, s.contents.fwd)[:, 0]
     lib.smp_sample_free(s)
     assert list(got) == [0.5, 0, 0, 0, 0, -0.25, 0, 0]
+
+
+# Windows Media Foundation: the stage after the libraries, for files nothing earlier reads
+BY_WINDOWS, BY_FFMPEG = 2, 3
+
+
+def windows_file(tmp_path, name, args, rate=44100, frames=44100):
+    """ffmpeg encodes two_tones (frames at rate) into tmp_path/name with args: (path, the source)."""
+    src = two_tones(frames, rate)
+    w = tmp_path / "src.wav"
+    write_wav(w, src, rate)
+    f = tmp_path / name
+    ffmpeg("-i", w, *args, f)
+    return f, src
+
+
+def check_tones(lib, f, src, rate, by=BY_WINDOWS, corr_min=0.98, max_lag=64):
+    """f loads, decoded by by, at rate, its length within 2048 frames of src, and each channel matches src above
+    corr_min where they line up: the start must be within max_lag frames (an MPEG-4 file's start delay is cut by its
+    edit list). Returns the lag."""
+    s, err = load(lib, f)
+    assert s, err
+    try:
+        assert s.contents.by == by, (s.contents.by, err)
+        assert s.contents.rate == rate
+        assert abs(int(s.contents.frames) - len(src)) <= 2048, (int(s.contents.frames), len(src))
+        got = whole(lib, s.contents.fwd)
+    finally:
+        lib.smp_sample_free(s)
+
+    def lined_up(k, c):
+        """the correlation of channel c when got is k frames late (k < 0: early); the last 2048 frames are left out"""
+        a, b = got[max(k, 0):, c], src[max(-k, 0):, c]
+        n = min(len(a), len(b)) - 2048
+        return corr(a[:n], b[:n])
+
+    best = max(range(-max_lag, max_lag + 1), key=lambda k: lined_up(k, 0))
+    for c in range(src.shape[1]):
+        assert lined_up(best, c) > corr_min, (c, best, lined_up(best, c))
+    return best
+
+
+@need_ffmpeg
+def test_m4a_aac(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac", "-b:a", "192k"])
+    assert f.read_bytes()[4:8] == b"ftyp"
+    check_tones(lib, f, src, 44100)
+
+
+@need_ffmpeg
+def test_mp4_audio(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tone.mp4", ["-c:a", "aac", "-b:a", "192k"], rate=48000, frames=48000)
+    check_tones(lib, f, src, 48000)
+
+
+@need_ffmpeg
+def test_wma(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tone.wma", ["-c:a", "wmav2", "-b:a", "192k"])
+    assert f.read_bytes()[:4] == bytes.fromhex("3026b275")      # the ASF header GUID
+    check_tones(lib, f, src, 44100)
+
+
+@need_ffmpeg
+def test_windows_path_in_any_language(lib, tmp_path):
+    # the wide path reaches Media Foundation as it is: spaces, accents, '#' and '%' are a file name, not a URL
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tóne #1 50% üж.m4a", ["-c:a", "aac", "-b:a", "192k"])
+    check_tones(lib, f, src, 44100)
+
+
+@need_ffmpeg
+def test_windows_not_from_memory(lib, tmp_path):
+    # SoundFont streams (decode_memory) never go through Windows
+    f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
+    x, why = decode_mem(lib, f.read_bytes())
+    assert x is None and why
+
+
+@need_ffmpeg
+def test_alac_m4a(lib, tmp_path, record_property):
+    # Windows 10 and 11 usually have an ALAC decoder (MSAlacDecoder.dll); without one, FFmpeg takes it in a later
+    # stage. Either passes, and the test records which; when it loads it must be lossless.
+    point_cache(lib, tmp_path / "cache")
+    w = tmp_path / "src.wav"
+    sf.write(str(w), two_tones(22050), 44100, subtype="PCM_16")
+    src, _ = sf.read(str(w), dtype="float32")
+    f = tmp_path / "tone alac.m4a"
+    ffmpeg("-i", w, "-c:a", "alac", f)
+    s, err = load(lib, f)
+    if not s:
+        record_property("decoded_by", "nothing: " + err)
+        assert err and "0x" not in err, err
+        pytest.skip("this machine can't decode ALAC yet (FFmpeg comes in a later stage): " + err)
+    try:
+        record_property("decoded_by", {BY_WINDOWS: "Windows", BY_FFMPEG: "FFmpeg"}.get(s.contents.by, s.contents.by))
+        assert s.contents.by in (BY_WINDOWS, BY_FFMPEG) and s.contents.rate == 44100
+        assert np.array_equal(whole(lib, s.contents.fwd), src)     # bit-exact, start and length too
+    finally:
+        lib.smp_sample_free(s)
+
+
+@need_ffmpeg
+def test_amr_3gp(lib, tmp_path, record_property):
+    # AMR-NB is 8000 Hz mono speech; a tone survives it only roughly
+    point_cache(lib, tmp_path / "cache")
+    r = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True)
+    if "libopencore_amrnb" not in r.stdout:
+        pytest.skip("this ffmpeg has no AMR-NB encoder")
+    src = two_tones(8000, 8000)[:, :1]
+    w = tmp_path / "src.wav"
+    write_wav(w, src, 8000)
+    f = tmp_path / "tone.3gp"
+    ffmpeg("-i", w, "-c:a", "libopencore_amrnb", "-b:a", "12.2k", f)
+    s, err = load(lib, f)
+    if not s:
+        record_property("decoded_by", "nothing: " + err)
+        assert err and "0x" not in err, err
+        pytest.skip("this machine can't decode AMR-NB yet: " + err)
+    try:
+        record_property("decoded_by", s.contents.by)
+        assert s.contents.by in (BY_WINDOWS, BY_FFMPEG) and s.contents.rate == 8000
+        assert abs(int(s.contents.frames) - 8000) <= 2048
+    finally:
+        lib.smp_sample_free(s)
+
+
+@need_ffmpeg
+def test_ac3(lib, tmp_path, record_property):
+    # Windows 11 24H2 removed its AC-3 decoder: refused plainly, or decoded right
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tone.ac3", ["-c:a", "ac3", "-b:a", "384k"], 48000, 48000)
+    s, err = load(lib, f)
+    if not s:
+        record_property("decoded_by", "nothing: " + err)
+        assert err and "0x" not in err, err
+        pytest.skip("this machine can't decode AC-3: " + err)
+    by = s.contents.by
+    lib.smp_sample_free(s)
+    record_property("decoded_by", by)
+    assert by in (BY_WINDOWS, BY_FFMPEG), by
+    # a bare AC-3 stream doesn't say how long the encoder's delay is (256 frames or so), so it stays
+    check_tones(lib, f, src, 48000, by=by, corr_min=0.98, max_lag=512)
+
+
+@need_ffmpeg
+def test_windows_refuses_cleanly(lib, tmp_path):
+    # damaged files Windows is offered: a plain reason (never an HRESULT) or some audio, quickly, and no crash
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "good.m4a", ["-c:a", "aac"])
+    b = f.read_bytes()
+    rnd = np.random.default_rng(11)
+    cases = {"empty.m4a": b"", "ftyp only.m4a": b[:32], "garbage.m4a": bytes(rnd.integers(0, 256, 5000, dtype=np.uint8)),
+             "header then garbage.m4a": b[:64] + bytes(rnd.integers(0, 256, 5000, dtype=np.uint8)),
+             "half.m4a": b[:len(b) // 2], "no moov.m4a": b.replace(b"moov", b"mxxv"), "fake.wma": bytes.fromhex(
+                 "3026b2758e66cf11a6d900aa0062ce6c") + bytes(200)}
+    for i in range(6):                                            # scribbles over the real file
+        c = bytearray(b)
+        for at in rnd.integers(0, len(c), 20):
+            c[at] = int(rnd.integers(0, 256))
+        cases["scribbled %d.m4a" % i] = bytes(c)
+    must_refuse = {"empty.m4a", "ftyp only.m4a", "garbage.m4a", "fake.wma"}
+    for name, data in cases.items():
+        g = tmp_path / name
+        g.write_bytes(data)
+        t = time.perf_counter()
+        s, err = load(lib, g)
+        secs = time.perf_counter() - t
+        assert secs < 5, (name, secs)
+        if s:
+            assert name not in must_refuse, name
+            lib.smp_sample_free(s)
+        else:
+            assert err and "0x" not in err and "HRESULT" not in err, (name, err)
+
+
+@need_ffmpeg
+def test_status_says_windows(P, tmp_path):
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(24000, 48000), 48000)
+    f = tmp_path / "tone A3.m4a"
+    ffmpeg("-i", w, "-c:a", "aac", f)
+    y, d, r = P.play(P.script(str(f)), "on 57 100 0\noff 57 4800", 9600)
+    assert d["status"] == "Ready: tone A3.m4a (decoded by Windows)", d["status"]
+    assert np.max(np.abs(y)) > 0.01
+
+
+@need_ffmpeg
+def test_windows_too_long(lib, tmp_path):
+    # the same size limit holds for what Windows decodes (lowered here to 65536 floats by the test flag)
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "long.m4a", ["-c:a", "aac"])
+    lib.smp_test_only_decode_flags.restype = None
+    lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_test_only_decode_flags(2)
+    try:
+        s, err = load(lib, f)
+        assert not s and err == "it's too long to load (over 2 GB decoded)", err
+    finally:
+        lib.smp_test_only_decode_flags(0)
+    s, err = load(lib, f)
+    assert s, err
+    lib.smp_sample_free(s)

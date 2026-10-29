@@ -3,17 +3,18 @@
    sound file's samples as float, channel after channel (malloc'd), or NULL and a plain message in err. Paths are
    UTF-8. Built in: WAV in any encoding with RIFF, RIFX, RF64 and Wave64 (W64) containers, AIFF and AIFF-C, FLAC,
    MP3, Ogg Vorbis, CAF (PCM and float), and raw PCM (.raw, .pcm) read as the Settings say. From the vendored
-   libraries in codecs/: Opus, WavPack and Monkey's Audio. A sample that isn't finite, or is absurdly large, comes
-   back as 0. */
+   libraries in codecs/: Opus, WavPack and Monkey's Audio. From Windows Media Foundation, for files only: AAC, WMA
+   and whatever else this machine's Windows decodes. A sample that isn't finite, or is absurdly large, comes back as
+   0. */
 #include <stddef.h>
 #include <wchar.h>
 #include "samplosis.h"
 
 typedef enum { SMP_DEC_BUILTIN, SMP_DEC_LIBRARY, SMP_DEC_WINDOWS, SMP_DEC_FFMPEG } SmpDecBy;
 
-/* The decode chain: the built-in decoders by the file's first bytes, then CAF, then raw PCM by the extension. by
-   says what decoded it (may be NULL); cancel, when it isn't NULL, is asked now and then and a nonzero answer stops
-   the decode. */
+/* The decode chain: the built-in and library decoders by the file's first bytes, then raw PCM by the extension,
+   then (not for raw names) Windows. by says what decoded it (may be NULL); cancel, when it isn't NULL, is asked now
+   and then and a nonzero answer stops the decode. */
 float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
                        int (*cancel)(void *), void *arg, char *err, int cap);
 /* decode_audio_ex with no by and no cancel */

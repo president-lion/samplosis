@@ -26,7 +26,9 @@ cl /nologo /c /O2 /w /MT /MP /DWIN32 /D_CRT_SECURE_NO_DEPRECATE /DENABLE_DSD /DE
 cl /nologo /c /O2 /w /MT /MP /EHsc /std:c++17 /DPLATFORM_WINDOWS /DWIN32 /I "%CODECS%\mac\Source\Shared" /I "%CODECS%\mac\Source\MACLib" /Fo"%CO%\\" "%CODECS%\mac\Source\MACLib\*.cpp" "%CODECS%\mac\Source\MACLib\Old\*.cpp" "%CODECS%\mac\Source\Shared\*.cpp" || exit /b 1
 rem Our shim around Monkey's Audio: /EHsc, and every exception is caught inside it
 cl /nologo /c /O2 /W3 /MT /EHsc /std:c++17 /DPLATFORM_WINDOWS /DWIN32 /I "%CODECS%\mac\Source\Shared" /I "%CODECS%\mac\Source\MACLib" /Fo"%OBJ%\mac_shim.obj" "%CODECS%\mac_shim.cpp" || exit /b 1
-cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /MP /I "%CLAPINC%" /I "%CODECS%\opusfile\include" /I "%CODECS%\ogg\include" /I "%CODECS%\opus\include" /I "%CODECS%\wavpack\include" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\stretch.obj" "%OBJ%\mac_shim.obj" "%CO%\*.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib oleacc.lib || exit /b 1
+rem The plugin. Media Foundation (mfdecode.c) is delay-loaded, so the plugin loads on Windows without it (an N
+rem edition); mfdecode.c looks for its DLLs before the first call
+cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /MP /I "%CLAPINC%" /I "%CODECS%\opusfile\include" /I "%CODECS%\ogg\include" /I "%CODECS%\opus\include" /I "%CODECS%\wavpack\include" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\stretch.obj" "%OBJ%\mac_shim.obj" "%CO%\*.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib oleacc.lib mfplat.lib mfreadwrite.lib mfuuid.lib delayimp.lib /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll || exit /b 1
 if /i "%1"=="test" (
   cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /I "%CLAPINC%" /I src /Fo"%OBJ%\\" tests\host.c /Fe:tests\host.exe /link /NOLOGO user32.lib ole32.lib oleaut32.lib oleacc.lib || exit /b 1
 )
