@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from conftest import SmpSfCond, SmpSfRegion, SmpSfSample
 from test_sf2 import load_all, mods, peak_hz, presets, regions, sf_open
 from test_sffont import pcm
 
@@ -642,3 +643,180 @@ def test_gig_parse_cache(lib, tmp_path):
         assert model(lib, f) == first
     finally:
         lib.smp_sf_close(f)
+
+
+class SfPhdr(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char * 21), ("program", ctypes.c_uint16), ("bank", ctypes.c_uint16),
+                ("bag", ctypes.c_uint16)]
+
+
+class SmpSrc(ctypes.Structure):
+    u8 = ctypes.c_uint8
+    _fields_ = [("kind", ctypes.c_int), ("path_id", ctypes.c_int), ("offset", ctypes.c_uint64),
+                ("length", ctypes.c_uint64), ("enc", u8), ("channels", u8), ("channel", u8),
+                ("key", ctypes.c_uint64), ("wrap", u8), ("skip", ctypes.c_uint32), ("gen", u8), ("guessed", u8),
+                ("giga", u8), ("index", ctypes.c_uint32)]
+
+
+def fnv64(data):
+    h = 0xcbf29ce484222325
+    for x in data:
+        h = ((h ^ x) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def gigp_layout(b):
+    """Where a .gigp's parts are: the header (magic, version, the payload's FNV-1a), the struct sizes and counts, the
+    paths, then the presets, sample headers, sources, preset starts and regions (each followed by two indices)."""
+    assert b[:4] == b"SGPC" and struct.unpack_from("<I", b, 4)[0] == 2
+    sizes = struct.unpack_from("<5I", b, 16)
+    assert sizes == (ctypes.sizeof(SfPhdr), ctypes.sizeof(SmpSfRegion), 10, ctypes.sizeof(SmpSfSample),
+                     ctypes.sizeof(SmpSrc)), sizes
+    np_, nr, ns, npaths = struct.unpack_from("<4I", b, 36)
+    nmods, ncurve = struct.unpack_from("<2Q", b, 52)
+    at = 80 + 64                                         # the flags, then the first ignored setting's name
+    for _ in range(npaths):
+        at += 4 + struct.unpack_from("<I", b, at)[0] + 16
+    L = dict(np=np_, nr=nr, ns=ns, npaths=npaths, nmods=nmods, phdr=at)
+    L["shdr"] = at + np_ * sizes[0]
+    L["src"] = L["shdr"] + ns * sizes[3]
+    L["rstart"] = L["src"] + ns * sizes[4]
+    L["regs"] = L["rstart"] + (np_ + 1) * 4
+    L["mods"] = L["regs"] + nr * (sizes[1] + 16)
+    return L
+
+
+def resealed(b):
+    """b with its check made right again, so only the field checks stand between it and the players"""
+    b = bytearray(b)
+    struct.pack_into("<Q", b, 8, fnv64(b[16:]))
+    return bytes(b)
+
+
+def gigp_damage(b, L):
+    """The fields the review named, each set to a value the parse never makes, with the check made right: name ->
+    bytes"""
+    src_at = lambda i, field: L["src"] + i * ctypes.sizeof(SmpSrc) + getattr(SmpSrc, field).offset
+    shdr_at = lambda i, field: L["shdr"] + i * ctypes.sizeof(SmpSfSample) + getattr(SmpSfSample, field).offset
+    reg_at = lambda i, field: L["regs"] + i * (ctypes.sizeof(SmpSfRegion) + 16) + getattr(SmpSfRegion, field).offset
+    cond_at = lambda i, field: reg_at(i, "cond") + getattr(SmpSfCond, field).offset
+    stereo = next(i for i in range(L["ns"])
+                  if struct.unpack_from("<B", b, src_at(i, "channels"))[0] == 2)   # a stereo wave's channel
+    out = {}
+
+    def put(name, fmt, at, v):
+        d = bytearray(b)
+        struct.pack_into(fmt, d, at, v)
+        out[name] = resealed(d)
+
+    for i in (0, stereo):
+        put("channels0_%d" % i, "<B", src_at(i, "channels"), 0)
+        put("channel_past_%d" % i, "<B", src_at(i, "channel"), struct.unpack_from("<B", b, src_at(i, "channels"))[0])
+    d = bytearray(b)
+    struct.pack_into("<BB", d, src_at(stereo, "channels"), 3, 2)        # channels then channel: a third channel
+    out["channel_2_of_3"] = resealed(d)
+    put("kind", "<i", src_at(0, "kind"), 7)
+    put("enc", "<B", src_at(0, "enc"), 9)
+    put("path_neg", "<i", src_at(0, "path_id"), -1)
+    put("path_past", "<i", src_at(0, "path_id"), L["npaths"])
+    put("end_past_file", "<I", shdr_at(0, "end"), 0x3FFFFFF)
+    put("name_unended", "21s", L["phdr"], b"A" * 21)
+    put("bank", "<H", L["phdr"] + SfPhdr.bank.offset, 129)
+    for r in range(min(L["nr"], 3)):
+        put("locc_n5_%d" % r, "<B", cond_at(r, "locc_n"), 5)
+        put("locc_n255_%d" % r, "<B", cond_at(r, "locc_n"), 255)
+        put("sample_neg_%d" % r, "<i", reg_at(r, "sample"), -1)
+        put("sample_past_%d" % r, "<i", reg_at(r, "sample"), L["ns"])
+        put("sw_lokey_%d" % r, "<b", cond_at(r, "sw_lokey"), -100)
+        put("sw_last_%d" % r, "<b", cond_at(r, "sw_last"), -2)
+        d = bytearray(b)                                                  # a range set at one end only
+        struct.pack_into("<bb", d, cond_at(r, "sw_lokey"), -1, 50)        # (sw_lokey, then sw_hikey)
+        out["sw_half_%d" % r] = resealed(d)
+        put("hikey_%d" % r, "<B", reg_at(r, "hikey"), 200)
+        put("nimod_%d" % r, "<i", reg_at(r, "nimod"), -5)
+        put("trigger_%d" % r, "<B", cond_at(r, "trigger"), 9)
+        put("gen_out_of_range_%d" % r, "<h", reg_at(r, "gen") + 2 * 47, 500)   # velocity: -1..127
+    put("rstart_back", "<i", L["rstart"] + 4, L["nr"] + 1)
+    if L["nmods"]:
+        put("mod_dest", "<H", L["mods"] + 2, 999)
+    return out
+
+
+@pytest.mark.parametrize("which", ["pitch", "structure"])
+def test_gig_parse_cache_damage(lib, tmp_path, which):
+    """A damaged .gigp never reaches the players: bit flips at seeded offsets fail the payload's check, and the
+    fields the parse guarantees (channels, the channel, the CC count, the sample index, keyswitch keys, ranges and
+    the rest), set to bad values with the check made right, fail the field checks. Either way the cache is ignored,
+    the file is parsed, the font is the same as before, and the cache is written again (the next open reads it).
+    Random damage with the check made right may be believed when every field is still in range: then the font
+    must walk, load and play, never crash."""
+    from test_cache import point_cache
+    point_cache(lib, tmp_path / "cache")
+    lib.smp_sf_test_gig_cache_hits.restype = ctypes.c_long
+    path = pitch_gig(tmp_path) if which == "pitch" else structure_gig(tmp_path)
+    f = opened(lib, path)
+    try:
+        first = model(lib, f)
+    finally:
+        lib.smp_sf_close(f)
+    gigp = [p for p in os.listdir(tmp_path / "cache") if p.endswith(".gigp")]
+    assert len(gigp) == 1
+    gigp = tmp_path / "cache" / gigp[0]
+    good = gigp.read_bytes()
+    assert struct.unpack_from("<Q", good, 8)[0] == fnv64(good[16:])
+    L = gigp_layout(good)
+
+    def reopen():
+        """opens the file with the cache as it is: (believed, the model)"""
+        hits = lib.smp_sf_test_gig_cache_hits()
+        f = opened(lib, path)
+        try:
+            return lib.smp_sf_test_gig_cache_hits() == hits + 1, model(lib, f)
+        finally:
+            lib.smp_sf_close(f)
+
+    assert reopen() == (True, first)                     # the good cache is believed (every field passes)
+
+    rng = random.Random(4242)
+    flips = []
+    for _ in range(150):                                 # bit flips: the check fails
+        d = bytearray(good)
+        for _ in range(rng.randint(1, 4)):
+            d[rng.randrange(16, len(d))] ^= 1 << rng.randrange(8)
+        flips.append(bytes(d))
+    for d in flips:
+        gigp.write_bytes(d)
+        assert reopen() == (False, first)
+    assert reopen() == (True, first)                     # written again by the last parse
+
+    named = gigp_damage(good, L)
+    assert len(named) > 30
+    for name, d in named.items():
+        gigp.write_bytes(d)
+        believed, got = reopen()
+        assert not believed, name
+        assert got == first, name
+        assert reopen() == (True, first), name           # and written again
+
+    believed_n = 0
+    for _ in range(200):                                 # random damage with the check made right
+        d = bytearray(good)
+        for _ in range(rng.randint(1, 3)):
+            d[rng.randrange(16, len(d))] = rng.randrange(256)
+        gigp.write_bytes(resealed(d))
+        hits = lib.smp_sf_test_gig_cache_hits()
+        f, err = sf_open(lib, path)
+        assert f, err
+        try:
+            if lib.smp_sf_test_gig_cache_hits() == hits + 1:
+                believed_n += 1
+                walk(lib, f)
+                load_all(lib, f, 3000)
+                out = (ctypes.c_float * 4800)()
+                for p in range(lib.smp_sf_preset_count(f)):
+                    lib.smp_sf_test_note(f, p, 60, 100, float(OUT), 2400, -1, out)
+            else:
+                assert model(lib, f) == first
+        finally:
+            lib.smp_sf_close(f)
+    assert believed_n > 0                                # names and levels can change and still be in range

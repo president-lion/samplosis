@@ -689,7 +689,7 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
     gig::Sample *s = waves[w];
     RIFF::Chunk *data = SampleData::of(s);
     int ch = s->Channels > 2 ? 2 : (int)s->Channels;
-    if (ch < 1 || !s->SamplesPerSecond || !s->SamplesTotal || !data) continue;
+    if (ch < 1 || s->Channels > 255 || !s->SamplesPerSecond || !s->SamplesTotal || !data) continue;
     /* plain PCM plays from the file; GigaStudio's compression is decoded by libgig; anything else can't play */
     si[w].pcm = !s->Compressed && s->FormatTag == 1 && (s->BitDepth == 8 || s->BitDepth == 16 || s->BitDepth == 24) &&
                 s->FrameSize == (uint)(s->Channels * (s->BitDepth / 8)) &&
@@ -733,7 +733,10 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
        counted; sf_gig_decode reads no further */
     if (frames > MAX_DECODE_FRAMES) { frames = MAX_DECODE_FRAMES; cut = 1; }
     if (!frames) {
-      for (int k = 0; k < si[w].nch; k++) f->src[si[w].first + k].kind = SMP_SRC_PCM_FILE;   /* empty: never loads */
+      for (int k = 0; k < si[w].nch; k++) {                    /* empty: never loads */
+        f->src[si[w].first + k].kind = SMP_SRC_PCM_FILE;
+        f->src[si[w].first + k].channels = 1;                    /* a frame size like any other's */
+      }
       continue;
     }
     for (int k = 0; k < si[w].nch; k++) {
@@ -1041,13 +1044,22 @@ float *decode_guarded(Decode *d) {
 /* ---- the parse cache ----
    A big .gig's parse reads libgig's chunk headers all through the file: on a cold USB hard disk that is many seconds
    (a project's state load parses on the main thread). So what a parse makes is kept in the cache folder, one small
-   file per .gig (<key>.gigp, key: "gigparse1|its full path|size|modified time"), with each extension file's size and
+   file per .gig (<key>.gigp, key: "gigparse2|its full path|size|modified time"), with each extension file's size and
    time; the next open of the unchanged file reads that instead of opening libgig. Any doubt (another version, other
-   struct sizes, counts the file can't hold, an extension file changed) and the cache is ignored and the file parsed.
+   struct sizes, a payload that doesn't match its check, counts the file can't hold, a field the parse could never
+   have made, an extension file changed) and the cache is ignored and the file parsed (and the cache written again).
    The cache is trimmed with the rest of the cache folder. */
 namespace {
 
-const uint32_t GPC_VERSION = 1;
+const uint32_t GPC_VERSION = 2;                /* 2: the payload's check in the header, and every field checked */
+const size_t GPC_HEAD = 16;                    /* "SGPC", the version, the payload's FNV-1a; the payload follows */
+
+/* FNV-1a, 64-bit: the payload's check, so a bit flipped on the disk is never believed */
+uint64_t fnv64(const uint8_t *p, size_t n) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
+  return h;
+}
 
 bool gpc_path(const SmpFont *f, const char *path, wchar_t *out, int cap) {
   wchar_t w[2048], full[2048];
@@ -1115,7 +1127,7 @@ void gpc_save(const SmpFont *f, const char *path) {
     if (c) { size_t e = (size_t)(c - (const float *)(block + cur_at)) + 128; if (e > ncurve) ncurve = e; }
   }
   GOut o;
-  o.raw("SGPC", 4); o.u32(GPC_VERSION);
+  o.raw("SGPC", 4); o.u32(GPC_VERSION); o.u64(0);                /* the check, filled in once the payload is made */
   for (uint32_t s : SIZES) o.u32(s);
   o.u32((uint32_t)f->nphdr); o.u32((uint32_t)f->nregions); o.u32((uint32_t)f->nshdr); o.u32((uint32_t)f->npaths);
   o.u64(nmods); o.u64(ncurve);
@@ -1139,6 +1151,8 @@ void gpc_save(const SmpFont *f, const char *path) {
   }
   o.raw(block + mod_at, nmods * sizeof(SmpSfMod));
   o.raw(block + cur_at, ncurve * sizeof(float));
+  uint64_t check = fnv64(o.b.data() + GPC_HEAD, o.b.size() - GPC_HEAD);
+  memcpy(o.b.data() + 8, &check, 8);
   /* the cache folder (and its parents) first, then the file written whole under a temporary name and moved
      over: a reader never sees half a file */
   {
@@ -1162,6 +1176,56 @@ void gpc_save(const SmpFont *f, const char *path) {
   if (!ok || !MoveFileExW(part, file, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part);
 }
 
+/* What the parse guarantees, checked again on what the cache gives (the check above catches damage on the disk; these
+   make sure nothing the players index or divide by is out of range, whatever the bytes): a name ends within its 21
+   bytes */
+bool name_ok(const char *n) { return memchr(n, 0, 21) != nullptr; }
+
+bool preset_ok(const SfPhdr &p) { return name_ok(p.name) && p.bank <= 128 && p.program <= 127 && !p.bag; }
+
+/* a wave's channel: its header as the parse writes it, a frame size the players can divide by, a channel inside
+   the frame, and a PCM wave's frames inside its file (psize: each path's size) */
+bool sample_ok(const SmpSfSample &h, const SmpSrc &c, uint32_t npaths, const std::vector<uint64_t> &psize) {
+  if (!name_ok(h.name) || h.start || h.end > MAX_DECODE_FRAMES || h.correction || h.link) return false;
+  if (c.path_id < 0 || (uint32_t)c.path_id >= npaths || c.channels < 1 || c.channel >= c.channels || c.channel > 1)
+    return false;
+  if (c.wrap || c.skip || c.gen || c.guessed || c.key) return false;   /* the parse never sets these (keys come after) */
+  if (c.kind == SMP_SRC_PCM_FILE) {
+    if (c.giga || c.length || c.index) return false;
+    if (!h.end) return !c.enc && !c.offset && c.channels == 1 && !c.channel;   /* an empty wave: never loads */
+    int bytes = c.enc == SMP_PCM_U8 ? 1 : c.enc == SMP_PCM_S16LE ? 2 : c.enc == SMP_PCM_S24LE ? 3 : 0;
+    if (!bytes || !h.rate || h.pitch > 127 || h.type != SF_MONO) return false;
+    uint64_t sz = psize[(size_t)c.path_id];
+    return c.offset <= sz && (uint64_t)h.end * c.channels * (uint64_t)bytes <= sz - c.offset;
+  }
+  if (c.kind == SMP_SRC_DECODED)
+    return c.giga == 1 && !c.enc && c.length && h.end && h.rate && h.pitch <= 127 && h.type == SF_MONO;
+  return false;
+}
+
+/* a region as emit makes it: ranges inside MIDI's, a sample that is there, generators inside their ranges, and
+   conditions with known values and keys (a keyswitch range set at both ends or neither) */
+bool region_ok(const SmpSfRegion &r, uint32_t ns) {
+  if (r.lokey > r.hikey || r.hikey > 127 || r.lovel > r.hivel || r.hivel > 127) return false;
+  if (r.sample < 0 || (uint32_t)r.sample >= ns || r.nimod < 0 || r.nimod > 64) return false;
+  for (int i = 0; i < SMP_SF_NGEN; i++)
+    if (i != G_KEYRANGE && i != G_VELRANGE && i != G_SAMPLEID && r.gen[i] != sf_gen_clamp(i, r.gen[i])) return false;
+  if (r.gen[G_KEYRANGE] != (int16_t)(r.lokey | r.hikey << 8) || r.gen[G_VELRANGE] != (int16_t)(r.lovel | r.hivel << 8) ||
+      r.gen[G_SAMPLEID] != (int16_t)(r.sample > 32767 ? 32767 : r.sample)) return false;
+  const SmpSfCond &c = r.cond;
+  if (c.trigger > SMP_TRIG_LEGATO || c.fil_type > SMP_FIL_BR || c.xf_curve > 1 || c.off_mode > 1 || c.pair > 1 ||
+      c.one_shot > 1 || c.locc_n > 4 || c.end_frame || c.seq_pos > c.seq_len) return false;
+  for (int i = 0; i < c.locc_n; i++) if (c.locc[i].cc > 127 || c.locc[i].lo > 127 || c.locc[i].hi > 127) return false;
+  const int8_t keys[] = {c.sw_lokey, c.sw_hikey, c.sw_last, c.sw_down, c.sw_up, c.sw_previous, c.sw_default,
+                         c.xfin_lokey, c.xfin_hikey, c.xfout_lokey, c.xfout_hikey};
+  for (int8_t k : keys) if (k < -1) return false;
+  if ((c.sw_lokey < 0) != (c.sw_hikey < 0) || c.sw_lokey > c.sw_hikey) return false;
+  return c.xfin_lovel <= 127 && c.xfin_hivel <= 127 && c.xfout_lovel <= 127 && c.xfout_hivel <= 127;
+}
+
+/* a modulator the voice can apply: a real generator as its destination, a known transform */
+bool mod_ok(const SmpSfMod &m) { return m.dest < SMP_SF_NGEN && (m.trans == 0 || m.trans == 2); }
+
 /* 1 when f was filled from the cache (everything sf_parse_gig fills); 0: parse it */
 volatile LONG g_gpc_hits;                /* tests: opens served by the parse cache */
 
@@ -1181,6 +1245,7 @@ int gpc_load(SmpFont *f, const char *path) {
   char magic[4];
   in.raw(magic, 4);
   if (!in.ok || memcmp(magic, "SGPC", 4) || in.u32() != GPC_VERSION) return 0;
+  if (in.u64() != fnv64(b.data() + GPC_HEAD, b.size() - GPC_HEAD) || !in.ok) return 0;   /* damaged */
   for (uint32_t s : SIZES) if (in.u32() != s) return 0;
   uint32_t np = in.u32(), nr = in.u32(), ns = in.u32(), npaths = in.u32();
   uint64_t nmods = in.u64(), ncurve = in.u64();
@@ -1191,7 +1256,12 @@ int gpc_load(SmpFont *f, const char *path) {
   if (!in.ok || !np || !npaths || np > b.size() / sizeof(SfPhdr) || nr > b.size() / sizeof(SmpSfRegion) ||
       ns > b.size() / sizeof(SmpSrc) || npaths > b.size() / 20 || nmods > b.size() / sizeof(SmpSfMod) ||
       ncurve > b.size() / sizeof(float)) return 0;
+  /* nor counts the parse never makes, nor flags but 0 and 1 */
+  if (np > 65535 || nr > SF_MAX_REGIONS || ns > MAX_SAMPLES || ncurve % 128 || has_long > 1 || ign > 1u << 20)
+    return 0;
   std::vector<std::string> paths(npaths);
+  std::vector<uint64_t> psize(npaths);
+  psize[0] = f->size;
   for (uint32_t k = 0; k < npaths; k++) {
     uint32_t L = in.u32();
     if (!in.ok || L > 4096 || L > in.n - in.at) return 0;
@@ -1199,6 +1269,7 @@ int gpc_load(SmpFont *f, const char *path) {
     uint64_t s0 = in.u64(), m0 = in.u64(), s1, m1;
     if (!in.ok) return 0;
     if (k > 0 && (!file_stamp(paths[k].c_str(), s1, m1) || s1 != s0 || m1 != m0)) return 0;   /* an extension changed */
+    if (k > 0) psize[k] = s1;
   }
   size_t mod_at, cur_at, total;
   block_layout((int)nr, (int)np, (size_t)nmods, (size_t)ncurve, mod_at, cur_at, total);
@@ -1209,7 +1280,8 @@ int gpc_load(SmpFont *f, const char *path) {
   char *block = (char *)calloc(1, total ? total : 1);
   char **pl = (char **)calloc(npaths, sizeof *pl);
   bool ok = phdr && order && shdr && src && block && pl;
-  for (uint32_t k = 0; ok && k < npaths; k++) ok = (pl[k] = _strdup(paths[k].c_str())) != nullptr;
+  /* path 0 is the .gig itself (the parse puts it first): the path it is opened by now, whatever the cache says */
+  for (uint32_t k = 0; ok && k < npaths; k++) ok = (pl[k] = _strdup(k ? paths[k].c_str() : path)) != nullptr;
   ok = ok && in.raw(phdr, (size_t)np * sizeof *phdr) && in.raw(shdr, (size_t)ns * sizeof *shdr) &&
        in.raw(src, (size_t)ns * sizeof *src) && in.raw(block + (size_t)nr * sizeof(SmpSfRegion), ((size_t)np + 1) * sizeof(int));
   SmpSfRegion *regs = (SmpSfRegion *)block;
@@ -1227,12 +1299,14 @@ int gpc_load(SmpFont *f, const char *path) {
       if (ci + 128 > ncurve) { ok = false; break; }
       regs[i].cond.amp_velcurve = (const float *)(block + cur_at) + ci;
     }
-    if (regs[i].sample >= (int)ns) { ok = false; break; }
+    if (!region_ok(regs[i], ns)) { ok = false; break; }
   }
   ok = ok && in.raw(block + mod_at, (size_t)nmods * sizeof(SmpSfMod)) && in.raw(block + cur_at, (size_t)ncurve * sizeof(float));
   const int *rs = (const int *)(block + (size_t)nr * sizeof(SmpSfRegion));
   for (uint32_t p = 0; ok && p <= np; p++) ok = rs[p] >= 0 && rs[p] <= (int)nr && (p == 0 || rs[p] >= rs[p - 1]);
-  for (uint32_t s = 0; ok && s < ns; s++) ok = src[s].path_id >= 0 && src[s].path_id < (int)npaths;
+  for (uint32_t s = 0; ok && s < ns; s++) ok = sample_ok(shdr[s], src[s], npaths, psize);
+  for (uint32_t p = 0; ok && p < np; p++) ok = preset_ok(phdr[p]);
+  for (uint64_t m = 0; ok && m < nmods; m++) ok = mod_ok(((const SmpSfMod *)(block + mod_at))[m]);
   if (!ok) {
     free(phdr); free(order); free(shdr); free(src); free(block);
     if (pl) { for (uint32_t k = 0; k < npaths; k++) free(pl[k]); free(pl); }

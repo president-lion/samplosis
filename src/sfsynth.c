@@ -840,9 +840,10 @@ SMP_API int smp_synth_collect(SmpSynth *s) {
   while (i < s->nret) {
     SmpFont *f = s->ret[i].f;
     if (s->epoch >= s->ret[i].a0 + 2 && (s->cur != f || f == s->font)) {
-      /* the audio thread has let go of f and ended its voices; the streamer lets go on its next whole pass */
+      /* the audio thread has let go of f and ended its voices; the streamer lets go once it has dropped their records
+         (sfs_release_sync: no top-up asked for, so a busy streamer on a slow disk doesn't hold this up) */
       if (s->st && !synced) {
-        if (!sfs_sync_for(s->st, COLLECT_WAIT_MS)) break;   /* a slow disk: closed on a later call */
+        if (!sfs_release_sync(s->st, COLLECT_WAIT_MS)) break;   /* a slow disk: closed on a later call */
         synced = 1;
       }
       if (s->used_font == f && f != s->font) used_drop_main(s);

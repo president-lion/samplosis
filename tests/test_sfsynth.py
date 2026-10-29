@@ -1138,6 +1138,7 @@ def test_stream_font_switch_lifetime(lib, tmp_path):
                     lib.smp_synth_free(s)
     finally:
         lib.smp_sf_close(fa)
+        lib.smp_sf_test_grace(0)                                  # back to the default for later tests
         lib.smp_sf_test_grace(0)
 
 
@@ -1158,3 +1159,49 @@ def test_offline_waits_past_ten_seconds(lib, S):
     assert waited >= 10.5, waited
     assert onset(x) is not None and abs(onset(x) - 4800) < 64, onset(x)
     assert abs(peak_freq(x[6000:20000, 0]) - 440) < 5
+
+
+def test_stream_collect_never_settled(lib, tmp_path):
+    """A font switch while long samples stream and the streamer never settles (as on a cold disk under heavy
+    streaming, where a sync that waits for every ring to be topped up may never return): collect still closes the old
+    font within a few calls, since it waits only for the ended voices' records to let go, and nothing of it stays
+    held."""
+    a = tmp_path / "a.sf2"
+    write_sf2(str(a), [preset("A", 0, 0, [zone(i, keys=(60 + i, 60 + i)) for i in range(3)])],
+              [dict(name="a%d" % i, data=busy(10.0, 300 + i), rate=SR, pitch=60 + i, loop=None) for i in range(3)])
+    bpath = tmp_path / "b.sf2"
+    write_font(bpath)
+    bufs = [np.zeros(256, np.float32) for _ in range(32)]
+    arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+    err = ctypes.create_string_buffer(512)
+    lib.smp_sf_test_grace(20)
+    fa = lib.smp_sf_open(str(a).encode(), err, 512)
+    assert fa
+    s = lib.smp_synth_new(float(OUT), 256)
+    try:
+        assert lib.smp_synth_load(s, str(a).encode(), err, 512) == 1
+        lib.smp_synth_process(s, arr, 256)
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        for k in range(3):
+            lib.smp_synth_midi(s, bytes([0x90, 60 + k, 100]), 3, 0)
+        _blocks(lib, s, 80, arr)                                  # streaming
+        lib.smp_sfs_test_unsettled(1)
+        assert lib.smp_synth_load(s, str(bpath).encode(), err, 512) == 1
+        for k in range(3):                                        # the new font plays and streams meanwhile
+            lib.smp_synth_midi(s, bytes([0x90, 60 + k, 100]), 3, 0)
+        t0 = time.time()
+        while True:
+            _blocks(lib, s, 1, arr)
+            if lib.smp_synth_collect(s) == 0 or time.time() - t0 > 3:
+                break
+        assert lib.smp_synth_collect(s) == 0
+        assert time.time() - t0 < 3
+        t0 = time.time()
+        while lib.smp_sf_loaded_samples(fa) and time.time() - t0 < 3:
+            time.sleep(0.01)
+        assert lib.smp_sf_loaded_samples(fa) == 0                 # nothing of A is held any more
+    finally:
+        lib.smp_sfs_test_unsettled(0)
+        lib.smp_synth_free(s)
+        lib.smp_sf_close(fa)
+        lib.smp_sf_test_grace(0)                                  # back to the default for later tests

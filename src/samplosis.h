@@ -269,6 +269,10 @@ SMP_API const char *smp_sf_problem(const SmpFont *f);
    (pitch envelope)"); 0 for every other format. Any thread. */
 SMP_API int smp_sf_ignored(const SmpFont *f, char *first, int cap);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
+SMP_API void smp_sf_test_close_race(int on);                /* tests: the decode worker takes no job, and a decode
+                                    being queued waits for its font's close to begin (sffont.c) */
+SMP_API int smp_sf_test_jobs(int *waits);                   /* tests: decode jobs waiting for the worker, and how
+                                    many decodes have waited for a close so far (waits may be NULL) */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */
 SMP_API void smp_sf_test_whole(int on);                     /* tests: samples loaded from now on are held whole (as
@@ -364,6 +368,8 @@ SMP_API long smp_synth_underruns(const SmpSynth *s);   /* stream underruns so fa
 SMP_API long smp_synth_underruns_onset(const SmpSynth *s);   /* tests: of the underruns, those of voices whose first
                                     streamed read hadn't come yet (a note's onset), the rest being voices already fed */
 SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on);   /* tests: the streamer reads nothing */
+SMP_API void smp_sfs_test_unsettled(int on);   /* tests: no streamer pass counts as settled (sfs_sync never returns;
+                                    smp_synth_collect still closes retired fonts) */
 SMP_API int smp_sfs_test_features(int mask);   /* tests: the streamer features on (sfstream.h SFS_F_*; -1: the
                                     default set); returns the mask before */
 SMP_API void smp_sfs_test_read_hist(long *out, int n, int reset);   /* tests: the streamers' read latencies so far

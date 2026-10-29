@@ -72,6 +72,10 @@ SMP_API int smp_sfs_test_features(int mask) {
   return (int)old;
 }
 
+/* tests: no pass counts as settled (a busy streamer on a cold disk that never catches up) */
+static volatile LONG g_unsettled;
+SMP_API void smp_sfs_test_unsettled(int on) { InterlockedExchange(&g_unsettled, on ? 1 : 0); }
+
 /* tests: read latencies of every streamer, in buckets (see smp_sfs_test_read_hist) */
 static volatile LONG g_hist[10], g_nreads, g_kb;
 static const double g_edges[9] = {1, 2, 5, 10, 20, 50, 100, 200, 500};
@@ -111,6 +115,7 @@ typedef struct {
   int bad;                               /* a read of the stretch failed: the rest of it is thrown away */
   LONG fgen;                             /* the follower's generation when the reads started (a pair) */
   int dead;                              /* its voice is gone: dropped once its read finishes */
+  LONG64 dead_at;                        /* while dead: the pass it was found dead in (see sfs_release_sync) */
   int pend;                              /* a newer voice in the slot, started once those reads finish: its message
                                             in the streamer's pend pool, or -1 */
   int lead, led;                         /* a stereo pair: the follower's slot (in the leader), the leader's slot (in
@@ -149,7 +154,11 @@ struct SfStream {
   volatile LONG qw, qr;                  /* written by the audio thread and by the streamer */
   HANDLE thread, wake, idle;
   volatile LONG quit, topup, paused;
-  volatile LONG64 pass;
+  volatile LONG64 pass;                  /* passes sfs_sync counts (settled ones while it tops up) */
+  volatile LONG64 npass;                 /* every pass, settled or not */
+  volatile LONG64 dead_floor;            /* at the end of the last pass: the earliest pass a record that still holds
+                                            its sample was found dead in (an ended voice not yet dropped counts as
+                                            that pass); INT64_MAX when none */
 };
 
 SfSlot *sfs_slot(SfStream *st, int i) { return &st->slot[i]; }
@@ -172,12 +181,18 @@ static void unpair(SfStream *st, Rec *r) {
 
 static void start_rec(SfStream *st, Rec *r, const SfMsg *m);
 
+/* the record's voice is gone, but its reads are in flight: dropped when they finish */
+static void mark_dead(SfStream *st, Rec *r) {
+  if (!r->dead) r->dead_at = st->npass + 1;        /* the pass going on now */
+  r->dead = 1;
+}
+
 /* lets go of a record's hold, unless a read for it is in flight (then that read's end does it). A newer voice
    waiting for the slot starts then. */
 static void drop(SfStream *st, Rec *r) {
   int last;
   if (!r->on) return;
-  if (r->nio) { r->dead = 1; return; }
+  if (r->nio) { mark_dead(st, r); return; }
   unpair(st, r);
   smp_sf_pcm_release(r->m.f, r->m.sample);
   r->on = 0; r->dead = 0;
@@ -224,7 +239,7 @@ static void drain(SfStream *st) {
         if (k == NIO) { smp_sf_pcm_release(m.f, m.sample); prev = -1; continue; }   /* (never): it plays its head */
         r->pend = k; st->pend_on[k] = 1;
       } else smp_sf_pcm_release(st->pendq[r->pend].f, st->pendq[r->pend].sample);   /* replaced: let go */
-      st->pendq[r->pend] = m; r->dead = 1;
+      st->pendq[r->pend] = m; mark_dead(st, r);
       prev = -1;
       continue;
     }
@@ -543,10 +558,19 @@ static DWORD WINAPI streamer(LPVOID arg) {
     /* more to start at once; else wait for a read, a block or the poll; else sleep until woken (or an idle ring
        is due to go) */
     wait = !settled && !st->nbusy && !st->paused ? 0 : st->nact || st->nbusy ? POLL_MS : committed ? 1000 : INFINITE;
-    if (!st->topup || settled) {                    /* a sync counts only settled passes */
+    if (!st->topup || (settled && !g_unsettled))  /* a sync counts only settled passes */
       InterlockedIncrement64(&st->pass);
-      SetEvent(st->idle);
+    {                                               /* what sfs_release_sync waits on */
+      LONG64 lo = INT64_MAX, cur = st->npass + 1;
+      for (i = 0; i < st->nact; i++) {
+        Rec *r = &st->rec[st->act[i]];
+        LONG64 at = r->dead ? r->dead_at : st->slot[st->act[i]].live != r->m.gen ? cur : INT64_MAX;
+        if (at < lo) lo = at;
+      }
+      InterlockedExchange64(&st->dead_floor, lo);
+      InterlockedIncrement64(&st->npass);           /* after the floor: a waiter that sees the pass sees its floor */
     }
+    SetEvent(st->idle);
   }
   /* stopping: reads in flight are cancelled and waited for (bounded: a dead network share may never answer) */
   for (k = 0; k < NIO; k++) if (st->io[k].busy && st->io[k].inflight) CancelIoEx(st->io[k].h, &st->io[k].o);
@@ -631,3 +655,23 @@ int sfs_sync_for(SfStream *st, int timeout_ms) {
 }
 
 void sfs_sync(SfStream *st) { sfs_sync_for(st, -1); }
+
+/* Waits until every voice that ended before the call has let go of its sample, without asking for a top-up (so a
+   busy streamer on a slow disk isn't made to fill every ring first). Pass n0 + 1 may have begun before the call;
+   pass n0 + 2 began after it, so by its end the voices ended before the call have each been dropped, or (reads in
+   flight) found dead in a pass no later than n0 + 2. Done at the end of a pass when no record found dead by then
+   still holds its sample. */
+int sfs_release_sync(SfStream *st, int timeout_ms) {
+  LONG64 n0, target;
+  ULONGLONG t0 = GetTickCount64();
+  if (!st) return 1;
+  n0 = st->npass;
+  target = n0 + 2;
+  for (;;) {
+    LONG64 n = InterlockedCompareExchange64(&st->npass, 0, 0);
+    if (n >= target && InterlockedCompareExchange64(&st->dead_floor, 0, 0) > target) return 1;
+    if (timeout_ms >= 0 && GetTickCount64() - t0 >= (ULONGLONG)timeout_ms) return 0;
+    SetEvent(st->wake);
+    WaitForSingleObject(st->idle, 50);
+  }
+}

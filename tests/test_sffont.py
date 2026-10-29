@@ -461,3 +461,51 @@ def test_sf3_decoded_once(lib, tmp_path):
     assert np.sqrt(np.mean(x[-48000 * 2:] ** 2)) > 0.01                 # the end of the note is there
     err_db = 20 * np.log10(np.sqrt(np.mean((x - y) ** 2)) / np.sqrt(np.mean(x ** 2)))
     assert err_db < -30, err_db
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_close_while_decode_queued(lib, tmp_path, last):
+    """A font closed while the loader is queuing one of its decodes: the close drops the font's queued jobs, then lets
+    go of the lock while it waits for the loader, so a decode queued in that moment used to stay in the queue and reach
+    the worker after the font was freed (and, for the last font, outlive the threads). The test hook holds the worker
+    and makes the loader's queuing wait until the close has begun, so the moment is hit every time; nothing may be left
+    queued. Opened again, the font decodes and loads as usual."""
+    rate = 44100
+    samples = [dict(name="A", data=tone(rate, 330.0, rate), rate=rate, pitch=60, loop=None),
+               dict(name="B", data=tone(rate, 440.0, rate), rate=rate, pitch=60, loop=None)]
+    presets = [preset("All", 0, [0, 1])]
+    plain, comp = str(tmp_path / "p.sf2"), str(tmp_path / "c.sf3")
+    write_sf2(plain, PRESETS, SAMPLES)
+    write_sf2(comp, presets, samples, sf3=True)
+    waits = ctypes.c_int()
+    other = None if last else sf_open(lib, plain)        # keeps the threads going when f isn't the last font
+    try:
+        lib.smp_sf_test_jobs(ctypes.byref(waits))
+        w0 = waits.value
+        lib.smp_sf_test_close_race(1)
+        try:
+            f = sf_open(lib, comp)
+            lib.smp_sf_use(f, 0, 1)
+            # the loader is now in queue_decode, waiting for the close
+            assert poll(lambda: lib.smp_sf_test_jobs(ctypes.byref(waits)) == 0 and waits.value > w0, 5)
+            lib.smp_sf_use(f, 0, -1)
+            t = time.perf_counter()
+            lib.smp_sf_close(f)
+            assert time.perf_counter() - t < 2.0
+            assert lib.smp_sf_test_jobs(None) == 0         # nothing queued for the freed font
+        finally:
+            lib.smp_sf_test_close_race(0)
+        d0 = lib.smp_sf_test_decodes()
+        f = sf_open(lib, comp)
+        try:
+            lib.smp_sf_use(f, 0, 1)
+            assert lib.smp_sf_wait_idle(f, 10000) == 0
+            assert lib.smp_sf_loaded_samples(f) == 2
+            assert lib.smp_sf_test_decodes() - d0 == 2
+            assert lib.smp_sf_problem(f) == b""
+            lib.smp_sf_use(f, 0, -1)
+        finally:
+            lib.smp_sf_close(f)
+    finally:
+        if other:
+            lib.smp_sf_close(other)

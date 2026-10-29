@@ -99,9 +99,30 @@ void smp_sf_test_whole(int on) { InterlockedExchange(&g_whole, on ? 1 : 0); }
 long smp_sf_test_decodes(void) { return g_decodes; }
 
 static volatile LONG g_pause;              /* tests: the loader does nothing while set */
+static volatile LONG g_race;               /* tests: the worker takes no job, and a queued decode waits for a close */
+static volatile LONG g_race_waits;         /* tests: decodes that waited so */
+static SRWLOCK g_plock = SRWLOCK_INIT;     /* set_problem's (the loader and the worker can find one at once) */
 void smp_sf_test_pause(int on) {
   InterlockedExchange(&g_pause, on ? 1 : 0);
   if (!on && g_wake) SetEvent(g_wake);
+}
+
+/* tests: close while a decode is being queued. While on, the decode worker takes no job, and a decode the loader
+   queues first waits (up to 5 s) for its font's close to begin, the moment a job used to slip in after the close
+   dropped the font's jobs */
+void smp_sf_test_close_race(int on) {
+  InterlockedExchange(&g_race, on ? 1 : 0);
+  if (!on) WakeAllConditionVariable(&g_jcv);
+}
+
+/* tests: the worker's queued jobs, and (waits, may be NULL) how many decodes have waited for a close so far */
+int smp_sf_test_jobs(int *waits) {
+  int n;
+  AcquireSRWLockShared(&g_lock);
+  n = g_njobs;
+  ReleaseSRWLockShared(&g_lock);
+  if (waits) *waits = (int)g_race_waits;
+  return n;
 }
 
 /* ---- loading one sample ---- */
@@ -522,21 +543,27 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   return p;
 }
 
-/* the font's problem, said once: written before has_problem is set, so a reader that sees the flag sees the text */
+/* the font's problem, said once: written before has_problem is set, so a reader that sees the flag sees the text.
+   The loader and the decode worker can both find one, so the check and the write are one step under g_plock (which
+   only this takes: readers go by the flags) */
 static void set_problem(SmpFont *f, const char *fmt, const char *a, const char *b) {
-  if (InterlockedCompareExchange(&f->has_problem2, 0, 0)) return;
+  AcquireSRWLockExclusive(&g_plock);
+  if (InterlockedCompareExchange(&f->has_problem2, 0, 0)) { ReleaseSRWLockExclusive(&g_plock); return; }
   if (InterlockedCompareExchange(&f->has_problem, 0, 0)) {
     /* the open already said one (an SFZ's missing samples): both, in the second buffer, once */
     size_t L;
-    if (!f->is_sfz) return;
-    snprintf(f->problem2, sizeof f->problem2, "%s; ", f->problem);
-    L = strlen(f->problem2);
-    snprintf(f->problem2 + L, sizeof f->problem2 - L, fmt, a, b ? b : "");
-    InterlockedExchange(&f->has_problem2, 1);
+    if (f->is_sfz) {
+      snprintf(f->problem2, sizeof f->problem2, "%s; ", f->problem);
+      L = strlen(f->problem2);
+      snprintf(f->problem2 + L, sizeof f->problem2 - L, fmt, a, b ? b : "");
+      InterlockedExchange(&f->has_problem2, 1);
+    }
+    ReleaseSRWLockExclusive(&g_plock);
     return;
   }
   snprintf(f->problem, sizeof f->problem, fmt, a, b ? b : "");
   InterlockedExchange(&f->has_problem, 1);
+  ReleaseSRWLockExclusive(&g_plock);
 }
 
 /* the font's file name, for its problem */
@@ -689,10 +716,18 @@ static void take(SmpFont *f, int s, SfPcm *pc, int broken, int *retry) {
   trim_after_writes(f, 0);
 }
 
-/* a job for the decode worker: sample s's decode, or (s = -1) the font's SF2Pack. Loader thread. */
+/* a job for the decode worker: sample s's decode, or (s = -1) the font's SF2Pack. Loader thread. Never for a
+   closing font: its close has dropped its jobs and may free it as soon as the loader lets go, so a job queued after
+   that would reach the worker with a freed font (closing is set under g_lock, and checked here under it). */
 static void queue_decode(SmpFont *f, int s) {
   if (s < 0 ? f->pack_q : f->dq[s]) return;
+  if (g_race) {                                 /* tests: wait for the close to begin */
+    ULONGLONG end = GetTickCount64() + 5000;
+    InterlockedIncrement(&g_race_waits);
+    while (!f->closing && GetTickCount64() < end) Sleep(1);
+  }
   AcquireSRWLockExclusive(&g_lock);
+  if (f->closing) { ReleaseSRWLockExclusive(&g_lock); return; }
   if (g_njobs == g_capjobs) {
     int nc = g_capjobs ? g_capjobs * 2 : 64;
     Job *nj = realloc(g_jobs, (size_t)nc * sizeof *nj);
@@ -860,7 +895,7 @@ static DWORD WINAPI decoder(void *arg) {
   for (;;) {
     SmpFont *f = NULL; int s = 0;
     AcquireSRWLockExclusive(&g_lock);
-    while (!g_stop && !g_njobs) SleepConditionVariableSRW(&g_jcv, &g_lock, INFINITE, 0);
+    while (!g_stop && (!g_njobs || g_race)) SleepConditionVariableSRW(&g_jcv, &g_lock, g_race ? 10 : INFINITE, 0);
     if (g_stop) { ReleaseSRWLockExclusive(&g_lock); break; }
     f = g_jobs[0].f; s = g_jobs[0].s;
     memmove(g_jobs, g_jobs + 1, (size_t)(--g_njobs) * sizeof *g_jobs);
@@ -1096,6 +1131,7 @@ void smp_sf_close(SmpFont *f) {
     t = g_thread; g_thread = NULL;
     dt = g_dthread; g_dthread = NULL;
     InterlockedExchange(&g_stop, 1);
+    g_njobs = 0;                                    /* nothing is left for the next worker (no font is open) */
   }
   ReleaseSRWLockExclusive(&g_lock);
   if (g_wake) SetEvent(g_wake);                     /* wakes it to stop, or to walk the shifted list again */

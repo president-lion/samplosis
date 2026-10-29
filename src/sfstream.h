@@ -60,6 +60,8 @@ void sfs_wake(SfStream *st);             /* audio thread: a block was played */
 void sfs_sync(SfStream *st);             /* offline and main thread: returns after a whole pass that tops every ring
                                             up (not just the half-empty ones) */
 int sfs_sync_for(SfStream *st, int timeout_ms);   /* the same, giving up after timeout_ms: 1 done, 0 timed out */
+int sfs_release_sync(SfStream *st, int timeout_ms);   /* main thread: returns once every voice ended before the call
+                                            has let go of its sample (no top-up asked for); 1 done, 0 timed out */
 void sfs_pause(SfStream *st, int on);    /* tests: the streamer reads nothing (forces underruns) */
 
 /* The streamer's features. The default (SFS_F_DEFAULT) is what measured best on a USB hard disk (Bulk-Only
