@@ -207,6 +207,19 @@ SMP_API int smp_synth_wait_loaded(SmpSynth *s, int timeout_ms);   /* tests: 0 on
 SMP_API int smp_synth_collect(SmpSynth *s);   /* main thread: closes replaced fonts the audio thread has let go
                                     of; returns how many still wait */
 SMP_API SmpFont *smp_synth_font(const SmpSynth *s);   /* main thread: the font loaded last, or NULL */
+/* for the plugin (plugin.c) */
+SMP_API int smp_synth_unload(SmpSynth *s);   /* main thread: no font (silence); the old one closes like a replaced
+                                    one (smp_synth_collect). 1 ok, 0 out of memory (the font stays) */
+SMP_API void smp_synth_set_offline(SmpSynth *s, int on);   /* any thread: an offline render (the host's
+                                    clap.render): process waits for the loader at each block and at notes whose
+                                    samples aren't loaded, so the render is exact. Off: real time, never waits */
+SMP_API void smp_synth_skip(SmpSynth *s, int n);   /* audio thread: a block the player doesn't play (the sampler
+                                    plays). It takes the font and configuration, counts down sf_used, ends every
+                                    voice at once and drops the queued events, so replaced fonts can still close */
+SMP_API int smp_synth_loading(const SmpSynth *s);   /* main thread: presets in use whose samples are still
+                                    loading (0 when the loader has caught up) */
+SMP_API int smp_synth_channel_preset(const SmpSynth *s, int ch, int *bank, int *program);   /* main thread: the
+                                    preset channel ch (1 to 16) plays now; 1 found, 0 none */
 SMP_API int smp_synth_voices(const SmpSynth *s, int *peak);   /* sounding voices (not counting ones fading out
                                     after a steal or kill); peak: the most since the last render_test */
 SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released);   /* tests: 1 when

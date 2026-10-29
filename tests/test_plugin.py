@@ -10,10 +10,11 @@ import soundfile as sf
 
 from conftest import ROOT, write_wav
 from test_cache import point_cache
+from test_sfsynth import write_font as write_sf_font
 
 HOST = os.path.join(ROOT, "tests", "host.exe")
 CLAP = os.path.join(ROOT, "samplosis.clap")
-NP = 31
+NP = 35         # the sampler's 31 and the SoundFont player's 4
 VOLUME = 3
 
 
@@ -85,17 +86,42 @@ def P(lib, tmp_path):
             y, _ = sf.read(str(out), dtype="float32")
             return y
 
-        def play(self, text, events, frames, rate=None):
+        def play(self, text, events, frames, rate=None, all_outputs=False):
             st = self.state_file(text)
             ev = tmp_path / "events.txt"
             ev.write_text(events + "\nlength %d\n" % frames)
             out = tmp_path / "plug.wav"
-            args = ["play", st, ev, out] + ([rate] if rate else [])
+            args = ["play", st, ev, out] + ([rate or 48000, "all"] if all_outputs else [rate] if rate else [])
             code, so, se = host(*args)
             assert code == 0, so + se
             y, r = sf.read(str(out), dtype="float32")
-            assert y.shape == (frames, 2)
+            assert y.shape == (frames, 32 if all_outputs else 2)
             return y, lines(so), r
+
+        def sf_defaults(self):
+            """The SoundFont player's lines with nothing loaded and nothing set, as a saved state ends."""
+            s = lib.smp_synth_new(48000.0, 256)
+            n = lib.smp_synth_script_write(s, None, 0)
+            buf = ctypes.create_string_buffer(n + 1)
+            lib.smp_synth_script_write(s, buf, n + 1)
+            lib.smp_synth_free(s)
+            return buf.value.decode()
+
+        def font(self, name="gm.sf2"):
+            f = tmp_path / name
+            write_sf_font(f)
+            return f
+
+        def sf_reference(self, text, events, frames, all_outputs=0, rate=48000):
+            """The same SoundFont state and MIDI through smp_synth_render_test (it waits for loads: exact)."""
+            s = lib.smp_synth_new(float(rate), 256)
+            err = ctypes.create_string_buffer(1024)
+            assert lib.smp_synth_script_apply(s, text.encode(), err, 1024) == 0, err.value
+            out = tmp_path / "sfref.wav"
+            assert lib.smp_synth_render_test(s, events.encode(), frames, 256, str(out).encode(), all_outputs) == 0
+            lib.smp_synth_free(s)
+            y, _ = sf.read(str(out), dtype="float32", always_2d=True)
+            return y
 
     return H()
 
@@ -114,8 +140,9 @@ def test_descriptor(P):
     assert d["id"] == "com.audioskit.samplosis"
     assert set(d["features"].split()) >= {"instrument", "sampler", "stereo"}
     assert d["params"] == str(NP)
-    assert d["note ports"] == "1 in, clap midi"
-    assert d["audio ports"] == "1 out, 2 channels"
+    assert d["note ports"] == "1 in, clap midi, prefers midi"
+    assert d["audio ports"] == "16 out, 2 channels"
+    assert d["audio port names"] == ", ".join(["Output 1 (main)"] + ["Output %d" % i for i in range(2, 17)])
     assert d["latency"] == "0"
 
 
@@ -169,7 +196,7 @@ def test_state_roundtrip(lib, P):
     text = P.script(f, "\n".join(extra))
     code, out, err = host("state", P.state_file(text))
     assert code == 0, out + err
-    assert saved_state(out) == text
+    assert saved_state(out) == "plays sampler\n" + text + P.sf_defaults()
     assert lines(out)["status"].startswith("Ready")
 
 
@@ -217,7 +244,7 @@ def test_state_with_missing_file(P, tmp_path):
     code, out, err = host("state", P.state_file(text, "s2.txt"))
     assert code == 0, out + err
     assert lines(out)["status"] == "Missing: %s" % f
-    assert saved_state(out) == text
+    assert saved_state(out) == "plays sampler\n" + text + P.sf_defaults()
 
 
 def test_streamed_keep_length_start(P):
@@ -271,6 +298,131 @@ def test_note_at_block_end_clamped(P):
     y, d, r = P.play(text, "rawon 57 100 0 256", 4000)
     nz = np.nonzero(np.abs(y[:, 0]) > 0)[0]
     assert len(nz) and nz[0] >= 255 and nz[0] < 300
+
+
+# ---- the SoundFont player ----
+def first_sound(y, th=1e-6):
+    idx = np.nonzero(np.max(np.abs(y), axis=1) > th)[0]
+    return int(idx[0]) if len(idx) else None
+
+
+def peak_hz(x, rate=48000):
+    spec = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    return np.argmax(spec) * rate / len(x)
+
+
+def test_plugin_plays_soundfont(P):
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\n' % f
+    frames = 48000
+    # program 33 (the bass) on channel 2, then a note there; the host's MIDI events carry 3 bytes, the reference 2
+    ref = P.sf_reference(text, "midi 193 33 0\nmidi 145 57 100 0\nmidi 129 57 0 24000", frames)
+    y, d, r = P.play(text, "midi 193 33 0 0\nmidi 145 57 100 0\nmidi 129 57 0 24000", frames)
+    assert db(ref) > -40
+    assert db(y - ref) - db(ref) < -90, d
+    assert abs(peak_hz(y[4800:20000, 0]) - 110) < 3            # the bass an octave under the piano's 220 Hz
+    assert d["status after"] == "Ready: gm.sf2, 6 presets"
+    # a CLAP note goes to the player as MIDI on its channel (the host sends channel 0: MIDI channel 1)
+    ref = P.sf_reference(text, "midi 144 57 100 0\nmidi 128 57 0 24000", frames)
+    y, d, r = P.play(text, "on 57 100 0\noff 57 24000", frames)
+    assert db(y - ref) - db(ref) < -90
+    assert abs(peak_hz(y[4800:20000, 0]) - 220) < 3
+    # at another rate, the player is made again with the same state
+    ref = P.sf_reference(text, "midi 144 57 100 0\nmidi 128 57 0 22050", 44100, rate=44100)
+    y, d, r = P.play(text, "on 57 100 0\noff 57 22050", 44100, rate=44100)
+    assert r == 44100
+    assert db(y - ref) - db(ref) < -90
+
+
+def test_plugin_old_state_is_sampler(P):
+    text = P.script(P.sample())                          # a stage 1 state: no plays line
+    events = "on 57 100 0\noff 57 24000"
+    ref = P.reference(text, events, 48000)
+    y, d, r = P.play(text, events, 48000)
+    assert db(ref) > -40
+    assert db(y - ref) - db(ref) < -90
+    assert d["status"] == "Ready: tone A3.wav"
+    # with every output: the sampler writes output 1, the rest stay silent
+    y, d, r = P.play(text, events, 48000, all_outputs=True)
+    assert db(y[:, :2] - ref) - db(ref) < -90
+    assert np.max(np.abs(y[:, 2:])) == 0
+    code, out, err = host("state", P.state_file(text, "old.txt"))
+    assert code == 0, out + err
+    assert saved_state(out).startswith("plays sampler\n" + text)
+
+
+def test_plugin_outputs(P):
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\nsf_output 2 3\n' % f
+    frames = 24000
+    ref = P.sf_reference(text, "midi 145 57 100 0", frames, all_outputs=1)
+    y, d, r = P.play(text, "midi 145 57 100 0", frames, all_outputs=True)
+    assert db(y[:, 4:6]) > -40
+    assert db(y - ref) - db(ref) < -90
+    others = [c for c in range(32) if c not in (4, 5)]
+    assert np.max(np.abs(y[:, others])) == 0
+    # a host that gives only the main output: channel 2 falls back to it
+    y, d, r = P.play(text, "midi 145 57 100 0", frames)
+    assert db(y) > -40
+
+
+def test_plugin_offline_render_waits(P):
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\n' % f        # nothing loaded ahead
+    frames = 12000
+    events = "midi 193 33 0 0\nmidi 145 57 100 0"
+    ref = P.sf_reference(text, "midi 193 33 0\nmidi 145 57 100 0", frames)
+    y, d, r = P.play(text, "render offline 0\n" + events, frames)
+    assert first_sound(ref) is not None and first_sound(ref) < 64     # from frame 0 (the attack's first frames are tiny)
+    assert first_sound(y) == first_sound(ref)
+    assert db(y - ref) - db(ref) < -90
+    # in real time the samples load while the audio runs on: the note starts late, at a later block
+    y, d, r = P.play(text, events, frames)
+    assert first_sound(y) is None or first_sound(y) >= 256
+
+
+def test_plugin_font_missing(P, tmp_path):
+    f = P.font("gone.sf2")
+    text = ('plays soundfont\nsoundfont "%s"\nsf_channel_preset 3 0 25\nsf_output 2 3\nsf_used 0:0 0:33\n'
+            'sf_volume -3\n' % f)
+    code, out, err = host("state", P.state_file(text))
+    assert code == 0, out + err
+    st = lines(out)["status"]
+    assert st == "Ready: gone.sf2, 6 presets" or st in ("Loading samples for 1 preset", "Loading samples for 2 presets")
+    saved = saved_state(out)
+    assert saved.startswith('plays soundfont\n# Samplosis 0.1.0\n')
+    assert ('soundfont "%s"\n' % f) in saved and "sf_used 0:0 0:33\n" in saved and "sf_volume -3.0 dB\n" in saved
+    f.unlink()
+    code, out, err = host("state", P.state_file(saved, "s2.txt"))
+    assert code == 0, out + err
+    d = lines(out)
+    assert d["load"] == "ok"
+    assert d["status"] == "Missing: %s" % f
+    assert saved_state(out) == saved
+    y, d, r = P.play(saved, "midi 144 57 100 0", 4800)
+    assert np.max(np.abs(y)) == 0
+
+
+SF_PARAMS = ["param 31 SoundFont volume -60 12 0 automatable text 0.0 dB",
+             "param 32 SoundFont voices 16 1024 256 automatable stepped text 256",
+             "param 33 Reverb and chorus 0 1 1 automatable stepped text on",
+             "param 34 SoundFont transpose -24 24 0 automatable stepped text +0 st"]
+
+
+def test_plugin_params(P):
+    code, out, err = host("state", P.state_file("# Samplosis 0.1.0\n"))
+    assert code == 0, out + err
+    params = [ln for ln in out.splitlines() if ln.startswith("param ")]
+    assert params[31:35] == SF_PARAMS, params[31:35]
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\n' % f
+    events = "midi 144 57 100 0"
+    y0, d, r = P.play(text, events, 24000)
+    y1, d, r = P.play(text, events + "\nparam 31 -6 0", 24000)
+    assert abs((db(y1[256:]) - db(y0[256:])) - -6) < 0.1
+    # transpose +12 through the host: an octave up
+    y2, d, r = P.play(text, events + "\nparam 34 12 0", 24000)
+    assert abs(peak_hz(y2[4800:20000, 0]) - 440) < 5
 
 
 # ---- the window, driven by messages through host.exe's gui command ----

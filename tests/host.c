@@ -1,10 +1,12 @@
 /* A stand-in CLAP host for the tests: loads samplosis.clap through clap_entry and prints plain lines.
      host.exe samplosis.clap state <state.txt>                     load the state, save it, print it
-     host.exe samplosis.clap play <state.txt> <events> <out.wav> [rate]
+     host.exe samplosis.clap play <state.txt> <events> <out.wav> [rate [all]]
    Events, one per line: "on key vel frame", "off key frame" (CLAP notes), "midi status d1 d2 frame",
    "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames"; between blocks: "reset frame",
-   "cycle frame" (deactivate and activate again), "state <file> frame" (load another state); and "rawon key vel frame
-   time" (a note-on in the block holding frame, with its time field set to time as is: a sloppy host). Blocks of 256 frames.
+   "cycle frame" (deactivate and activate again), "state <file> frame" (load another state), "render offline|realtime
+   frame" (the render extension's set); and "rawon key vel frame time" (a note-on in the block holding frame, with its
+   time field set to time as is: a sloppy host). Blocks of 256 frames. The host gives one stereo output, or with
+   `all` every output port the plugin has, each written to the wav as 2 channels in port order.
    play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks.
      host.exe samplosis.clap gui <state.txt> <actions.txt>
    Opens the plugin's window on a desktop of its own (never the one in use) between a "before" and an "after" button, as
@@ -136,13 +138,21 @@ static int cmd_state(const clap_plugin_t *p, const char *path) {
   {
     clap_note_port_info_t ni; memset(&ni, 0, sizeof ni);
     np->get(p, 0, true, &ni);
-    printf("note ports: %u in,%s%s\n", np->count(p, true), ni.supported_dialects & CLAP_NOTE_DIALECT_CLAP ? " clap" : "",
-           ni.supported_dialects & CLAP_NOTE_DIALECT_MIDI ? " midi" : "");
+    printf("note ports: %u in,%s%s, prefers %s\n", np->count(p, true), ni.supported_dialects & CLAP_NOTE_DIALECT_CLAP ? " clap" : "",
+           ni.supported_dialects & CLAP_NOTE_DIALECT_MIDI ? " midi" : "",
+           ni.preferred_dialect == CLAP_NOTE_DIALECT_MIDI ? "midi" : ni.preferred_dialect == CLAP_NOTE_DIALECT_CLAP ? "clap" : "other");
   }
   {
     clap_audio_port_info_t ai; memset(&ai, 0, sizeof ai);
     ap->get(p, 0, false, &ai);
     printf("audio ports: %u out, %u channels\n", ap->count(p, false), ai.channel_count);
+    printf("audio port names: ");
+    for (i = 0; i < ap->count(p, false); i++) {
+      memset(&ai, 0, sizeof ai);
+      ap->get(p, i, false, &ai);
+      printf("%s%s%s", i ? ", " : "", ai.name, ai.flags & CLAP_AUDIO_PORT_IS_MAIN ? " (main)" : "");
+    }
+    printf("\n");
   }
   printf("latency: %u\n", lat->get(p));
   n = pa->count(p);
@@ -168,7 +178,8 @@ static int cmd_state(const clap_plugin_t *p, const char *path) {
 }
 
 typedef struct { long frame; clap_event_param_value_t pv; clap_event_note_t note; clap_event_midi_t midi; int kind;
-                 int action; char path[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and activate, 3 load state */
+                 int action; char path[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and activate, 3 load state,
+                                                                     4 render offline, 5 render realtime */
 static Ev *evs; static int nev;
 typedef struct { const Ev *const *list; uint32_t n; } EvList;
 static const clap_event_header_t *ev_header(const Ev *e) {
@@ -201,6 +212,8 @@ static int parse_events(const char *text, long *length) {
       if (!strcmp(w, "reset") && sscanf(p + used, "%ld", &e.frame) == 1) { e.action = 1; ok = 1; }
       else if (!strcmp(w, "cycle") && sscanf(p + used, "%ld", &e.frame) == 1) { e.action = 2; ok = 1; }
       else if (!strcmp(w, "state") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2) { e.action = 3; ok = 1; }
+      else if (!strcmp(w, "render") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2 &&
+               (!strcmp(e.path, "offline") || !strcmp(e.path, "realtime"))) { e.action = strcmp(e.path, "offline") ? 5 : 4; ok = 1; }
       else if (!strcmp(w, "rawon") && sscanf(p + used, "%d %d %ld %ld", &a, &b, &e.frame, &e.rawtime) == 4) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; e.rawtime++; ok = 1;
       } else if (!strcmp(w, "on") && sscanf(p + used, "%d %d %ld", &a, &b, &e.frame) == 3) {
@@ -236,25 +249,28 @@ static int parse_events(const char *text, long *length) {
   return 1;
 }
 
-static void wav_header(FILE *f, uint32_t frames, uint32_t sr) {
-  uint32_t data = frames * 8, riff = 36 + data, br = sr * 8, fmt = 16;
-  uint16_t tag = 3, ch = 2, align = 8, bits = 32;
+static void wav_header(FILE *f, uint32_t frames, uint32_t sr, uint16_t ch) {
+  uint32_t data = frames * 4 * ch, riff = 36 + data, br = sr * 4 * ch, fmt = 16;
+  uint16_t tag = 3, align = (uint16_t)(4 * ch), bits = 32;
   fwrite("RIFF", 1, 4, f); fwrite(&riff, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f); fwrite(&fmt, 4, 1, f);
   fwrite(&tag, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&sr, 4, 1, f); fwrite(&br, 4, 1, f);
   fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f); fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
 }
 
-static int cmd_play(const clap_plugin_t *p, const char *state, const char *events, const char *out, double rate) {
+#define MAXPORTS 16
+static int cmd_play(const clap_plugin_t *p, const char *state, const char *events, const char *out, double rate, int all) {
   WaitFn wait = (WaitFn)GetProcAddress(dll, "smp_test_plugin_wait");
   OfflineFn offline = (OfflineFn)GetProcAddress(dll, "smp_test_plugin_offline");
   SyncFn sync = (SyncFn)GetProcAddress(dll, "smp_test_plugin_sync");
   VoicesFn voices = (VoicesFn)GetProcAddress(dll, "smp_test_plugin_voices");
   char *text = read_file(events, NULL); long length, b; int k = 0;
-  float l[BLOCK], r[BLOCK], lr[2 * BLOCK]; float *chans[2] = {l, r};
+  static float bufs[2 * MAXPORTS][BLOCK], lr[2 * MAXPORTS * BLOCK]; float *chans[2 * MAXPORTS];
   const Ev *list[1024]; EvList el; FILE *f;
   clap_input_events_t in = {&el, el_size, el_get};
   clap_output_events_t oe = {NULL, oe_push};
-  clap_audio_buffer_t ob; clap_process_t pr;
+  const clap_plugin_audio_ports_t *ap = p->get_extension(p, CLAP_EXT_AUDIO_PORTS);
+  const clap_plugin_render_t *rn = p->get_extension(p, CLAP_EXT_RENDER);
+  clap_audio_buffer_t ob[MAXPORTS]; clap_process_t pr; uint32_t nports = 1, c, j;
   if (!wait || !offline || !sync) { printf("error: the test hooks are missing\n"); return 1; }
   if (!text || !parse_events(text, &length)) { printf("error: can't read the events in %s\n", events); return 1; }
   free(text);
@@ -267,10 +283,13 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
   offline(p, 1);
   p->start_processing(p);
   if (!(f = fopen(out, "wb"))) { printf("error: can't write %s\n", out); return 1; }
-  wav_header(f, (uint32_t)length, (uint32_t)(rate + 0.5));
-  memset(&ob, 0, sizeof ob); ob.data32 = chans; ob.channel_count = 2;
+  if (all) { nports = ap ? ap->count(p, false) : 1; if (nports > MAXPORTS) nports = MAXPORTS; }
+  wav_header(f, (uint32_t)length, (uint32_t)(rate + 0.5), (uint16_t)(2 * nports));
+  memset(ob, 0, sizeof ob);
+  for (c = 0; c < 2 * MAXPORTS; c++) chans[c] = bufs[c];
+  for (c = 0; c < nports; c++) { ob[c].data32 = chans + 2 * c; ob[c].channel_count = 2; }
   memset(&pr, 0, sizeof pr);
-  pr.steady_time = 0; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
+  pr.steady_time = 0; pr.audio_outputs = ob; pr.audio_outputs_count = nports; pr.in_events = &in; pr.out_events = &oe;
   for (b = 0; b < length; b += BLOCK) {
     uint32_t n = (uint32_t)(length - b < BLOCK ? length - b : BLOCK), i;
     el.list = list; el.n = 0;
@@ -283,13 +302,17 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
         offline(p, 1); p->start_processing(p); continue;
       }
       if (evs[k].action == 3) { if (load_state(p, evs[k].path) < 0) return 1; main_thread(p); continue; }
+      if (evs[k].action == 4 || evs[k].action == 5) {
+        if (!rn || !rn->set(p, evs[k].action == 4 ? CLAP_RENDER_OFFLINE : CLAP_RENDER_REALTIME)) { printf("error: render set failed\n"); return 1; }
+        continue;
+      }
       h->time = (uint32_t)(evs[k].rawtime ? evs[k].rawtime - 1 : evs[k].frame < b ? 0 : evs[k].frame - b);
       list[el.n++] = &evs[k];
     }
     pr.frames_count = n; pr.steady_time = b;
     p->process(p, &pr);
-    for (i = 0; i < n; i++) { lr[2 * i] = l[i]; lr[2 * i + 1] = r[i]; }
-    fwrite(lr, 8, n, f);
+    for (i = 0; i < n; i++) for (j = 0; j < 2 * nports; j++) lr[2 * nports * i + j] = bufs[j][i];
+    fwrite(lr, 8 * nports, n, f);
     sync(p);
     main_thread(p);
   }
@@ -506,7 +529,7 @@ int main(int argc, char **argv) {
   const clap_plugin_entry_t *entry; const clap_plugin_factory_t *fac; const clap_plugin_t *p; int r;
   _setmode(_fileno(stdout), _O_BINARY);
   setvbuf(stdout, NULL, _IONBF, 0);
-  if (argc < 4) { printf("usage: host.exe samplosis.clap state <state.txt> | play <state.txt> <events> <out.wav> [rate] | gui <state.txt> <actions.txt>\n"); return 2; }
+  if (argc < 4) { printf("usage: host.exe samplosis.clap state <state.txt> | play <state.txt> <events> <out.wav> [rate [all]] | gui <state.txt> <actions.txt>\n"); return 2; }
   dll = LoadLibraryA(argv[1]);
   if (!dll) { printf("error: can't load %s\n", argv[1]); return 1; }
   entry = (const clap_plugin_entry_t *)GetProcAddress(dll, "clap_entry");
@@ -517,7 +540,8 @@ int main(int argc, char **argv) {
   if (!p || !p->init(p)) { printf("error: the plugin didn't start\n"); return 1; }
   if (!strcmp(argv[2], "state")) r = cmd_state(p, argv[3]);
   else if (!strcmp(argv[2], "gui") && argc >= 5) r = cmd_gui(p, argv[3], argv[4]);
-  else if (!strcmp(argv[2], "play") && argc >= 6) r = cmd_play(p, argv[3], argv[4], argv[5], argc > 6 ? atof(argv[6]) : 48000.0);
+  else if (!strcmp(argv[2], "play") && argc >= 6)
+    r = cmd_play(p, argv[3], argv[4], argv[5], argc > 6 ? atof(argv[6]) : 48000.0, argc > 7 && !strcmp(argv[7], "all"));
   else { printf("unknown command %s\n", argv[2]); r = 2; }
   if (!plugin_gone) p->destroy(p);
   entry->deinit();

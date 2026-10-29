@@ -114,6 +114,7 @@ struct SmpSynth {
   SmpSfFx *fx;                    /* the reverb and chorus: their output joins output 1 before sf_volume */
   double gain;                    /* the volume gain at the end of the last block */
   int offline;                    /* wait for the loader (the offline test render) */
+  volatile LONG render_offline;   /* wait for the loader (the host renders offline: smp_synth_set_offline) */
   int test_wait;                  /* render_test's waiting, on by default */
   volatile LONG peak;
 };
@@ -323,7 +324,7 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   t->chan = c; t->key = key; t->vel = vel; t->keydown = 1; t->reg = r; t->excl = r->gen[G_EXCL];
   t->st = V_PENDING;
   if (try_start(s, i)) return;
-  if (s->offline) {                         /* the offline render waits, so the note starts on its frame */
+  if (s->offline || s->render_offline) {   /* an offline render waits, so the note starts on its frame */
     smp_sf_wait_idle(s->cur, 10000);
     if (try_start(s, i)) return;
   }
@@ -670,6 +671,7 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
   double g0, g1, vol;
   if (!s || !outs || n <= 0 || !outs[0] || !outs[1]) { if (s) s->nev = 0; return; }
   for (i = 0; i < 2 * NOUT; i++) if (outs[i]) memset(outs[i], 0, sizeof(float) * (size_t)n);
+  if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);   /* offline: voices waiting start now */
   block_start(s, n);
   for (i = 1; i < s->nev; i++) {               /* stable sort by offset */
     Ev x = s->ev[i];
@@ -734,6 +736,58 @@ SMP_API int smp_synth_wait_loaded(SmpSynth *s, int timeout_ms) {
 }
 
 SMP_API void smp_synth_test_offline(SmpSynth *s, int wait) { if (s) s->test_wait = wait ? 1 : 0; }
+
+/* ---- for the plugin ---- */
+SMP_API int smp_synth_unload(SmpSynth *s) {
+  if (!s || !s->font) return 1;
+  if (s->nret == s->cret) {
+    int c = s->cret ? s->cret * 2 : 4;
+    Retired *n = (Retired *)realloc(s->ret, sizeof *n * (size_t)c);
+    if (!n) return 0;
+    s->ret = n; s->cret = c;
+  }
+  used_drop_main(s);
+  s->ret[s->nret].f = s->font; s->ret[s->nret].a0 = s->epoch; s->nret++;
+  s->font = NULL; s->path[0] = 0;
+  InterlockedExchangePointer((PVOID volatile *)&s->want, NULL);
+  smp_synth_collect(s);
+  return 1;
+}
+
+SMP_API void smp_synth_set_offline(SmpSynth *s, int on) { if (s) InterlockedExchange(&s->render_offline, on ? 1 : 0); }
+
+SMP_API void smp_synth_skip(SmpSynth *s, int n) {
+  int i;
+  if (!s) return;
+  s->nev = 0;
+  block_start(s, n < 0 ? 0 : n);
+  for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; }
+  InterlockedIncrement64(&s->epoch);
+}
+
+SMP_API int smp_synth_loading(const SmpSynth *s) {
+  SmpFont *f = s ? s->font : NULL; int i, k, n = 0, np;
+  if (!f || InterlockedCompareExchange(&f->done_gen, 0, 0) == InterlockedCompareExchange(&f->use_gen, 0, 0)) return 0;
+  np = smp_sf_preset_count(f);
+  for (i = 0; i < np; i++) {
+    const SmpSfRegion *r; int nr;
+    if (InterlockedCompareExchange(&f->users[i], 0, 0) <= 0) continue;
+    nr = smp_sf_regions(f, i, &r);
+    for (k = 0; k < nr; k++) {
+      int sm = r[k].sample;
+      /* not there yet and not broken (the loader's state byte: a stale read only delays the count) */
+      if (sm >= 0 && sm < f->nshdr && !f->pcm[sm] && f->state[sm] != SF_ST_BROKEN) { n++; break; }
+    }
+  }
+  return n;
+}
+
+SMP_API int smp_synth_channel_preset(const SmpSynth *s, int ch, int *bank, int *program) {
+  LONG p;
+  if (!s || !s->font || ch < 1 || ch > NCH || s->cur != s->font) return 0;
+  p = s->chan_preset[ch - 1];
+  return p >= 0 && smp_sf_preset_info(s->font, (int)p, bank, program, NULL, 0);
+}
 
 /* ---- state lines ---- */
 typedef struct { char *out; int cap; int n; } Out;

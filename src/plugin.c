@@ -1,5 +1,9 @@
-/* plugin.c: Samplosis as a CLAP instrument. One note input (CLAP and MIDI), one stereo output, every engine
-   parameter automatable, and the instrument as text (script.c) for its state.
+/* plugin.c: Samplosis as a CLAP instrument. Two players: the sampler (the engine) and the SoundFont player (the
+   synth, sfsynth.c); `plays` says which one hears the notes, and both keep their settings. One note input (MIDI
+   preferred, CLAP notes too: they reach the SoundFont player as MIDI on their channel), 16 stereo outputs (the
+   sampler writes the first; the SoundFont player routes channels with sf_output), every parameter of both players
+   automatable, and the state as text: `plays sampler|soundfont`, then the sampler's text (script.c), then the
+   SoundFont player's lines.
 
    Threads. The engine is made in init (48 kHz) so state loaded before activate has somewhere to go; activate at
    another rate makes a new engine from the old one's text. State load, activate, deactivate, on_main_thread and
@@ -10,7 +14,14 @@
    is thread-safe) and each one collects.
 
    A sample that can't be loaded (the file and its cache copy both gone) leaves the instrument silent with the
-   status "Missing: <path>"; the text it came in is kept, so saving writes the path back rather than losing it. */
+   status "Missing: <path>"; the text it came in is kept, so saving writes the path back rather than losing it.
+   A SoundFont that can't be loaded is the same: silence, "Missing: <path>", and its soundfont and sf_used lines
+   are written back as they came.
+
+   The SoundFont player is made with the engine, made again at a new rate (from the same text), and freed only in
+   destroy: smp_synth_free closes fonts, which may join the loader thread, so never at DLL unload. Replaced fonts
+   close in smp_synth_collect on the main thread, as replaced samples do. The host's offline render (clap.render)
+   lets the player wait for its samples on the audio thread, so a render to file is exact. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,9 +30,12 @@
 #include <clap/clap.h>
 #include "engine_int.h"
 #include "plugin_int.h"
+#include "sf2.h"
 
 #define DEFAULT_RATE 48000.0
 #define COLLECT_ROUNDS 8
+#define NOUTS 16                 /* stereo output ports */
+#define SF_BLOCK 4096            /* the SoundFont player's piece size; it splits longer blocks itself */
 
 /* Plug (plugin_int.h) is shared with the window (gui.c). */
 
@@ -89,6 +103,68 @@ static char *without_sample(const char *text) {
   return out;
 }
 
+/* The last line whose first word is word: 1, with the line (trimmed) in line, the rest after the word in rest and
+   its number in *lineno; 0 if there is none. Any out pointer may be NULL. */
+static int word_line(const char *text, const char *word, char *line, int lcap, char *rest, int rcap, int *lineno) {
+  const char *p = text; int n = 0, found = 0; size_t wl = strlen(word);
+  while (p && *p) {
+    const char *eol = strchr(p, '\n'), *s = p, *end = eol ? eol : p + strlen(p);
+    n++;
+    while (s < end && (*s == ' ' || *s == '\t')) s++;
+    if ((size_t)(end - s) >= wl && !strncmp(s, word, wl) && (s + wl == end || s[wl] == ' ' || s[wl] == '\t' ||
+                                                             s[wl] == '\r' || s[wl] == '"')) {
+      const char *r = s + wl;
+      while (end > s && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
+      while (r < end && (*r == ' ' || *r == '\t')) r++;
+      if (line) snprintf(line, (size_t)lcap, "%.*s", (int)(end - s), s);
+      if (rest) snprintf(rest, (size_t)rcap, "%.*s", (int)(end > r ? end - r : 0), r);
+      if (lineno) *lineno = n;
+      found = 1;
+    }
+    p = eol ? eol + 1 : NULL;
+  }
+  return found;
+}
+
+/* text without the lines whose first word is word */
+static char *without_word(const char *text, const char *word) {
+  char *out = malloc(strlen(text) + 1), *o = out;
+  const char *p = text; size_t wl = strlen(word);
+  if (!out) return NULL;
+  while (*p) {
+    const char *eol = strchr(p, '\n'), *s = p, *end = eol ? eol + 1 : p + strlen(p);
+    while (*s == ' ' || *s == '\t') s++;
+    if (!(!strncmp(s, word, wl) && (s[wl] == ' ' || s[wl] == '\t' || s[wl] == '"' || s[wl] == '\r' ||
+                                    s[wl] == '\n' || !s[wl]))) {
+      memcpy(o, p, (size_t)(end - p)); o += end - p;
+    }
+    p = end;
+  }
+  *o = 0;
+  return out;
+}
+
+/* the plays line: 0 the sampler (also when there is none), 1 the SoundFont player, -1 and err when it doesn't read */
+static int plays_of(const char *text, char *err, int cap) {
+  char rest[200]; int ln = 0;
+  if (!word_line(text, "plays", NULL, 0, rest, sizeof rest, &ln) || !strcmp(rest, "sampler")) return 0;
+  if (!strcmp(rest, "soundfont")) return 1;
+  snprintf(err, (size_t)cap, "line %d: plays is sampler or soundfont, not '%s'", ln, rest);
+  return -1;
+}
+
+/* the soundfont line: 0 none, 1 not well formed, 2 well formed (soundfont "path" and nothing after), with the
+   line and its path */
+static int font_line(const char *text, char *line, int lcap, char *path, int pcap) {
+  char rest[1200]; size_t n;
+  line[0] = path[0] = 0;
+  if (!word_line(text, "soundfont", line, lcap, rest, sizeof rest, NULL)) return 0;
+  n = strlen(rest);
+  if (n < 3 || rest[0] != '"' || rest[n - 1] != '"' || memchr(rest + 1, '"', n - 2)) return 1;
+  snprintf(path, (size_t)pcap, "%.*s", (int)(n - 2), rest + 1);
+  return 2;
+}
+
 static void keep_text(Plug *P, const char *text) {
   char *t = _strdup(text);
   if (!t) return;
@@ -106,9 +182,9 @@ static int file_exists(const char *utf8) {
   return GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES;
 }
 
-/* Applies a state text. 1 when it's taken (the sample may still be missing), 0 when it doesn't read (nothing
-   changes). Main thread. */
-static int apply_text(Plug *P, const char *text) {
+/* Applies a state text to the sampler. 1 when it's taken (the sample may still be missing), 0 when it doesn't
+   read (nothing changes). Main thread. */
+static int apply_sampler(Plug *P, const char *text) {
   char err[700] = "", line[1200], path[1100];
   if (!P->e) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
   if (!smp_script_apply(P->e, text, err, sizeof err)) {
@@ -142,8 +218,9 @@ static int apply_text(Plug *P, const char *text) {
   return 0;
 }
 
-/* The state to save: the engine's text, or with the sample missing, its text with the original sample line. */
-static char *state_text(Plug *P) {
+/* The sampler's part of the state: the engine's text, or with the sample missing, its text with the original
+   sample line. */
+static char *sampler_text(Plug *P) {
   char *t, *out, line[1200], path[1100];
   if (!P->e) return _strdup(P->text ? P->text : "# Samplosis 0.1.0\n");
   t = engine_text(P->e);
@@ -162,7 +239,91 @@ static char *state_text(Plug *P) {
   }
 }
 
+/* The SoundFont player's part: its lines, or with the font missing, its lines with the original soundfont line
+   first and the original sf_used line just before the parameters, where the player writes them. */
+static char *synth_text(Plug *P) {
+  int n = smp_synth_script_write(P->s, NULL, 0);
+  char *t = malloc((size_t)n + 1), *out, *at;
+  const char *first = smp_param_info(SMP_NPARAMS)->name;
+  size_t head, fl, ul, k = strlen(first);
+  if (!t) return NULL;
+  smp_synth_script_write(P->s, t, n + 1);
+  if (!P->sf_missing || !P->sf_line) return t;
+  fl = strlen(P->sf_line); ul = P->sf_used ? strlen(P->sf_used) : 0;
+  out = malloc((size_t)n + fl + ul + 3);
+  if (!out) return t;
+  for (at = t; at; at = strchr(at, '\n') ? strchr(at, '\n') + 1 : NULL)
+    if (!strncmp(at, first, k) && at[k] == ' ') break;
+  head = at ? (size_t)(at - t) : (size_t)n;
+  memcpy(out, P->sf_line, fl); out[fl] = '\n';
+  memcpy(out + fl + 1, t, head);
+  if (ul) { memcpy(out + fl + 1 + head, P->sf_used, ul); out[fl + 1 + head + ul] = '\n'; ul++; }
+  strcpy(out + fl + 1 + head + ul, t + head);
+  free(t);
+  return out;
+}
+
+/* The whole state: plays, the sampler's text, the SoundFont player's lines. */
+static char *state_text(Plug *P) {
+  char *a = sampler_text(P), *b = P->s ? synth_text(P) : _strdup(""), *out = NULL;
+  if (a && b && (out = malloc(strlen(a) + strlen(b) + 32)))
+    sprintf(out, "plays %s\n%s%s", P->plays ? "soundfont" : "sampler", a, b);
+  free(a); free(b);
+  return out;
+}
+
+static void refuse(Plug *P, const char *why) {
+  snprintf(P->status, sizeof P->status, "The saved instrument doesn't read, so nothing changed: %s", why);
+  P->bad = 1;
+}
+
+static void set_plays(Plug *P, int which) {
+  if (P->plays == which) return;
+  InterlockedExchange(&P->plays, which);
+  InterlockedExchange(&P->silence, 1);    /* the other player's voices end at the next block */
+}
+
+/* Applies a whole state: plays, the sampler's text and the SoundFont player's lines. 1 when it's taken (the sample
+   or the font may be missing), 0 when it doesn't read (nothing changes). Main thread. */
+static int apply_text(Plug *P, const char *text) {
+  char err[1400] = "", line[1200], path[1100], used[1200];
+  char *rest; int plays, fk, r;
+  SmpSynth *chk;
+  if (!P->e || !P->s) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
+  plays = plays_of(text, err, sizeof err);
+  if (plays < 0) { refuse(P, err); return 0; }
+  /* The player's lines are checked first, on a player of its own without the font, so a bad line refuses the
+     whole state before the sampler changes. After that only the font can fail. */
+  fk = font_line(text, line, sizeof line, path, sizeof path);
+  rest = fk == 2 ? without_word(text, "soundfont") : _strdup(text);
+  if (!rest) { refuse(P, "out of memory"); return 0; }
+  chk = smp_synth_new(P->rate, 64);
+  r = chk ? smp_synth_script_apply(chk, rest, err, sizeof err) : -1;
+  smp_synth_free(chk);
+  if (r) { free(rest); refuse(P, r < 0 ? "out of memory" : err); return 0; }
+  if (!apply_sampler(P, text)) { free(rest); P->bad = 1; return 0; }
+  free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
+  if (!smp_synth_script_apply(P->s, text, err, sizeof err)) {
+    if (!fk) smp_synth_unload(P->s);      /* a state without a font has none, as one without a sample */
+  } else {                                /* the font didn't load: everything else, and silence */
+    smp_synth_script_apply(P->s, rest, NULL, 0);
+    smp_synth_unload(P->s);
+    P->sf_missing = 1;
+    P->sf_line = _strdup(line);
+    if (word_line(text, "sf_used", used, sizeof used, NULL, 0, NULL)) P->sf_used = _strdup(used);
+    if (!file_exists(path)) snprintf(P->sf_err, sizeof P->sf_err, "Missing: %s", path);
+    else snprintf(P->sf_err, sizeof P->sf_err, "Can't load the SoundFont: %s", err);
+  }
+  free(rest);
+  set_plays(P, plays);
+  P->bad = 0;
+  ask_collect(P);
+  return 1;
+}
+
 /* ---- life cycle ---- */
+static void midi3(SmpSynth *s, int st, int d1, int d2, int at);
+
 static bool p_init(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   P->rate = DEFAULT_RATE;
@@ -171,20 +332,23 @@ static bool p_init(const clap_plugin_t *p) {
     P->host_state = P->host->get_extension(P->host, CLAP_EXT_STATE);
   }
   P->e = smp_engine_new(P->rate, 4096);
-  snprintf(P->status, sizeof P->status, P->e ? "No sample loaded" : "Not working: the sound engine couldn't start");
-  return P->e != NULL;
+  P->s = smp_synth_new(P->rate, SF_BLOCK);
+  snprintf(P->status, sizeof P->status, P->e && P->s ? "No sample loaded" : "Not working: the sound engine couldn't start");
+  return P->e != NULL && P->s != NULL;
 }
 
 static void p_deactivate(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   if (P->e) smp_engine_collect(P->e);
+  if (P->s) smp_synth_collect(P->s);
 }
 
 static void p_destroy(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   smp_gui_close(P);                      /* a host that didn't destroy the window first */
   smp_engine_free(P->e);
-  free(P->text); free(P->scratch);
+  smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
+  free(P->text); free(P->scratch); free(P->sf_line); free(P->sf_used);
   free(P);
 }
 
@@ -194,18 +358,28 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
   if (rate <= 0) return false;
   free(P->scratch);
   P->maxf = maxf ? maxf : 4096;
-  P->scratch = malloc(sizeof(float) * P->maxf);
+  P->scratch = malloc(sizeof(float) * 2 * P->maxf);   /* also a stereo pair when the host's main output isn't one */
   if (!P->scratch) return false;
-  if (!P->e || rate != P->rate) {        /* a new engine at this rate, with the same instrument */
+  if (!P->e || !P->s || rate != P->rate) {   /* new players at this rate, with the same instrument */
     char *t = state_text(P);
+    SmpSynth *old = P->s, *s = smp_synth_new(rate, SF_BLOCK);
+    if (!s) { free(t); snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return false; }
     smp_engine_free(P->e);
     P->rate = rate;
     P->e = smp_engine_new(rate, (int)P->maxf);
-    if (!P->e) { free(t); snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return false; }
-    if (t) apply_text(P, t);             /* text the engine wrote (or was given) always reads */
+    P->s = s;
+    if (!P->e) { free(t); smp_synth_free(old); snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return false; }
+    if (t) apply_text(P, t);             /* text the players wrote (or were given) always reads */
     free(t);
+    smp_synth_free(old);                 /* after the new one opened the same font, so it isn't loaded twice */
+    smp_synth_set_offline(P->s, P->offline);
+  } else {                               /* nothing processes now: voices from before deactivate end */
+    int ch;
+    smp_engine_reset(P->e, 1);
+    /* All Sound Off and Reset All Controllers, queued for the first block. Not smp_synth_reset: that also lets
+       the state's sf_used presets go, which a song about to start still wants loaded. */
+    for (ch = 0; ch < 16; ch++) { midi3(P->s, 0xB0 | ch, 120, 0, 0); midi3(P->s, 0xB0 | ch, 121, 0, 0); }
   }
-  else smp_engine_reset(P->e, 1);         /* nothing processes now: voices from before deactivate end at once */
   P->since = 0;
   return true;
 }
@@ -215,6 +389,7 @@ static void p_stop(const clap_plugin_t *p) { (void)p; }
 static void p_reset(const clap_plugin_t *p) {   /* audio thread: every voice ends (a 5 ms fade), bend to center */
   Plug *P = p->plugin_data;
   if (P->e) smp_engine_reset(P->e, 0);
+  if (P->s) smp_synth_reset(P->s);       /* and the SoundFont player's controllers go back to their defaults */
 }
 
 /* ---- events ---- */
@@ -222,10 +397,56 @@ static int vel127(double v) { int k = (int)floor(v * 127.0 + 0.5); return k < 0 
 
 static void all_off(SmpEngine *e, int at) { int k; for (k = 0; k < 128; k++) smp_engine_note_off(e, k, at); }
 
+static void midi3(SmpSynth *s, int st, int d1, int d2, int at) {
+  uint8_t m[3]; m[0] = (uint8_t)st; m[1] = (uint8_t)(d1 & 127); m[2] = (uint8_t)(d2 & 127);
+  smp_synth_midi(s, m, 3, at);
+}
+
+/* a parameter value: the sampler's ids to the engine, 31 to 34 to the SoundFont player */
+static void set_value(Plug *P, int id, double v) {
+  if (id >= 0 && id < SMP_NPARAMS) smp_engine_set_param(P->e, id, v);
+  else if (id >= SMP_NPARAMS && id < SMP_NALLPARAMS) smp_synth_set_param(P->s, id, v);
+}
+
+/* one event for the SoundFont player at offset `at` in its next block: CLAP notes become MIDI on their channel */
+static void synth_event(Plug *P, const clap_event_header_t *h, int at) {
+  SmpSynth *s = P->s;
+  switch (h->type) {
+    case CLAP_EVENT_NOTE_ON: {
+      const clap_event_note_t *n = (const clap_event_note_t *)h;
+      int ch = n->channel >= 0 && n->channel < 16 ? n->channel : 0, v = vel127(n->velocity);
+      if (n->key >= 0 && n->key < 128) midi3(s, 0x90 | ch, n->key, v ? v : 1, at);   /* velocity 0 would be an off */
+      break;
+    }
+    case CLAP_EVENT_NOTE_OFF: case CLAP_EVENT_NOTE_CHOKE: {
+      const clap_event_note_t *n = (const clap_event_note_t *)h;
+      int one = n->channel >= 0 && n->channel < 16, lo = one ? n->channel : 0, hi = one ? n->channel : 15, ch;
+      if (n->key >= 0 && n->key < 128) { midi3(s, 0x80 | lo, n->key, 0, at); break; }
+      /* every key: All Notes Off, or All Sound Off for a choke */
+      for (ch = lo; ch <= hi; ch++) midi3(s, 0xB0 | ch, h->type == CLAP_EVENT_NOTE_CHOKE ? 120 : 123, 0, at);
+      break;
+    }
+    case CLAP_EVENT_MIDI:
+      smp_synth_midi(s, ((const clap_event_midi_t *)h)->data, 3, at);
+      break;
+    case CLAP_EVENT_MIDI_SYSEX: {
+      const clap_event_midi_sysex_t *x = (const clap_event_midi_sysex_t *)h;
+      if (x->buffer && x->size) smp_synth_midi(s, x->buffer, (int)x->size, at);
+      break;
+    }
+  }
+}
+
 /* one event at offset `at` in the sub-block that follows; parameter values apply at once */
 static void event(Plug *P, const clap_event_header_t *h, int at) {
   SmpEngine *e = P->e;
   if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
+  if (h->type == CLAP_EVENT_PARAM_VALUE) {
+    const clap_event_param_value_t *v = (const clap_event_param_value_t *)h;
+    set_value(P, (int)v->param_id, v->value);
+    return;
+  }
+  if (P->plays) { synth_event(P, h, at); return; }
   switch (h->type) {
     case CLAP_EVENT_NOTE_ON: {
       const clap_event_note_t *n = (const clap_event_note_t *)h;
@@ -247,11 +468,6 @@ static void event(Plug *P, const clap_event_header_t *h, int at) {
       else if (st == 0xB0 && (d[1] == 123 || d[1] == 120)) all_off(e, at);   /* all notes off, all sound off */
       break;
     }
-    case CLAP_EVENT_PARAM_VALUE: {
-      const clap_event_param_value_t *v = (const clap_event_param_value_t *)h;
-      if (v->param_id < SMP_NPARAMS) smp_engine_set_param(e, (int)v->param_id, v->value);
-      break;
-    }
   }
 }
 
@@ -259,8 +475,8 @@ static void event(Plug *P, const clap_event_header_t *h, int at) {
    automation and its own controls follow. Audio thread (process) or main thread (flush); no allocation. */
 static void emit_gui_params(Plug *P, const clap_output_events_t *out) {
   int id;
-  if (!out || !P->e || !InterlockedExchange(&P->gui_any, 0)) return;
-  for (id = 0; id < SMP_NPARAMS; id++) {
+  if (!out || !P->e || !P->s || !InterlockedExchange(&P->gui_any, 0)) return;
+  for (id = 0; id < SMP_NALLPARAMS; id++) {
     clap_event_param_gesture_t g; clap_event_param_value_t v;
     if (!InterlockedExchange(&P->gui_pending[id], 0)) continue;
     memset(&g, 0, sizeof g); memset(&v, 0, sizeof v);
@@ -269,11 +485,60 @@ static void emit_gui_params(Plug *P, const clap_output_events_t *out) {
     out->try_push(out, &g.header);
     v.header.size = sizeof v; v.header.space_id = CLAP_CORE_EVENT_SPACE_ID; v.header.type = CLAP_EVENT_PARAM_VALUE;
     v.param_id = (clap_id)id; v.note_id = -1; v.port_index = -1; v.channel = -1; v.key = -1;
-    v.value = smp_engine_get_param(P->e, id);
+    v.value = smp_plug_get_param(P, id);
     out->try_push(out, &v.header);
     g.header.type = CLAP_EVENT_PARAM_GESTURE_END;
     out->try_push(out, &g.header);
   }
+}
+
+/* zeroes every output port from `from` on, as far as the host gave channels */
+static void zero_ports(const clap_process_t *pr, uint32_t from, uint32_t n) {
+  uint32_t i, c;
+  for (i = from; i < pr->audio_outputs_count; i++) {
+    const clap_audio_buffer_t *b = &pr->audio_outputs[i];
+    if (!b->data32) continue;
+    for (c = 0; c < b->channel_count; c++) if (b->data32[c]) memset(b->data32[c], 0, sizeof(float) * n);
+  }
+}
+
+static void synth_run(Plug *P, float *const *outs, uint32_t a, uint32_t b) {
+  float *o[2 * NOUTS]; int i;
+  for (i = 0; i < 2 * NOUTS; i++) o[i] = outs[i] ? outs[i] + a : NULL;
+  smp_synth_process(P->s, o, (int)(b - a));
+}
+
+/* The SoundFont player's block. Each stereo port the host gave is an output. One it didn't give (fewer ports, a
+   mono port, NULL buffers) plays into output 1, and when output 1 itself isn't a stereo pair the player writes a
+   scratch pair, folded to mono for a mono main port. MIDI is queued on its frame; the block is split only at
+   parameter changes. */
+static void process_synth(Plug *P, const clap_process_t *pr) {
+  uint32_t n = pr->frames_count, ne = pr->in_events ? pr->in_events->size(pr->in_events) : 0, i, pos = 0;
+  float *outs[2 * NOUTS]; float *mono = NULL;
+  memset(outs, 0, sizeof outs);
+  zero_ports(pr, 0, n);
+  for (i = 0; i < pr->audio_outputs_count && i < NOUTS; i++) {
+    const clap_audio_buffer_t *b = &pr->audio_outputs[i];
+    if (b->data32 && b->channel_count >= 2 && b->data32[0] && b->data32[1]) { outs[2 * i] = b->data32[0]; outs[2 * i + 1] = b->data32[1]; }
+  }
+  if (!outs[0]) {
+    const clap_audio_buffer_t *b = pr->audio_outputs_count ? &pr->audio_outputs[0] : NULL;
+    if (n > P->maxf) { smp_synth_skip(P->s, (int)n); return; }   /* a host past its own block limit */
+    outs[0] = P->scratch + P->maxf; outs[1] = P->scratch;
+    if (b && b->data32 && b->channel_count == 1) mono = b->data32[0];
+  }
+  for (i = 0; i < ne; i++) {
+    const clap_event_header_t *h = pr->in_events->get(pr->in_events, i);
+    uint32_t t = h->time >= n ? (n ? n - 1 : 0) : h->time;   /* a time past the block: its last frame */
+    if (t < pos) t = pos;
+    if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE && t > pos) {
+      synth_run(P, outs, pos, t); pos = t;
+    }
+    event(P, h, (int)(t - pos));
+  }
+  if (n > pos) synth_run(P, outs, pos, n);
+  else smp_synth_process(P->s, outs, 0);              /* clears events queued at the very end */
+  if (mono) for (i = 0; i < n; i++) mono[i] = 0.5f * (outs[0][i] + outs[1][i]);
 }
 
 static clap_process_status p_process(const clap_plugin_t *p, const clap_process_t *pr) {
@@ -281,13 +546,24 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   uint32_t n = pr->frames_count, ne = pr->in_events ? pr->in_events->size(pr->in_events) : 0, i, pos = 0;
   const clap_audio_buffer_t *ob;
   float *l, *r;
+  int plays = P->plays;
+  if (P->e && P->s && InterlockedExchange(&P->silence, 0)) {   /* plays changed: the other player goes quiet */
+    if (plays) smp_engine_reset(P->e, 0); else smp_synth_reset(P->s);
+  }
+  if (plays && P->e && P->s) {
+    /* the sampler runs on silently, so its fades end and its replaced samples can be freed */
+    if (n <= P->maxf) smp_engine_process(P->e, P->scratch, P->scratch + P->maxf, (int)n);
+    process_synth(P, pr);
+    goto done;
+  }
   if (!pr->audio_outputs_count) return CLAP_PROCESS_CONTINUE;
   ob = &pr->audio_outputs[0];
   if (!ob->data32 || !ob->channel_count) return CLAP_PROCESS_ERROR;
   l = ob->data32[0];
   r = ob->channel_count > 1 ? ob->data32[1] : P->scratch;
   if (!P->e || (ob->channel_count < 2 && n > P->maxf)) {
-    for (i = 0; i < ob->channel_count; i++) memset(ob->data32[i], 0, sizeof(float) * n);
+    for (i = 0; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
+    zero_ports(pr, 1, n);
     return CLAP_PROCESS_CONTINUE;
   }
   /* the block runs in pieces between event times, so every event lands on its frame */
@@ -301,7 +577,10 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   if (n > pos) smp_engine_process(P->e, l + pos, r + pos, (int)(n - pos));
   else smp_engine_process(P->e, l, r, 0);              /* clears events queued at the very end */
   if (ob->channel_count < 2) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
-  for (i = 2; i < ob->channel_count; i++) memset(ob->data32[i], 0, sizeof(float) * n);
+  for (i = 2; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
+  zero_ports(pr, 1, n);                  /* the sampler writes output 1 only */
+  if (P->s) smp_synth_skip(P->s, (int)n);   /* the SoundFont player still takes its font, so replaced ones close */
+done:
   emit_gui_params(P, pr->out_events);
   if (P->collect_left > 0) {
     P->since += n;
@@ -314,6 +593,8 @@ static void p_main(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   if (P->e) smp_engine_collect(P->e);
   if (P->collect_left > 0) InterlockedDecrement(&P->collect_left);
+  /* a replaced font closes once the audio thread has let go of it: keep asking until it has */
+  if (P->s && smp_synth_collect(P->s) > 0 && P->collect_left <= 0) InterlockedExchange(&P->collect_left, COLLECT_ROUNDS);
 }
 
 /* ---- note ports ---- */
@@ -323,20 +604,20 @@ static bool np_get(const clap_plugin_t *p, uint32_t i, bool in, clap_note_port_i
   if (!in || i) return false;
   info->id = 0;
   info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
-  info->preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+  info->preferred_dialect = CLAP_NOTE_DIALECT_MIDI;   /* the SoundFont player wants programs and controllers */
   snprintf(info->name, sizeof info->name, "Notes");
   return true;
 }
 static const clap_plugin_note_ports_t note_ports = {np_count, np_get};
 
 /* ---- audio ports ---- */
-static uint32_t ap_count(const clap_plugin_t *p, bool in) { (void)p; return in ? 0 : 1; }
+static uint32_t ap_count(const clap_plugin_t *p, bool in) { (void)p; return in ? 0 : NOUTS; }
 static bool ap_get(const clap_plugin_t *p, uint32_t i, bool in, clap_audio_port_info_t *info) {
   (void)p;
-  if (in || i) return false;
-  info->id = 0;
-  snprintf(info->name, sizeof info->name, "Output");
-  info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+  if (in || i >= NOUTS) return false;
+  info->id = i;
+  snprintf(info->name, sizeof info->name, "Output %u", i + 1);
+  info->flags = i ? 0 : CLAP_AUDIO_PORT_IS_MAIN;
   info->channel_count = 2;
   info->port_type = CLAP_PORT_STEREO;
   info->in_place_pair = CLAP_INVALID_ID;
@@ -345,17 +626,18 @@ static bool ap_get(const clap_plugin_t *p, uint32_t i, bool in, clap_audio_port_
 static const clap_plugin_audio_ports_t audio_ports = {ap_count, ap_get};
 
 /* ---- parameters (ids are the engine's) ---- */
-const char *const smp_param_label[SMP_NPARAMS] = {
+const char *const smp_param_label[SMP_NALLPARAMS] = {
   "Root note", "Transpose", "Fine tune", "Volume", "Pan", "Attack", "Decay", "Sustain", "Release",
   "Velocity sensitivity", "Minimum volume", "Mode", "Lowest note", "Highest note", "Pitch at lowest note",
   "Lowest velocity", "Highest velocity", "Obey note off", "Loop", "Loop start", "Start", "End", "Bend range",
-  "Pitch at highest note", "Reverse", "Keep length", "Voices", "Probability", "Speed", "Glide", "Glide mode"};
+  "Pitch at highest note", "Reverse", "Keep length", "Voices", "Probability", "Speed", "Glide", "Glide mode",
+  "SoundFont volume", "SoundFont voices", "Reverb and chorus", "SoundFont transpose"};
 
-static uint32_t pa_count(const clap_plugin_t *p) { (void)p; return SMP_NPARAMS; }
+static uint32_t pa_count(const clap_plugin_t *p) { (void)p; return SMP_NALLPARAMS; }
 static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info) {
   const SmpParamInfo *pi = smp_param_info((int)i);
   (void)p;
-  if (!pi) return false;
+  if (!pi || i >= SMP_NALLPARAMS) return false;
   memset(info, 0, sizeof *info);
   info->id = i;
   info->flags = CLAP_PARAM_IS_AUTOMATABLE;
@@ -370,23 +652,23 @@ static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info)
 }
 static bool pa_value(const clap_plugin_t *p, clap_id id, double *v) {
   Plug *P = p->plugin_data;
-  if (id >= SMP_NPARAMS) return false;
-  *v = P->e ? smp_engine_get_param(P->e, (int)id) : smp_param_info((int)id)->def;
+  if (id >= SMP_NALLPARAMS) return false;
+  *v = smp_plug_get_param(P, (int)id);
   return true;
 }
 static bool pa_text(const clap_plugin_t *p, clap_id id, double v, char *out, uint32_t cap) {
   (void)p;
-  if (id >= SMP_NPARAMS || !cap) return false;
+  if (id >= SMP_NALLPARAMS || !cap) return false;
   smp_value_text((int)id, v, out, (int)cap);
   return true;
 }
 static bool pa_parse(const clap_plugin_t *p, clap_id id, const char *s, double *v) {
   (void)p;
-  return id < SMP_NPARAMS && smp_value_parse((int)id, s, v);
+  return id < SMP_NALLPARAMS && smp_value_parse((int)id, s, v);
 }
 static void pa_flush(const clap_plugin_t *p, const clap_input_events_t *in, const clap_output_events_t *out) {
   Plug *P = p->plugin_data; uint32_t i, n = in ? in->size(in) : 0;
-  if (!P->e) return;
+  if (!P->e || !P->s) return;
   for (i = 0; i < n; i++) {
     const clap_event_header_t *h = in->get(in, i);
     if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) event(P, h, 0);
@@ -435,6 +717,16 @@ static const clap_plugin_state_t state = {st_save, st_load};
 static uint32_t lat_get(const clap_plugin_t *p) { (void)p; return 0; }
 static const clap_plugin_latency_t latency = {lat_get};
 
+/* ---- render: offline, the SoundFont player waits for its samples, so a render to file is exact ---- */
+static bool rn_hard(const clap_plugin_t *p) { (void)p; return false; }
+static bool rn_set(const clap_plugin_t *p, clap_plugin_render_mode mode) {
+  Plug *P = p->plugin_data;
+  InterlockedExchange(&P->offline, mode == CLAP_RENDER_OFFLINE);
+  smp_synth_set_offline(P->s, mode == CLAP_RENDER_OFFLINE);
+  return true;
+}
+static const clap_plugin_render_t render = {rn_hard, rn_set};
+
 static const void *p_ext(const clap_plugin_t *p, const char *id) {
   (void)p;
   if (!strcmp(id, CLAP_EXT_NOTE_PORTS)) return &note_ports;
@@ -442,15 +734,19 @@ static const void *p_ext(const clap_plugin_t *p, const char *id) {
   if (!strcmp(id, CLAP_EXT_PARAMS)) return &params;
   if (!strcmp(id, CLAP_EXT_STATE)) return &state;
   if (!strcmp(id, CLAP_EXT_LATENCY)) return &latency;
+  if (!strcmp(id, CLAP_EXT_RENDER)) return &render;
   if (!strcmp(id, CLAP_EXT_GUI)) return &smp_gui_ext;
   return NULL;
 }
 
 /* ---- the status, for the window (and the test host) ---- */
+static void sf_status(Plug *P, char *out, int cap);
+
 SMP_API int smp_plugin_status(const clap_plugin_t *p, char *out, int cap) {
   Plug *P = plug_of(p);
   if (!P || !out || cap <= 0) return 0;
-  snprintf(out, (size_t)cap, "%s", P->status);
+  if (P->plays && !P->bad && P->e && P->s) sf_status(P, out, cap);
+  else snprintf(out, (size_t)cap, "%s", P->status);
   return 1;
 }
 
@@ -464,14 +760,16 @@ static void tell_host(Plug *P, int id) {
 }
 
 void smp_plug_set_param(Plug *P, int id, double v) {
-  if (!P->e || id < 0 || id >= SMP_NPARAMS) return;
-  smp_engine_set_param(P->e, id, v);
+  if (!P->e || !P->s || id < 0 || id >= SMP_NALLPARAMS) return;
+  set_value(P, id, v);
   tell_host(P, id);
   mark_dirty(P);
 }
 
 double smp_plug_get_param(Plug *P, int id) {
-  return P->e ? smp_engine_get_param(P->e, id) : smp_param_info(id)->def;
+  if (id < 0 || id >= SMP_NALLPARAMS) return 0;
+  if (id < SMP_NPARAMS) return P->e ? smp_engine_get_param(P->e, id) : smp_param_info(id)->def;
+  return P->s ? smp_synth_get_param(P->s, id) : smp_param_info(id)->def;
 }
 
 int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
@@ -513,6 +811,7 @@ void smp_plug_sample_text(Plug *P, char *out, int cap) {
 
 void smp_plug_status_text(Plug *P, char *out, int cap) {
   int ready = 0, total = 0; char why[600] = "";
+  if (P->plays && !P->bad && P->e && P->s) { sf_status(P, out, cap); return; }
   if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }
   if (smp_engine_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_engine_render_status(P->e, &ready, &total, why, sizeof why)) {
     if (why[0]) snprintf(out, (size_t)cap, "%s", why);
@@ -522,12 +821,100 @@ void smp_plug_status_text(Plug *P, char *out, int cap) {
   snprintf(out, (size_t)cap, "%s", P->status);
 }
 
+/* ---- the SoundFont player, for the window (plugin_int.h); main thread ---- */
+int smp_plug_plays(Plug *P) { return P->plays ? 1 : 0; }
+
+void smp_plug_set_plays(Plug *P, int which) {
+  which = which ? 1 : 0;
+  if (P->plays == which) return;
+  set_plays(P, which);
+  mark_dirty(P);
+}
+
+SmpSynth *smp_plug_synth(Plug *P) { return P->s; }
+
+void smp_plug_font_text(Plug *P, char *out, int cap) {
+  SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
+  if (P->sf_missing) {
+    char path[1100] = "", line[1200];
+    if (P->sf_line) font_line(P->sf_line, line, sizeof line, path, sizeof path);
+    snprintf(out, (size_t)cap, "Missing: %s", path);
+  } else if (!f) snprintf(out, (size_t)cap, "No SoundFont loaded");
+  else {
+    const char *name = f->path, *q;
+    int n = smp_sf_preset_count(f);
+    for (q = f->path; *q; q++) if (*q == '\\' || *q == '/') name = q + 1;
+    snprintf(out, (size_t)cap, "%s, %d %s", name, n, n == 1 ? "preset" : "presets");
+  }
+}
+
+static void sf_status(Plug *P, char *out, int cap) {
+  char t[1200]; int n;
+  if (P->sf_missing) { snprintf(out, (size_t)cap, "%s", P->sf_err); return; }
+  if (!smp_synth_font(P->s)) { snprintf(out, (size_t)cap, "No SoundFont loaded"); return; }
+  n = smp_synth_loading(P->s);
+  if (n > 0) { snprintf(out, (size_t)cap, "Loading samples for %d %s", n, n == 1 ? "preset" : "presets"); return; }
+  smp_plug_font_text(P, t, sizeof t);
+  snprintf(out, (size_t)cap, "Ready: %s", t);
+}
+
+int smp_plug_load_font(Plug *P, const char *path, char *err, int cap) {
+  if (!P->s) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  if (!smp_synth_load(P->s, path, err, cap)) return 0;
+  free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
+  set_plays(P, 1);
+  mark_dirty(P);
+  ask_collect(P);
+  return 1;
+}
+
+/* the first word of a state line, or the first two for the per-channel settings: the line it replaces has the
+   same. 1 when it is "sf_channel_preset <ch> song": the pin goes, and the song chooses again. */
+static int sf_key(const char *line, char *key, int cap) {
+  char a[64] = "", b[64] = "", c[64] = "";
+  int n = sscanf(line, " %63s %63s %63s", a, b, c), two = !strcmp(a, "sf_channel_preset") || !strcmp(a, "sf_output");
+  if (two && n >= 2) snprintf(key, (size_t)cap, "%s %s", a, b);
+  else snprintf(key, (size_t)cap, "%s", a);
+  return two && n == 3 && !strcmp(a, "sf_channel_preset") && !strcmp(c, "song");
+}
+
+void smp_plug_sf_set(Plug *P, const char *line) {
+  char key[140], k2[140], err[700];
+  char *cur, *out, *o; const char *p;
+  int n, drop;
+  if (!P->s || !line) return;
+  drop = sf_key(line, key, sizeof key);
+  n = smp_synth_script_write(P->s, NULL, 0);
+  cur = malloc((size_t)n + 1);
+  out = malloc((size_t)n + strlen(line) + 2);
+  if (!cur || !out) { free(cur); free(out); return; }
+  smp_synth_script_write(P->s, cur, n + 1);
+  /* the player's own lines with this one in place of the line it replaces; everything else stays */
+  for (p = cur, o = out; *p; ) {
+    const char *eol = strchr(p, '\n'), *end = eol ? eol + 1 : p + strlen(p);
+    char one[1200];
+    snprintf(one, sizeof one, "%.*s", (int)(end - p), p);
+    sf_key(one, k2, sizeof k2);
+    if (strcmp(k2, key)) { memcpy(o, p, (size_t)(end - p)); o += end - p; }
+    p = end;
+  }
+  if (!drop) { strcpy(o, line); o += strlen(line); *o++ = '\n'; }
+  *o = 0;
+  if (!smp_synth_script_apply(P->s, out, err, sizeof err)) mark_dirty(P);
+  free(cur); free(out);
+}
+
+int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program) {
+  return P->s ? smp_synth_channel_preset(P->s, ch, bank, program) : 0;
+}
+
 /* ---- test hooks (tests\host.c): make a real-time plugin render exactly like smp_engine_render_test ---- */
 SMP_API int smp_test_plugin_wait(const clap_plugin_t *p, int timeout_ms) {   /* keep-length copies and start heads */
   Plug *P = plug_of(p);
   if (!P || !P->e) return 1;
   if (smp_engine_wait_renders(P->e, timeout_ms)) return 1;
   smp_worker_wait_idle(P->e);
+  if (P->s && smp_synth_wait_loaded(P->s, timeout_ms)) return 1;   /* the state's sf_used presets */
   return 0;
 }
 SMP_API void smp_test_plugin_offline(const clap_plugin_t *p, int on) {   /* note-ons past the head wait for the streamer */
@@ -536,6 +923,7 @@ SMP_API void smp_test_plugin_offline(const clap_plugin_t *p, int on) {   /* note
 }
 SMP_API int smp_test_plugin_voices(const clap_plugin_t *p) {   /* sounding voices */
   Plug *P = plug_of(p);
+  if (P && P->plays && P->s) return smp_synth_voices(P->s, NULL);
   return P && P->e ? smp_engine_active_voices(P->e) : 0;
 }
 SMP_API void smp_test_plugin_sync(const clap_plugin_t *p) {   /* a whole streamer pass; call between process calls */
