@@ -1,11 +1,13 @@
 /* sfvoice.h: one SoundFont voice, all the SF2.04 sound generation for a single region of a note (section 9):
-   pitch, 4-point Hermite interpolation of the int16 sample, loops and sample modes, the volume and modulation
+   pitch, 4-point Hermite interpolation of the sample (int16 or float; its head in memory, then its ring when it
+   streams), loops and sample modes, the volume and modulation
    envelopes, the two LFOs, the resonant lowpass, attenuation, pan and the effect sends, and the modulators.
 
    Every smp_sfv_* call is made on the audio thread: none allocates, locks, waits or touches the disk. A voice
    holds its sample (smp_sf_pcm_acquire) from a successful start until it ends or is killed, and releases it
-   exactly once then, so a synth whose voices have all ended holds nothing. The struct is public so a synth can
-   keep a fixed array of voices. */
+   exactly once then, so a synth whose voices have all ended holds nothing. A voice that plays past its sample's
+   head reads the rest from a ring its player's streamer fills (sfstream.c); the streamer holds the sample for
+   itself meanwhile. The struct is public so a synth can keep a fixed array of voices. */
 #ifndef SFVOICE_H
 #define SFVOICE_H
 #include <stdint.h>
@@ -29,7 +31,8 @@ typedef struct { double t, delay, phase, inc, val; } SmpSfLfo;    /* t: samples 
 typedef struct SmpSfVoice {
   int live;                              /* 1 from a successful start until the voice ends */
   SmpFont *font; const SmpSfRegion *reg; int sample;
-  const int16_t *data;                   /* the held sample */
+  const void *data; int is_float;        /* the held head (int16 or float): the whole sample when it is under 1 s */
+  int64_t hf;                            /* frames in data */
   int key, vel;                          /* as played (for the modulators' key and velocity sources) */
   int pkey;                              /* the key for pitch and the keynum scalings: keynum when set */
   double rate, transpose, srate;         /* output rate, transpose in semitones, the sample's rate */
@@ -58,11 +61,27 @@ typedef struct SmpSfVoice {
   double level;                          /* the last envelope level times the attenuation, for stealing */
   /* kill: a linear fade */
   int killing; double fade, fade_step;
+  /* streaming: the voice plays past its head. ss and ring are its slot in the player's streamer (NULL when it has
+     none: then it plays its head and falls silent). Path frames count along the loop: frame i of the current lap is
+     path frame i + laps * L. */
+  int streaming, loopy;
+  struct SfSlot *ss; float *ring; LONG sgen;
+  int64_t L, laps, rel_w;                /* rel_w: the laps when a loop-until-release let go, else -1 */
+  int64_t avail;                         /* path frames in the ring, as last read */
+  int64_t roff;                          /* laps * L, for a stretch read from the ring */
+  double ug;                             /* underrun gain: fades out before the ring runs dry and back in after */
+  int underrun;                          /* the ring ran dry since the player last looked (it clears this) */
 } SmpSfVoice;
 
-/* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. */
+/* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. st and slot:
+   the player's streamer and the voice's slot in it, for samples longer than their head (st may be NULL). */
+struct SfStream;
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
-                  double rate, double transpose);
+                  double rate, double transpose, struct SfStream *st, int slot);
+int smp_sfv_needs_ring_now(const SmpSfVoice *v);       /* the voice's first frames are past its head (an offline
+                                                          render waits for the streamer then) */
+int smp_sfv_ring_low(SmpSfVoice *v);                   /* the voice streams and its ring holds less than half a ring
+                                                          ahead of it (an offline render tops the rings up then) */
 void smp_sfv_release(SmpSfVoice *v);                   /* note-off: the envelopes' release stages */
 void smp_sfv_kill(SmpSfVoice *v, double fade_ms);      /* fades out over fade_ms; 0 or less ends it at once */
 void smp_sfv_update(SmpSfVoice *v, const SmpSfChan *c);   /* a controller changed: the modulators again */

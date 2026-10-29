@@ -69,6 +69,13 @@ SMP_API int smp_entry_rate(const SmpEntry *e);
 SMP_API int smp_entry_whole(const SmpEntry *e);       /* 1 when the head holds the whole file */
 SMP_API const float *smp_entry_head(const SmpEntry *e, uint64_t *head_frames); /* immutable after open */
 SMP_API long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames); /* streamer thread only */
+/* Mono cache files, for the SoundFont engine's decoded samples (SF3 and later compressed formats): the same .smpc
+   header with 1 channel, then float32 mono. A SoundFont sample is one channel, so it isn't stored twice as stereo.
+   They are trimmed like the others (never while open). A mono entry has no head of its own (the font holds one). */
+SMP_API int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate);  /* 0 ok */
+SMP_API SmpEntry *smp_cache_open_mono(uint64_t key);  /* NULL if missing or not a mono file */
+SMP_API long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames);  /* any one thread at a time
+                                    per call; positional, so threads may share an entry */
 SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files and .part files over an hour old;
                                                          returns bytes left */
 SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */
@@ -171,12 +178,21 @@ SMP_API const SmpSfSample *smp_sf_sample(const SmpFont *f, int i);         /* NU
    for the presets in use, and is freed 2 s after no preset in use needs it. */
 SMP_API void smp_sf_use(SmpFont *f, int preset, int delta);   /* any thread, audio too: a synth starts (+1) or
                                     stops (-1) using a preset (public index), and the loader is woken */
-SMP_API const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames, uint32_t *loop_start,
-                                    uint32_t *loop_end);   /* any thread, audio too: the sample's int16 mono data,
-                                    its frame count and its loop (frames from the data's start, clamped to it), held
-                                    until release even if the sample is retired meanwhile; NULL (and nothing to
-                                    release) when it isn't loaded. Any out pointer may be NULL. A few zero frames are
-                                    readable before the start and after the end */
+/* What smp_sf_pcm_acquire holds: the sample's head in memory (int16 or float mono, by is_float), the frame
+   counts, the loop (frames from the sample's start, clamped to it), and a stream handle for the frames past the
+   head (NULL when the head is the whole sample: under 1 s). A few zero frames are readable before head[0] and after
+   the head's last frame. Everything stays valid until release, even if the sample is retired meanwhile. */
+typedef struct {
+  const void *head; int is_float;
+  uint32_t head_frames, frames, loop_start, loop_end;
+  const void *stream;
+} SmpSfView;
+SMP_API int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view);   /* any thread, audio too: 1 and the view
+                                    when the sample is loaded (held until release); 0 (nothing to release, view
+                                    zeroed) when it isn't. view may be NULL */
+SMP_API long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n);   /* never the audio
+                                    thread (it reads the disk); while the sample is held: n frames from frame (from the
+                                    sample's start) as float. Returns the frames read; the rest of out is zeroed */
 SMP_API void smp_sf_pcm_release(SmpFont *f, int sample);   /* any thread: after a non-NULL acquire */
 SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once every sample the presets in use
                                     need is loaded (or broken, or can't load for now: the file is gone or memory ran out; the loader
@@ -186,6 +202,9 @@ SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */
+SMP_API void smp_sf_test_whole(int on);                     /* tests: samples loaded from now on are held whole (as
+                                    in stage 2), so a render can be compared with a streamed one */
+SMP_API long smp_sf_test_decodes(void);                     /* tests: compressed SoundFont samples decoded so far */
 /* sfvoice.c, tests: plays one note of a preset (public index) on a default channel (GM reset controllers, bend
    centred, a 200 cent bend range), every region the key and velocity match, and writes frames of stereo into
    out_lr (frames * 2 floats, interleaved). The note is released at frame release_at (negative: never). Uses the
@@ -253,6 +272,9 @@ SMP_API int smp_synth_channel_preset(const SmpSynth *s, int ch, int *bank, int *
                                     preset channel ch (1 to 16) plays now; 1 found, 0 none */
 SMP_API int smp_synth_voices(const SmpSynth *s, int *peak);   /* sounding voices (not counting ones fading out
                                     after a steal or kill); peak: the most since the last render_test */
+SMP_API long smp_synth_underruns(const SmpSynth *s);   /* stream underruns so far: blocks in which a voice past its
+                                    head found its ring empty (it fades out and back in, and never stalls) */
+SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on);   /* tests: the streamer reads nothing */
 SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released);   /* tests: 1 when
                                     voice slot i (0..1087) is sounding, with its channel (0..15), key and release */
 #ifdef __cplusplus

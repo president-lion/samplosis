@@ -33,6 +33,7 @@
 #include "sf2.h"
 #include "sfvoice.h"
 #include "sffx.h"
+#include "sfstream.h"
 
 #define NCH 16
 #define NOUT 16
@@ -46,6 +47,8 @@
 #define HOLD_SECONDS 10.0         /* sf_used presets are let go this long after the first note-on after the state
                                      loaded (a project loads long before Play is pressed) */
 #define G_EXCL 57                 /* exclusiveClass */
+#define OFFLINE_STEP 256          /* an offline render with streaming voices plays this many frames between waits for
+                                     the streamer, so no ring can run dry even at a high pitch */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
 
 enum { V_FREE, V_PENDING, V_LIVE };
@@ -126,6 +129,10 @@ struct SmpSynth {
                                      presets aren't used (their samples can be freed), but chan_preset still says
                                      what each channel would play; the next process uses them again */
   volatile LONG peak;
+  /* streaming: the streamer thread and its rings, made when the first font with long samples loads (main thread)
+     and kept until free; the voice slots are its slots */
+  SfStream *volatile st;
+  volatile LONG underruns;
 };
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -317,8 +324,10 @@ static int free_slot(SmpSynth *s) {
 static int try_start(SmpSynth *s, int i) {
   Slot *t = &s->sl[i];
   if (!smp_sfv_start(&s->v[i], s->cur, t->reg, t->key, t->vel, &s->ch[t->chan].c, s->rate,
-                     floor(param(s, SMP_P_SF_TRANSPOSE) + 0.5)))
+                     floor(param(s, SMP_P_SF_TRANSPOSE) + 0.5), s->st, i))
     return 0;
+  /* an offline render waits for the streamer when the note's first frames are past its head */
+  if ((s->offline || s->render_offline) && s->st && smp_sfv_needs_ring_now(&s->v[i])) sfs_sync(s->st);
   t->st = V_LIVE;
   t->age = ++s->age;
   limit(s, i);
@@ -535,6 +544,8 @@ SMP_API void smp_synth_free(SmpSynth *s) {
   int i;
   if (!s) return;
   drop_font(s);
+  sfs_free(s->st);                             /* every voice has ended: the streamer releases its holds and stops */
+  s->st = NULL;
   used_drop_main(s);
   if (s->font) smp_sf_close(s->font);
   for (i = 0; i < s->nret; i++) smp_sf_close(s->ret[i].f);
@@ -544,11 +555,13 @@ SMP_API void smp_synth_free(SmpSynth *s) {
 }
 
 SMP_API int smp_synth_collect(SmpSynth *s) {
-  int i = 0;
+  int i = 0, synced = 0;
   if (!s) return 0;
   while (i < s->nret) {
     SmpFont *f = s->ret[i].f;
     if (s->epoch >= s->ret[i].a0 + 2 && (s->cur != f || f == s->font)) {
+      /* the audio thread has let go of f and ended its voices; the streamer lets go on its next whole pass */
+      if (s->st && !synced) { sfs_sync(s->st); synced = 1; }
       if (s->used_font == f && f != s->font) used_drop_main(s);
       smp_sf_close(f);
       s->ret[i] = s->ret[--s->nret];
@@ -568,6 +581,11 @@ SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap) {
   if (strlen(path) >= sizeof s->path) { if (err && cap > 0) snprintf(err, (size_t)cap, "the path is too long"); return 0; }
   f = smp_sf_open(path, err, cap);
   if (!f) return 0;
+  if (f->has_long && !s->st) {                 /* long samples stream: the streamer starts now, before any note */
+    SfStream *st = sfs_new(MAXV);
+    if (!st) { smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "out of memory"); return 0; }
+    InterlockedExchangePointer((PVOID volatile *)&s->st, st);
+  }
   if (s->nret == s->cret) {                    /* room on the retired list first, so nothing can fail later */
     int c = s->cret ? s->cret * 2 : 4;
     Retired *n = (Retired *)realloc(s->ret, sizeof *n * (size_t)c);
@@ -653,7 +671,7 @@ static void reset_now(SmpSynth *s) {
 }
 
 /* ---- process ---- */
-static void render(SmpSynth *s, float *const *outs, int a, int b, int base) {
+static void render_voices(SmpSynth *s, float *const *outs, int a, int b, int base) {
   int i;
   for (i = 0; i < MAXV; i++) {
     int o; float *l, *r;
@@ -666,6 +684,34 @@ static void render(SmpSynth *s, float *const *outs, int a, int b, int base) {
                         o == 0 ? s->cho + (a - base) : NULL, b - a))
       slot_free(s, i);
   }
+}
+
+static int any_streaming(const SmpSynth *s) {
+  int i;
+  for (i = 0; i < MAXV; i++) if (s->sl[i].st == V_LIVE && s->v[i].ss) return 1;
+  return 0;
+}
+
+static int any_ring_low(SmpSynth *s) {
+  int i;
+  for (i = 0; i < MAXV; i++) if (s->sl[i].st == V_LIVE && smp_sfv_ring_low(&s->v[i])) return 1;
+  return 0;
+}
+
+/* Offline, voices that stream are played OFFLINE_STEP frames at a time, and before a step in which any ring holds
+   less than half a ring ahead of its voice the streamer tops every ring up, so the render is exact. (A step at
+   up to 32 times the speed fits in half a ring.) The steps change nothing else: every voice carries its state. */
+static void render(SmpSynth *s, float *const *outs, int a, int b, int base) {
+  if ((s->offline || s->render_offline) && s->st && any_streaming(s)) {
+    while (a < b) {
+      int e = b - a > OFFLINE_STEP ? a + OFFLINE_STEP : b;
+      if (any_ring_low(s)) sfs_sync(s->st);
+      render_voices(s, outs, a, e, base);
+      a = e;
+    }
+    return;
+  }
+  render_voices(s, outs, a, b, base);
 }
 
 /* the start of a block: configuration, the font, the sf_used countdown (once a note-on armed it), pending voices */
@@ -740,6 +786,14 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
     }
   }
   s->gain = g1;
+  if (s->st) {                                  /* underruns counted, and the streamer woken when voices stream */
+    int any = 0;
+    for (i = 0; i < MAXV; i++) {
+      if (s->v[i].underrun) { s->v[i].underrun = 0; InterlockedIncrement(&s->underruns); }
+      if (s->v[i].live && s->v[i].ss) any = 1;
+    }
+    if (any) sfs_wake(s->st);
+  }
   InterlockedIncrement64(&s->epoch);
 }
 
@@ -762,6 +816,10 @@ SMP_API int smp_synth_voices(const SmpSynth *s, int *peak) {
   for (i = 0; i < MAXV; i++) if (sounding(s, i)) n++;
   return n;
 }
+
+SMP_API long smp_synth_underruns(const SmpSynth *s) { return s ? s->underruns : 0; }
+
+SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on) { if (s && s->st) sfs_pause(s->st, on); }
 
 SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released) {
   if (!s || i < 0 || i >= MAXV || !sounding(s, i)) return 0;

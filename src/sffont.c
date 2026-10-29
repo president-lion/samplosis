@@ -1,4 +1,5 @@
-/* sffont.c: the process-wide font registry, preset use counts, the loader thread and sample decoding.
+/* sffont.c: the process-wide font registry, preset use counts, the loader thread, sample heads and the reads that
+   stream the rest of a sample.
 
    The registry. Every smp_sf_open of the same file (same full path, compared case-insensitively, same size and
    modified time) shares one SmpFont, so many instances of a big font hold one copy of its samples. Only the main
@@ -14,6 +15,14 @@
    and retires samples no preset in use has needed for the grace time (2 s). It never holds g_lock while it reads
    a file.
 
+   Heads and streaming. A loaded sample keeps only its head in memory: the first quarter second, or the whole
+   sample when it is under 1 s. A voice starts from the head at once; the rest is read by the synth's streamer
+   thread through smp_sf_stream_read, from the font file (PCM_FILE: one shared handle per file, opened by the loader
+   with full sharing, read with positional reads so any number of streamers can share it) or from a mono float
+   cache file (DECODED: SF3's Ogg Vorbis, decoded once by the loader into the cache folder; the second open of the
+   font decodes nothing). A stream handle is the loaded sample itself, so it is valid exactly as long as the
+   sample is held.
+
    Freeing (the protocol the audio thread relies on). A reader does:
        InterlockedIncrement(&voices[s]);  p = pcm[s];  if (!p) InterlockedDecrement(&voices[s]);
    and InterlockedDecrement(&voices[s]) when it is done with p. The loader does:
@@ -28,24 +37,25 @@
    holds old and nobody can get it any more. There is never more than one buffer per sample, published or retired,
    so voices[s] only ever counts holders of that one buffer. A retired sample that is needed again before it is
    freed is published again rather than loaded anew, which also stops quick program changes from thrashing.
+   A streamer reading for a voice holds the sample too: the voice adds a second count for it at its start (it
+   already holds one, so no read of pcm[s] is needed), and the streamer releases that count itself once the voice
+   is gone and it has stopped reading (sfstream.c).
 
-   The caller's guarantee: every voice has released its samples before smp_sf_close drops the last reference (the
-   synth stops its voices first). Close frees the counters themselves, so a release after it would write freed
-   memory. */
+   The caller's guarantee: every voice and streamer has released its samples before smp_sf_close drops the last
+   reference (the synth stops its voices, then waits for its streamer). Close frees the counters themselves, so a
+   release after it would write freed memory. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include "sf2.h"
-#define STB_VORBIS_HEADER_ONLY
-#define STB_VORBIS_NO_PUSHDATA_API
-#define STB_VORBIS_NO_STDIO
-#include "decode/stb_vorbis.c"   /* declarations only; decode.c compiles it */
+#include "decode.h"
 
 #define DEFAULT_GRACE_MS 2000
 #define HELD_RECHECK_MS 20                 /* how often a retired sample that someone still holds is checked */
 #define RETRY_MS 500                       /* how often a load that failed for now (no file, no memory) is retried */
-#define MAX_VORBIS_FRAMES (1u << 26)       /* a decoded SF3 sample's limit (128 MB), against lying headers */
+#define MAX_DECODED_FRAMES (1u << 26)      /* a decoded sample's limit (25 minutes at 44.1 kHz), against lying headers */
+#define MIN_HEAD 1024                      /* the shortest head, for samples with absurdly low rates */
 
 static SRWLOCK g_lock = SRWLOCK_INIT;      /* guards the list, g_busy and g_thread */
 static CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;   /* signalled when the loader lets go of a font */
@@ -55,8 +65,12 @@ static HANDLE g_thread;
 static HANDLE g_wake;                      /* auto-reset; made once and never closed, so SetEvent is always safe */
 static volatile LONG g_stop;
 static volatile LONG g_grace = DEFAULT_GRACE_MS;
+static volatile LONG g_whole;              /* tests: samples are held whole */
+static volatile LONG g_decodes;            /* tests: compressed samples decoded */
 
 void smp_sf_test_grace(int ms) { InterlockedExchange(&g_grace, ms > 0 ? ms : DEFAULT_GRACE_MS); }
+void smp_sf_test_whole(int on) { InterlockedExchange(&g_whole, on ? 1 : 0); }
+long smp_sf_test_decodes(void) { return g_decodes; }
 
 static volatile LONG g_pause;              /* tests: the loader does nothing while set */
 void smp_sf_test_pause(int on) {
@@ -66,73 +80,198 @@ void smp_sf_test_pause(int on) {
 
 /* ---- loading one sample ---- */
 
-static SfPcm *new_pcm(uint32_t frames) {
-  size_t hdr = (sizeof(SfPcm) + 15) & ~(size_t)15;
-  size_t bytes = hdr + ((size_t)frames + 2 * SF_PCM_PAD) * sizeof(int16_t);
+/* the frames a sample keeps in memory: all of them under 1 s, else the first quarter second */
+static uint32_t head_of(uint32_t frames, uint32_t rate) {
+  uint32_t hf = rate / 4 > MIN_HEAD ? rate / 4 : MIN_HEAD;
+  if (g_whole || frames < rate || hf >= frames) return frames;
+  return hf;
+}
+
+static SfPcm *new_pcm(uint32_t frames, uint32_t head, int is_float) {
+  size_t hdr = (sizeof(SfPcm) + 15) & ~(size_t)15, w = is_float ? sizeof(float) : sizeof(int16_t);
+  size_t bytes = hdr + ((size_t)head + 2 * SF_PCM_PAD) * w;
   uint8_t *b = calloc(1, bytes);           /* zeroed: the pads before and after the data stay zero */
   SfPcm *p = (SfPcm *)b;
   if (!b) return NULL;
   p->frames = frames;
+  p->head_frames = head;
+  p->is_float = is_float;
   p->bytes = bytes;
-  p->data = (int16_t *)(b + hdr) + SF_PCM_PAD;
+  p->data = b + hdr + SF_PCM_PAD * w;
+  p->h = INVALID_HANDLE_VALUE;
   return p;
 }
 
 /* overwrites a freed buffer's start first, so a read after free shows up in tests instead of finding old data */
 static void free_pcm(SfPcm *p) {
   if (!p) return;
+  if (p->entry) smp_cache_close(p->entry);
   memset(p, 0xDD, p->bytes < 65536 ? (size_t)p->bytes : 65536);
   free(p);
 }
 
+/* a positional read, so several threads may read one handle at once; 1 when all n bytes came */
 static int read_at(HANDLE h, uint64_t off, void *buf, uint64_t n) {
-  LARGE_INTEGER li;
-  li.QuadPart = (LONGLONG)off;
-  if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) return 0;
   while (n > 0) {
+    OVERLAPPED o;
     DWORD want = n > (1u << 30) ? (1u << 30) : (DWORD)n, got = 0;
-    if (!ReadFile(h, buf, want, &got, NULL) || got != want) return 0;
-    buf = (uint8_t *)buf + got; n -= got;
+    memset(&o, 0, sizeof o);
+    o.Offset = (DWORD)off; o.OffsetHigh = (DWORD)(off >> 32);
+    if (!ReadFile(h, buf, want, &got, &o) || got != want) return 0;
+    buf = (uint8_t *)buf + got; n -= got; off += got;
   }
   return 1;
 }
 
-/* loads sample s; NULL with *broken set when the sample can never load (empty, unreadable or bad Ogg), NULL
-   without it when memory ran out (tried again on a later pass) */
-static SfPcm *load_sample(SmpFont *f, HANDLE h, int s, int *broken) {
+static int pcm_bytes(int enc) {
+  switch (enc) {
+    case SMP_PCM_U8: return 1;
+    case SMP_PCM_S16LE: case SMP_PCM_S16BE: return 2;
+    case SMP_PCM_S24LE: case SMP_PCM_S24BE: return 3;
+    default: return 4;
+  }
+}
+
+/* n PCM frames (interleaved over ch channels) to channel c alone: as float (of), or as int16 (oi) for the 16- and
+   8-bit kinds. 16-bit as float is exactly what the voice computes from int16 data, x * (1 / 32768). */
+static void pcm_convert(const uint8_t *b, int enc, int ch, int c, uint32_t n, float *of, int16_t *oi) {
+  int bps = pcm_bytes(enc), stride = bps * ch;
+  uint32_t i;
+  b += bps * c;
+  for (i = 0; i < n; i++, b += stride) {
+    int16_t x16; int32_t x; float y;
+    switch (enc) {
+      case SMP_PCM_S16LE: x16 = (int16_t)(b[0] | b[1] << 8); goto narrow;
+      case SMP_PCM_S16BE: x16 = (int16_t)(b[1] | b[0] << 8); goto narrow;
+      case SMP_PCM_U8: x16 = (int16_t)((b[0] - 128) * 256); goto narrow;
+      case SMP_PCM_S24LE: x = (int32_t)((uint32_t)b[0] << 8 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 24) >> 8; y = x * (1.0f / 8388608.0f); break;
+      case SMP_PCM_S24BE: x = (int32_t)((uint32_t)b[2] << 8 | (uint32_t)b[1] << 16 | (uint32_t)b[0] << 24) >> 8; y = x * (1.0f / 8388608.0f); break;
+      case SMP_PCM_S32LE: x = (int32_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24); y = (float)(x * (1.0 / 2147483648.0)); break;
+      default: memcpy(&y, b, 4); if (!(y >= -1e6f && y <= 1e6f)) y = 0; break;   /* F32LE; NaN and junk become 0 */
+    }
+    if (of) of[i] = y; else oi[i] = (int16_t)(y >= 1 ? 32767 : y <= -1 ? -32768 : y * 32768.0f);
+    continue;
+  narrow:
+    if (oi) oi[i] = x16; else of[i] = x16 * (1.0f / 32768.0f);
+  }
+}
+
+/* The handle for path_id in this pass (loader thread only). Each pass opens the file by name, as stage 2 did, so a
+   file that has gone away stops new samples loading (the ones loaded keep playing). The first time, a duplicate of
+   that handle becomes the font's streaming handle, kept until the font closes, so streams read the very file the
+   headers came from even if it is renamed meanwhile. NULL when the file can't be opened now. */
+static HANDLE font_handle(SmpFont *f, int path_id) {
+  HANDLE h;
+  wchar_t w[2048];
+  const wchar_t *name = f->wpath;
+  if (path_id < 0 || path_id >= f->npaths) return NULL;
+  if (f->ph[path_id]) return f->ph[path_id];
+  if (path_id > 0) {
+    if (!MultiByteToWideChar(CP_UTF8, 0, f->paths[path_id], -1, w, 2048)) return NULL;
+    name = w;
+  }
+  /* the same sharing as the parser's, so a file another program has open can still load */
+  h = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return NULL;
+  if (!f->fh[path_id]) {
+    HANDLE d;
+    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      CloseHandle(h);
+      return NULL;
+    }
+    f->fh[path_id] = d;
+  }
+  f->ph[path_id] = h;
+  return h;
+}
+
+/* A DECODED sample: its head from its cache file when there is one; else decoded now (once) and written there.
+   When the cache can't be written, the whole decoded sample is held in memory instead. NULL with *broken set when
+   the data can never decode; NULL without it when memory ran out or the file can't be opened for now. */
+static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *broken) {
+  SmpEntry *e = smp_cache_open_mono(c->key);
+  SfPcm *p;
+  uint32_t n, hf;
+  if (!e) {
+    float *x; int ch = 0, r = 0; long frames = 0; char err[256];
+    const float *mono;
+    if (c->length) {
+      HANDLE h = font_handle(f, c->path_id);
+      uint8_t *bytes;
+      if (!h) return NULL;                                          /* tried again in RETRY_MS */
+      if (c->length > 0x7fffffffu) { *broken = 1; return NULL; }
+      if (!(bytes = malloc((size_t)c->length))) return NULL;
+      if (!read_at(h, c->offset, bytes, c->length)) { free(bytes); *broken = 1; return NULL; }
+      x = decode_memory(bytes, (size_t)c->length, &ch, &frames, &r, err, sizeof err);
+      free(bytes);
+    } else {
+      x = decode_audio(f->paths[c->path_id], &ch, &frames, &r, err, sizeof err);
+    }
+    if (!x) { *broken = 1; return NULL; }
+    InterlockedIncrement(&g_decodes);
+    if (frames <= 0 || frames > (long)MAX_DECODED_FRAMES || ch <= 0) { free(x); *broken = 1; return NULL; }
+    n = (uint32_t)frames;
+    mono = x + (size_t)(c->channel < ch ? c->channel : 0) * (size_t)n;   /* channel after channel */
+    /* every decoded sample goes to the cache, short ones too, so the next open decodes nothing */
+    if (smp_cache_write_mono(c->key, mono, n, r > 0 ? r : (int)rate) == 0) e = smp_cache_open_mono(c->key);
+    hf = e ? head_of(n, rate) : n;                                  /* no cache: held whole */
+    p = new_pcm(n, hf, 1);
+    if (!p) { free(x); if (e) smp_cache_close(e); return NULL; }
+    memcpy(p->data, mono, (size_t)hf * sizeof(float));
+    free(x);
+    if (hf < n) p->entry = e;
+    else if (e) smp_cache_close(e);
+    return p;
+  }
+  if (smp_entry_frames(e) == 0 || smp_entry_frames(e) > MAX_DECODED_FRAMES) { smp_cache_close(e); *broken = 1; return NULL; }
+  n = (uint32_t)smp_entry_frames(e);
+  hf = head_of(n, rate);
+  p = new_pcm(n, hf, 1);
+  if (!p) { smp_cache_close(e); return NULL; }
+  if (smp_entry_read_mono(e, 0, (float *)p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
+  if (hf < n) p->entry = e;
+  else smp_cache_close(e);
+  return p;
+}
+
+/* loads sample s's head (all of it under 1 s); NULL with *broken set when the sample can never load (empty,
+   unreadable or bad Ogg), NULL without it when memory ran out or the file can't be opened (tried again on a later
+   pass) */
+static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   const SmpSfSample *sh = &f->shdr[s];
+  const SmpSrc *c = &f->src[s];
+  uint32_t rate = sh->rate ? sh->rate : 44100;
   SfPcm *p = NULL;
   uint64_t ls, le;
   *broken = 0;
   if (sh->end <= sh->start) { *broken = 1; return NULL; }   /* start and end were clamped into smpl at open */
+  if (c->kind == SMP_SRC_DECODED) {
+    p = load_decoded(f, c, rate, broken);
+    if (!p) return NULL;
+  } else {
+    uint32_t frames = sh->end - sh->start, hf = head_of(frames, rate);
+    int bps = pcm_bytes(c->enc), wide = bps > 2;
+    HANDLE h = font_handle(f, c->path_id);
+    if (!h) return NULL;
+    p = new_pcm(frames, hf, wide);
+    if (!p) return NULL;
+    if (c->enc == SMP_PCM_S16LE && c->channels == 1) {             /* SF2: straight into the head */
+      if (!read_at(h, c->offset, p->data, (uint64_t)hf * 2)) { free(p); *broken = 1; return NULL; }
+    } else {
+      uint64_t nb = (uint64_t)hf * (uint64_t)bps * c->channels;
+      uint8_t *b = nb < 0x7fffffffu ? malloc((size_t)nb) : NULL;
+      if (!b) { free(p); return NULL; }
+      if (!read_at(h, c->offset, b, nb)) { free(b); free(p); *broken = 1; return NULL; }
+      pcm_convert(b, c->enc, c->channels, c->channel, hf, wide ? (float *)p->data : NULL, wide ? NULL : (int16_t *)p->data);
+      free(b);
+    }
+    if (hf < frames) { p->h = f->fh[c->path_id]; p->offset = c->offset; p->enc = c->enc; p->channels = c->channels; p->channel = c->channel; }
+  }
   if (sh->type & SF_VORBIS) {
-    /* SF3: start and end are byte offsets of an Ogg Vorbis stream in smpl; loop points count decoded frames from
-       the stream's start (as MuseScore and Polyphone write them) */
-    uint32_t len = sh->end - sh->start; int e = 0, got; unsigned total;
-    uint8_t *ogg;
-    stb_vorbis *v;
-    if (len > 0x7fffffffu) { *broken = 1; return NULL; }
-    if (!(ogg = malloc(len))) return NULL;
-    if (!read_at(h, f->smpl_off + sh->start, ogg, len)) { free(ogg); *broken = 1; return NULL; }
-    v = stb_vorbis_open_memory(ogg, (int)len, &e, NULL);
-    if (!v) { free(ogg); *broken = 1; return NULL; }
-    total = stb_vorbis_stream_length_in_samples(v);
-    if (total == 0 || total > MAX_VORBIS_FRAMES) { stb_vorbis_close(v); free(ogg); *broken = 1; return NULL; }
-    p = new_pcm(total);
-    if (!p) { stb_vorbis_close(v); free(ogg); return NULL; }
-    got = stb_vorbis_get_samples_short_interleaved(v, 1, p->data, (int)total);   /* the first channel, or a mix */
-    stb_vorbis_close(v); free(ogg);
-    if (got <= 0) { free(p); *broken = 1; return NULL; }
-    p->frames = (uint32_t)got;
+    /* SF3: loop points count decoded frames from the stream's start (as MuseScore and Polyphone write them) */
     ls = sh->loop_start; le = sh->loop_end;
   } else {
-    /* SF2: 16-bit little-endian frames in smpl. sm24 is ignored (its lowest 8 bits are inaudible here). */
-    uint32_t frames = sh->end - sh->start;
-    p = new_pcm(frames);
-    if (!p) return NULL;
-    if (!read_at(h, f->smpl_off + (uint64_t)sh->start * 2, p->data, (uint64_t)frames * 2)) {
-      free(p); *broken = 1; return NULL;
-    }
     ls = sh->loop_start > sh->start ? sh->loop_start - sh->start : 0;
     le = sh->loop_end > sh->start ? sh->loop_end - sh->start : 0;
   }
@@ -157,8 +296,7 @@ static DWORD pass(SmpFont *f) {
   ULONGLONG now = GetTickCount64();
   ULONGLONG grace = (ULONGLONG)(DWORD)g_grace;
   DWORD next = INFINITE;
-  HANDLE h = INVALID_HANDLE_VALUE;
-  int s, p, k, cant_open = 0, aborted = 0, retry = 0;
+  int s, p, k, aborted = 0, retry = 0, cant_open = 0;
 
   memset(f->need, 0, (size_t)f->nshdr);
   for (p = 0; p < f->nphdr; p++) {
@@ -179,13 +317,8 @@ static DWORD pass(SmpFont *f) {
         retry = 1;
       } else if (f->state[s] == SF_ST_NONE) {
         SfPcm *pc; int broken;
-        if (h == INVALID_HANDLE_VALUE) {
-          /* the same sharing as the parser's, so a file another program has open can still load */
-          h = CreateFileW(f->wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-          if (h == INVALID_HANDLE_VALUE) { cant_open = retry = 1; continue; }   /* tried again in RETRY_MS */
-        }
-        pc = load_sample(f, h, s, &broken);
+        if (!font_handle(f, f->src[s].path_id)) { cant_open = retry = 1; continue; }   /* tried again in RETRY_MS */
+        pc = load_sample(f, s, &broken);
         if (pc) {
           f->held[s] = pc;
           InterlockedIncrement(&f->nloaded);
@@ -195,7 +328,7 @@ static DWORD pass(SmpFont *f) {
         } else if (broken) {
           f->state[s] = SF_ST_BROKEN;                /* never tried again */
         } else {
-          retry = 1;                                 /* out of memory: tried again in RETRY_MS */
+          retry = 1;                                 /* no file or no memory: tried again in RETRY_MS */
         }
       }
       continue;
@@ -225,7 +358,7 @@ static DWORD pass(SmpFont *f) {
       }
     }
   }
-  if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+  for (s = 0; s < f->npaths; s++) if (f->ph[s]) { CloseHandle(f->ph[s]); f->ph[s] = NULL; }
   /* A pass that left a needed sample unloaded for now (the file can't be opened, or memory ran out) isn't done: it
      runs again in RETRY_MS, and the status still counts the presets as loading. But it is as done as it can be
      for now, so wait_idle stops waiting (an offline render goes on, silent where samples are missing, rather than
@@ -275,10 +408,27 @@ static void free_font(SmpFont *f) {
     if (f->voices[s] > 0) { OutputDebugStringA("samplosis: a SoundFont was closed while a voice held a sample\n"); break; }
 #endif
   if (f->held) for (s = 0; s < f->nshdr; s++) free_pcm(f->held[s]);
-  free((void *)f->users); free((void *)f->voices); free((void *)f->pcm);
+  if (f->fh) for (s = 0; s < f->npaths; s++) if (f->fh[s]) CloseHandle(f->fh[s]);
+  free((void *)f->users); free((void *)f->voices); free((void *)f->pcm); free(f->fh); free(f->ph);
   free(f->held); free(f->state); free(f->need); free(f->idle_since); free(f->wpath);
   f->wpath = NULL;
   sf_free(f);
+}
+
+/* the cache keys of the font's DECODED samples: the file's full path, size and modified time, the byte range and
+   the channel, so a changed file never finds a stale copy */
+static void source_keys(SmpFont *f) {
+  char path[2048 * 3], d[2048 * 3 + 160];
+  int s;
+  if (!WideCharToMultiByte(CP_UTF8, 0, f->wpath, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path);
+  for (s = 0; s < f->nshdr; s++) {
+    SmpSrc *c = &f->src[s];
+    if (c->kind != SMP_SRC_DECODED) continue;
+    snprintf(d, sizeof d, "sfdec|%s|%s|%llu|%llu|%llu|%llu|%u", path, c->path_id ? f->paths[c->path_id] : "",
+             (unsigned long long)f->size, (unsigned long long)f->mtime, (unsigned long long)c->offset,
+             (unsigned long long)c->length, (unsigned)c->channel);
+    c->key = smp_key(d);
+  }
 }
 
 static int setup(SmpFont *f) {
@@ -290,8 +440,12 @@ static int setup(SmpFont *f) {
   f->state = calloc(ns, 1);
   f->need = calloc(ns, 1);
   f->idle_since = calloc(ns, sizeof(ULONGLONG));
+  f->fh = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
+  f->ph = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
   f->stuck_gen = -1;
-  return f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since;
+  if (!(f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since && f->fh && f->ph)) return 0;
+  source_keys(f);
+  return 1;
 }
 
 /* the file's full path as a new wide string, or NULL */
@@ -398,26 +552,54 @@ void smp_sf_use(SmpFont *f, int preset, int delta) {
   SetEvent(g_wake);                                 /* made before the first font, never closed */
 }
 
-const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *frames, uint32_t *loop_start,
-                                  uint32_t *loop_end) {
+int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view) {
   SfPcm *p;
-  if (frames) *frames = 0;
-  if (loop_start) *loop_start = 0;
-  if (loop_end) *loop_end = 0;
-  if (!f || sample < 0 || sample >= f->nshdr) return NULL;
+  if (view) memset(view, 0, sizeof *view);
+  if (!f || sample < 0 || sample >= f->nshdr) return 0;
   InterlockedIncrement(&f->voices[sample]);         /* first count ourselves, then read (see the top comment) */
   p = f->pcm[sample];
-  if (!p) { InterlockedDecrement(&f->voices[sample]); return NULL; }
+  if (!p) { InterlockedDecrement(&f->voices[sample]); return 0; }
   /* everything from the one pointer read: it stays valid while held, even after the sample is retired */
-  if (frames) *frames = p->frames;
-  if (loop_start) *loop_start = p->loop_start;
-  if (loop_end) *loop_end = p->loop_end;
-  return p->data;
+  if (view) {
+    view->head = p->data; view->is_float = p->is_float;
+    view->head_frames = p->head_frames; view->frames = p->frames;
+    view->loop_start = p->loop_start; view->loop_end = p->loop_end;
+    view->stream = p->head_frames < p->frames ? p : NULL;
+  }
+  return 1;
 }
+
+void sf_hold(SmpFont *f, int sample) { InterlockedIncrement(&f->voices[sample]); }
 
 void smp_sf_pcm_release(SmpFont *f, int sample) {
   if (!f || sample < 0 || sample >= f->nshdr) return;
   InterlockedDecrement(&f->voices[sample]);
+}
+
+long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n) {
+  const SfPcm *p = (const SfPcm *)stream;
+  long got = 0;
+  if (n <= 0) return 0;
+  if (p && frame < p->frames) {
+    long want = (uint64_t)n < p->frames - frame ? n : (long)(p->frames - frame);
+    if (p->entry) {
+      got = smp_entry_read_mono(p->entry, frame, out, want);
+      if (got < 0) got = 0;
+    } else if (p->h != INVALID_HANDLE_VALUE) {
+      /* through a small buffer on the stack, a piece at a time: no allocation, and a failed read stops here */
+      uint8_t buf[16384];
+      int fb = pcm_bytes(p->enc) * p->channels;
+      long per = (long)(sizeof buf / (size_t)fb);
+      while (got < want) {
+        long k = want - got < per ? want - got : per;
+        if (!read_at(p->h, p->offset + (frame + (uint64_t)got) * (uint64_t)fb, buf, (uint64_t)k * (uint64_t)fb)) break;
+        pcm_convert(buf, p->enc, p->channels, p->channel, (uint32_t)k, out + got, NULL);
+        got += k;
+      }
+    }
+  }
+  if (got < n) memset(out + got, 0, (size_t)(n - got) * sizeof(float));
+  return got;
 }
 
 /* pending retires (unneeded samples waiting out the grace or a holder) don't count as busy, and neither do

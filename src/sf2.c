@@ -201,6 +201,34 @@ static void clamp_samples(SmpFont *f) {
   }
 }
 
+/* every sample's source: SF2 data is 16-bit mono PCM in smpl (sm24 is ignored: its lowest 8 bits are inaudible
+   here); SF3 data is an Ogg Vorbis stream in smpl, decoded once into the cache. has_long says whether any sample
+   may be 1 s or longer (an SF3 stream's length isn't known until it is decoded, so any SF3 counts). */
+static int build_sources(SmpFont *f, const char *path) {
+  int i;
+  f->src = calloc(f->nshdr > 0 ? (size_t)f->nshdr : 1, sizeof *f->src);
+  f->paths = calloc(1, sizeof *f->paths);
+  if (!f->src || !f->paths || !(f->paths[0] = _strdup(path))) return 0;
+  f->npaths = 1;
+  for (i = 0; i < f->nshdr; i++) {
+    const SmpSfSample *sh = &f->shdr[i];
+    SmpSrc *c = &f->src[i];
+    c->path_id = 0; c->channels = 1; c->channel = 0;
+    if (sh->type & SF_VORBIS) {
+      c->kind = SMP_SRC_DECODED;
+      c->offset = f->smpl_off + sh->start;
+      c->length = sh->end - sh->start;
+      f->has_long = 1;
+    } else {
+      c->kind = SMP_SRC_PCM_FILE;
+      c->enc = SMP_PCM_S16LE;
+      c->offset = f->smpl_off + (uint64_t)sh->start * 2;
+      if (sh->end - sh->start >= (sh->rate ? sh->rate : 44100)) f->has_long = 1;
+    }
+  }
+  return 1;
+}
+
 /* ---- flattening presets into regions (SF2.04 sections 8 and 9) ---- */
 
 /* each generator's default and range, from SF2.04 section 8.1.3 (the same numbers as FluidSynth's gen table).
@@ -643,7 +671,7 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
   if (f->sm24_size && (f->is_sf3 || f->sm24_size < f->smpl_size / 2)) f->sm24_off = f->sm24_size = 0;
   clamp_samples(f);
   f->path = _strdup(path);
-  if (!f->path) { snprintf(why, sizeof why, "out of memory"); goto bad; }
+  if (!f->path || !build_sources(f, path)) { snprintf(why, sizeof why, "out of memory"); goto bad; }
   ok = 1;
   goto done;
 bad:
@@ -657,7 +685,10 @@ done:
 
 /* frees what sf_parse made (sffont.c frees the loader's arrays and the sample data first) */
 void sf_free(SmpFont *f) {
+  int i;
   if (!f) return;
+  if (f->paths) for (i = 0; i < f->npaths; i++) free(f->paths[i]);
+  free(f->paths); free(f->src);
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */

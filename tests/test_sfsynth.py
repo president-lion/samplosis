@@ -2,6 +2,7 @@
 through smp_synth_render_test from a small font written by sf2make."""
 import ctypes
 import itertools
+import os
 import threading
 import time
 
@@ -827,3 +828,145 @@ def test_no_stuck_notes_with_effects(lib, S):
     assert after < 0.1 * np.max(np.abs(held[int(0.6 * OUT):]))      # the voice is gone, what is left is the tail
     x = S.render(s, hold + "reset 14400", 1.0)                       # a reset clears the tails as well (the voices' 5 ms fade still feeds a little)
     assert np.max(np.abs(x[int(0.4 * OUT):])) < 0.05 * np.max(np.abs(held[int(0.6 * OUT):]))
+
+
+# ---- streaming (stage 3): samples past their head stream from the font file ----
+
+STREAM_DIR = r"E:\samplepacks\_build\samplosis_stream_test"   # big fonts go here, not to C: (nearly full)
+
+
+def busy(secs, seed, freq=330.0):
+    """A tone with noise on it, so a frame out of place shows."""
+    rng = np.random.default_rng(seed)
+    n = int(secs * SR)
+    t = np.arange(n) / SR
+    x = 9000 * np.sin(2 * np.pi * freq * t) + 2500 * rng.standard_normal(n)
+    return np.clip(x, -32000, 32000).astype(np.int16)
+
+
+def render_file(lib, path, events, secs, tmp_path, whole=False, block=256, pause=False):
+    """Renders events offline on a new synth with path loaded: (stereo out, underruns). whole: the samples are held
+    whole, as in stage 2 (the reference)."""
+    lib.smp_sf_test_whole(1 if whole else 0)
+    s = lib.smp_synth_new(float(OUT), 256)
+    try:
+        lib.smp_synth_set_param(s, P_EFFECTS, 0)
+        err = ctypes.create_string_buffer(512)
+        assert lib.smp_synth_load(s, str(path).encode(), err, 512) == 1, err.value
+        if pause:
+            lib.smp_synth_test_stream_pause(s, 1)
+        out = tmp_path / ("s%d.wav" % next(_count))
+        assert lib.smp_synth_render_test(s, events.encode(), int(secs * OUT), block, str(out).encode(), 0) == 0
+        x, _ = sf.read(str(out), dtype="float32", always_2d=True)
+        return x, lib.smp_synth_underruns(s)
+    finally:
+        lib.smp_synth_free(s)
+        lib.smp_sf_test_whole(0)
+
+
+def err_db(ref, x):
+    d = np.sqrt(np.mean((ref.astype(np.float64) - x) ** 2))
+    return -999.0 if d == 0 else 20 * np.log10(d / np.sqrt(np.mean(ref.astype(np.float64) ** 2)))
+
+
+def test_long_sample_streams(lib, tmp_path):
+    """A 30 s sample keeps only its first quarter second in memory, and a 30 s note of it matches the same note
+    with the sample held whole within -90 dB (offline renders wait for the streamer, so nothing underruns)."""
+    data = busy(30.0, 1)
+    path = tmp_path / "long.sf2"
+    write_sf2(str(path), [preset("Long", 0, 0, [zone(0)])],
+              [dict(name="long", data=data, rate=SR, pitch=60, loop=None)])
+    err = ctypes.create_string_buffer(512)
+    f = lib.smp_sf_open(str(path).encode(), err, 512)
+    assert f, err.value
+    try:
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 5000) == 0
+        held = lib.smp_sf_loaded_bytes(f)
+        assert 0.25 * SR * 2 <= held < 0.25 * SR * 2 + 4096, held      # 22 KB, not 2.6 MB
+        lib.smp_sf_use(f, 0, -1)
+    finally:
+        lib.smp_sf_close(f)
+    ev = "midi 144 60 100 0\nmidi 128 60 0 %d" % int(29.5 * OUT)
+    ref, _ = render_file(lib, path, ev, 30.6, tmp_path, whole=True)
+    x, under = render_file(lib, path, ev, 30.6, tmp_path)
+    assert under == 0
+    assert np.sqrt(np.mean(x[int(28 * OUT):int(29 * OUT)] ** 2)) > 0.05      # the end of the sample plays
+    assert err_db(ref, x) < -90, err_db(ref, x)
+
+
+def test_streamed_loop(lib, tmp_path):
+    """Loops past the head stream with wraparound: a 9 s loop played for 30 s (and an octave up, which wraps twice as
+    often), and a loop-until-release let go after a few laps, which goes on to the sample's end. Each matches the
+    same notes with the sample held whole within -90 dB."""
+    data = busy(12.0, 2, 220.0)
+    path = tmp_path / "loop.sf2"
+    write_sf2(str(path), [preset("Loop", 0, 0, [zone(0, gens={MODES: 1})]),
+                          preset("Release", 0, 1, [zone(0, gens={MODES: 3, RELEASE_VOL: 2400})])],
+              [dict(name="loop", data=data, rate=SR, pitch=60, loop=(2 * SR, 11 * SR))])
+    for ev, secs in (("midi 144 60 100 0", 30.0),
+                     ("midi 144 72 100 0", 20.0),
+                     ("midi 192 1 0\nmidi 144 72 100 0\nmidi 128 72 0 %d" % int(14.3 * OUT), 22.0)):
+        ref, _ = render_file(lib, path, ev, secs, tmp_path, whole=True)
+        x, under = render_file(lib, path, ev, secs, tmp_path)
+        assert under == 0, ev
+        assert np.sqrt(np.mean(ref[-OUT:] ** 2)) > 0.01 or "128" in ev, ev   # still sounding at the end
+        assert err_db(ref, x) < -90, (ev, err_db(ref, x))
+
+
+def test_stream_underrun_fades(lib, tmp_path):
+    """With the streamer stopped the note plays its head, then fades out (no click), counts underruns and goes on
+    in silence (the render finishes: nothing stalls)."""
+    data = sine(330, 3.0)
+    path = tmp_path / "u.sf2"
+    write_sf2(str(path), [preset("U", 0, 0, [zone(0)])], [dict(name="u", data=data, rate=SR, pitch=60, loop=None)])
+    x, under = render_file(lib, path, "midi 144 60 100 0", 1.0, tmp_path, pause=True)
+    m = x[:, 0].astype(np.float64)
+    head_end = int(0.25 * OUT)
+    assert np.max(np.abs(m[head_end - 2000:head_end - 400])) > 0.1           # the head plays
+    assert np.max(np.abs(m[head_end + 400:])) < 1e-6                         # then silence
+    assert under > 0
+    assert np.max(np.abs(np.diff(m))) < 0.06                                 # faded: no step anywhere
+
+
+def test_streaming_many_voices_no_underrun(lib, tmp_path):
+    """64 voices of distinct 20 s samples from one font file, played in real time for 5 s: no ring ever runs dry."""
+    os.makedirs(STREAM_DIR, exist_ok=True)
+    path = os.path.join(STREAM_DIR, "many_%d.sf2" % os.getpid())
+    try:
+        samples = [dict(name="m%d" % i, data=busy(20.0, 100 + i, 110.0 + 7 * i), rate=SR, pitch=30 + i, loop=None)
+                   for i in range(64)]
+        write_sf2(path, [preset("Many", 0, 0, [zone(i, keys=(30 + i, 30 + i)) for i in range(64)])], samples)
+        del samples
+        s = lib.smp_synth_new(float(OUT), 256)
+        try:
+            lib.smp_synth_set_param(s, P_EFFECTS, 0)
+            err = ctypes.create_string_buffer(512)
+            assert lib.smp_synth_load(s, path.encode(), err, 512) == 1, err.value
+            warm = tmp_path / "warm.wav"
+            assert lib.smp_synth_render_test(s, b"", 256, 256, str(warm).encode(), 0) == 0   # uses the preset
+            assert lib.smp_synth_wait_loaded(s, 20000) == 0
+            ev = "\n".join("midi 144 %d 100 0" % (30 + i) for i in range(64))
+            out = tmp_path / "many.wav"
+            lib.smp_synth_test_offline(s, 0)                                 # real time: never waits
+            c0, t0 = time.process_time(), time.perf_counter()
+            assert lib.smp_synth_render_test(s, ev.encode(), 5 * OUT, 256, str(out).encode(), 0) == 0
+            cpu, wall = time.process_time() - c0, time.perf_counter() - t0
+            peak = ctypes.c_int()
+            lib.smp_synth_voices(s, ctypes.byref(peak))
+            under = lib.smp_synth_underruns(s)
+            print("\n64 streaming voices, 5 s in real time: %.2f s wall, %.2f s CPU (%.1f %% of one core), underruns %d"
+                  % (wall, cpu, 100 * cpu / wall, under))
+            assert peak.value == 64
+            assert under == 0
+            x, _ = sf.read(str(out), dtype="float32")
+            assert np.sqrt(np.mean(x[-OUT:] ** 2)) > 0.05                    # still playing past every head
+        finally:
+            lib.smp_synth_free(s)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+        try:
+            os.rmdir(STREAM_DIR)
+        except OSError:
+            pass

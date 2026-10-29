@@ -9,6 +9,7 @@ import time
 import numpy as np
 import pytest
 
+from conftest import SmpSfView
 from sf2make import write_sf2
 
 REAL_FONT = r"E:\samplepacks\soundfonts\just_t4_fixed.sf2"
@@ -47,15 +48,23 @@ def sf_open(lib, path):
     return f
 
 
+def head_array(view):
+    """The view's head as a numpy array (a view into the held data): int16 as stored, or float scaled to int16 units."""
+    if view.is_float:
+        p = ctypes.cast(view.head, ctypes.POINTER(ctypes.c_float))
+        return np.ctypeslib.as_array(p, shape=(view.head_frames,)) * 32768.0
+    p = ctypes.cast(view.head, ctypes.POINTER(ctypes.c_int16))
+    return np.ctypeslib.as_array(p, shape=(view.head_frames,))
+
+
 def pcm(lib, f, i):
-    """The sample's loaded data as int16 (copied while held), its loop points, or None when not loaded."""
-    n, ls, le = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
-    p = lib.smp_sf_pcm_acquire(f, i, ctypes.byref(n), ctypes.byref(ls), ctypes.byref(le))
-    if not p:
+    """The sample's loaded head (the whole sample under 1 s) as int16 units (copied while held), its loop points,
+    or None when not loaded."""
+    v = SmpSfView()
+    if not lib.smp_sf_pcm_acquire(f, i, ctypes.byref(v)):
         return None
     try:
-        data = np.ctypeslib.as_array(p, shape=(n.value,)).copy()
-        return data, (ls.value, le.value)
+        return head_array(v).copy(), (v.loop_start, v.loop_end)
     finally:
         lib.smp_sf_pcm_release(f, i)
 
@@ -96,10 +105,10 @@ def test_samples_load_only_when_used(lib, tmp_path):
         # out-of-range presets and samples are ignored
         lib.smp_sf_use(f, 99, 1)
         lib.smp_sf_use(f, -1, 1)
-        n = ctypes.c_uint32(7)
-        assert not lib.smp_sf_pcm_acquire(f, 99, ctypes.byref(n), None, None)
-        assert n.value == 0
-        assert not lib.smp_sf_pcm_acquire(f, -1, None, None, None)
+        v = SmpSfView(frames=7)
+        assert not lib.smp_sf_pcm_acquire(f, 99, ctypes.byref(v))
+        assert v.frames == 0
+        assert not lib.smp_sf_pcm_acquire(f, -1, None)
         assert lib.smp_sf_wait_idle(f, 1000) == 0
         assert lib.smp_sf_loaded_samples(f) == 0
     finally:
@@ -195,13 +204,13 @@ def test_acquire_after_unpublish(lib, tmp_path):
     stats = dict(hits=0, misses=0, bad=0)
 
     def hammer():
-        n = ctypes.c_uint32()
+        v = SmpSfView()
         while not stop.is_set():
-            p = lib.smp_sf_pcm_acquire(f, 0, ctypes.byref(n), None, None)
-            if not p:
+            if not lib.smp_sf_pcm_acquire(f, 0, ctypes.byref(v)):
                 stats["misses"] += 1
                 continue
-            if n.value != 2000 or p[0] != known or p[999] != known or p[1999] != known:
+            p = ctypes.cast(v.head, ctypes.POINTER(ctypes.c_int16))
+            if v.frames != 2000 or p[0] != known or p[999] != known or p[1999] != known:
                 stats["bad"] += 1
             stats["hits"] += 1
             lib.smp_sf_pcm_release(f, 0)
@@ -238,16 +247,16 @@ def test_held_sample_survives_retire(lib, tmp_path):
     try:
         lib.smp_sf_use(f, 1, 1)
         assert lib.smp_sf_wait_idle(f, 3000) == 0
-        n, ls, le = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
-        p = lib.smp_sf_pcm_acquire(f, 1, ctypes.byref(n), ctypes.byref(ls), ctypes.byref(le))
-        assert p
+        v = SmpSfView()
+        assert lib.smp_sf_pcm_acquire(f, 1, ctypes.byref(v))
+        n, ls, le = v.frames, v.loop_start, v.loop_end
         lib.smp_sf_use(f, 1, -1)
         time.sleep(0.3)                                  # well past the grace: sample 1 is retired, not freed
         assert pcm(lib, f, 1) is None                    # unpublished: a new acquire gets nothing
         assert pcm(lib, f, 2) is None                    # not held: freed
         assert lib.smp_sf_loaded_samples(f) == 1         # the held one is still in memory
-        assert (n.value, ls.value, le.value) == (3000, 1000, 2900)
-        assert np.array_equal(np.ctypeslib.as_array(p, shape=(3000,)), SAMPLES[1]["data"])
+        assert (n, ls, le) == (3000, 1000, 2900)
+        assert np.array_equal(head_array(v), SAMPLES[1]["data"])
         lib.smp_sf_pcm_release(f, 1)
         assert poll(lambda: lib.smp_sf_loaded_samples(f) == 0, 2.0)
     finally:
@@ -350,3 +359,102 @@ def test_real_font_preset_memory(lib):
         lib.smp_sf_use(f, p, -1)
     finally:
         lib.smp_sf_close(f)
+
+
+# ---- heads and streaming (stage 3) ----
+
+def head_frames(n, rate):
+    """What the loader keeps of an n-frame sample: all of it under 1 s, else the first quarter second."""
+    return n if n < rate else min(n, max(rate // 4, 1024))
+
+
+def test_memory_follows_heads(lib, tmp_path):
+    """A preset of long samples loads only their heads: under 1.2 times the heads' bytes, and the view says how
+    much is in memory and how long the sample is."""
+    specs = [(5.0, 44100), (8.0, 44100), (3.0, 48000), (2.0, 22050), (0.5, 44100)]
+    samples = [dict(name="L%d" % i, data=tone(int(secs * rate), 220.0 + 50 * i, rate), rate=rate, pitch=60,
+                    loop=None) for i, (secs, rate) in enumerate(specs)]
+    path = str(tmp_path / "long.sf2")
+    write_sf2(path, [preset("Long", 0, list(range(len(samples))))], samples)
+    heads = sum(2 * head_frames(len(s["data"]), s["rate"]) for s in samples)
+    whole = sum(2 * len(s["data"]) for s in samples)
+    f = sf_open(lib, path)
+    try:
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 5000) == 0
+        loaded = lib.smp_sf_loaded_bytes(f)
+        assert heads <= loaded < 1.2 * heads, (loaded, heads, whole)
+        for i, s in enumerate(samples):
+            v = SmpSfView()
+            assert lib.smp_sf_pcm_acquire(f, i, ctypes.byref(v))
+            try:
+                n = len(s["data"])
+                assert (v.frames, v.head_frames, v.is_float) == (n, head_frames(n, s["rate"]), 0)
+                assert bool(v.stream) == (v.head_frames < n)
+                assert np.array_equal(head_array(v), s["data"][:v.head_frames])
+                if v.stream:                                     # the rest reads back exactly, as float
+                    out = np.zeros(4000, np.float32)
+                    got = lib.smp_sf_stream_read(v.stream, n - 3000, out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), 4000)
+                    assert got == 3000
+                    assert np.array_equal(out[:3000], s["data"][-3000:].astype(np.float32) / 32768)
+                    assert not out[3000:].any()                 # past the end: zeros
+            finally:
+                lib.smp_sf_pcm_release(f, i)
+        lib.smp_sf_use(f, 0, -1)
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sf3_decoded_once(lib, tmp_path):
+    """SF3 samples are decoded once, into the cache folder as mono float; the second open of the font decodes
+    nothing, holds only heads, and a long sample streams from the cache."""
+    rate = 44100
+    samples = [dict(name="Long", data=tone(3 * rate, 330.0, rate), rate=rate, pitch=5, loop=None),   # key 5 plays it
+               dict(name="Short", data=tone(rate // 2, 440.0, rate), rate=rate, pitch=60, loop=None),
+               dict(name="Loop", data=tone(2 * rate, 550.0, rate), rate=rate, pitch=60, loop=(rate // 2, rate))]
+    presets = [preset("All", 0, [0, 1, 2])]
+    a, b = str(tmp_path / "d.sf2"), str(tmp_path / "d.sf3")
+    write_sf2(a, presets, samples)
+    write_sf2(b, presets, samples, sf3=True)
+    views = []
+    for attempt in range(2):
+        d0 = lib.smp_sf_test_decodes()
+        f = sf_open(lib, b)
+        try:
+            lib.smp_sf_use(f, 0, 1)
+            assert lib.smp_sf_wait_idle(f, 10000) == 0
+            assert lib.smp_sf_loaded_samples(f) == 3
+            assert lib.smp_sf_test_decodes() - d0 == (3 if attempt == 0 else 0)
+            heads = []
+            for i, s in enumerate(samples):
+                v = SmpSfView()
+                assert lib.smp_sf_pcm_acquire(f, i, ctypes.byref(v))
+                try:
+                    assert v.is_float == 1
+                    assert abs(v.frames - len(s["data"])) <= 2048          # within one Ogg packet
+                    assert v.head_frames == head_frames(v.frames, rate)
+                    heads.append(head_array(v).copy())
+                finally:
+                    lib.smp_sf_pcm_release(f, i)
+            views.append(heads)
+            assert lib.smp_sf_loaded_bytes(f) < 1.2 * sum(4 * len(h) for h in heads)
+            lib.smp_sf_use(f, 0, -1)
+        finally:
+            lib.smp_sf_close(f)
+    for h1, h2 in zip(*views):
+        assert np.array_equal(h1, h2)
+    # the long sample through a voice: the SF3 one streams from the cache and sounds like the SF2 one
+    outs = []
+    for path in (a, b):
+        f = sf_open(lib, path)
+        try:
+            n = int(3.2 * 48000)
+            out = np.zeros(2 * n, np.float32)
+            assert lib.smp_sf_test_note(f, 0, 5, 100, 48000.0, n, -1, out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))) == 1
+            outs.append(out[0::2].astype(np.float64))
+        finally:
+            lib.smp_sf_close(f)
+    x, y = outs
+    assert np.sqrt(np.mean(x[-48000 * 2:] ** 2)) > 0.01                 # the end of the note is there
+    err_db = 20 * np.log10(np.sqrt(np.mean((x - y) ** 2)) / np.sqrt(np.mean(x ** 2)))
+    assert err_db < -30, err_db

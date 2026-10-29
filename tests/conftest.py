@@ -51,6 +51,13 @@ class SmpSfRegion(ctypes.Structure):
                 ("pmod", ctypes.POINTER(SmpSfMod)), ("npmod", ctypes.c_int)]
 
 
+class SmpSfView(ctypes.Structure):
+    _fields_ = [("head", ctypes.c_void_p), ("is_float", ctypes.c_int),
+                ("head_frames", ctypes.c_uint32), ("frames", ctypes.c_uint32),
+                ("loop_start", ctypes.c_uint32), ("loop_end", ctypes.c_uint32),
+                ("stream", ctypes.c_void_p)]
+
+
 def write_wav(path, data, rate):
     """Write a float32 wav (mono or frames x channels)."""
     sf.write(str(path), data, rate, subtype="FLOAT")
@@ -167,8 +174,8 @@ def lib(settings_file):
     u32p = ctypes.POINTER(ctypes.c_uint32)
     dll.smp_sf_use.restype = None
     dll.smp_sf_use.argtypes = [vp, c_int, c_int]
-    dll.smp_sf_pcm_acquire.restype = ctypes.POINTER(ctypes.c_int16)
-    dll.smp_sf_pcm_acquire.argtypes = [vp, c_int, u32p, u32p, u32p]
+    dll.smp_sf_pcm_acquire.restype = c_int
+    dll.smp_sf_pcm_acquire.argtypes = [vp, c_int, ctypes.POINTER(SmpSfView)]
     dll.smp_sf_pcm_release.restype = None
     dll.smp_sf_pcm_release.argtypes = [vp, c_int]
     dll.smp_sf_wait_idle.restype = c_int
@@ -215,4 +222,14 @@ def lib(settings_file):
     dll.smp_synth_collect.argtypes = [vp]
     dll.smp_synth_font.restype = vp
     dll.smp_synth_font.argtypes = [vp]
+    # stage 3 (streaming); looked up only when present, so an older build still loads
+    for name, res, args in (("smp_sf_stream_read", c_long, [vp, c_u64, fp, c_long]),
+                            ("smp_sf_test_whole", None, [c_int]),
+                            ("smp_sf_test_decodes", c_long, []),
+                            ("smp_synth_underruns", c_long, [vp]),
+                            ("smp_synth_test_stream_pause", None, [vp, c_int]),
+                            ("smp_synth_set_offline", None, [vp, c_int])):
+        if hasattr(dll, name):
+            getattr(dll, name).restype = res
+            getattr(dll, name).argtypes = args
     return dll

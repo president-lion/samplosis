@@ -1,0 +1,61 @@
+/* sfstream.h: the SoundFont streamer. One thread per player keeps a ring buffer ahead of each voice that plays
+   past its sample's head, reading the rest of the sample from the font file or the cache (smp_sf_stream_read). See
+   the top of sfstream.c for the handoffs. */
+#ifndef SFSTREAM_H
+#define SFSTREAM_H
+#include <windows.h>
+#include <stdint.h>
+#include "samplosis.h"
+
+#define SF_RING 16384                    /* frames per voice ring (power of two): 64 KB of mono float */
+#define SF_RMASK (SF_RING - 1)
+#define SF_UFADE 64                      /* samples of fade out and back in around an underrun */
+
+/* need and filled: a voice generation and a "released" bit packed with a path frame count */
+#define SF_TAG(g, rel) (((LONG64)((g) & 0x7FFFFF) << 41) | ((LONG64)((rel) ? 1 : 0) << 40))
+#define SF_TAGGEN(x) ((LONG)(((x) >> 41) & 0x7FFFFF))
+#define SF_TAGREL(x) ((int)(((x) >> 40) & 1))
+#define SF_VAL(x) ((int64_t)((x) & ((1LL << 40) - 1)))
+
+/* one voice slot, shared by the audio thread and the streamer */
+typedef struct SfSlot {
+  volatile LONG live;                    /* audio: the generation of the streaming voice sounding here, 0 when none */
+  volatile LONG rel;                     /* audio: -1, or the laps done when a loop-until-release was released */
+  volatile LONG64 need;                  /* audio: tag | the oldest path frame the voice still needs */
+  volatile LONG64 filled;                /* streamer: tag | path frames written to the ring so far */
+  LONG gen;                              /* audio only: the last generation given out in this slot */
+} SfSlot;
+
+/* a streaming voice's start, from the audio thread to the streamer. It carries one hold of the sample (taken by
+   the voice for the streamer), which the streamer releases. Frames count from the sample's start. */
+typedef struct SfMsg {
+  SmpFont *f; const void *stream;
+  int slot, sample; LONG gen;
+  uint32_t hf;                           /* frames in the head: those are never read into the ring */
+  uint32_t end, ls, le;                  /* the voice's end and loop */
+  int64_t p0;                            /* the first path frame the voice reads */
+  int loopy;                             /* the voice loops (sample mode 1 or 3, with a loop) */
+} SfMsg;
+
+/* The sample frame at path frame p. A voice's path is its frames in the order it plays them: straight to the loop
+   end, then round the loop (forever, or until the laps given by rel when a loop-until-release lets go, then on
+   to the end). The voice and the streamer both map path frames with this, so they always agree. */
+static __inline int64_t sf_path_frame(int64_t p, int64_t ls, int64_t le, int loopy, int64_t rel) {
+  int64_t L = le - ls;
+  if (!loopy || p < le) return p;
+  if (rel >= 0 && p >= le + rel * L) return p - rel * L;
+  return ls + (p - le) % L;
+}
+
+typedef struct SfStream SfStream;
+SfStream *sfs_new(int nslots);           /* main thread: starts the thread; NULL when out of memory */
+void sfs_free(SfStream *st);             /* main thread, while no audio thread runs: stops it, releases its holds */
+SfSlot *sfs_slot(SfStream *st, int i);
+float *sfs_ring(SfStream *st, int i);    /* the slot's ring (committed by the streamer before it writes to it) */
+int sfs_push(SfStream *st, const SfMsg *m);   /* audio thread: 1 queued, 0 full (the caller keeps its hold) */
+void sfs_wake(SfStream *st);             /* audio thread: a block was played */
+void sfs_sync(SfStream *st);             /* offline and main thread: returns after a whole pass that tops every ring
+                                            up (not just the half-empty ones) */
+void sfs_pause(SfStream *st, int on);    /* tests: the streamer reads nothing (forces underruns) */
+
+#endif

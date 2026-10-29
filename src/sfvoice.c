@@ -7,7 +7,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "sf2.h"
 #include "sfvoice.h"
+#include "sfstream.h"
 
 #define PI 3.14159265358979323846
 
@@ -361,25 +363,51 @@ static void control(SmpSfVoice *v) {
 static void end_voice(SmpSfVoice *v) {
   if (!v->live) return;
   v->live = 0;
+  if (v->ss) InterlockedExchange(&v->ss->live, 0);   /* the streamer lets go of its hold on its next pass */
   smp_sf_pcm_release(v->font, v->sample);     /* exactly once per successful start */
 }
 
+/* the voice's slot in the streamer: a new generation, the first frame it needs, and a start message carrying a
+   second hold of the sample for the streamer. Without room in the queue the voice plays without a ring. */
+static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stream) {
+  SfSlot *ss = sfs_slot(st, slot);
+  SfMsg m;
+  LONG g = ++ss->gen;
+  if (!(g & 0x7FFFFF)) g = ++ss->gen;          /* 0 means "none" in the tags */
+  memset(&m, 0, sizeof m);
+  m.f = v->font; m.stream = stream; m.slot = slot; m.sample = v->sample; m.gen = g;
+  m.hf = (uint32_t)v->hf; m.end = (uint32_t)v->end; m.ls = (uint32_t)v->ls; m.le = (uint32_t)v->le;
+  m.p0 = v->start > 0 ? v->start - 1 : 0;
+  m.loopy = v->loopy;
+  InterlockedExchange(&ss->rel, -1);
+  InterlockedExchange64(&ss->need, SF_TAG(g, 0) | m.p0);
+  InterlockedExchange(&ss->live, g);
+  sf_hold(v->font, v->sample);
+  if (!sfs_push(st, &m)) {
+    InterlockedExchange(&ss->live, 0);
+    smp_sf_pcm_release(v->font, v->sample);
+    return;
+  }
+  v->ss = ss; v->ring = sfs_ring(st, slot); v->sgen = g;
+}
+
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
-                  double rate, double transpose) {
+                  double rate, double transpose, SfStream *st, int slot) {
   const SmpSfSample *sh;
-  const int16_t *data;
-  uint32_t frames = 0, ls = 0, le = 0;
+  SmpSfView vw;
+  uint32_t frames, ls, le;
   int64_t start, end, lps, lpe;
   const int16_t *gen = r->gen;
   memset(v, 0, sizeof *v);
   if (!f || !r || !c || !(rate > 0)) return 0;
   sh = smp_sf_sample(f, r->sample);
   if (!sh) return 0;
-  data = smp_sf_pcm_acquire(f, r->sample, &frames, &ls, &le);
-  if (!data) return 0;
+  if (!smp_sf_pcm_acquire(f, r->sample, &vw)) return 0;
+  frames = vw.frames; ls = vw.loop_start; le = vw.loop_end;
   if (frames == 0) { smp_sf_pcm_release(f, r->sample); return 0; }
 
-  v->font = f; v->reg = r; v->sample = r->sample; v->data = data;
+  v->font = f; v->reg = r; v->sample = r->sample;
+  v->data = vw.head; v->is_float = vw.is_float; v->hf = vw.head_frames;
   v->key = key & 127; v->vel = vel & 127;
   if (gen[G_VELOCITY] >= 0) v->vel = gen[G_VELOCITY] & 127;
   v->pkey = gen[G_KEYNUM] >= 0 ? (gen[G_KEYNUM] & 127) : v->key;
@@ -405,7 +433,13 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   v->looping = (v->mode == 1 || v->mode == 3) && lpe > lps;     /* 0 and 2: no loop; a bad loop plays once */
   v->pos = (double)start;
 
+  /* Past the head? A loop wholly inside the head plays from it; a loop-until-release may go on to the end. */
+  v->loopy = v->looping;
+  v->L = v->looping ? lpe - lps : 0;
+  v->rel_w = -1; v->ug = 1;
+  v->streaming = vw.stream && ((v->looping && v->mode != 3) ? lpe > v->hf : end > v->hf);
   v->live = 1;
+  if (v->streaming && st) stream_start(v, st, slot, vw.stream);
   derive(v, c);
   v->venv.stage = E_DELAY; v->menv.stage = E_DELAY;
   v->fade = 1;
@@ -426,7 +460,27 @@ void smp_sfv_release(SmpSfVoice *v) {
     if (v->menv.stage == E_DELAY) v->menv.val = 0;
     v->menv.stage = E_RELEASE;
   }
-  if (v->mode == 3) v->looping = 0;          /* loop until release, then on to the end */
+  if (v->mode == 3 && v->looping) {          /* loop until release, then on to the end */
+    v->looping = 0;
+    v->rel_w = v->laps;                       /* the path leaves the loop at this lap's end */
+    if (v->ss) InterlockedExchange(&v->ss->rel, (LONG)v->laps);
+  }
+}
+
+int smp_sfv_needs_ring_now(const SmpSfVoice *v) {
+  return v->live && v->streaming && v->ss && v->start + 2 >= v->hf;
+}
+
+static void read_avail(SmpSfVoice *v);
+
+int smp_sfv_ring_low(SmpSfVoice *v) {
+  int64_t p, total;
+  if (!v->live || !v->streaming || !v->ss) return 0;
+  read_avail(v);
+  total = !v->loopy ? v->end : v->rel_w >= 0 ? v->end + v->rel_w * v->L : INT64_MAX;
+  if (v->avail >= total) return 0;
+  p = (int64_t)v->pos - 1 + v->laps * v->L;
+  return v->avail - p < SF_RING / 2;
 }
 
 void smp_sfv_kill(SmpSfVoice *v, double fade_ms) {
@@ -448,54 +502,204 @@ double smp_sfv_level(const SmpSfVoice *v) {
   return v->level * (v->killing ? v->fade : 1);
 }
 
-/* one frame at index i of the sample, as int16 scaled to -1..1: wrapped into the loop while looping, 0 past
-   the end otherwise (the pad makes a frame or two before the start readable). Once the loop has wrapped, the
-   point before the loop start is the loop's last frame, so the interpolation is seamless across the joint
-   (FluidSynth does the same). */
-static __inline float frame_at(const SmpSfVoice *v, int64_t i) {
+/* one frame at index i of the sample, scaled to -1..1: wrapped into the loop while looping, 0 past the end
+   otherwise (the pad makes a frame or two before the start readable). Once the loop has wrapped, the point before
+   the loop start is the loop's last frame, so the interpolation is seamless across the joint (FluidSynth does the
+   same). These read the head, which holds every frame the voice can reach when it doesn't stream. */
+static __inline int64_t wrap_at(const SmpSfVoice *v, int64_t i) {
   if (v->looping) {
     if (i >= v->le) i = v->ls + (i - v->le) % (v->le - v->ls);
     else if (i < v->ls && v->looped) i = v->le - 1 - (v->ls - 1 - i) % (v->le - v->ls);
-  } else if (i >= v->end) return 0;
-  return v->data[i] * (1.0f / 32768.0f);
+  } else if (i >= v->end) return -SF_PCM_PAD - 1;
+  return i;
+}
+static __inline float frame_i16(const SmpSfVoice *v, int64_t i) {
+  i = wrap_at(v, i);
+  return i < -SF_PCM_PAD ? 0 : ((const int16_t *)v->data)[i] * (1.0f / 32768.0f);
+}
+static __inline float frame_f32(const SmpSfVoice *v, int64_t i) {
+  i = wrap_at(v, i);
+  return i < -SF_PCM_PAD ? 0 : ((const float *)v->data)[i];
 }
 
-/* m samples of the current stretch; 0 when the voice must end */
-static int run(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) {
-  int i;
+/* A streaming voice's frame i (of the current lap): from the head when the sample frame is inside it, else from
+   the ring at its path frame, if the streamer has got that far; else *dry is set and it is 0. */
+static __inline float frame_stream(const SmpSfVoice *v, int64_t i, int *dry) {
+  int64_t p = i + v->laps * v->L, s = sf_path_frame(p, v->ls, v->le, v->loopy, v->rel_w);
+  if (s >= v->end) return 0;
+  if (s < v->hf) return v->is_float ? ((const float *)v->data)[s] : ((const int16_t *)v->data)[s] * (1.0f / 32768.0f);
+  if (p < v->avail) return v->ring[p & SF_RMASK];
+  *dry = 1;
+  return 0;
+}
+
+/* frame i will come from the ring, and the ring doesn't have it yet */
+static __inline int ring_short(const SmpSfVoice *v, int64_t i) {
+  int64_t p = i + v->laps * v->L, s = sf_path_frame(p, v->ls, v->le, v->loopy, v->rel_w);
+  return s >= v->hf && s < v->end && p >= v->avail;
+}
+
+/* the ring won't have every frame the next m samples and SF_UFADE more need: fade out now. The ring fills in path
+   order, so it is enough to look at the furthest frame, and at the loop's last frame when the loop end comes
+   first (past it the path may be back in the head). */
+static int ahead_short(const SmpSfVoice *v, int m) {
+  int64_t a = (int64_t)v->pos, b = (int64_t)(v->pos + (SF_UFADE + m) * fabs(v->ratio)) + 3;
+  if (ring_short(v, b)) return 1;
+  return v->looping && a < v->le && b >= v->le && ring_short(v, v->le - 1);
+}
+
+/* the path frames in the ring, from the slot's filled count. Until the streamer has seen a loop-until-release let
+   go, only frames before that lap's loop end are good. */
+static void read_avail(SmpSfVoice *v) {
+  LONG64 f;
+  v->avail = 0;
+  if (!v->ss) return;
+  f = v->ss->filled;
+  if (SF_TAGGEN(f) != (v->sgen & 0x7FFFFF)) return;
+  v->avail = SF_VAL(f);
+  if (v->rel_w >= 0 && !SF_TAGREL(f)) {
+    int64_t b = v->le + v->rel_w * v->L;
+    if (v->avail > b) v->avail = b;
+  }
+}
+
+/* m samples of the current stretch; 0 when the voice must end. FRAME(v, i) gives frame i. The int16 one is the
+   stage 2 code exactly, so a sample held whole sounds bit for bit as it did. */
+#define RUN_BODY(FRAME)                                                                                          \
+  int i;                                                                                                         \
+  for (i = 0; i < m; i++) {                                                                                      \
+    int64_t i0 = (int64_t)v->pos;                                                                                \
+    float x0 = FRAME(v, i0 - 1), x1 = FRAME(v, i0), x2 = FRAME(v, i0 + 1), x3 = FRAME(v, i0 + 2);                \
+    float t = (float)(v->pos - (double)i0);                                                                      \
+    float c1 = 0.5f * (x2 - x0), c2 = x0 - 2.5f * x1 + 2.0f * x2 - 0.5f * x3, c3 = 0.5f * (x3 - x0) + 1.5f * (x1 - x2); \
+    double y = ((c3 * t + c2) * t + c1) * t + x1, f = v->fade;                                                   \
+    if (v->filt_on) {                                                                                            \
+      double o = v->b0 * y + v->b1 * v->x1 + v->b2 * v->x2 - v->a1 * v->y1 - v->a2 * v->y2;                      \
+      v->x2 = v->x1; v->x1 = y; v->y2 = v->y1; v->y1 = o;                                                        \
+      y = o;                                                                                                     \
+      v->b0 += v->d_b0; v->b1 += v->d_b1; v->b2 += v->d_b2; v->a1 += v->d_a1; v->a2 += v->d_a2;                  \
+    }                                                                                                            \
+    l[i] += (float)(y * v->gl * f);                                                                              \
+    r[i] += (float)(y * v->gr * f);                                                                              \
+    if (rev) rev[i] += (float)(y * v->grev * f);                                                                 \
+    if (cho) cho[i] += (float)(y * v->gcho * f);                                                                 \
+    v->gl += v->d_gl; v->gr += v->d_gr; v->grev += v->d_grev; v->gcho += v->d_gcho;                              \
+    v->pos += v->ratio;                                                                                          \
+    v->ratio += v->d_ratio;                                                                                      \
+    if (v->looping) {                                                                                            \
+      if (v->pos >= (double)v->le) {                                                                             \
+        v->pos -= (double)(v->le - v->ls) * floor((v->pos - v->ls) / (double)(v->le - v->ls));                   \
+        v->looped = 1;                                                                                           \
+      }                                                                                                          \
+    } else if (v->pos >= (double)v->end) return 0;                                                               \
+    if (v->killing && (v->fade -= v->fade_step) <= 0) return 0;                                                  \
+  }                                                                                                              \
+  /* no denormals: tiny filter state is flushed to 0 */                                                          \
+  if (fabs(v->x1) < 1e-20) v->x1 = 0;                                                                            \
+  if (fabs(v->x2) < 1e-20) v->x2 = 0;                                                                            \
+  if (fabs(v->y1) < 1e-20) v->y1 = 0;                                                                            \
+  if (fabs(v->y2) < 1e-20) v->y2 = 0;                                                                            \
+  return 1;
+
+static int run_i16(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) { RUN_BODY(frame_i16) }
+static int run_f32(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) { RUN_BODY(frame_f32) }
+/* a streaming voice's stretch that the ring covers whole, with no loop joint in it (see run_stream) */
+#define frame_ring(v, i) ((v)->ring[((i) + (v)->roff) & SF_RMASK])
+static int run_ring(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) { RUN_BODY(frame_ring) }
+
+/* the same for a streaming voice: frames from the head or the ring, the laps counted, and the underrun gain, which
+   fades out over SF_UFADE samples before the ring runs dry (looking that far ahead) and back in once it has
+   frames again. A dry frame plays as silence and the voice goes on, so it never stalls. With the gain at 1 the
+   output is the same as run_i16's. */
+static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) {
+  int i, short_ahead;
+  int64_t hend = v->hf < v->end ? v->hf : v->end;   /* head frames the voice can play */
+  read_avail(v);
+  short_ahead = ahead_short(v, m);
+  if (!short_ahead && v->ug == 1) {
+    /* Most stretches lie wholly in the head or wholly in the ring, with no loop joint in them (then no lap can end
+       in the stretch either): they run the plain loops, which give the same output. */
+    double rmax = v->ratio + (v->d_ratio > 0 ? v->d_ratio * m : 0);
+    int64_t lo = (int64_t)v->pos - 1, hi = (int64_t)(v->pos + rmax * m) + 3;
+    int lin = !v->loopy || ((v->laps == 0 || lo >= v->ls) && (!v->looping || hi < v->le));
+    if (lin && hi < hend) return v->is_float ? run_f32(v, l, r, rev, cho, m) : run_i16(v, l, r, rev, cho, m);
+    if (lin && lo >= v->hf && hi < v->end && hi + v->laps * v->L < v->avail) {
+      v->roff = v->laps * v->L;
+      return run_ring(v, l, r, rev, cho, m);
+    }
+  }
   for (i = 0; i < m; i++) {
     int64_t i0 = (int64_t)v->pos;
-    float x0 = frame_at(v, i0 - 1), x1 = frame_at(v, i0), x2 = frame_at(v, i0 + 1), x3 = frame_at(v, i0 + 2);
-    float t = (float)(v->pos - (double)i0);
-    float c1 = 0.5f * (x2 - x0), c2 = x0 - 2.5f * x1 + 2.0f * x2 - 0.5f * x3, c3 = 0.5f * (x3 - x0) + 1.5f * (x1 - x2);
-    double y = ((c3 * t + c2) * t + c1) * t + x1, f = v->fade;
-    if (v->filt_on) {
-      double o = v->b0 * y + v->b1 * v->x1 + v->b2 * v->x2 - v->a1 * v->y1 - v->a2 * v->y2;
-      v->x2 = v->x1; v->x1 = y; v->y2 = v->y1; v->y1 = o;
-      y = o;
-      v->b0 += v->d_b0; v->b1 += v->d_b1; v->b2 += v->d_b2; v->a1 += v->d_a1; v->a2 += v->d_a2;
-    }
-    l[i] += (float)(y * v->gl * f);
-    r[i] += (float)(y * v->gr * f);
-    if (rev) rev[i] += (float)(y * v->grev * f);
-    if (cho) cho[i] += (float)(y * v->gcho * f);
-    v->gl += v->d_gl; v->gr += v->d_gr; v->grev += v->d_grev; v->gcho += v->d_gcho;
-    v->pos += v->ratio;
-    v->ratio += v->d_ratio;
-    if (v->looping) {
-      if (v->pos >= (double)v->le) {
-        v->pos -= (double)(v->le - v->ls) * floor((v->pos - v->ls) / (double)(v->le - v->ls));
-        v->looped = 1;
+    int dry = 0;
+    float x0, x1, x2, x3;
+    /* the four frames straight on in the sample (no loop joint among them): from the head, or from the ring */
+    int lin = !v->loopy || ((v->laps == 0 || i0 - 1 >= v->ls) && (!v->looping || i0 + 2 < v->le));
+    if (lin && i0 + 2 < hend) {
+      if (v->is_float) {
+        const float *d = (const float *)v->data + i0;
+        x0 = d[-1]; x1 = d[0]; x2 = d[1]; x3 = d[2];
+      } else {
+        const int16_t *d = (const int16_t *)v->data + i0;
+        x0 = d[-1] * (1.0f / 32768.0f); x1 = d[0] * (1.0f / 32768.0f); x2 = d[1] * (1.0f / 32768.0f); x3 = d[2] * (1.0f / 32768.0f);
       }
-    } else if (v->pos >= (double)v->end) return 0;
-    if (v->killing && (v->fade -= v->fade_step) <= 0) return 0;
+    } else if (lin && i0 - 1 >= v->hf && i0 + 2 < v->end && i0 + 2 + v->laps * v->L < v->avail) {
+      int64_t q = i0 - 1 + v->laps * v->L;
+      x0 = v->ring[q & SF_RMASK]; x1 = v->ring[(q + 1) & SF_RMASK]; x2 = v->ring[(q + 2) & SF_RMASK]; x3 = v->ring[(q + 3) & SF_RMASK];
+    } else {
+      x0 = frame_stream(v, i0 - 1, &dry); x1 = frame_stream(v, i0, &dry); x2 = frame_stream(v, i0 + 1, &dry);
+      x3 = frame_stream(v, i0 + 2, &dry);
+    }
+    {                                   /* the interpolation, the gains and the step, as in run_i16 */
+      float t = (float)(v->pos - (double)i0);
+      float c1 = 0.5f * (x2 - x0), c2 = x0 - 2.5f * x1 + 2.0f * x2 - 0.5f * x3, c3 = 0.5f * (x3 - x0) + 1.5f * (x1 - x2);
+      double y = ((c3 * t + c2) * t + c1) * t + x1, f = v->fade;
+      if (dry || short_ahead) {
+        if ((v->ug -= 1.0 / SF_UFADE) < 0) v->ug = 0;
+      } else if (v->ug < 1 && (v->ug += 1.0 / SF_UFADE) > 1) v->ug = 1;
+      if (dry) { v->underrun = 1; y = 0; }
+      if (v->filt_on) {
+        double o = v->b0 * y + v->b1 * v->x1 + v->b2 * v->x2 - v->a1 * v->y1 - v->a2 * v->y2;
+        v->x2 = v->x1; v->x1 = y; v->y2 = v->y1; v->y1 = o;
+        y = o;
+        v->b0 += v->d_b0; v->b1 += v->d_b1; v->b2 += v->d_b2; v->a1 += v->d_a1; v->a2 += v->d_a2;
+      }
+      y *= v->ug;
+      l[i] += (float)(y * v->gl * f);
+      r[i] += (float)(y * v->gr * f);
+      if (rev) rev[i] += (float)(y * v->grev * f);
+      if (cho) cho[i] += (float)(y * v->gcho * f);
+      v->gl += v->d_gl; v->gr += v->d_gr; v->grev += v->d_grev; v->gcho += v->d_gcho;
+      v->pos += v->ratio;
+      v->ratio += v->d_ratio;
+      if (v->looping) {
+        if (v->pos >= (double)v->le) {
+          double k = floor((v->pos - v->ls) / (double)(v->le - v->ls));
+          v->pos -= (double)(v->le - v->ls) * k;
+          v->laps += (int64_t)k;
+          v->looped = 1;
+        }
+      } else if (v->pos >= (double)v->end) return 0;
+      if (v->killing && (v->fade -= v->fade_step) <= 0) return 0;
+    }
   }
-  /* no denormals: tiny filter state is flushed to 0 */
   if (fabs(v->x1) < 1e-20) v->x1 = 0;
   if (fabs(v->x2) < 1e-20) v->x2 = 0;
   if (fabs(v->y1) < 1e-20) v->y1 = 0;
   if (fabs(v->y2) < 1e-20) v->y2 = 0;
   return 1;
+}
+
+static int run(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m) {
+  if (v->streaming) return run_stream(v, l, r, rev, cho, m);
+  return v->is_float ? run_f32(v, l, r, rev, cho, m) : run_i16(v, l, r, rev, cho, m);
+}
+
+/* the oldest path frame the voice still needs, for the streamer */
+static void publish_need(SmpSfVoice *v) {
+  int64_t nd;
+  if (!v->ss || !v->live) return;
+  nd = (int64_t)v->pos - 1 + v->laps * v->L;
+  v->ss->need = SF_TAG(v->sgen, 0) | (nd < 0 ? 0 : nd);
 }
 
 int smp_sfv_render(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int n) {
@@ -514,6 +718,7 @@ int smp_sfv_render(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, in
     v->ctl_left -= m;
   }
   if (v->ctl_left <= 0 && v->ending) { end_voice(v); return 0; }
+  publish_need(v);
   return 1;
 }
 
@@ -527,6 +732,7 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
   SmpSfVoice *vs = NULL;
   SmpSfChan ch;
   float *l = NULL, *r = NULL, *rev = NULL, *cho = NULL;
+  SfStream *st = NULL;
   int nreg, nv = 0, i;
   long at;
   if (!f || frames < 0 || !out_lr || !(rate > 0)) return -1;
@@ -542,16 +748,18 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
   r = (float *)calloc((size_t)frames + 1, sizeof *r);
   rev = (float *)calloc(TEST_BLOCK, sizeof *rev);
   cho = (float *)calloc(TEST_BLOCK, sizeof *cho);
-  if (!vs || !l || !r || !rev || !cho) { nv = -1; goto done; }
+  if (f->has_long) st = sfs_new(nreg);          /* a streamer of its own, waited for before every block */
+  if (!vs || !l || !r || !rev || !cho || (f->has_long && !st)) { nv = -1; goto done; }
   for (i = 0; i < nreg; i++) {
     const SmpSfRegion *g = &regs[i];
     if (key < g->lokey || key > g->hikey || vel < g->lovel || vel > g->hivel) continue;
-    if (smp_sfv_start(&vs[nv], f, g, key, vel, &ch, rate, 0)) nv++;
+    if (smp_sfv_start(&vs[nv], f, g, key, vel, &ch, rate, 0, st, nv)) nv++;
   }
   for (at = 0; at < frames;) {
     long n = frames - at < TEST_BLOCK ? frames - at : TEST_BLOCK;
     if (release_at >= 0 && at < release_at && at + n > release_at) n = release_at - at;
     if (at == release_at) for (i = 0; i < nv; i++) smp_sfv_release(&vs[i]);
+    if (st) for (i = 0; i < nv; i++) if (smp_sfv_ring_low(&vs[i]) || smp_sfv_needs_ring_now(&vs[i])) { sfs_sync(st); break; }
     for (i = 0; i < nv; i++) smp_sfv_render(&vs[i], l + at, r + at, rev, cho, (int)n);
     at += n;
   }
@@ -559,6 +767,7 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
   for (at = 0; at < frames; at++) { out_lr[2 * at] = l[at]; out_lr[2 * at + 1] = r[at]; }
 done:
   if (vs && nv < 0) for (i = 0; i < nreg; i++) smp_sfv_kill(&vs[i], 0);
+  sfs_free(st);                                 /* after every voice ended: releases the streamer's holds */
   free(vs); free(l); free(r); free(rev); free(cho);
   smp_sf_use(f, preset, -1);
   return nv;

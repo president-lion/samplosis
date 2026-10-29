@@ -1,4 +1,5 @@
-/* On-disk sample cache: <16 hex>.smpc = 32 byte header + float32 stereo interleaved. */
+/* On-disk sample cache: <16 hex>.smpc = 32 byte header + float32 stereo interleaved (or mono, for the SoundFont
+   engine's decoded samples: the header says how many channels). */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@
 struct SmpEntry {
   HANDLE h;
   uint64_t key, frames;
-  int rate, whole;
+  int rate, whole, ch;
   float *head;
   uint64_t head_frames;
 };
@@ -68,7 +69,7 @@ static int write_all(HANDLE h, const void *buf, uint64_t n) {
   return 1;
 }
 
-int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) {
+static int write_ch(uint64_t key, const float *lr, uint64_t frames, int rate, uint32_t ch) {
   wchar_t dir[1100], part[1200], fin[1200];
   static volatile LONG counter;
   wchar_t ext[64];
@@ -78,19 +79,22 @@ int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) {
   HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return 2;
   unsigned char hdr[HDR] = {0};
-  uint32_t v = 1, ch = 2, r = (uint32_t)rate;
+  uint32_t v = 1, r = (uint32_t)rate;
   memcpy(hdr, "SMPC", 4); memcpy(hdr + 4, &v, 4); memcpy(hdr + 8, &ch, 4); memcpy(hdr + 12, &r, 4); memcpy(hdr + 16, &frames, 8);
-  int ok = write_all(h, hdr, HDR) && write_all(h, lr, frames * 8);
+  int ok = write_all(h, hdr, HDR) && write_all(h, lr, frames * 4 * ch);
   CloseHandle(h);
   if (ok && MoveFileExW(part, fin, MOVEFILE_REPLACE_EXISTING)) return 0;
   DeleteFileW(part);
   if (ok) { /* keys are content-addressed: a complete file already there (maybe held open) is as good as ours */
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (GetFileAttributesExW(fin, GetFileExInfoStandard, &d) &&
-        (((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow) == HDR + frames * 8) return 0;
+        (((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow) == HDR + frames * 4 * ch) return 0;
   }
   return 3;
 }
+
+int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) { return write_ch(key, lr, frames, rate, 2); }
+int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) { return write_ch(key, x, frames, rate, 1); }
 
 static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
   OVERLAPPED o = {0};
@@ -99,8 +103,9 @@ static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
   return ReadFile(h, buf, n, got, &o) != 0;
 }
 
-/* whole_div: the entry is held whole when it is at most rate / whole_div frames long */
-static SmpEntry *open_entry(uint64_t key, int whole_div) {
+/* whole_div: the entry is held whole when it is at most rate / whole_div frames long. want_ch 1: a mono file,
+   opened with no head (whole_div unused) */
+static SmpEntry *open_entry(uint64_t key, int whole_div, uint32_t want_ch) {
   wchar_t fn[1200];
   if (!file_w(key, L".smpc", fn, 1200)) return NULL;
   HANDLE h = CreateFileW(fn, GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -110,12 +115,13 @@ static SmpEntry *open_entry(uint64_t key, int whole_div) {
   if (!read_at(h, 0, hdr, HDR, &got) || got != HDR || memcmp(hdr, "SMPC", 4)) { CloseHandle(h); return NULL; }
   memcpy(&ver, hdr + 4, 4); memcpy(&ch, hdr + 8, 4); memcpy(&rate, hdr + 12, 4); memcpy(&frames, hdr + 16, 8);
   LARGE_INTEGER sz;
-  if (ver != 1 || ch != 2 || !GetFileSizeEx(h, &sz) || (uint64_t)sz.QuadPart < HDR + frames * 8) { CloseHandle(h); return NULL; }
+  if (ver != 1 || ch != want_ch || !GetFileSizeEx(h, &sz) || (uint64_t)sz.QuadPart < HDR + frames * 4 * ch) { CloseHandle(h); return NULL; }
   SmpEntry *e = calloc(1, sizeof *e);
   if (!e) { CloseHandle(h); return NULL; }
-  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate;
+  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate; e->ch = (int)ch;
   uint64_t hf = (uint64_t)rate / 4;
-  if (frames <= (uint64_t)rate / (uint64_t)whole_div) { hf = frames; e->whole = 1; }
+  if (ch == 1) hf = 0;                     /* mono: no head here; the SoundFont loader holds its own */
+  else if (frames <= (uint64_t)rate / (uint64_t)whole_div) { hf = frames; e->whole = 1; }
   else if (hf > frames) hf = frames;
   e->head_frames = hf;
   e->head = malloc((size_t)(hf ? hf * 8 : 8));
@@ -131,8 +137,9 @@ static SmpEntry *open_entry(uint64_t key, int whole_div) {
   return e;
 }
 
-SmpEntry *smp_cache_open(uint64_t key) { return open_entry(key, 1); }       /* imported files: whole up to 1 s */
-SmpEntry *smp_cache_open_copy(uint64_t key) { return open_entry(key, 4); }  /* keep-length copies: whole up to 0.25 s */
+SmpEntry *smp_cache_open(uint64_t key) { return open_entry(key, 1, 2); }       /* imported files: whole up to 1 s */
+SmpEntry *smp_cache_open_copy(uint64_t key) { return open_entry(key, 4, 2); }  /* keep-length copies: whole up to 0.25 s */
+SmpEntry *smp_cache_open_mono(uint64_t key) { return open_entry(key, 1, 1); }  /* SoundFont samples: no head */
 
 void smp_cache_close(SmpEntry *e) {
   if (!e) return;
@@ -156,6 +163,15 @@ long smp_entry_read(SmpEntry *e, uint64_t frame, float *lr, long frames) {
   DWORD got;
   if (!read_at(e->h, HDR + frame * 8, lr, (DWORD)(n * 8), &got)) return 0;
   return (long)(got / 8);
+}
+
+long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames) {
+  if (e->ch != 1 || frame >= e->frames || frames <= 0) return 0;
+  uint64_t n = e->frames - frame;
+  if (n > (uint64_t)frames) n = (uint64_t)frames;
+  DWORD got;
+  if (!read_at(e->h, HDR + frame * 4, x, (DWORD)(n * 4), &got)) return 0;
+  return (long)(got / 4);
 }
 
 typedef struct { uint64_t key, size, time; } Item;

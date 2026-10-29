@@ -119,6 +119,15 @@ player does. Notes, program changes, controllers, pitch bend, pressure, sustain,
 GM, GS and XG reset messages all work. Samples load in the background for the presets in use, and a font shared by
 several instances is kept in memory once.
 
+Only the start of each sample is kept in memory: the first quarter second, or the whole sample when it is shorter
+than 1 second. A note starts from that at once, and the rest streams from the disk while it plays: from the font
+file for an .sf2, and from the cache folder (Settings) for an .sf3, whose Ogg samples are decoded once, the first
+time they are needed, and stored there as mono float files, so the next time the font opens nothing is decoded. A
+loop that lies wholly in the first quarter second plays from memory. Each player streams with a thread of its own,
+into a 64 KB ring for each voice that plays past a sample's start. If the disk falls behind, the voice fades out
+and back in rather than clicking (an underrun), and nothing stalls. An offline render waits for the disk, so it is
+exact. The piano of a General MIDI font that needed 24 MB in memory now needs under 1 MB.
+
 The SoundFont page, in Tab order:
 
 1. Player (the tab control).
@@ -378,6 +387,12 @@ E:\samplepacks\soundfonts\just_t4_fixed.sf2 (526 MB, 142 presets), through the e
 growth of this process's private bytes. The file was in the operating system's file cache, so the load times are
 warm-cache times; a first read from a cold disk is slower.
 
+- Since streaming (stage 3, measured 2026-10-29 the same way): the three presets below load 0.82, 0.58 and 5.27 MB of
+  sample data (6.7 MB for all three instead of 52.4); the piano loads in 1 ms. A new idle player is 1.93 MB (1.80
+  before), and a second instance on the same font 1.95 MB idle and 2.10 MB with a piano note playing (1.81 before:
+  each voice that streams has a 64 KB ring). The time spent in smp_synth_process at real-time pace is the same as
+  before; the streamer thread adds about 1 to 1.5 percent of a core for 66 streaming voices. The numbers below are
+  the stage 2 ones.
 - Opening the font (headers and preset lists only): 2 ms and 1 to 3 MB.
 - Loading a preset's samples, time and memory:
   - program 0, the acoustic piano: 11 to 12 ms, 24 MB (23.8 MB of sample data);
