@@ -553,6 +553,16 @@ static int windows_name(const char *path) {
   return 0;
 }
 
+/* the extensions of the formats our own decoders read: a damaged file named so isn't a format that needs FFmpeg */
+static int own_name(const char *path) {
+  static const char *const ext[] = {".wav", ".flac", ".mp3", ".ogg", ".aif", ".aiff", ".aifc", ".w64", ".rf64",
+                                    ".caf", ".opus", ".wv", ".ape"};
+  const char *e = ext_of(path);
+  for (size_t i = 0; i < sizeof ext / sizeof ext[0]; i++)
+    if (!_stricmp(e, ext[i])) return 1;
+  return 0;
+}
+
 /* The Windows stage on a file the chain refused. Its result, channel after channel, or NULL; err keeps the chain's
    message unless that was only "not a sound file" and Windows knows better (no decoder for it, damaged), or Windows
    stopped (too long, too slow, cancelled). */
@@ -589,8 +599,8 @@ static float *windows_stage(const char *path, int edit, double start, double dur
 
 /* The FFmpeg stage on a file nothing else read. Its result, channel after channel, or NULL. err becomes FFmpeg's
    reason only when the earlier message was a general one (not specific: our own decoder didn't know the format), and
-   "FFmpeg isn't installed" only when it was the plain "not a sound file"; it stays as it was when FFmpeg can't open
-   the file either. Stopping (cancelled, too slow, too long) always says so. */
+   "FFmpeg isn't installed" only when it was the plain "not a sound file" and the name isn't one our decoders or
+   Windows read (a damaged .wav doesn't need FFmpeg); it stays as it was when FFmpeg can't open the file either. Stopping (cancelled, too slow, too long) always says so. */
 static float *ffmpeg_stage(const char *path, unsigned *ch, unsigned *sr, unsigned long long *n, int (*cancel)(void *),
                            void (*stage)(void *), void *arg, int specific, char *err, int cap) {
   char why[300] = ""; float *g = NULL, *x = NULL; size_t floats = 0;
@@ -602,7 +612,7 @@ static float *ffmpeg_stage(const char *path, unsigned *ch, unsigned *sr, unsigne
     snprintf(err, (size_t)cap, TOO_LONG);
   } else if (r == SMP_FF_STOPPED) {
     snprintf(err, (size_t)cap, "%s", why);
-  } else if (r == SMP_FF_MISSING && !strcmp(err, NOT_SOUND)) {
+  } else if (r == SMP_FF_MISSING && !strcmp(err, NOT_SOUND) && !own_name(path) && !windows_name(path)) {
     snprintf(err, (size_t)cap, "FFmpeg isn't installed; this format needs it");
   } else if (r == SMP_FF_FAILED && !specific) {
     snprintf(err, (size_t)cap, "%s", why);

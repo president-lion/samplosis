@@ -121,7 +121,7 @@ static int run_tool(const wchar_t *exe, wchar_t *cmd, Out *o, int (*cancel)(void
   STARTUPINFOEXW si; PROCESS_INFORMATION pi; SIZE_T asz = 0;
   LPPROC_THREAD_ATTRIBUTE_LIST al = NULL;
   int res = RUN_NO_START, i, started = 0;
-  ULONGLONG last;
+  ULONGLONG last, exited = 0;
   memset(&pi, 0, sizeof pi);
   if (!rd) return RUN_NO_START;
   rd[0].h = rd[1].h = INVALID_HANDLE_VALUE;
@@ -150,11 +150,17 @@ static int run_tool(const wchar_t *exe, wchar_t *cmd, Out *o, int (*cancel)(void
     li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li)) { CloseHandle(job); job = NULL; }
   }
+  if (!job) goto out;                            /* FFmpeg never runs outside a job that can kill it */
   if (!CreateProcessW(exe, cmd, NULL, NULL, TRUE,
                       CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
                       NULL, NULL, &si.StartupInfo, &pi)) goto out;
   started = 1;
-  if (job) AssignProcessToJobObject(job, pi.hProcess);   /* before it runs a single instruction */
+  if (!AssignProcessToJobObject(job, pi.hProcess)) {   /* before it runs a single instruction, or not at all */
+    TerminateProcess(pi.hProcess, 1);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hThread);
+    goto out;
+  }
   ResumeThread(pi.hThread);
   CloseHandle(pi.hThread);
   close_h(&out_w); close_h(&err_w); close_h(&nul);       /* the child's ends are the child's alone now */
@@ -165,7 +171,11 @@ static int run_tool(const wchar_t *exe, wchar_t *cmd, Out *o, int (*cancel)(void
     HANDLE ev[2]; int ne = 0;
     for (i = 0; i < 2; i++) if (rd[i].pending) ev[ne++] = rd[i].ov.hEvent;
     if (!ne) break;                              /* both pipes closed: the child is ending */
-    WaitForMultipleObjects((DWORD)ne, ev, FALSE, 50);
+    /* the child has ended but something it started still holds a pipe open: what is left in the pipes is read for
+       200 ms, then it's done (not a 60 s stall) */
+    if (!exited && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) exited = GetTickCount64();
+    if (exited && GetTickCount64() - exited > 200) break;
+    WaitForMultipleObjects((DWORD)ne, ev, FALSE, exited ? 20 : 50);
     for (i = 0; i < 2 && res == RUN_DONE; i++) {
       long got;
       if (!rd[i].pending || WaitForSingleObject(rd[i].ov.hEvent, 0) != WAIT_OBJECT_0) continue;
@@ -236,6 +246,10 @@ static int stopped(int r, char *err, int cap) {
   snprintf(err, (size_t)cap, "%s", r == RUN_CANCELLED ? "cancelled" : "FFmpeg took too long to decode it");
   return SMP_FF_STOPPED;
 }
+static int too_long_path(char *err, int cap) {
+  snprintf(err, (size_t)cap, "the file's path is too long for FFmpeg");
+  return SMP_FF_FAILED;
+}
 
 int smp_ff_decode(const char *path, size_t max_floats, float **x, size_t *floats, unsigned *ch, unsigned *sr,
                   int (*cancel)(void *), void (*stage)(void *), void *arg, char *err, int cap) {
@@ -279,7 +293,7 @@ int smp_ff_decode(const char *path, size_t max_floats, float **x, size_t *floats
     const wchar_t *a[] = {probe, L"-v", L"error", L"-hide_banner", L"-select_streams", L"a:0", L"-show_entries",
                           L"stream=sample_rate,channels:format=duration", L"-of", L"json", fpath, NULL};
     at = 0;
-    if (!put_args(cmd, CMD, &at, a)) goto done;  /* a path too long for a command line */
+    if (!put_args(cmd, CMD, &at, a)) { res = too_long_path(err, cap); goto done; }
   }
   po.max = 1 << 18;
   r = run_tool(probe, cmd, &po, cancel, arg, stall);
@@ -305,7 +319,7 @@ int smp_ff_decode(const char *path, size_t max_floats, float **x, size_t *floats
     const wchar_t *a[] = {ff, L"-hide_banner", L"-nostdin", L"-v", L"error", L"-i", fpath, L"-map", L"0:a:0",
                           L"-c:a", L"pcm_f32le", L"-f", L"f32le", L"-ac", num_ch, L"-ar", num_sr, L"pipe:1", NULL};
     at = 0;
-    if (!put_args(cmd, CMD, &at, a)) goto done;
+    if (!put_args(cmd, CMD, &at, a)) { res = too_long_path(err, cap); goto done; }
   }
   o.max = max_floats * sizeof(float);
   if (dur > 0 && GetFileAttributesExW(fpath + 5, GetFileExInfoStandard, &fa)) {
@@ -314,6 +328,7 @@ int smp_ff_decode(const char *path, size_t max_floats, float **x, size_t *floats
     double most = (double)(((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) * 64 * sizeof(float);
     if (want > most) want = most;
     if (want > (double)o.max) want = (double)o.max;
+    if (want > 256.0 * 1024 * 1024) want = 256.0 * 1024 * 1024;   /* past 256 MB it grows by doubling, as it decodes */
     if (want > 0 && (o.buf = malloc((size_t)want)) != NULL) o.cap = (size_t)want;
   }
   r = run_tool(ff, cmd, &o, cancel, arg, stall);

@@ -923,10 +923,13 @@ def test_gui_load_does_not_block(P, tmp_path):
     src = P.sample("src.wav")
     f = tmp_path / "tone A3.tta"
     subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-y", "-i", str(src), "-c:a", "tta", str(f)], check=True, timeout=60)
+    junk = tmp_path / "junk.wav"
+    junk.write_bytes(b" not a wav" * 200)
     text = P.script(P.sample())
     out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % f, "focus Browse", "clock", "key enter", "clock",
                                   "pump 300", "read Status", "read Sample", "wait", "read Status", "read Sample",
-                                  "state", "counts"],
+                                  "state", "counts", "dialog pick %s" % junk, "focus Browse", "key enter", "wait",
+                                  "status", "counts"],
               env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
     r = [x[1] for x in got(out, "read")]
     ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
@@ -937,6 +940,9 @@ def test_gui_load_does_not_block(P, tmp_path):
     assert r[3].startswith("tone A3.tta, "), out
     assert ('state: sample "%s"' % f) in out
     assert got(out, "counts")[0][0] == "beeps 0"
+    # a load that fails: told in Status with a beep, and kept in the plugin's status for a window opened later
+    assert "status: Can't load junk.wav: it isn't a sound file Samplosis can read" in out, out
+    assert got(out, "counts")[1][0] == "beeps 1"
 
 
 def test_background_load_cancel(lib, P, tmp_path):

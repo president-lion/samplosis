@@ -46,6 +46,7 @@
      async <on|off>          on: keys and drops don't wait for the background load they start (see settle)
      wait                    wait for the background load to be swapped in (up to 20 s)
      clock                   "clock: <n> ms" since the last clock
+     status                  "status: <text>", the plugin's own status (smp_plugin_status)
      pids <file>             "pids: <running> of <all> running" for the process ids listed in the file
    SAMPLOSIS_TEST_DECODE_FLAGS passes its number to smp_test_only_decode_flags. */
 #include <windows.h>
@@ -629,6 +630,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     } else if (!strcmp(a, "alive")) printf("alive: %s\n", plugin_gone ? "plugin destroyed" : "plugin");
     else if (!strcmp(a, "async")) async_loads = !strcmp(arg, "on");
     else if (!strcmp(a, "wait")) settle(p, 1);
+    else if (!strcmp(a, "status")) status_line(p);   /* the plugin's own status (what a window opened later shows) */
     else if (!strcmp(a, "clock")) {           /* milliseconds since the last clock */
       static DWORD last; DWORD now = GetTickCount();
       printf("clock: %lu ms\n", last ? now - last : 0); last = now;

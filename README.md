@@ -18,6 +18,9 @@ The Sampler:
   aac, wma and whatever else Windows itself decodes; with FFmpeg installed, also dsf, tta and anything else it
   decodes) with the Browse button, by dragging it onto the window, or from a saved REAPER project. Files from the
   window load in the background: the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" until it's ready.
+  A damaged file of a built-in format (a .wav or .flac the built-in decoders refuse) may still load through FFmpeg;
+  the status then says "(decoded by FFmpeg)". Known limit: a saved project loads its sample while REAPER waits, so
+  a sample not yet in the cache that needs FFmpeg holds up opening the project while it decodes.
 - The root note comes from a note name in the file name ("Guitar C3.wav", "Pad F#2.flac") or, if there is none,
   from pitch detection on the audio.
 - Notes keep their length. With Keep length on, a note played above or below the root is made by a time stretcher

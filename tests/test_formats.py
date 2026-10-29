@@ -1219,3 +1219,78 @@ def test_ffmpeg_too_long(lib, tmp_path):
     finally:
         mf_flags(lib, 0)
     assert not s and err == "it's too long to load (over 2 GB decoded)", err
+
+
+def test_ffmpeg_missing_message_by_name(lib, tmp_path):
+    # without FFmpeg, "FFmpeg isn't installed" only for a name our own decoders and Windows don't claim
+    point_cache(lib, tmp_path / "cache")
+    junk = bytes(np.random.default_rng(3).integers(0, 256, 3000, dtype=np.uint8))
+    mf_flags(lib, FF_MISSING)
+    try:
+        for name in ("junk.wav", "junk.flac", "junk.ogg", "junk.caf", "junk.m4a"):
+            f = tmp_path / name
+            f.write_bytes(junk)
+            s, err = load(lib, f)
+            assert not s and err == NOT_SOUND, (name, err)
+        f = tmp_path / "junk.dsf"
+        f.write_bytes(junk)
+        s, err = load(lib, f)
+        assert not s and err == "FFmpeg isn't installed; this format needs it", err
+    finally:
+        mf_flags(lib, 0)
+
+
+def test_ffprobe_hangs(lib, tmp_path):
+    # a hanging ffprobe is killed after the (shortened) stall timer
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "probehang")
+    f = tmp_path / "stuck.tta"
+    f.write_bytes(b"not anything" * 100)
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    mf_flags(lib, FF_STALL_SHORT)
+    try:
+        t = time.perf_counter()
+        s, err = load(lib, f)
+        secs = time.perf_counter() - t
+    finally:
+        mf_flags(lib, 0)
+        settings(lib, ffmpeg_path="")
+    assert not s and err == "FFmpeg took too long to decode it", err
+    assert secs < 3, secs
+    assert pids_running(d) == (0, 1)
+
+
+def test_ffprobe_missing(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    d = tmp_path / "fail"
+    d.mkdir()
+    shutil.copyfile(FAKEFF, d / "ffmpeg.exe")
+    f = tmp_path / "x.tta"
+    f.write_bytes(b"not anything" * 100)
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    try:
+        s, err = load(lib, f)
+    finally:
+        settings(lib, ffmpeg_path="")
+    assert not s and err == "FFmpeg's ffprobe.exe isn't beside ffmpeg.exe, and it's needed", err
+
+
+def test_ffmpeg_ends_while_pipe_held(lib, tmp_path):
+    # FFmpeg exits 0 but something it started still holds the pipe: the decode finishes at once (not after the
+    # 60 s stall timer), and the job leaves nothing running
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "orphan")
+    f = tmp_path / "x.tta"
+    f.write_bytes(b"not anything" * 100)
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    try:
+        t = time.perf_counter()
+        s, err = load(lib, f)
+        secs = time.perf_counter() - t
+    finally:
+        settings(lib, ffmpeg_path="")
+    assert s, err
+    assert s.contents.by == BY_FFMPEG and s.contents.frames == 44100
+    lib.smp_sample_free(s)
+    assert secs < 5, secs
+    assert pids_running(d) == (0, 3)                              # ffprobe, ffmpeg, and its orphan (killed)

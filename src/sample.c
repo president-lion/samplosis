@@ -132,7 +132,7 @@ SmpSample *smp_sample_load_ex(const char *path, int (*cancel)(void *), void (*st
   }
   {
     int ch = 0, rate = 0; long n = 0, i; float *x, *lr;
-    g_decodes++;
+    InterlockedIncrement(&g_decodes);              /* the window's worker and the main thread both decode */
     x = decode_audio_full(path, &ch, &n, &rate, &by, cancel, stage, arg, err, cap);
     if (!x) return NULL;
     lr = malloc(sizeof(float) * 2 * (size_t)n);

@@ -980,7 +980,10 @@ int smp_plug_poll_load(Plug *P) {
     if (j->dropped) smp_plug_set_plays(P, 0);   /* a dropped sample: the sampler plays */
     r = 1;
   } else {
-    snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path), j->err);
+    /* told by the window when it's open; the status keeps it for a window opened later */
+    snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path),
+             j->s ? "the sound engine isn't working" : j->err);
+    snprintf(P->status, sizeof P->status, "%s", P->load_err);
     P->load_failed++;
     r = -1;
   }
