@@ -240,6 +240,7 @@ namespace RIFF {
             Chunk(File* pFile);
             Chunk(File* pFile, List* pParent, uint32_t uiChunkID, file_offset_t ullBodySize);
             void ReadHeader(file_offset_t filePos);
+            void ClampToParent(); // Samplosis
             void WriteHeader(file_offset_t filePos);
             file_offset_t ReadSceptical(void* pData, file_offset_t WordCount, file_offset_t WordSize);
             inline static String convertToString(uint32_t word) {

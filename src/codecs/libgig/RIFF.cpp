@@ -27,6 +27,19 @@
 
 #include "RIFF.h"
 
+#if defined(WIN32)
+// Samplosis: paths are UTF-8 (Samplosis passes them so), opened as wide paths, so any file name works; the
+// extension files (.gx01...) are found from the same UTF-8 folder.
+static HANDLE CreateFileU8(const char* path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
+                           DWORD flags, HANDLE templ) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (n <= 0) { SetLastError(ERROR_INVALID_NAME); return INVALID_HANDLE_VALUE; }
+    std::wstring w((size_t) n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, &w[0], n);
+    return CreateFileW(w.c_str(), access, share, sa, disposition, flags, templ);
+}
+#endif
+
 #include "helper.h"
 
 #if POSIX
@@ -195,6 +208,17 @@ struct _FileProgress {
         ullNewChunkSize = 0;
         ullChunkDataSize = 0;
         ReadHeader(StartPos);
+        ClampToParent();
+    }
+
+    // Samplosis: a damaged size field must not reach past the chunk's parent (and so past the file): reads and
+    // LoadChunkData() would otherwise run past it or allocate as much as the field says
+    void Chunk::ClampToParent() {
+        if (!pParent) return;
+        const file_offset_t end = pParent->ullStartPos + pParent->ullCurrentChunkSize;
+        if (ullStartPos >= end) ullCurrentChunkSize = 0;
+        else if (ullCurrentChunkSize > end - ullStartPos) ullCurrentChunkSize = end - ullStartPos;
+        ullNewChunkSize = ullCurrentChunkSize;
     }
 
     Chunk::Chunk(File* pFile, List* pParent, uint32_t uiChunkID, file_offset_t ullBodySize) {
@@ -1211,6 +1235,7 @@ struct _FileProgress {
         pSubChunksMap = NULL;
         ReadHeader(StartPos);
         ullStartPos = StartPos + LIST_HEADER_SIZE(pFile->FileOffsetSize);
+        ClampToParent();   // Samplosis
     }
 
     List::List(File* pFile, List* pParent, uint32_t uiListID)
@@ -1940,7 +1965,7 @@ struct _FileProgress {
             throw RIFF::Exception("Can't open \"" + path + "\": " + sError);
         }
         #elif defined(WIN32)
-        io.hRead = io.hWrite = CreateFile(
+        io.hRead = io.hWrite = CreateFileU8(
                                      path.c_str(), GENERIC_READ,
                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
                                      NULL, OPEN_EXISTING,
@@ -1965,6 +1990,12 @@ struct _FileProgress {
             case layout_standard: // this is a normal RIFF file
                 ullStartPos = RIFF_HEADER_SIZE(FileOffsetSize);
                 ReadHeader(0);
+                {   // Samplosis: the RIFF chunk ends at the file's end at the latest
+                    const file_offset_t fileSize = GetCurrentFileSize();
+                    if (ullStartPos >= fileSize) ullCurrentChunkSize = 0;
+                    else if (ullCurrentChunkSize > fileSize - ullStartPos) ullCurrentChunkSize = fileSize - ullStartPos;
+                    ullNewChunkSize = ullCurrentChunkSize;
+                }
                 if (FileType && ChunkID != *FileType)
                     throw RIFF::Exception("Invalid file container ID");
                 break;
@@ -2108,7 +2139,7 @@ struct _FileProgress {
                         throw Exception("Could not (re)open file \"" + Filename + "\" in read mode: " + sError);
                     }
                     #elif defined(WIN32)
-                    io.hRead = io.hWrite = CreateFile(
+                    io.hRead = io.hWrite = CreateFileU8(
                                                  Filename.c_str(), GENERIC_READ,
                                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
                                                  NULL, OPEN_EXISTING,
@@ -2136,7 +2167,7 @@ struct _FileProgress {
                         throw Exception("Could not open file \"" + Filename + "\" in read+write mode: " + sError);
                     }
                     #elif defined(WIN32)
-                    io.hRead = io.hWrite = CreateFile(
+                    io.hRead = io.hWrite = CreateFileU8(
                                                  Filename.c_str(),
                                                  GENERIC_READ | GENERIC_WRITE,
                                                  FILE_SHARE_READ,
@@ -2146,7 +2177,7 @@ struct _FileProgress {
                                                  NULL
                                              );
                     if (!_isValidHandle(io.hRead)) {
-                        io.hRead = io.hWrite = CreateFile(
+                        io.hRead = io.hWrite = CreateFileU8(
                                                      Filename.c_str(), GENERIC_READ,
                                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
                                                      NULL, OPEN_EXISTING,
@@ -2380,7 +2411,7 @@ struct _FileProgress {
                 throw Exception("Could not open file \"" + path + "\" for writing: " + sError);
             }
             #elif defined(WIN32)
-            io.hWrite = CreateFile(
+            io.hWrite = CreateFileU8(
                 path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                 NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL |
                 FILE_FLAG_RANDOM_ACCESS, NULL

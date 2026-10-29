@@ -42,11 +42,16 @@
 
    Threads. libgig keeps some state in statics (instance counts and a shared decompression buffer), so every open,
    parse and close of a libgig file runs under one lock (g_lock). A decode reads its own file's sample with its own
-   decompression buffer and touches no static, so its reads don't take the lock.
+   decompression buffer and touches no static, so its reads don't take the lock. A font closed while the lock is
+   held hands its file to the holder, which frees it before letting go (sf_gig_free never waits).
 
-   Damage. libgig throws for most damage; the few crashes the damage tests found in it are fixed in the vendored
-   copy (VERSION.txt lists them). As a last resort, each entry point also runs inside a structured-exception guard
-   (seh_filter), so a crash not yet found becomes a refusal instead of taking the host down. */
+   Damage. libgig throws for most damage; the crashes, unbounded writes and file-sized allocations the damage tests
+   and review found in it are fixed in the vendored copy (VERSION.txt lists them). As a last resort, each entry
+   point also runs inside a structured-exception guard (seh_filter). A crash it catches leaks that call's libgig
+   objects, and from then on every GigaStudio open and decode in the process is refused with a plain reason (save
+   the project and restart), since the heap can't be trusted after it.
+
+   Paths are UTF-8 throughout: libgig's RIFF.cpp is patched to open them with CreateFileW. */
 #include <windows.h>
 #include <math.h>
 #include <stdio.h>
@@ -67,6 +72,10 @@ extern "C" {
 namespace {
 
 SRWLOCK g_lock = SRWLOCK_INIT;   /* taken and let go explicitly, so a guard that catches a crash can let go of it */
+volatile LONG g_guards;          /* crashes the guards caught (tests: smp_sf_test_gig_guards) */
+volatile LONG g_crashed;         /* a guard caught a crash: every later open and decode is refused (see seh_filter) */
+volatile LONG g_fault;           /* tests: 1 crashes the next parse, 2 the next decode open, inside the guard */
+const char *const CRASHED = "A GigaStudio file crashed the reader; save your project under a new name and restart REAPER";
 
 /* a parse or decode stopped by its cancel hook (thrown from libgig's progress callback, or between our steps) */
 struct Cancelled {};
@@ -107,37 +116,10 @@ int tc(double s) { return s > 0.001 ? iround(1200 * log2(s)) : -12000; }
 /* Hz to SF2 absolute cents */
 int abscents(double hz) { return hz > 0 ? iround(1200 * log2(hz / 8.176)) : -16000; }
 
-/* libgig wants the path in the system's code page (it calls CreateFileA). The UTF-8 path converted, when that is
-   lossless; else the file's short (8.3) path, which is plain ASCII where the volume keeps short names. */
-bool ansi_path(const char *utf8, std::string &out) {
-  wchar_t w[2048], s[2048];
-  char a[6144];
-  BOOL lossy = FALSE;
-  if (GetACP() == CP_UTF8) { out = utf8; return true; }
-  if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, 2048)) return false;
-  if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, -1, a, (int)sizeof a, NULL, &lossy) > 0 && !lossy) {
-    out = a;
-    return true;
-  }
-  DWORD m = GetShortPathNameW(w, s, 2048);
-  if (!m || m >= 2048) return false;
-  lossy = FALSE;
-  if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, s, -1, a, (int)sizeof a, NULL, &lossy) <= 0 || lossy) return false;
-  out = a;
-  return true;
-}
-
-/* a path libgig made (the system's code page) as UTF-8 */
-std::string utf8_of(const std::string &ansi) {
-  wchar_t w[2048];
-  char u[6144];
-  if (GetACP() == CP_UTF8) return ansi;
-  if (!MultiByteToWideChar(CP_ACP, 0, ansi.c_str(), -1, w, 2048)) return ansi;
-  if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, u, (int)sizeof u, NULL, NULL)) return ansi;
-  return u;
-}
-
-/* an open libgig file: the RIFF file and the gig file over it (deleted in that order's reverse) */
+/* An open libgig file: the RIFF file and the gig file over it (deleted in that order's reverse). It is always made
+   with new and deleted only on a normal return or after a C++ exception, never after a guard caught a crash, when
+   its tree may be half-built: it is then left (leaked). libgig opens the UTF-8 path itself (its RIFF.cpp is
+   patched to CreateFileW), and finds extension files by the same UTF-8 folder. */
 struct Gig {
   RIFF::File *riff = nullptr;
   gig::File *file = nullptr;
@@ -561,6 +543,20 @@ void build_region(Out &o, const RegionCtx &c, std::map<gig::Sample *, int> &sidx
   /* more than 8 bits, or more zones than a dimension's bits can number: damaged, and libgig's lookups would index
      past its 256 dimension regions, so the region is left out */
   if (bp > 8) { o.ign.add("damaged dimensions"); return; }
+  /* libgig's GetDimensionRegionIndexByValue (used for the velocity ranges) reads dimension region 0 and, for each
+     normal dimension with gig3 limits, the dimension region of each of its zones, without checking them: a region
+     where any of those is missing is damaged, and left out before a lookup could touch it */
+  for (d = 0; d < D.n; d++) {
+    if (D.def[d]->dimension != gig::dimension_velocity) continue;
+    if (!rg->pDimensionRegions[0]) { o.ign.add("damaged dimensions"); return; }
+    for (int e = 0; e < D.n; e++) {
+      if (e == d || D.def[e]->split_type != gig::split_type_normal || !rg->pDimensionRegions[0]->DimensionUpperLimits[e])
+        continue;
+      for (int z = 0; z < D.def[e]->zones; z++)
+        if (!rg->pDimensionRegions[z << D.bitpos[e]]) { o.ign.add("damaged dimensions"); return; }
+    }
+    break;
+  }
   for (d = 0; d < D.n; d++) {
     D.kind[d] = dim_kind(D.def[d]->dimension);
     D.zone0[d] = 0;
@@ -655,15 +651,16 @@ void name20(char *out, const std::string &s, const char *fallback, int n) {
   else snprintf(out, 21, fallback, n);
 }
 
-int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
-  std::string apath;
+/* g: the caller's owner of the libgig file (see Gig), set as soon as it exists */
+int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap, Gig *&gp) {
   CancelHook hook = {cancel, carg};
   RIFF::progress_t prog;
   prog.callback = on_progress;
   prog.custom = &hook;
-  if (!ansi_path(path, apath)) { say(why, wcap, "its path has characters this can't pass to libgig"); return 0; }
-  Gig g;
-  g.riff = new RIFF::File(apath);
+  gp = new Gig;
+  Gig &g = *gp;
+  if (g_fault == 1) { g_fault = 0; *(volatile int *)nullptr = 0; }   /* tests: a crash inside the guard */
+  g.riff = new RIFF::File(path);
   if (g.riff->GetListType() != RIFF_TYPE_DLS) { say(why, wcap, "it isn't a DLS or GigaStudio file"); return 0; }
   g.file = new gig::File(g.riff);
 
@@ -682,7 +679,7 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
     waves.push_back(s);
   }
   si.resize(nwaves);
-  int nsamp = 0, odd = 0;
+  int nsamp = 0, odd = 0, cut = 0;
   for (size_t w = 0; w < nwaves; w++) {
     gig::Sample *s = waves[w];
     RIFF::Chunk *data = SampleData::of(s);
@@ -712,12 +709,25 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
     else {
       pid = (int)paths.size();
       path_of[file] = pid;
-      paths.push_back(utf8_of(file->GetFileName()));
+      paths.push_back(file->GetFileName());
     }
     data->SetPos(0);
     uint64_t off = data->GetFilePos(), len = data->GetSize();
-    uint64_t frames = s->SamplesTotal > MAX_DECODE_FRAMES ? MAX_DECODE_FRAMES : s->SamplesTotal;
+    uint64_t frames = s->SamplesTotal;
     bool pcm = si[w].pcm;
+    if (pcm) {
+      /* a PCM wave ends at its file's end at the latest (libgig already keeps the data chunk inside it) */
+      uint64_t fsize = file->GetCurrentFileSize();
+      uint64_t room = fsize > off ? (fsize - off) / s->FrameSize : 0;
+      if (frames > room) frames = room;
+    }
+    /* one length rule for every wave: one longer than 2^26 frames (25 minutes at 44.1 kHz) is cut there, and
+       counted; sf_gig_decode reads no further */
+    if (frames > MAX_DECODE_FRAMES) { frames = MAX_DECODE_FRAMES; cut = 1; }
+    if (!frames) {
+      for (int k = 0; k < si[w].nch; k++) f->src[si[w].first + k].kind = SMP_SRC_PCM_FILE;   /* empty: never loads */
+      continue;
+    }
     for (int k = 0; k < si[w].nch; k++) {
       SmpSfSample *sh = &f->shdr[si[w].first + k];
       SmpSrc *c = &f->src[si[w].first + k];
@@ -748,6 +758,7 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
   /* instruments */
   Out o;
   if (odd) o.ign.add("wave format");
+  if (cut) o.ign.add("wave over 25 minutes (cut there)");
   std::vector<SfPhdr> ph;
   std::vector<int> rstart;
   for (size_t n = 0; ; n++) {
@@ -824,10 +835,10 @@ void reason_of(const std::string &m, char *why, int wcap) { say(why, wcap, m.emp
 
 /* The structured exceptions a damaged file could still raise inside libgig (a bad pointer, a division by zero), for
    the last-resort guards below; C++ exceptions are caught where they are thrown. The crashes the damage tests found
-   are fixed in libgig itself (see VERSION.txt); a guard only turns one not yet found into a refusal. What libgig
-   had allocated is then left as it is (a small leak, once per damaged file), never freed half-built. */
-volatile LONG g_guards;           /* crashes the guards caught (tests: smp_sf_test_gig_guards) */
-
+   are fixed in libgig itself (see VERSION.txt); a guard only catches one not yet found. After a trip, nothing more
+   is trusted: libgig's objects from that call are leaked rather than destroyed, and g_crashed refuses every later
+   GigaStudio open and decode in this process, with CRASHED as the reason, since the crash may have damaged the
+   heap and only a restart is safe. */
 int seh_filter(unsigned long code) {
   switch (code) {
     case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_INT_DIVIDE_BY_ZERO:
@@ -838,9 +849,51 @@ int seh_filter(unsigned long code) {
   }
 }
 
+void tripped(char *why, int wcap) {
+  InterlockedIncrement(&g_guards);
+  InterlockedExchange(&g_crashed, 1);
+  say(why, wcap, CRASHED);
+}
+
+/* Freeing a libgig file touches its statics, so it needs g_lock. A font closed while another file is being parsed
+   doesn't wait for that: its file goes on a list that whoever holds the lock frees before letting go. */
+SRWLOCK g_pending_lock = SRWLOCK_INIT;
+std::vector<Gig *> *g_pending;
+void free_caught(Gig *g) { try { delete g; } catch (...) {} }
+void free_guarded(Gig *g) {
+  __try { free_caught(g); } __except (seh_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); InterlockedExchange(&g_crashed, 1); }
+}
+void drain_pending(void) {   /* g_lock held */
+  for (;;) {
+    Gig *g = nullptr;
+    AcquireSRWLockExclusive(&g_pending_lock);
+    if (g_pending && !g_pending->empty()) { g = g_pending->back(); g_pending->pop_back(); }
+    ReleaseSRWLockExclusive(&g_pending_lock);
+    if (!g) return;
+    if (!g_crashed) free_guarded(g);              /* after a crash nothing more is freed */
+  }
+}
+bool pending_empty(void) {
+  AcquireSRWLockExclusive(&g_pending_lock);
+  bool e = !g_pending || g_pending->empty();
+  ReleaseSRWLockExclusive(&g_pending_lock);
+  return e;
+}
+void lock_gig(void) { AcquireSRWLockExclusive(&g_lock); }
+void unlock_gig(void) {
+  for (;;) {
+    drain_pending();
+    ReleaseSRWLockExclusive(&g_lock);
+    /* a file added after the drain is freed here, or by the next holder if someone else has the lock now */
+    if (pending_empty() || !TryAcquireSRWLockExclusive(&g_lock)) return;
+  }
+}
+
 int parse_caught(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+  Gig *g = nullptr;
+  int r = 0;
   try {
-    return parse(f, path, cancel, carg, why, wcap);
+    r = parse(f, path, cancel, carg, why, wcap, g);
   } catch (const Cancelled &) {
     say(why, wcap, "cancelled");
   } catch (const RIFF::Exception &e) {
@@ -854,16 +907,16 @@ int parse_caught(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
   } catch (...) {
     say(why, wcap, "it can't be read");
   }
-  return 0;
+  free_caught(g);                                  /* normal and C++-exception paths only */
+  return r;
 }
 
 int parse_guarded(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   __try {
     return parse_caught(f, path, cancel, carg, why, wcap);
   } __except (seh_filter(GetExceptionCode())) {
-    InterlockedIncrement(&g_guards);
-    say(why, wcap, "it is damaged (libgig failed reading it)");
-    return 0;
+    tripped(why, wcap);
+    return -1;
   }
 }
 
@@ -874,31 +927,36 @@ struct Decode {
   float *out; void *raw; gig::buffer_t dbuf; bool locked;
 };
 
-void decode_unlock(Decode &d) { if (d.locked) { d.locked = false; ReleaseSRWLockExclusive(&g_lock); } }
+void decode_unlock(Decode &d) { if (d.locked) { d.locked = false; unlock_gig(); } }
 
 float *decode(Decode &d) {
   Gig *g = (Gig *)d.f->gig;
   if (!g) {
     /* the loader thread's libgig file for this font, opened when its first compressed wave is needed and kept
-       until the font is freed (opening reads every wave's header and scans each compressed wave's frames) */
-    std::string apath;
-    if (!ansi_path(d.f->path, apath)) { say(d.err, d.cap, "its path has characters this can't pass to libgig"); return nullptr; }
-    AcquireSRWLockExclusive(&g_lock);
+       until the font is freed. Opening reads every wave's header and scans each compressed wave's frames, under
+       the lock, with the cancel hook asked as libgig goes (a closing font stops it). */
+    CancelHook hook = {d.cancel, d.carg};
+    RIFF::progress_t prog;
+    prog.callback = on_progress;
+    prog.custom = &hook;
+    lock_gig();
     d.locked = true;
     g = new Gig;
     try {
-      g->riff = new RIFF::File(apath);
+      if (g_fault == 2) { g_fault = 0; *(volatile int *)nullptr = 0; }   /* tests: a crash inside the guard */
+      g->riff = new RIFF::File(d.f->path);
       g->file = new gig::File(g->riff);
-      g->file->GetSample(0);                              /* every wave's header, now, under the lock */
-    } catch (...) { delete g; throw; }
+      g->file->GetSample(0, &prog);
+    } catch (...) { free_caught(g); throw; }
     d.f->gig = g;
     decode_unlock(d);
   }
   gig::Sample *s = g->file->GetSample(d.c->index);
   if (!s || !s->SamplesTotal || !s->Channels || !s->Compressed) { say(d.err, d.cap, "the wave is missing"); return nullptr; }
-  uint64_t n = s->SamplesTotal;
+  /* the same length rule as the parse: cut at 2^26 frames */
+  uint64_t n = s->SamplesTotal > MAX_DECODE_FRAMES ? MAX_DECODE_FRAMES : s->SamplesTotal;
   int ch = (int)s->Channels, bytes = s->BitDepth == 24 ? 3 : 2;
-  if (n > MAX_DECODE_FRAMES || ch > 2) { say(d.err, d.cap, "the wave is too long"); return nullptr; }
+  if (ch > 2) { say(d.err, d.cap, "the wave has more than two channels"); return nullptr; }
   d.out = (float *)malloc((size_t)n * ch * sizeof(float));
   d.raw = malloc((size_t)DECODE_CHUNK * ch * bytes);
   if (!d.out || !d.raw) { say(d.err, d.cap, "out of memory"); return nullptr; }
@@ -958,25 +1016,26 @@ float *decode_guarded(Decode *d) {
   __try {
     return decode_caught(*d);
   } __except (seh_filter(GetExceptionCode())) {
-    InterlockedIncrement(&g_guards);
-    decode_unlock(*d);
-    d->f->gig = nullptr;                                  /* left as it is: it may be half-built */
-    say(d->err, d->cap, "it is damaged (libgig failed reading it)");
+    d->f->gig = nullptr;                                  /* leaked: it may be half-built */
+    d->out = nullptr; d->raw = nullptr;                   /* (leaked too: the heap isn't trusted now) */
+    tripped(d->err, d->cap);
+    if (d->locked) { d->locked = false; ReleaseSRWLockExclusive(&g_lock); }
     return nullptr;
   }
 }
 
-void free_caught(Gig *g) { try { delete g; } catch (...) {} }
-void free_guarded(Gig *g) { __try { free_caught(g); } __except (seh_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); } }
-
 } /* namespace */
+
+extern "C" int sf_gig_crashed(void) { return g_crashed != 0; }
 
 extern "C" int sf_parse_gig(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   int r;
   if (why && wcap > 0) why[0] = 0;
-  AcquireSRWLockExclusive(&g_lock);
+  if (g_crashed) { say(why, wcap, CRASHED); return -1; }
+  lock_gig();
   r = parse_guarded(f, path, cancel, carg, why, wcap);
-  ReleaseSRWLockExclusive(&g_lock);
+  if (g_crashed) ReleaseSRWLockExclusive(&g_lock);        /* nothing pending is freed after a crash */
+  else unlock_gig();
   return r;
 }
 
@@ -985,6 +1044,7 @@ extern "C" float *sf_gig_decode(SmpFont *f, const SmpSrc *c, int *chans, long *f
   Decode d;
   float *r;
   if (err && cap > 0) err[0] = 0;
+  if (g_crashed) { say(err, cap, CRASHED); return nullptr; }
   d.f = f; d.c = c; d.chans = chans; d.frames = frames; d.rate = rate; d.cancel = cancel; d.carg = carg;
   d.err = err; d.cap = cap; d.out = nullptr; d.raw = nullptr; d.locked = false;
   r = decode_guarded(&d);
@@ -993,13 +1053,23 @@ extern "C" float *sf_gig_decode(SmpFont *f, const SmpSrc *c, int *chans, long *f
   return r;
 }
 
-/* the font's libgig file for decoding, if one was opened (sf_free calls it) */
+/* the font's libgig file for decoding, if one was opened (sf_free calls it): freed now when the lock is free, else
+   by the lock's holder when it lets go, so closing a font never waits for another file's parse; after a crash it is
+   left (leaked) */
 extern "C" void sf_gig_free(SmpFont *f) {
+  Gig *g;
   if (!f || !f->gig) return;
-  AcquireSRWLockExclusive(&g_lock);
-  free_guarded((Gig *)f->gig);
-  ReleaseSRWLockExclusive(&g_lock);
+  g = (Gig *)f->gig;
   f->gig = nullptr;
+  if (g_crashed) return;
+  AcquireSRWLockExclusive(&g_pending_lock);
+  try {
+    if (!g_pending) g_pending = new std::vector<Gig *>;
+    g_pending->push_back(g);
+  } catch (...) { g = nullptr; }                          /* out of memory: leaked rather than block */
+  ReleaseSRWLockExclusive(&g_pending_lock);
+  if (TryAcquireSRWLockExclusive(&g_lock)) unlock_gig();
 }
 
 extern "C" long smp_sf_test_gig_guards(void) { return g_guards; }
+extern "C" void smp_sf_test_gig_fault(int where) { g_fault = where; }

@@ -5,7 +5,9 @@ import ctypes
 import math
 import os
 import random
+import struct
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -372,7 +374,8 @@ def structure_gig(tmp_path):
 def test_gig_corrupt(lib, tmp_path, kind):
     """Every 97th truncation and 300 seeded corruptions of a small .gig with a compressed wave (one mostly wave data,
     one mostly headers): libgig's exceptions are caught, and each opens or gives NULL with a reason, never a crash or
-    a hang, and without needing the last-resort guard; every 7th variant that opens loads its samples too."""
+    a hang, and without needing the last-resort guard; every variant that opens loads all its samples too (so the
+    compressed wave goes through libgig's decoder damaged)."""
     data = open(pitch_gig(tmp_path) if kind == "data" else structure_gig(tmp_path), "rb").read()
     step = 97 if kind == "data" else 31
     variants = [data[:cut] for cut in range(0, len(data), step)]
@@ -391,8 +394,7 @@ def test_gig_corrupt(lib, tmp_path, kind):
         if f:
             opened_n += 1
             walk(lib, f)
-            if k % 7 == 0:
-                load_all(lib, f)
+            load_all(lib, f)                            # every one that opens: the PCM reads and libgig's decode
             lib.smp_sf_close(f)
         else:
             refused += 1
@@ -410,5 +412,144 @@ def test_gig_named_dls_giga_chunks_go_to_libgig(lib, tmp_path):
     f = opened(lib, str(other))
     try:
         assert len(presets(lib, f)) == 4
+    finally:
+        lib.smp_sf_close(f)
+
+
+# ---- review round 1: bounded memory, unbounded writes, the crash flag, paths ----
+
+CHILD = os.path.join(HERE, "gigchild.py")
+CRASHED = "A GigaStudio file crashed the reader; save your project under a new name and restart REAPER"
+
+
+def child(tmp_path, *args):
+    """runs gigchild.py in a fresh process with its own settings (cache under tmp_path) and returns its JSON"""
+    import json
+    settings = tmp_path / "child_settings.txt"
+    if not settings.exists():
+        (tmp_path / "child_cache").mkdir(exist_ok=True)
+        settings.write_text("cache_dir %s\n" % (tmp_path / "child_cache"))
+    env = dict(os.environ, SAMPLOSIS_SETTINGS=str(settings))
+    r = subprocess.run([sys.executable, "-I", CHILD] + [str(a) for a in args], capture_output=True, text=True,
+                       timeout=120, env=env)
+    assert r.returncode == 0, (r.returncode, r.stderr[-2000:])     # a crash would end the child with an error code
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def set32(data, at, value):
+    struct.pack_into("<I", data, at, value)
+
+
+def damaged(tmp_path, name, src, fn):
+    data = bytearray(open(src, "rb").read())
+    hits = fn(data)
+    assert hits, name
+    p = tmp_path / (name + ".gig")
+    p.write_bytes(bytes(data))
+    return p
+
+
+def each(data, cid):
+    at, out = 0, []
+    while True:
+        at = data.find(cid, at)
+        if at < 0:
+            return out
+        out.append(at)
+        at += 4
+
+
+@pytest.mark.parametrize("field", ["ptbl_count", "wsmp_loops", "3lnk_size_and_count", "info_size", "3gnm_size",
+                                   "3ewg_triggers", "riff_size"])
+def test_gig_field_damage_bounded(lib, tmp_path, field):
+    """A damaged count or size field never allocates what it claims or writes past an array: in a child process,
+    the open (and loading every sample) grows peak committed memory by under 64 MB, and the child doesn't crash."""
+    src = structure_gig(tmp_path)
+
+    def fn(data):
+        hits = 0
+        if field == "ptbl_count":                       # WavePoolCount (was: 4 bytes x the count allocated, twice)
+            for i in each(data, b"ptbl"):
+                set32(data, i + 12, 0xFFFFFFFF); hits += 1
+        elif field == "wsmp_loops":                     # SampleLoops (was: 16 bytes x the count)
+            for i in each(data, b"wsmp"):
+                set32(data, i + 8 + 16, 0x7FFFFFFF); hits += 1
+        elif field == "3lnk_size_and_count":            # DimensionRegions past 256 (was: a heap overflow), size past the file
+            for i in each(data, b"3lnk"):
+                set32(data, i + 8, 0xFFFFFFFF); set32(data, i + 4, 0x7FFFFFF0); hits += 1
+        elif field == "info_size":                      # an INFO string chunk claiming far more than the file holds
+            for i in each(data, b"INAM"):
+                set32(data, i + 4, 0x7FFFFFF0); hits += 1
+        elif field == "3gnm_size":                      # a group name claiming a huge size
+            for i in each(data, b"3gnm"):
+                set32(data, i + 4, 0x7FFFFFF0); hits += 1
+        elif field == "3ewg_triggers":                  # a MIDI rule with 255 triggers (the array has 32)
+            for i in each(data, b"3ewg"):
+                if struct.unpack_from("<I", data, i + 4)[0] >= 40:
+                    data[i + 8 + 32] = 4; data[i + 8 + 33] = 16; data[i + 8 + 36] = 255; hits += 1
+        else:                                           # the RIFF size itself
+            set32(data, 4, 0xFFFFFFF0); hits = 1
+        return hits
+
+    p = damaged(tmp_path, field, src, fn)
+    got = child(tmp_path, "open", p)
+    assert got["grow_mb"] < 64, got
+    if not got["opened"]:
+        assert got["err"].startswith(field + ".gig isn't a GigaStudio file this can read ("), got
+
+
+def test_gig_crash_flag_parse(lib, tmp_path):
+    """A crash caught by the last-resort guard (made on purpose inside the parse) refuses that file and every later
+    one in the process, with the plain reason."""
+    good = structure_gig(tmp_path)
+    got = child(tmp_path, "fault", "parse", good)
+    assert got["first_opened"] is False and got["first_err"] == CRASHED, got
+    assert got["second_opened"] is False and got["second_err"] == CRASHED, got
+    assert got["guards"] == 1
+
+
+def test_gig_crash_flag_decode(lib, tmp_path):
+    """The same for a crash while the loader opens libgig to decode a compressed wave: the font says the reason as
+    its problem, and the next open is refused."""
+    good = pitch_gig(tmp_path)
+    got = child(tmp_path, "fault", "decode", good)
+    assert got["first_opened"] is True and got["problem"] == CRASHED, got
+    assert got["second_opened"] is False and got["second_err"] == CRASHED, got
+    assert got["guards"] == 1
+
+
+def add_top_chunk(data, cid, body):
+    """appends a top-level chunk to a RIFF file (after everything, so no offset inside it moves)"""
+    out = bytearray(data) + cid + struct.pack("<I", len(body)) + body + (b"\0" if len(body) & 1 else b"")
+    struct.pack_into("<I", out, 4, len(out) - 8)
+    return bytes(out)
+
+
+def test_gig_extension_file_names(lib, tmp_path):
+    """Extension file names (the xfil chunk) are plain names in the .gig's folder: one with a folder in it is
+    refused, and a missing one gives libgig's plain reason."""
+    src = open(pitch_gig(tmp_path), "rb").read()
+    for name, want in [(b"..\\evil.gx01", "Extension file name not allowed"), (b"sub/x.gx01", "not allowed"),
+                       (b"missing.gx01", "missing.gx01")]:
+        body = struct.pack("<I", 1) + name.ljust(128, b"\0") + b"\0" * 16
+        p = tmp_path / "x.gig"
+        p.write_bytes(add_top_chunk(src, b"xfil", body))
+        f, err = sf_open(lib, p)
+        assert not f and err.startswith("x.gig isn't a GigaStudio file this can read (") and want in err, err
+
+
+def test_gig_unicode_path(lib, tmp_path):
+    """A file under a folder whose name isn't in the system code page opens, and its compressed wave decodes
+    (libgig opens UTF-8 paths with CreateFileW)."""
+    d = tmp_path / "日本語 Жито"
+    d.mkdir()
+    p = d / "Γκιγκ.gig"
+    p.write_bytes(open(pitch_gig(tmp_path), "rb").read())
+    f = opened(lib, str(p))
+    try:
+        assert len(presets(lib, f)) == 4
+        x = head(lib, f, 3, 3)
+        want = np.round(sine(66150, 220.5, amp=0.25) * 32767)
+        assert len(x) >= 11025 and np.max(np.abs(x - want[:len(x)])) <= 1
     finally:
         lib.smp_sf_close(f)

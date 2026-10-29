@@ -277,18 +277,15 @@ void SwapMemoryArea(void* pData, unsigned long AreaSize, uint WordSize) {
  */
 static inline void LoadString(RIFF::Chunk* ck, std::string& s) {
     if (ck) {
-        const char* str = (char*)ck->LoadChunkData();
-        if (!str) {
-            ck->ReleaseChunkData();
-            s = "";
-            return;
-        }
-        int size = (int) ck->GetSize();
-        int len;
-        for (len = 0 ; len < size ; len++)
-            if (str[len] == '\0') break;
-        s.assign(str, len);
-        ck->ReleaseChunkData();
+        // Samplosis: at most 4 KB of the chunk is read (it was loaded whole, as big as its size field said)
+        const RIFF::file_offset_t size = ck->GetSize() < 4096 ? ck->GetSize() : 4096;
+        std::string buf((size_t) size, '\0');
+        ck->SetPos(0);
+        const RIFF::file_offset_t got = size ? ck->Read(&buf[0], size, 1) : 0;
+        size_t len;
+        for (len = 0 ; len < got ; len++)
+            if (buf[len] == '\0') break;
+        s.assign(buf, 0, len);
     }
 }
 

@@ -3322,6 +3322,7 @@ namespace {
             _3lnk->SetPos(0);
 
             DimensionRegions = _3lnk->ReadUint32();
+            if (DimensionRegions > 256) DimensionRegions = 256;   // Samplosis: the array has 256 (was a heap overflow)
             for (int i = 0; i < dimensionBits; i++) {
                 dimension_t dimension = static_cast<dimension_t>(_3lnk->ReadUint8());
                 uint8_t     bits      = _3lnk->ReadUint8();
@@ -3505,6 +3506,7 @@ namespace {
                  _3ewl = _3prg->GetSubListAt(++i))
             {
                 if (_3ewl->GetListType() == LIST_TYPE_3EWL) {
+                    if (dimensionRegionNr >= 256) break;   // Samplosis: the array has 256 (was a heap overflow)
                     pDimensionRegions[dimensionRegionNr] = new DimensionRegion(this, _3ewl);
                     dimensionRegionNr++;
                 }
@@ -4445,6 +4447,7 @@ namespace {
     MidiRuleCtrlTrigger::MidiRuleCtrlTrigger(RIFF::Chunk* _3ewg) {
         _3ewg->SetPos(36);
         Triggers = _3ewg->ReadUint8();
+        if (Triggers > 32) Triggers = 32;   // Samplosis: pTriggers has 32 (was a heap overflow)
         _3ewg->SetPos(40);
         ControllerNumber = _3ewg->ReadUint8();
         _3ewg->SetPos(46);
@@ -5034,6 +5037,8 @@ namespace {
 
                 int headerSize = ckSCSL->ReadUint32();
                 int slotCount  = ckSCSL->ReadUint32();
+                // Samplosis: no more slots than the chunk holds (8 bytes each at least)
+                if (slotCount < 0 || file_offset_t(slotCount) > ckSCSL->GetSize() / 8) slotCount = 0;
                 if (slotCount) {
                     int slotSize  = ckSCSL->ReadUint32();
                     ckSCSL->SetPos(headerSize); // in case of future header extensions
@@ -6487,6 +6492,9 @@ namespace {
                 // read the filename and load the extension file
                 std::string name;
                 ckXfil->ReadString(name, 128);
+                // Samplosis: an extension file is a plain name in the .gig's own folder
+                if (name.empty() || name.find_first_of("/\\:") != std::string::npos || name.find("..") != std::string::npos)
+                    throw gig::Exception("Extension file name not allowed: %s", name.c_str());
                 std::string path = concatPath(folder, name);
                 RIFF::File* pExtFile = new RIFF::File(path);
                 // check that the dlsids match
@@ -6867,13 +6875,16 @@ namespace {
 
         RIFF::Chunk* _3crc = pRIFF->GetSubChunk(CHUNK_ID_3CRC);
         if (!_3crc) throw gig::Exception("Could not retrieve reference crc of sample, no checksums stored for this file yet");
-        uint8_t* pData = (uint8_t*) _3crc->LoadChunkData();
-        if (!pData) throw gig::Exception("Could not retrieve reference crc of sample, no checksums stored for this file yet");
-
         // read the CRC-32 checksum directly from disk
+        // Samplosis: just its 8 bytes (the whole chunk was loaded, as big as its size field said)
         size_t pos = index * 8;
         if (pos + 8 > _3crc->GetNewSize())
             throw gig::Exception("Could not retrieve reference crc of sample, could not seek to required position in crc chunk");
+        uint8_t pData[8];
+        _3crc->SetPos(pos);
+        if (_3crc->Read(pData, 8, 1) != 8)
+            throw gig::Exception("Could not retrieve reference crc of sample, could not read crc chunk");
+        pos = 0;
 
         uint32_t one = load32(&pData[pos]); // always 1
         if (one != 1)
@@ -7113,7 +7124,7 @@ namespace {
                     if (ck->GetChunkID() == CHUNK_ID_3GNM) {
                         // Samplosis: a damaged chunk's data may not load (NULL) or be empty, and a name may not
                         // end in a NUL, so only its first byte is looked at (was: strcmp(LoadChunkData(), ""))
-                        const char* pName = static_cast<const char*>(ck->LoadChunkData());
+                        const char* pName = ck->GetSize() <= 64 ? static_cast<const char*>(ck->LoadChunkData()) : "x";
                         if (pVersion && pVersion->major > 2 &&
                             (!pName || !ck->GetSize() || pName[0] == 0)) break;
 

@@ -276,6 +276,8 @@ SMP_API void smp_sf_test_whole(int on);                     /* tests: samples lo
 SMP_API long smp_sf_test_decodes(void);                     /* tests: compressed SoundFont samples decoded so far */
 SMP_API long smp_sf_test_gig_guards(void);                  /* tests: crashes inside libgig that gigshim.cpp's last-resort
                                     guards turned into refusals (0 when libgig handled every damaged file itself) */
+SMP_API void smp_sf_test_gig_fault(int where);              /* tests: 1 makes the next GigaStudio parse, 2 the next
+                                    decode open, crash inside its guard (after which this process refuses them all) */
 /* sfvoice.c, tests: plays one note of a preset (public index) on a default channel (GM reset controllers, bend
    centred, a 200 cent bend range), every region the key and velocity match, and writes frames of stereo into
    out_lr (frames * 2 floats, interleaved). The note is released at frame release_at (negative: never). Uses the

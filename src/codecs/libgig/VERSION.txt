@@ -9,7 +9,8 @@ Licence: GNU GPL version 2 or (at your option) any later version, as each source
 Built by build.bat with /EHsc /Zc:__cplusplus /std:c++14 /DNOMINMAX /DWIN32 /DPACKAGE /DVERSION, and /wd4716 for
 Serialization.cpp's _stringToNumber<T> template (no return after an assert; never reached here).
 
-Local changes (each marked "Samplosis" in the source), for damaged files the GigaStudio tests found crashing:
+Local changes (each marked "Samplosis" in the source), for damaged files (crashes, unbounded writes and
+file-sized allocations the GigaStudio tests and review found), and for Unicode paths:
 - gig.cpp File::LoadGroups: a 3gnm chunk whose data doesn't load (NULL), is empty, or has no NUL was passed to
   strcmp; now only its first byte is looked at, after checking the data loaded.
 - gig.cpp Sample::ScanCompressedSample: a compressed wave with no data chunk dereferenced NULL; now it throws.
@@ -19,3 +20,22 @@ Local changes (each marked "Samplosis" in the source), for damaged files the Gig
   allow, over 256 dimension regions, or a missing dimension region) made it read past the dimension region array,
   dereference NULL, write past its 128-entry table, or step backwards without end; such a region now gets no
   custom velocity table, each index is checked, and the table index stops at 127.
+- gig.cpp Region::Region: DimensionRegions (from 3lnk) is held to 256, the array's size (a larger count wrote
+  pSample past the array: a heap overflow).
+- gig.cpp Region::LoadDimensionRegions: stops at 256 3ewl lists (it wrote past the array).
+- gig.cpp MidiRuleCtrlTrigger: at most 32 triggers, the array's size (up to 255 were written: a heap overflow).
+- gig.cpp File::GetSampleChecksumByIndex: reads the 8 bytes it needs instead of loading the whole 3crc chunk.
+- gig.cpp File::LoadGroups: a 3gnm chunk over 64 bytes isn't loaded.
+- gig.cpp Instrument (script slots): no more slots than the SCSL chunk holds.
+- gig.cpp File::LoadSamples: an extension file name (xfil) with a path separator, a colon or ".." is refused, so
+  only extension files in the .gig's own folder are opened.
+- DLS.cpp File::File: WavePoolCount is held to what the ptbl chunk holds (a damaged count allocated 2 x 4 bytes x
+  the count: up to 32 GB); a bad header size is taken as 8.
+- DLS.cpp Sampler::Sampler: SampleLoops is held to what the wsmp chunk holds (16 bytes a loop; up to 64 GB).
+- DLS.cpp Articulation::Articulation: Connections is held to what the chunk holds (12 bytes a block).
+- helper.h LoadString (INFO strings): reads at most 4 KB of the chunk instead of loading all of it.
+- RIFF.cpp Chunk::ClampToParent (new, declared in RIFF.h), called by the Chunk and List constructors: a chunk's size
+  is held to the bytes left in its parent; and the RIFF chunk's size to the file's. So no damaged size field can
+  make a read or LoadChunkData() reach past its parent or allocate more than the file holds.
+- RIFF.cpp: paths are UTF-8, opened with CreateFileW (CreateFileU8), so file names outside the system code page
+  open; extension files are found from the same UTF-8 folder.

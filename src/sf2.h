@@ -216,10 +216,13 @@ wchar_t *sf_full_path(const char *path);
    can't, -1 for a GigaStudio file (sf2.c then hands it to sf_parse_gig) */
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
 /* gigshim.cpp (C++, every exception caught inside): fills f from a GigaStudio file through libgig: 1 when it did, 0
-   with why (a reason to put in brackets, or "cancelled"). Any thread. sf_gig_decode decodes a compressed wave
-   (c->giga) on the loader thread: float, channel after channel, as decode_audio gives, or NULL with err; cancel is
-   asked between pieces. sf_gig_free frees the font's libgig file (sf_free calls it). */
+   with why (a reason to put in brackets, or "cancelled"), -1 with why the whole reason (libgig crashed, now or
+   before in this process: every later GigaStudio file is refused). Any thread. sf_gig_decode decodes a compressed
+   wave (c->giga) on the loader thread: float, channel after channel, as decode_audio gives, or NULL with err; cancel
+   is asked as it goes. sf_gig_free frees the font's libgig file (sf_free calls it). sf_gig_crashed: 1 once libgig
+   has crashed in this process. */
 int sf_parse_gig(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
+int sf_gig_crashed(void);
 float *sf_gig_decode(SmpFont *f, const SmpSrc *c, int *chans, long *frames, int *rate, int (*cancel)(void *),
                      void *carg, char *err, int cap);
 void sf_gig_free(SmpFont *f);

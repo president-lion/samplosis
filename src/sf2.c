@@ -972,7 +972,9 @@ SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *
         f->is_dls = 0;
         f->is_gig = 1;
         why[0] = 0;
-        if (sf_parse_gig(f, path, cancel, carg, why, sizeof why) > 0) { ok = 1; goto done; }
+        r = sf_parse_gig(f, path, cancel, carg, why, sizeof why);
+        if (r > 0) { ok = 1; goto done; }
+        if (r < 0) { if (err && cap > 0) snprintf(err, cap, "%s", why); goto done; }   /* the whole reason */
         if (err && cap > 0) snprintf(err, cap, "%s isn't a GigaStudio file this can read (%s)", base_name(path), why);
         goto done;
       }

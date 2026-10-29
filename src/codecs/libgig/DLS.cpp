@@ -127,6 +127,11 @@ namespace DLS {
 
         HeaderSize  = artl->ReadUint32();
         Connections = artl->ReadUint32();
+        // Samplosis: no more connection blocks than the chunk holds (12 bytes each)
+        {
+            const file_offset_t room = artl->GetSize() > HeaderSize ? artl->GetSize() - HeaderSize : 0;
+            if (Connections > room / 12) Connections = uint32_t(room / 12);
+        }
         artl->SetPos(HeaderSize);
 
         pConnections = new Connection[Connections];
@@ -671,6 +676,11 @@ namespace DLS {
             Gain           = wsmp->ReadInt32();
             SamplerOptions = wsmp->ReadUint32();
             SampleLoops    = wsmp->ReadUint32();
+            // Samplosis: no more loops than the chunk holds (16 bytes each; a damaged count allocated up to 64 GB)
+            {
+                const file_offset_t room = wsmp->GetSize() > uiHeaderSize ? wsmp->GetSize() - uiHeaderSize : 0;
+                if (SampleLoops > room / 16) SampleLoops = uint32_t(room / 16);
+            }
         } else { // 'wsmp' chunk missing
             uiHeaderSize   = 20;
             UnityNote      = 60;
@@ -1718,6 +1728,11 @@ namespace DLS {
 
             WavePoolHeaderSize = ptbl->ReadUint32();
             WavePoolCount  = ptbl->ReadUint32();
+            // Samplosis: no more entries than the chunk holds (a damaged count allocated up to 32 GB)
+            if (WavePoolHeaderSize < 8 || WavePoolHeaderSize > ptbl->GetSize()) WavePoolHeaderSize = 8;
+            if (ptbl->GetSize() < WavePoolHeaderSize) WavePoolCount = 0;
+            else if (WavePoolCount > (ptbl->GetSize() - WavePoolHeaderSize) / 4)
+                WavePoolCount = uint32_t((ptbl->GetSize() - WavePoolHeaderSize) / 4);
             pWavePoolTable = new uint32_t[WavePoolCount];
             pWavePoolTableHi = new uint32_t[WavePoolCount];
             ptbl->SetPos(WavePoolHeaderSize);

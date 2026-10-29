@@ -219,6 +219,7 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
       /* a compressed GigaStudio wave: libgig decodes it (gigshim.cpp), a piece at a time, stopping for a close */
       x = sf_gig_decode(f, c, &ch, &frames, &r, pack_cancel, f, err, sizeof err);
       if (!x && (f->closing || g_stop)) return NULL;                 /* cancelled: not broken */
+      if (!x && sf_gig_crashed()) { set_problem(f, "%s%s", err, ""); *broken = 1; return NULL; }   /* said plainly */
     } else if (c->length) {
       HANDLE h = font_handle(f, c->path_id);
       uint8_t *bytes;
