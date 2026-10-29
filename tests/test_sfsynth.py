@@ -679,6 +679,7 @@ def drive(lib, S):
 
     def midi(*b):
         lib.smp_synth_midi(s, bytes(b), len(b), 0)
+    run.bufs = bufs
     return s, run, midi
 
 
@@ -709,9 +710,36 @@ def test_effects_off_clears_tail(lib, S):
 
 
 def test_reset_clears_tail(lib, S):
+    """a reset (REAPER's stop, seek and loop flush the same way) fades the tails out over 10 ms, then clears
+    them: no click, and nothing comes back"""
+    lib.smp_synth_flush.argtypes = [ctypes.c_void_p, ctypes.c_int]
     s, run, midi = reverb_tail(lib, S)
+    bufs = run.bufs
+    run(1)
+    before = float(np.max(np.abs(bufs[0])))
+    assert before > 1e-4
     lib.smp_synth_reset(s)
+    out = []
+    for _ in range(4):
+        run(1)
+        out.append(bufs[0].copy())
+    y = np.concatenate(out)
+    fade = int(0.010 * OUT)                                    # 480 frames
+    assert np.max(np.abs(y[:16])) > before * 0.2               # it doesn't stop dead
+    assert np.max(np.abs(np.diff(y[:fade]))) < before          # no step
+    assert np.max(np.abs(y[fade - 48:fade])) < before * 0.15   # nearly gone at the end of the fade
+    assert np.max(np.abs(y[fade:])) == 0                       # then cleared
     assert run(8) < 1e-9
+    # the plugin's flush (REAPER's reset) fades the same way
+    s, run, midi = reverb_tail(lib, S)
+    lib.smp_synth_flush(s, 0)
+    run(1)
+    assert float(np.max(np.abs(run.bufs[0]))) > 0
+    run(1)
+    assert run(8) < 1e-9
+    # and with nothing sounding, the clear is at once
+    lib.smp_synth_flush(s, 0)
+    assert run(1) == 0.0
 
 
 def test_effects_follow_volume(lib, S):

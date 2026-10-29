@@ -191,11 +191,11 @@ SMP_API void smp_synth_midi(SmpSynth *s, const uint8_t *msg, int len, int at);  
                                     note_on: note on and off, CC, program, pressure, poly pressure, bend, and the GM,
                                     GS and XG reset SysEx; at is the frame offset in the next block */
 SMP_API void smp_synth_process(SmpSynth *s, float *const *outs /* 32: L,R per output */, int n);  /* audio thread */
-SMP_API void smp_synth_reset(SmpSynth *s);       /* audio thread: every voice off, controllers reset, and the
-                                    sf_used presets let go */
+SMP_API void smp_synth_reset(SmpSynth *s);       /* audio thread: every voice off (5 ms), the effect tails faded
+                                    out (10 ms), controllers reset, and the sf_used presets let go */
 SMP_API void smp_synth_flush(SmpSynth *s, int now);   /* audio thread, or main while nothing processes: every voice
                                     off (now: at once, else a 5 ms fade), controllers reset, reverb and chorus tails
-                                    cleared; the sf_used presets stay held (their countdown or the next state lets
+                                    cleared (now: at once, else faded out over 10 ms); the sf_used presets stay held (their countdown or the next state lets
                                     them go). For a host's reset, which comes on stop, seek and loop */
 SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v);   /* ids SMP_P_SF_*, any thread */
 SMP_API double smp_synth_get_param(const SmpSynth *s, int id);

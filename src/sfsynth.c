@@ -636,13 +636,14 @@ static void handle(SmpSynth *s, const Ev *e) {
   }
 }
 
-/* every voice off (5 ms, or at once), controllers reset and no reverb or chorus tail; the sf_used presets stay */
+/* every voice off and the reverb and chorus tails gone (at once, or faded: voices over 5 ms, tails over 10 ms, so
+   a stop, seek or loop doesn't click), controllers reset; the sf_used presets stay */
 static void flush_now(SmpSynth *s, int now) {
   int c, i;
   if (now) { for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; } }
   else sound_off(s, -1);
   for (c = 0; c < NCH; c++) { chan_controllers(&s->ch[c]); tuning(&s->ch[c]); }
-  smp_sffx_clear(s->fx);
+  if (now) smp_sffx_clear(s->fx); else smp_sffx_fade_out(s->fx);
 }
 
 /* the flush, and the sf_used presets let go */

@@ -36,6 +36,7 @@
 #define CHO_HZ 0.3
 #define CHO_LEVEL 2.0
 #define FLUSH 1e-18f
+#define FADE_MS 10.0                    /* smp_sffx_fade_out: the tails fade out over this, then clear */
 
 static const int comb_tune[NCOMB] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
 static const int all_tune[NALL] = {556, 441, 341, 225};
@@ -54,6 +55,8 @@ struct SmpSfFx {
   double crs, crc;                      /* the rotation per sample */
   float depth, base, gain;              /* in samples; the delay's centre; per-tap gain */
   float *mem;                           /* every buffer above lives in this one block */
+  int fade_len, fade_left;              /* fading out: frames in all, frames still to go (0: not fading) */
+  float level;                          /* the loudest wet sample of the last block (0: the tails are silent) */
 };
 
 static float flush(float x) { return fabsf(x) < FLUSH ? 0.0f : x; }
@@ -94,6 +97,8 @@ SMP_API SmpSfFx *smp_sffx_new(double rate) {
   fx->gain = (float)(CHO_LEVEL / CHO_VOICES);
   fx->crs = sin(2 * 3.14159265358979323846 * CHO_HZ / rate);
   fx->crc = cos(2 * 3.14159265358979323846 * CHO_HZ / rate);
+  fx->fade_len = (int)(FADE_MS * 0.001 * rate);
+  if (fx->fade_len < 1) fx->fade_len = 1;
   smp_sffx_clear(fx);
   return fx;
 }
@@ -112,6 +117,13 @@ SMP_API void smp_sffx_clear(SmpSfFx *fx) {
   }
   memset(fx->mem, 0, sizeof(float) * (total + (size_t)fx->cmask + 1));
   fx->cw = 0; fx->cs = 0; fx->cc = 1;
+  fx->fade_left = 0; fx->level = 0;
+}
+
+SMP_API void smp_sffx_fade_out(SmpSfFx *fx) {
+  if (!fx) return;
+  if (!fx->on || fx->level == 0) smp_sffx_clear(fx);   /* nothing sounds: no fade needed */
+  else if (!fx->fade_left) fx->fade_left = fx->fade_len;
 }
 
 SMP_API void smp_sffx_enable(SmpSfFx *fx, int on) {
@@ -145,16 +157,17 @@ static float reverb_side(SmpSfFx *fx, int side, float in) {
 SMP_API void smp_sffx_process(SmpSfFx *fx, const float *rev_in, const float *cho_in, float *l, float *r, int n) {
   int i;
   const double k1 = -0.5, k2 = 0.86602540378443865;      /* cos and sin of 120 degrees */
+  float peak = 0;
   if (!fx || !fx->on || !l || !r || n <= 0) return;
   for (i = 0; i < n; i++) {
     float rin = rev_in ? rev_in[i] * FIXEDGAIN : 0.0f, cin = cho_in ? cho_in[i] : 0.0f;
-    float wl, wr, d, a, b, y0 = 0, y1 = 0, y2 = 0; double s0 = fx->cs, c0 = fx->cc, s1, s2;
+    float wl, wr, ol, orr, d, a, b, y0 = 0, y1 = 0, y2 = 0; double s0 = fx->cs, c0 = fx->cc, s1, s2;
     int j, p;
     /* reverb */
     wl = reverb_side(fx, 0, rin);
     wr = reverb_side(fx, 1, rin);
-    l[i] += wl * fx->wet1 + wr * fx->wet2;
-    r[i] += wr * fx->wet1 + wl * fx->wet2;
+    ol = wl * fx->wet1 + wr * fx->wet2;
+    orr = wr * fx->wet1 + wl * fx->wet2;
     /* chorus: the three sines 120 degrees apart come from one rotating phasor */
     fx->cbuf[fx->cw] = cin;
     s1 = s0 * k1 + c0 * k2;                              /* sin(t + 120 degrees) */
@@ -168,12 +181,18 @@ SMP_API void smp_sffx_process(SmpSfFx *fx, const float *rev_in, const float *cho
       d = a + (b - a) * fr;
       if (j == 0) y0 = d; else if (j == 1) y1 = d; else y2 = d;
     }
-    l[i] += (y0 + 0.70710678f * y2) * fx->gain;
-    r[i] += (y1 + 0.70710678f * y2) * fx->gain;
+    ol += (y0 + 0.70710678f * y2) * fx->gain;
+    orr += (y1 + 0.70710678f * y2) * fx->gain;
+    if (fx->fade_left) { float g = (float)fx->fade_left / (float)fx->fade_len; ol *= g; orr *= g; }
+    l[i] += ol; r[i] += orr;
+    if (fabsf(ol) > peak) peak = fabsf(ol);
+    if (fabsf(orr) > peak) peak = fabsf(orr);
     fx->cw = (fx->cw + 1) & fx->cmask;
     fx->cs = s0 * fx->crc + c0 * fx->crs;
     fx->cc = c0 * fx->crc - s0 * fx->crs;
+    if (fx->fade_left && --fx->fade_left == 0) smp_sffx_clear(fx);   /* faded out: the tails are gone */
   }
+  fx->level = peak;
   {                                                       /* keep the phasor at length 1 */
     double m = sqrt(fx->cs * fx->cs + fx->cc * fx->cc);
     if (m > 0) { fx->cs /= m; fx->cc /= m; }
