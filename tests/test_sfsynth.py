@@ -522,15 +522,55 @@ def test_reverb_send(lib, S):
     assert np.max(np.abs(x[int(0.05 * OUT):])) < 1e-6
 
 
-def test_effects_off_clears_tail(lib, S):
+def drive(lib, S):
+    """a synth played straight through smp_synth_process (no render-start clearing): returns it and a block runner"""
     s = S.new(dry=False)
-    lib.smp_synth_set_param(s, P_EFFECTS, 1)
-    S.render(s, BURST.format(rev=127, cho=0), 0.1)      # leaves a tail behind in the reverb
+    assert lib.smp_synth_wait_loaded(s, 5000) == 0
+    bufs = [np.zeros(256, np.float32) for _ in range(32)]
+    arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+
+    def run(blocks):
+        peak = 0.0
+        for _ in range(blocks):
+            lib.smp_synth_process(s, arr, 256)
+            peak = max(peak, float(np.max(np.abs(bufs[0]))), float(np.max(np.abs(bufs[1]))))
+        return peak
+
+    def midi(*b):
+        lib.smp_synth_midi(s, bytes(b), len(b), 0)
+    return s, run, midi
+
+
+def reverb_tail(lib, S):
+    """a short loud note with a full reverb send, then all sound off: only the tail is left"""
+    s, run, midi = drive(lib, S)
+    midi(0xB0, 91, 127)
+    midi(0x90, 69, 127)
+    for _ in range(300):                                  # the preset may still be loading: wait for the note
+        if run(1) > 0.01:
+            break
+        time.sleep(0.01)
+    else:
+        assert False, 'the note never sounded'
+    run(3)
+    midi(0xB0, 120, 0)
+    run(2)
+    assert run(2) > 1e-4                                  # the tail is there
+    return s, run, midi
+
+
+def test_effects_off_clears_tail(lib, S):
+    s, run, midi = reverb_tail(lib, S)
     lib.smp_synth_set_param(s, P_EFFECTS, 0)
-    S.render(s, "midi 144 69 100 0", 0.2)
+    assert run(1) == 0.0                                  # off: nothing is added
     lib.smp_synth_set_param(s, P_EFFECTS, 1)
-    x = S.render(s, "midi 192 33 0", 0.3)               # nothing plays: no old tail may come back
-    assert np.max(np.abs(x)) < 1e-6
+    assert run(8) < 1e-9                                  # on again: the old tail does not come back
+
+
+def test_reset_clears_tail(lib, S):
+    s, run, midi = reverb_tail(lib, S)
+    lib.smp_synth_reset(s)
+    assert run(8) < 1e-9
 
 
 def test_effects_follow_volume(lib, S):
@@ -552,10 +592,32 @@ def test_chorus_send(lib, S):
     assert side > rms(a) * 10 ** (-30 / 20), (side, rms(a))           # the image is wide
     x = S.render(s, hold.format(cho=0), 1.2)
     assert np.max(np.abs(x[:, 0] - x[:, 1])) < 1e-6                   # mono without the send
-    # the delay swings, so the pitch stays within 10 cents of the note
-    x = S.render(s, hold.format(cho=127), 1.2)
-    f = peak_freq(seg(x, 0.3, 1.1, 0))
-    assert abs(1200 * np.log2(f / 220)) < 10
+    # the delay swings 8 ms, so the side signal rises and falls (flat when the tap delays do not move)
+    hold = "midi 192 16 0\nmidi 176 91 0 0\nmidi 176 93 127 0\nmidi 144 69 127 100\n"
+    x = S.render(s, hold, 3.5)
+    side = [rms(seg(x, t, t + 0.05, 0) - seg(x, t, t + 0.05, 1)) for t in np.arange(0.3, 3.4, 0.05)]
+    assert max(side) > 1.5 * min(side), (min(side), max(side))
+
+
+def test_chorus_taps_120_degrees(lib):
+    """a ramp through the chorus alone: each tap outputs ramp - delay * slope, so L - R follows the taps' delays.
+    Three sines 120 degrees apart (depth 8 ms) give L - R = gain * slope * depth * sqrt(3) * sin(t - 30 degrees);
+    taps 30 degrees apart would give less than a third of that."""
+    vp, fp = ctypes.c_void_p, FP
+    lib.smp_sffx_new.restype = vp
+    lib.smp_sffx_new.argtypes = [ctypes.c_double]
+    lib.smp_sffx_free.argtypes = [vp]
+    lib.smp_sffx_process.argtypes = [vp, fp, fp, fp, fp, ctypes.c_int]
+    fx = lib.smp_sffx_new(48000.0)
+    n = 48000 * 4
+    slope = 1e-3
+    ramp = (np.arange(n) * slope).astype(np.float32)
+    l, r = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    lib.smp_sffx_process(fx, None, ramp.ctypes.data_as(FP), l.ctypes.data_as(FP), r.ctypes.data_as(FP), n)
+    lib.smp_sffx_free(fx)
+    d = (l - r)[48000 // 5:]                                # past the line's first fill
+    want = (2.0 / 3.0) * slope * (0.008 * 48000) * np.sqrt(3)
+    assert abs(np.max(d) - want) < 0.05 * want and abs(np.min(d) + want) < 0.05 * want, (np.max(d), np.min(d), want)
 
 
 def test_fx_cpu(lib):
@@ -585,3 +647,14 @@ def test_fx_cpu(lib):
         assert fx
         lib.smp_sffx_process(fx, p(rev), p(cho), p(l), p(r), 4096)
         lib.smp_sffx_free(fx)
+
+
+def test_no_stuck_notes_with_effects(lib, S):
+    s = S.new(dry=False)
+    hold = "midi 176 91 40 0\nmidi 144 69 127 0\n"
+    tail = S.render(s, "midi 176 91 40 0\nmidi 144 69 127 0\nmidi 176 120 0 14400", 1.0)   # all sound off at 0.3 s
+    after = np.max(np.abs(tail[int(0.6 * OUT):]))
+    held = S.render(s, hold, 1.0)
+    assert after < 0.1 * np.max(np.abs(held[int(0.6 * OUT):]))      # the voice is gone, what is left is the tail
+    x = S.render(s, hold + "reset 14400", 1.0)                       # a reset clears the tails as well (the voices' 5 ms fade still feeds a little)
+    assert np.max(np.abs(x[int(0.4 * OUT):])) < 0.05 * np.max(np.abs(held[int(0.6 * OUT):]))

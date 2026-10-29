@@ -7,8 +7,9 @@
    FluidSynth the wet gain is level * 3, and the two sides are mixed with wet1 = gain * (width / 2 + 0.5) and
    wet2 = gain * (1 - width) / 2. The input gain is Freeverb's fixed 0.015.
 
-   Chorus: the mono send goes into one delay line with 3 taps. Each tap's delay is 8 ms plus a sine of 2 ms
-   depth at 0.3 Hz, the three sines 120 degrees apart, read with linear interpolation. Tap 0 goes to the left,
+   Chorus: the mono send goes into one delay line with 3 taps. Each tap's delay is 10 ms plus a sine of 8 ms
+   depth (FluidSynth's default) at 0.3 Hz, the three sines 120 degrees apart, read with linear interpolation. The
+   centre is 2 ms past the depth, so a tap never reads ahead of the write position. Tap 0 goes to the left,
    tap 1 to the right and tap 2 to the middle. Each tap has gain level / 3, level 2.0.
 
    The two effects are added to the left and right output in parallel. Everything is sized in smp_sffx_new, so
@@ -30,8 +31,8 @@
 #define SCALE_WET 3.0
 #define ALL_FEEDBACK 0.5f
 #define CHO_VOICES 3
-#define CHO_DEPTH_MS 2.0
-#define CHO_DELAY_MS 8.0
+#define CHO_DEPTH_MS 8.0
+#define CHO_DELAY_MS 10.0
 #define CHO_HZ 0.3
 #define CHO_LEVEL 2.0
 #define FLUSH 1e-18f
@@ -143,7 +144,7 @@ static float reverb_side(SmpSfFx *fx, int side, float in) {
 
 SMP_API void smp_sffx_process(SmpSfFx *fx, const float *rev_in, const float *cho_in, float *l, float *r, int n) {
   int i;
-  const double k1 = -0.5, k2 = 0.86602540378443865;      /* sin and cos of 120 degrees */
+  const double k1 = -0.5, k2 = 0.86602540378443865;      /* cos and sin of 120 degrees */
   if (!fx || !fx->on || !l || !r || n <= 0) return;
   for (i = 0; i < n; i++) {
     float rin = rev_in ? rev_in[i] * FIXEDGAIN : 0.0f, cin = cho_in ? cho_in[i] : 0.0f;
@@ -156,8 +157,8 @@ SMP_API void smp_sffx_process(SmpSfFx *fx, const float *rev_in, const float *cho
     r[i] += wr * fx->wet1 + wl * fx->wet2;
     /* chorus: the three sines 120 degrees apart come from one rotating phasor */
     fx->cbuf[fx->cw] = cin;
-    s1 = s0 * k2 + c0 * k1;                              /* sin(t + 120 degrees) */
-    s2 = s0 * k2 - c0 * k1;                              /* sin(t - 120 degrees) = sin(t + 240 degrees) */
+    s1 = s0 * k1 + c0 * k2;                              /* sin(t + 120 degrees) */
+    s2 = s0 * k1 - c0 * k2;                              /* sin(t - 120 degrees) = sin(t + 240 degrees) */
     for (j = 0; j < CHO_VOICES; j++) {
       double s = j == 0 ? s0 : j == 1 ? s1 : s2;
       float pos = (float)fx->cw - (fx->base + fx->depth * (float)s);
