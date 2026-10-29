@@ -66,6 +66,7 @@ enum { SF_GEN_NONE = 0, SF_GEN_SINE, SF_GEN_SILENCE, SF_GEN_NOISE };
 #define SF_GEN_SINE_RATE 267905u
 #define SF_GEN_NOISE_FRAMES 32768
 
+#define SF_HINTS 16                       /* pending voices' samples a font remembers (a power of two) */
 struct SmpFont {
   char *path;
   uint64_t size, mtime;                 /* the file's, to tell when it changed */
@@ -135,9 +136,17 @@ struct SmpFont {
   uint8_t *need;                        /* per sample: scratch for one pass */
   HANDLE *ph;                           /* per path: the handle one pass opened by name (closed at its end) */
   ULONGLONG *idle_since;                /* per sample: when a published sample stopped being needed (0: needed) */
+  int keys_done;                        /* sf_source_keys has run */
+  volatile uint8_t *dq;                 /* per sample: SF_DQ_* (sffont.c), the decode worker's job state */
+  struct SfPcm **dres;                  /* per sample: what the worker made, for the loader to publish */
+  uint8_t *dbroken;                     /* per sample: the worker's *broken */
+  volatile LONG pack_q;                 /* the worker has the SF2Pack's unpacking */
+  volatile LONG progress;               /* the loader's: counts samples tried and decode pieces (offline waits) */
+  volatile LONG hint[SF_HINTS], hint_w; /* samples pending voices want first (smp_sf_hint), as index + 1 */
+  volatile LONG64 wrote_bytes;          /* decoded bytes written to the cache since it was last trimmed */
   /* SF2Pack (the loader's own, but for pack_key, set at open): the pack decoded into a pinned 16-bit cache file */
   uint64_t pack_key;
-  int pack_state;                       /* SF_PACK_* */
+  volatile int pack_state;              /* SF_PACK_* (set by the decode worker, read by the loader) */
   SmpEntry *pack_entry;                 /* open while the font is, so the cache file is never trimmed */
   uint64_t pack_frames;                 /* frames in the decoded pack (sample ends are clamped to it at load) */
   /* a problem found after open (a pack that can't be unpacked), for smp_sf_problem: written once by the loader,
@@ -181,6 +190,14 @@ enum { SF_ST_NONE, SF_ST_PUBLISHED, SF_ST_RETIRED, SF_ST_BROKEN };
    registry); cancel (may be NULL) is asked now and then while an SFZ's files are read, and stops it ("cancelled"). */
 SmpFont *sf_parse(const char *path, char *err, int cap);
 SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *err, int cap);
+/* sffont.c: the cache keys of a font's DECODED samples and of its decoded pack (sf_parse_ex calls it; setup does for
+   fonts built another way). Any thread; looks at each sample file's size and modified time. */
+void sf_source_keys(SmpFont *f);
+/* sffont.c, for the player's offline renders: a pending voice's sample is loaded first (any thread); and the wait
+   for it (sample) or for everything the presets in use need (-1), with no fixed cap while the loader keeps making
+   progress (0 done, 1 gave up after a minute without any) */
+void smp_sf_hint(SmpFont *f, int sample);
+int smp_sf_wait_loaded(SmpFont *f, int sample);
 void sf_free(SmpFont *f);
 /* sf2.c, for the other loaders that build SF2's model themselves: every generator's default; a value held to its
    generator's range; SF2's ten default modulators; merging a zone's modulators into a list (identical ones
@@ -259,6 +276,18 @@ void sf_hold(SmpFont *f, int sample);
    thread's own, so threads sharing the handle read in parallel. 1 when the read worked (*got may be short at the
    end of the file). A thread that has used it calls smp_pread_thread_done before it ends. */
 int smp_pread(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got);
+/* sffont.c: bytes per sample of an SMP_PCM_* encoding; n frames interleaved over ch channels to channel c alone, as
+   float (of) or int16 (oi). In place is fine when a frame is at most 4 bytes and the bytes sit at the end of the
+   float stretch they become (each float is written only after its frame's bytes are read, and never over a later
+   frame's). */
+int sf_pcm_bytes(int enc);
+/* cache.c, for the SoundFont engine's mono cache files: the overlapped handle, bytes per frame (4 float, 2 int16),
+   the byte offset of a frame, and frames in the file's own format */
+HANDLE smp_entry_handle(const SmpEntry *e);
+int smp_entry_bps(const SmpEntry *e);
+uint64_t smp_entry_data_offset(const SmpEntry *e, uint64_t frame);
+long smp_entry_read_raw(SmpEntry *e, uint64_t frame, void *out, long frames);
+void sf_pcm_convert(const uint8_t *b, int enc, int ch, int c, uint32_t n, float *of, int16_t *oi);
 void smp_pread_thread_done(void);
 
 #endif

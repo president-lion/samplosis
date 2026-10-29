@@ -205,6 +205,7 @@ struct SmpSynth {
      and kept until free; the voice slots are its slots */
   SfStream *volatile st;
   volatile LONG underruns;
+  volatile LONG underruns_onset;  /* of those, the ones of voices whose first streamed read hadn't come yet */
 };
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -505,8 +506,10 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   t->st = V_PENDING;
   t->since = GetTickCount64();
   if (try_start(s, i)) return;
-  if (s->offline || s->render_offline) {   /* an offline render waits, so the note starts on its frame */
-    smp_sf_wait_idle(s->cur, 10000);
+  if (s->offline || s->render_offline) {   /* an offline render waits, so the note starts on its frame: its sample
+                                              first, for as long as the loader keeps making progress */
+    smp_sf_hint(s->cur, r->sample);
+    smp_sf_wait_loaded(s->cur, r->sample);
     if (try_start(s, i)) return;
   }
   /* pending: it starts on the first block its sample is there (late, from the beginning) */
@@ -1047,10 +1050,17 @@ static void block_start(SmpSynth *s, int n) {
   } else if (changed) resolve_all(s);
   if (s->used_state == U_HELD && s->used_armed && InterlockedExchangeAdd(&s->used_left, -n) - n <= 0)
     used_release(s, U_AUDIO);
+  if ((s->offline || s->render_offline) && s->cur) {   /* offline: pending voices' samples are loaded first */
+    for (i = 0; i < MAXV; i++) if (s->sl[i].st == V_PENDING && s->sl[i].reg) smp_sf_hint(s->cur, s->sl[i].reg->sample);
+  }
   for (i = 0; i < MAXV; i++) {
     Slot *t = &s->sl[i];
     if (t->st != V_PENDING) continue;
     if (try_start(s, i)) continue;
+    if ((s->offline || s->render_offline) && s->cur && t->reg) {   /* offline: waited for, and started now */
+      smp_sf_wait_loaded(s->cur, t->reg->sample);
+      if (try_start(s, i)) continue;
+    }
     /* waiting longer than PENDING_MS of real time: dropped. Timed in real time, not in frames, so a render that
        runs faster than real time without telling us (no clap.render) still gets its late notes; an offline
        render never drops one (it waits for the loader, and a missing file must not lose later notes either) */
@@ -1068,10 +1078,8 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
     block_start(s, n);
     s->dormant = 0;
     resolve_all(s);
-    if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);
   } else {
-    if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);   /* offline: voices waiting start now */
-    block_start(s, n);
+    block_start(s, n);                          /* offline, pending voices wait for their samples in there */
   }
   for (i = 1; i < s->nev; i++) {               /* stable sort by offset */
     Ev x = s->ev[i];
@@ -1110,7 +1118,11 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
   if (s->st) {                                  /* underruns counted, and the streamer woken when voices stream */
     int any = 0;
     for (i = 0; i < MAXV; i++) {
-      if (s->v[i].underrun) { s->v[i].underrun = 0; InterlockedIncrement(&s->underruns); }
+      if (s->v[i].underrun) {
+        if (s->v[i].underrun == 2) InterlockedIncrement(&s->underruns_onset);
+        s->v[i].underrun = 0;
+        InterlockedIncrement(&s->underruns);
+      }
       if (s->v[i].live && s->v[i].ss) any = 1;
     }
     if (any) sfs_wake(s->st);
@@ -1140,6 +1152,7 @@ SMP_API int smp_synth_voices(const SmpSynth *s, int *peak) {
 }
 
 SMP_API long smp_synth_underruns(const SmpSynth *s) { return s ? s->underruns : 0; }
+SMP_API long smp_synth_underruns_onset(const SmpSynth *s) { return s ? s->underruns_onset : 0; }
 
 SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on) { if (s && s->st) sfs_pause(s->st, on); }
 
@@ -1504,7 +1517,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
   for (b = 0; b < frames; b += block) {
     int n = (int)(frames - b < block ? frames - b : block), j;
-    if (s->offline && s->font) smp_sf_wait_idle(s->font, 10000);
+    if (s->offline && s->font) smp_sf_wait_loaded(s->font, -1);   /* no fixed cap while the loader progresses */
     for (; k < nev && ev[k].frame < b + n; k++) {
       int at = (int)(ev[k].frame - b);
       if (at < 0) at = 0;

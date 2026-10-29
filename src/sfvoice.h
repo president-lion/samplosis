@@ -73,7 +73,9 @@ typedef struct SmpSfVoice {
   int64_t avail;                         /* path frames in the ring, as last read */
   int64_t roff;                          /* laps * L, for a stretch read from the ring */
   double ug;                             /* underrun gain: fades out before the ring runs dry and back in after */
-  int underrun;                          /* the ring ran dry since the player last looked (it clears this) */
+  int underrun;                          /* the ring ran dry since the player last looked (it clears this): 1, or 2
+                                            when the streamer hadn't delivered the voice's first read yet (an onset) */
+  int64_t fed0; int fed;                 /* fed: the ring has had frames past path frame fed0 (the first read came) */
 } SmpSfVoice;
 
 /* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. st and slot:

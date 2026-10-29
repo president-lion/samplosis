@@ -451,6 +451,11 @@ static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stre
   m.hf = (uint32_t)v->hf; m.t0 = (uint32_t)v->t0; m.t1 = (uint32_t)v->t1; m.end = (uint32_t)v->end; m.ls = (uint32_t)v->ls; m.le = (uint32_t)v->le;
   m.p0 = v->start > 0 ? v->start - 1 : 0;
   m.loopy = v->loopy;
+  {                                            /* sample frames per second, from the pitch at the start */
+    double sp = pow(2.0, v->cents0 / 1200.0) * v->srate;
+    m.speed = sp > 1e7 ? 10000000 : sp < 100 ? 100 : (LONG)sp;
+  }
+  InterlockedExchange(&ss->speed, m.speed);
   InterlockedExchange(&ss->rel, -1);
   InterlockedExchange64(&ss->need, SF_TAG(g, 0) | m.p0);
   InterlockedExchange(&ss->live, g);
@@ -461,6 +466,7 @@ static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stre
     return;
   }
   v->ss = ss; v->ring = sfs_ring(st, slot); v->sgen = g;
+  v->fed0 = m.p0 > v->hf ? m.p0 : v->hf;
 }
 
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
@@ -513,9 +519,9 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   v->rel_w = -1; v->ug = 1;
   v->streaming = vw.stream && ((v->looping && v->mode != 3) ? lpe > v->hf : end > v->hf);
   v->live = 1;
-  if (v->streaming && st) stream_start(v, st, slot, vw.stream);
   v->cond_gain = cond_gain(r, v->key, v->vel, held);
   derive(v, c);
+  if (v->streaming && st) stream_start(v, st, slot, vw.stream);   /* after derive: its pitch gives the speed */
   v->venv.stage = E_DELAY; v->menv.stage = E_DELAY;
   v->fade = 1;
   v->ctl_left = 0;
@@ -629,6 +635,9 @@ static int ahead_short(const SmpSfVoice *v, int m) {
   double span = (SF_UFADE + m) * fabs(v->ratio);
   int64_t a = (int64_t)v->pos, b = (int64_t)(v->pos + (span < SF_RING / 4 ? span : SF_RING / 4)) + 3;
   if (ring_short(v, b)) return 1;
+  /* the frame before the post-loop head: when b lands in that head (in memory), the ring frames just before it
+     may still be missing, and without this look the voice would cut off there instead of fading */
+  if (!v->looping && v->t1 > v->t0 && a < v->t0 && b >= v->t0 && ring_short(v, v->t0 - 1)) return 1;
   return v->looping && a < v->le && b >= v->le && ring_short(v, v->le - 1);
 }
 
@@ -699,6 +708,7 @@ static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho,
   int i, short_ahead;
   int64_t hend = v->hf < v->end ? v->hf : v->end;   /* head frames the voice can play */
   read_avail(v);
+  if (!v->fed && v->avail > v->fed0) v->fed = 1;
   short_ahead = ahead_short(v, m);
   if (!short_ahead && v->ug == 1) {
     /* Most stretches lie wholly in the head or wholly in the ring, with no loop joint in them (then no lap can end
@@ -741,7 +751,7 @@ static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho,
       if (dry || short_ahead) {
         if ((v->ug -= 1.0 / SF_UFADE) < 0) v->ug = 0;
       } else if (v->ug < 1 && (v->ug += 1.0 / SF_UFADE) > 1) v->ug = 1;
-      if (dry) { v->underrun = 1; y = 0; }
+      if (dry) { v->underrun = v->fed ? 1 : 2; y = 0; }
       if (v->filt_on) {
         double o = v->b0 * y + v->b1 * v->x1 + v->b2 * v->x2 - v->a1 * v->y1 - v->a2 * v->y2;
         v->x2 = v->x1; v->x1 = y; v->y2 = v->y1; v->y1 = o;
@@ -785,6 +795,10 @@ static void publish_need(SmpSfVoice *v) {
   if (!v->ss || !v->live) return;
   nd = (int64_t)v->pos - 1 + v->laps * v->L;
   v->ss->need = SF_TAG(v->sgen, 0) | (nd < 0 ? 0 : nd);
+  if (v->primed) {                             /* the speed the streamer works out deadlines with */
+    double sp = fabs(v->ratio) * v->rate;
+    v->ss->speed = sp > 1e7 ? 10000000 : sp < 100 ? 100 : (LONG)sp;
+  }
 }
 
 int smp_sfv_render(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int n) {
@@ -827,7 +841,7 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
   ch.cc[7] = 100; ch.cc[10] = 64; ch.cc[11] = 127;      /* GM reset values */
   ch.bend = 8192; ch.bend_range_cents = 200;
   smp_sf_use(f, preset, 1);
-  smp_sf_wait_idle(f, 10000);
+  smp_sf_wait_loaded(f, -1);
   vs = (SmpSfVoice *)calloc((size_t)nreg, sizeof *vs);
   l = (float *)calloc((size_t)frames + 1, sizeof *l);
   r = (float *)calloc((size_t)frames + 1, sizeof *r);

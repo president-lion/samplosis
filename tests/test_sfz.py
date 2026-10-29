@@ -792,3 +792,105 @@ def test_sfz_guessed_mono_is_centred(lib, tmp_path):
             assert abs(db(rms(g[2000:20000, ch]), rms(m[2000:20000, ch]))) < 0.2, ch
     finally:
         lib.smp_sf_close(f)
+
+
+def test_sfz_close_stops_member_decode(lib, tmp_path):
+    """A member file only FFmpeg reads, and an FFmpeg that hangs (the full 60 s stall timer): closing the font while
+    the loader decodes it returns at once, and the FFmpeg it started is killed."""
+    from test_cache import point_cache
+    from test_formats import fake_ffmpeg, pids_running, settings
+    import time
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "hang")
+    (tmp_path / "x.tta").write_bytes(b"not anything" * 100)
+    path = write_sfz(tmp_path / "h.sfz", "<region> sample=x.tta key=60\n")
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    try:
+        f = opened(lib, path)
+        lib.smp_sf_use(f, 0, 1)
+        t = time.perf_counter()
+        while not (d / "pids.txt").exists() and time.perf_counter() - t < 10:
+            time.sleep(0.02)
+        assert (d / "pids.txt").exists()                                 # the loader is decoding it
+        time.sleep(0.3)
+        t = time.perf_counter()
+        lib.smp_sf_use(f, 0, -1)
+        lib.smp_sf_close(f)
+        secs = time.perf_counter() - t
+    finally:
+        settings(lib, ffmpeg_path="")
+    assert secs < 2, secs
+    t = time.perf_counter()
+    while pids_running(d)[0] and time.perf_counter() - t < 5:
+        time.sleep(0.05)
+    assert pids_running(d)[0] == 0
+
+
+def test_sfz_decode_cache_int16_and_trimmed(lib, tmp_path):
+    """Decoded member files (FLAC, 16-bit) go to the cache as int16 (version 2: half the size of float), and the
+    loader trims the cache to its limit after writing; the files of samples that stream (held open) stay."""
+    from test_cache import point_cache
+    import glob
+    cache = tmp_path / "cache"
+    point_cache(lib, cache, gb=0.0005)                         # about 0.5 MB
+    lines = []
+    for i in range(24):                                        # 24 short samples: 0.9 s each, about 79 KB as int16
+        sf.write(str(tmp_path / ("s%d.flac" % i)), sine(int(RATE * 0.9), 200.0 + 10 * i), RATE, subtype="PCM_16")
+        lines.append("<region> sample=s%d.flac key=%d" % (i, 40 + i))
+    sf.write(str(tmp_path / "long.flac"), sine(RATE * 3, 300.0), RATE, subtype="PCM_16")   # streams: stays pinned
+    lines.append("<region> sample=long.flac key=80 pitch_keycenter=80")
+    path = write_sfz(tmp_path / "c.sfz", "\n".join(lines) + "\n")
+    f = opened(lib, path)
+    try:
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 60000) == 0
+        files = glob.glob(str(cache / "*.smpc"))
+        heads = [open(p, "rb").read(32) for p in files]
+        assert heads and all(h[:4] == b"SMPC" and struct.unpack("<I", h[4:8])[0] == 2 for h in heads), heads[:2]
+        sizes = {os.path.basename(p): os.path.getsize(p) for p in files}
+        assert RATE * 3 * 2 + 32 in sizes.values()                       # the long one, int16, still there
+        assert sum(sizes.values()) <= 0.0005 * 2 ** 30 + RATE * 3 * 2 + 32, sizes   # the rest trimmed to the limit
+        g, nv = note(lib, f, 80, n=4 * RATE)                              # and it still plays from the cache
+        assert nv == 1 and rms(g[RATE * 2:RATE * 3, 0]) > 0.03
+    finally:
+        lib.smp_sf_use(f, 0, -1)
+        lib.smp_sf_close(f)
+        point_cache(lib, cache)
+
+
+def test_sfz_long_decode_doesnt_hold_up_other_fonts(lib, tmp_path):
+    """One font's member decode hangs in FFmpeg; another font's samples still load at once (the loader leaves
+    decodes to its worker)."""
+    from test_cache import point_cache
+    from test_formats import fake_ffmpeg, settings
+    import time
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "hang")
+    (tmp_path / "x.tta").write_bytes(b"not anything" * 100)
+    slow = write_sfz(tmp_path / "slow.sfz", "<region> sample=x.tta key=60\n")
+    write_wav(tmp_path / "b.wav", sine(RATE * 2, 440.0))
+    quick = write_sfz(tmp_path / "quick.sfz", "<region> sample=b.wav key=60\n")
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    try:
+        fa = opened(lib, slow)
+        lib.smp_sf_use(fa, 0, 1)
+        t = time.perf_counter()
+        while not (d / "pids.txt").exists() and time.perf_counter() - t < 10:
+            time.sleep(0.02)
+        assert (d / "pids.txt").exists()                                 # the worker is stuck in FFmpeg
+        fb = opened(lib, quick)
+        try:
+            t = time.perf_counter()
+            lib.smp_sf_use(fb, 0, 1)
+            assert lib.smp_sf_wait_idle(fb, 5000) == 0
+            secs = time.perf_counter() - t
+            assert lib.smp_sf_loaded_samples(fb) >= 1
+            assert lib.smp_sf_wait_idle(fa, 100) == 1                    # the first font is still decoding
+        finally:
+            lib.smp_sf_use(fb, 0, -1)
+            lib.smp_sf_close(fb)
+        lib.smp_sf_use(fa, 0, -1)
+        lib.smp_sf_close(fa)
+    finally:
+        settings(lib, ffmpeg_path="")
+    assert secs < 1, secs

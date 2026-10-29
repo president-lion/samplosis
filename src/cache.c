@@ -1,6 +1,7 @@
 /* On-disk sample cache: <16 hex>.smpc = 32 byte header + float32 stereo interleaved (or mono, for the SoundFont
    engine's decoded samples: the header says how many channels). Version 2 files hold int16 mono instead: a decoded
-   SF2Pack's sample data. */
+   SF2Pack's sample data, and a SoundFont engine's decoded sample whose values are all exact 16-bit ones (a 16-bit
+   source), which halves its size. */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,7 @@
 #include "sf2.h"
 
 #define HDR 32
-#define MAX_OPEN 4096
+#define PREAD_WAIT_MS 30000                /* smp_pread gives up on a read after this (a disk spinning up takes ~10 s) */
 
 struct SmpEntry {
   HANDLE h;
@@ -17,15 +18,27 @@ struct SmpEntry {
   int rate, whole, ch;
   float *head;
   uint64_t head_frames;
+  int bps;                                 /* a mono file's bytes per frame: 4 (float) or 2 (int16, version 2) */
 };
 
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 static CRITICAL_SECTION cs;
-static uint64_t open_keys[MAX_OPEN];
-static int open_n;
+static uint64_t *open_keys;               /* the keys of the files held open (never trimmed); grows as needed */
+static int open_n, open_cap;
 
 static BOOL CALLBACK init_cs(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&cs); return TRUE; }
 static void lock(void) { InitOnceExecuteOnce(&once, init_cs, NULL, NULL); EnterCriticalSection(&cs); }
+
+/* under the lock: one more open key (if memory runs out the file just isn't pinned, as before) */
+static void pin_locked(uint64_t key) {
+  if (open_n == open_cap) {
+    int nc = open_cap ? open_cap * 2 : 1024;
+    uint64_t *nk = realloc(open_keys, (size_t)nc * sizeof *nk);
+    if (!nk) return;
+    open_keys = nk; open_cap = nc;
+  }
+  open_keys[open_n++] = key;
+}
 
 static int is_open_locked(uint64_t key) {
   for (int i = 0; i < open_n; i++) if (open_keys[i] == key) return 1;
@@ -103,7 +116,28 @@ static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t f
 }
 
 int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) { return write_file(key, lr, frames * 8, frames, rate, 2, 1, NULL, NULL); }
-int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) { return write_file(key, x, frames * 4, frames, rate, 1, 1, NULL, NULL); }
+/* every value an exact 16-bit one (x * 32768 a whole number in range): a 16-bit source, kept as int16 */
+static int exact16(const float *x, uint64_t n) {
+  uint64_t i;
+  for (i = 0; i < n; i++) {
+    float v = x[i] * 32768.0f;
+    if (!(v >= -32768.0f && v <= 32767.0f) || v != (float)(int)v) return 0;
+  }
+  return 1;
+}
+int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) {
+  if (frames > 0 && frames < ((uint64_t)1 << 31) && exact16(x, frames)) {
+    int16_t *o = malloc((size_t)frames * sizeof *o);
+    if (o) {
+      uint64_t i; int k;
+      for (i = 0; i < frames; i++) o[i] = (int16_t)(int)(x[i] * 32768.0f);
+      k = write_file(key, o, frames * 2, frames, rate, 1, 2, NULL, NULL);
+      free(o);
+      return k;
+    }
+  }
+  return write_file(key, x, frames * 4, frames, rate, 1, 1, NULL, NULL);
+}
 int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate, int (*cancel)(void *), void *arg) {
   return write_file(key, x, frames * 2, frames, rate, 1, 2, cancel, arg);
 }
@@ -127,6 +161,9 @@ int smp_pread(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
     DWORD e = GetLastError();
     if (e == ERROR_HANDLE_EOF) return 1;
     if (e != ERROR_IO_PENDING) return 0;
+    /* bounded: a read that doesn't finish in PREAD_WAIT_MS (a dead network share) is cancelled; then the wait
+       below is for the cancel, which the system finishes */
+    if (WaitForSingleObject(t_ev, PREAD_WAIT_MS) != WAIT_OBJECT_0) CancelIoEx(h, &o);
   }
   if (!GetOverlappedResult(h, &o, got, TRUE)) return GetLastError() == ERROR_HANDLE_EOF;
   return 1;
@@ -158,10 +195,12 @@ static SmpEntry *open_entry(uint64_t key, int whole_div, uint32_t want_ch) {
   if (!ok || got != HDR || memcmp(hdr, "SMPC", 4)) { CloseHandle(h); return NULL; }
   memcpy(&ver, hdr + 4, 4); memcpy(&ch, hdr + 8, 4); memcpy(&rate, hdr + 12, 4); memcpy(&frames, hdr + 16, 8);
   LARGE_INTEGER sz;
-  if (ver != 1 || ch != want_ch || !GetFileSizeEx(h, &sz) || (uint64_t)sz.QuadPart < HDR + frames * 4 * ch) { CloseHandle(h); return NULL; }
+  int bps = ver == 2 && want_ch == 1 ? 2 : 4;   /* mono: float (version 1) or int16 (version 2) */
+  if ((ver != 1 && !(ver == 2 && want_ch == 1)) || ch != want_ch || frames > ((uint64_t)1 << 40) || !GetFileSizeEx(h, &sz) ||
+      (uint64_t)sz.QuadPart < HDR + frames * (uint64_t)bps * ch) { CloseHandle(h); return NULL; }
   SmpEntry *e = calloc(1, sizeof *e);
   if (!e) { CloseHandle(h); return NULL; }
-  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate; e->ch = (int)ch;
+  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate; e->ch = (int)ch; e->bps = bps;
   uint64_t hf = (uint64_t)rate / 4;
   if (ch == 1) hf = 0;                     /* mono: no head here; the SoundFont loader holds its own */
   else if (frames <= (uint64_t)rate / (uint64_t)whole_div) { hf = frames; e->whole = 1; }
@@ -175,7 +214,7 @@ static SmpEntry *open_entry(uint64_t key, int whole_div, uint32_t want_ch) {
   FILETIME ft; GetSystemTimeAsFileTime(&ft);
   SetFileTime(h, NULL, NULL, &ft);
   lock();
-  if (open_n < MAX_OPEN) open_keys[open_n++] = key;
+  pin_locked(key);
   LeaveCriticalSection(&cs);
   return e;
 }
@@ -201,13 +240,13 @@ SmpEntry *smp_cache_open_i16(uint64_t key) {
   if (ver != 2 || ch != 1 || frames == 0 || frames > ((uint64_t)1 << 40) || !GetFileSizeEx(h, &sz) ||
       (uint64_t)sz.QuadPart < HDR + frames * 2) { CloseHandle(h); return NULL; }
   if (!(e = calloc(1, sizeof *e))) { CloseHandle(h); return NULL; }
-  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate; e->ch = 1;
+  e->h = h; e->key = key; e->frames = frames; e->rate = (int)rate; e->ch = 1; e->bps = 2;
   {
     FILETIME ft; GetSystemTimeAsFileTime(&ft);
     SetFileTime(h, NULL, NULL, &ft);
   }
   lock();
-  if (open_n < MAX_OPEN) open_keys[open_n++] = key;
+  pin_locked(key);
   LeaveCriticalSection(&cs);
   return e;
 }
@@ -241,9 +280,32 @@ long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames) {
   uint64_t n = e->frames - frame;
   if (n > (uint64_t)frames) n = (uint64_t)frames;
   DWORD got;
+  if (e->bps == 2) {
+    /* int16: read into the second half of x, then widened front to back (each float is written after its value
+       is read, and never over a later one) */
+    int16_t *raw = (int16_t *)x + n;
+    long i, k;
+    if (!smp_pread(e->h, HDR + frame * 2, raw, (DWORD)(n * 2), &got)) return 0;
+    k = (long)(got / 2);
+    for (i = 0; i < k; i++) x[i] = raw[i] * (1.0f / 32768.0f);
+    return k;
+  }
   if (!smp_pread(e->h, HDR + frame * 4, x, (DWORD)(n * 4), &got)) return 0;
   return (long)(got / 4);
 }
+
+long smp_entry_read_raw(SmpEntry *e, uint64_t frame, void *out, long frames) {
+  if (e->ch != 1 || frame >= e->frames || frames <= 0) return 0;
+  uint64_t n = e->frames - frame;
+  if (n > (uint64_t)frames) n = (uint64_t)frames;
+  DWORD got;
+  if (!smp_pread(e->h, HDR + frame * (uint64_t)e->bps, out, (DWORD)(n * (uint64_t)e->bps), &got)) return 0;
+  return (long)(got / (DWORD)e->bps);
+}
+
+HANDLE smp_entry_handle(const SmpEntry *e) { return e->h; }
+int smp_entry_bps(const SmpEntry *e) { return e->bps ? e->bps : 4; }
+uint64_t smp_entry_data_offset(const SmpEntry *e, uint64_t frame) { return HDR + frame * (uint64_t)(e->bps ? e->bps : 4); }
 
 typedef struct { uint64_t key, size, time; int sfzp; } Item;   /* sfzp: an SFZ probe cache file (sfsfz.c) */
 static int by_time(const void *a, const void *b) {

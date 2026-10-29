@@ -245,3 +245,23 @@ def test_open_copy_holds_only_quarter_second(lib, tmp_path):
     e = lib.smp_cache_open_copy(k2)
     assert lib.smp_entry_whole(e) == 1
     lib.smp_cache_close(e)
+
+
+def test_open_files_pinned_past_4096(lib, tmp_path):
+    """More than 4096 cache files held open: every one stays pinned (the open-key table grows), so a trim to 0 deletes
+    none of them, and they go once closed."""
+    point_cache(lib, tmp_path)
+    one = ramp(4)
+    n = 4200
+    for k in range(n):
+        assert write(lib, 0x5A000000 + k, one) == 0
+    es = [lib.smp_cache_open(0x5A000000 + k) for k in range(n)]
+    try:
+        assert all(es)
+        lib.smp_cache_trim(0)
+        assert len([f for f in os.listdir(tmp_path) if f.endswith(".smpc")]) == n
+    finally:
+        for e in es:
+            if e: lib.smp_cache_close(e)
+    lib.smp_cache_trim(0)
+    assert not [f for f in os.listdir(tmp_path) if f.endswith(".smpc")]

@@ -23,6 +23,7 @@ typedef struct SfSlot {
   volatile LONG rel;                     /* audio: -1, or the laps done when a loop-until-release was released */
   volatile LONG64 need;                  /* audio: tag | the oldest path frame the voice still needs */
   volatile LONG64 filled;                /* streamer: tag | path frames written to the ring so far */
+  volatile LONG speed;                   /* audio: the voice's sample frames per second (its pitch), for deadlines */
   LONG gen;                              /* audio only: the last generation given out in this slot */
 } SfSlot;
 
@@ -36,6 +37,7 @@ typedef struct SfMsg {
   uint32_t end, ls, le;                  /* the voice's end and loop */
   int64_t p0;                            /* the first path frame the voice reads */
   int loopy;                             /* the voice loops (sample mode 1 or 3, with a loop) */
+  LONG speed;                            /* sample frames per second, estimated at the start */
 } SfMsg;
 
 /* The sample frame at path frame p. A voice's path is its frames in the order it plays them: straight to the loop
@@ -59,5 +61,18 @@ void sfs_sync(SfStream *st);             /* offline and main thread: returns aft
                                             up (not just the half-empty ones) */
 int sfs_sync_for(SfStream *st, int timeout_ms);   /* the same, giving up after timeout_ms: 1 done, 0 timed out */
 void sfs_pause(SfStream *st, int on);    /* tests: the streamer reads nothing (forces underruns) */
+
+/* The streamer's features, all on by default; tests and tests\measure.py turn some off to measure each one
+   (smp_sfs_test_features). */
+enum {
+  SFS_F_DEADLINE = 1,                    /* records served in deadline order, urgent ones first with short reads */
+  SFS_F_BIGREAD = 2,                     /* reads up to half a ring (else at most 16 KB, as stage 3 first did) */
+  SFS_F_PAIR = 4,                        /* a stereo pair's two halves read with one read */
+  SFS_F_ASYNC = 8,                       /* several records' reads in flight at once (else one record's at a time) */
+  SFS_F_SORT = 16,                       /* urgent first reads of one file in byte order */
+  SFS_F_WARM = 32,                       /* the loader reads 0.4 s past each head into the file cache */
+  SFS_F_ALL = 63
+};
+int sfs_features(void);
 
 #endif

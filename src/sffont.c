@@ -9,11 +9,15 @@
    Use counts. A synth calls smp_sf_use(f, preset, +1 or -1) from any thread, the audio thread included. That is an
    Interlocked add on users[preset] and a SetEvent on the loader, nothing more.
 
-   The loader. One thread for the whole process, at below-normal priority. It starts with the first font and
-   stops when the last one closes, so a process with no font open has no thread left to hang on unload. Each pass
-   it walks every font: it loads each sample a preset in use needs, publishes it with InterlockedExchangePointer,
-   and retires samples no preset in use has needed for the grace time (2 s). It never holds g_lock while it reads
-   a file.
+   The loader. One thread for the whole process, at below-normal priority, with a decode worker beside it. Both
+   start with the first font and stop when the last one closes, so a process with no font open has no thread left
+   to hang on unload. Each pass the loader walks every font: it loads each sample a preset in use needs (the
+   samples pending voices asked for first, smp_sf_hint), publishes it with InterlockedExchangePointer, and retires
+   samples no preset in use has needed for the grace time (2 s). It only does cheap work: heads read from a PCM
+   file, or from a decoded copy in the cache. A sample that must be decoded first (SF3, a compressed member file, a
+   GigaStudio wave) and an SF2Pack's unpacking go to the worker's queue; the worker decodes into the cache and
+   leaves the loaded sample for the loader to publish, so one font's long decode never holds up another font's
+   heads. Neither holds g_lock while it reads a file.
 
    Heads and streaming. A loaded sample keeps only its head in memory: the first quarter second, or the whole
    sample when it is under 1 s. A voice starts from the head at once; the rest is read by the synth's streamer
@@ -23,8 +27,8 @@
    second open of the font decodes nothing). A stream handle is the loaded sample itself, so it is valid exactly
    as long as the sample is held.
 
-   SF2Pack. The whole sample data is one compressed stream. The first time a preset of the font is used, the loader
-   decodes it, in its own pass (so off the main thread; other fonts wait for that pass), into a 16-bit cache file,
+   SF2Pack. The whole sample data is one compressed stream. The first time a preset of the font is used, the decode
+   worker decodes it (off the main thread and off the loader) into a 16-bit cache file,
    and from then on every sample is plain PCM in that file at its SF2 offset. The font opens at once from its
    headers; until the pack is decoded its samples aren't loaded, and smp_sf_wait_idle waits for that pass like any
    other. The cache file stays open (pinned) while the font is, and the next open finds it and decodes nothing.
@@ -56,6 +60,7 @@
 #include <string.h>
 #include <windows.h>
 #include "sf2.h"
+#include "sfstream.h"
 #include "decode.h"
 
 #define DEFAULT_GRACE_MS 2000
@@ -64,12 +69,24 @@
 #define MAX_DECODED_FRAMES (1u << 26)      /* a decoded sample's limit (25 minutes at 44.1 kHz), against lying headers */
 #define MIN_HEAD 1024                      /* the shortest head, for samples with absurdly low rates */
 #define SF_BROKEN_DECODE 2                 /* a load's *broken: the decoder couldn't read the file at all */
+#define SF_NEEDS_DECODE 3                  /* a load's *broken on the loader: not in the cache, the worker decodes it */
+enum { SF_DQ_NONE, SF_DQ_QUEUED, SF_DQ_DONE };
+#define WARM_DIV 5                         /* heads load with 2/WARM_DIV s (0.4 s) after them read into the file cache */
+#define TRIM_EVERY (256ull << 20)          /* a long pass trims the cache after this many decoded bytes written */
+#define STALL_MS 60000                     /* an offline render stops waiting for a font whose loader shows no progress
+                                              this long (FFmpeg's own stall timer is as long) */
 
 static SRWLOCK g_lock = SRWLOCK_INIT;      /* guards the list, g_busy and g_thread */
 static CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;   /* signalled when the loader lets go of a font */
 static SmpFont **g_fonts; static int g_nfonts, g_capfonts;
 static SmpFont *g_busy;                    /* the font the loader is working on, outside the lock */
 static HANDLE g_thread;
+static HANDLE g_dthread;                   /* the decode worker (started and stopped with the loader) */
+static SmpFont *g_dbusy;                   /* the font the worker is decoding for, outside the lock */
+typedef struct { SmpFont *f; int s; } Job;
+static Job *g_jobs; static int g_njobs, g_capjobs;   /* the worker's queue (under g_lock) */
+static CONDITION_VARIABLE g_jcv = CONDITION_VARIABLE_INIT;   /* signalled when a job comes, or to stop */
+static __declspec(thread) int t_decoder;   /* this thread is the decode worker */
 static HANDLE g_wake;                      /* auto-reset; made once and never closed, so SetEvent is always safe */
 static volatile LONG g_stop;
 static volatile LONG g_grace = DEFAULT_GRACE_MS;
@@ -172,16 +189,42 @@ static void pcm_convert(const uint8_t *b, int enc, int ch, int c, uint32_t n, fl
   }
 }
 
+int sf_pcm_bytes(int enc) { return pcm_bytes(enc); }
+void sf_pcm_convert(const uint8_t *b, int enc, int ch, int c, uint32_t n, float *of, int16_t *oi) { pcm_convert(b, enc, ch, c, n, of, oi); }
+
 /* The handle for path_id in this pass (loader thread only). Each pass opens the file by name, as stage 2 did, so a
    file that has gone away stops new samples loading (the ones loaded keep playing). The first time, a duplicate of
    then, a second handle opened by name becomes the font's streaming handle, kept until the font closes, so streams
    read the very file the headers came from even if it is renamed meanwhile. It is overlapped, so the streamers of
    every player on the font read it in parallel (smp_pread). NULL when the file can't be opened now. */
+#define DH_MAX 8
+static __declspec(thread) struct { SmpFont *f; int id; HANDLE h; } t_dh[DH_MAX];   /* the worker's own handles */
+static __declspec(thread) int t_ndh;
+static void decoder_handles_close(void) {
+  while (t_ndh > 0) { t_ndh--; CloseHandle(t_dh[t_ndh].h); }
+}
+
 static HANDLE font_handle(SmpFont *f, int path_id) {
   HANDLE h;
   wchar_t w[2048];
   const wchar_t *name = f->wpath;
+  int k;
   if (path_id < 0 || path_id >= f->npaths) return NULL;
+  if (t_decoder) {
+    /* the decode worker: handles of its own for this job (the per-pass ones and the streaming ones are the
+       loader's), closed when the job ends */
+    for (k = 0; k < t_ndh; k++) if (t_dh[k].f == f && t_dh[k].id == path_id) return t_dh[k].h;
+    if (path_id > 0) {
+      if (!MultiByteToWideChar(CP_UTF8, 0, f->paths[path_id], -1, w, 2048)) return NULL;
+      name = w;
+    }
+    if (t_ndh == DH_MAX) decoder_handles_close();
+    h = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    t_dh[t_ndh].f = f; t_dh[t_ndh].id = path_id; t_dh[t_ndh].h = h; t_ndh++;
+    return h;
+  }
   if (f->ph[path_id]) return f->ph[path_id];
   if (path_id > 0) {
     if (!MultiByteToWideChar(CP_UTF8, 0, f->paths[path_id], -1, w, 2048)) return NULL;
@@ -208,10 +251,21 @@ static int pack_cancel(void *arg);
 /* A DECODED sample: its head from its cache file when there is one; else decoded now (once) and written there.
    When the cache can't be written, the whole decoded sample is held in memory instead. NULL with *broken set when
    the data can never decode; NULL without it when memory ran out or the file can't be opened for now. */
+/* a DECODED sample streams from its cache file through the file's handle, like a PCM file: mono, float or int16 */
+static void stream_entry(SfPcm *p, SmpEntry *e, uint32_t skip) {
+  p->entry = e; p->skip = skip;
+  p->h = smp_entry_handle(e);
+  p->offset = smp_entry_data_offset(e, skip);
+  p->enc = smp_entry_bps(e) == 2 ? SMP_PCM_S16LE : SMP_PCM_F32LE;
+  p->channels = 1; p->channel = 0;
+}
+
 static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *broken) {
   SmpEntry *e = smp_cache_open_mono(c->key);
   SfPcm *p;
   uint32_t n, hf, skip = c->skip;
+  int i16;
+  if (!e && !t_decoder) { *broken = SF_NEEDS_DECODE; return NULL; }   /* the loader never decodes: the worker does */
   if (!e) {
     float *x; int ch = 0, r = 0; long frames = 0; char err[256];
     const float *mono;
@@ -231,10 +285,13 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
         memcpy(bytes, "RIFF", 4);
         memcpy(bytes + 8, "WAVE", 4);
       }
-      x = decode_memory(bytes, (size_t)c->length, &ch, &frames, &r, err, sizeof err);
+      x = decode_memory_ex(bytes, (size_t)c->length, &ch, &frames, &r, pack_cancel, f, err, sizeof err);
       free(bytes);
+      if (!x && (f->closing || g_stop)) return NULL;                 /* cancelled: not broken */
     } else {
-      x = decode_audio(f->paths[c->path_id], &ch, &frames, &r, err, sizeof err);
+      /* a member file (SFZ, Decent Sampler, DLS): Windows or FFmpeg may take a minute, so it stops for a close */
+      x = decode_audio_ex(f->paths[c->path_id], &ch, &frames, &r, NULL, pack_cancel, f, err, sizeof err);
+      if (!x && (f->closing || g_stop)) return NULL;                 /* cancelled: not broken */
     }
     if (!x) { *broken = SF_BROKEN_DECODE; return NULL; }
     InterlockedIncrement(&g_decodes);
@@ -249,7 +306,10 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
     }
     mono = x + (size_t)(c->channel < ch ? c->channel : 0) * (size_t)n;   /* channel after channel */
     /* every decoded sample goes to the cache, short ones too, so the next open decodes nothing */
-    if (smp_cache_write_mono(c->key, mono, n, r > 0 ? r : (int)rate) == 0) e = smp_cache_open_mono(c->key);
+    if (smp_cache_write_mono(c->key, mono, n, r > 0 ? r : (int)rate) == 0) {
+      e = smp_cache_open_mono(c->key);
+      InterlockedExchangeAdd64(&f->wrote_bytes, (LONG64)n * 4);    /* the cache is trimmed after the writes */
+    }
     /* A whole sample file (SFZ, Decent Sampler) or a GigaStudio wave in stereo: the loader made its other channel
        the sample next to this one, so that one's cache file is written now too, from the same decode, rather than
        decoding the file a second time when it loads. */
@@ -265,6 +325,7 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
             (o->channel >= ch && !(c->guessed && ch == 1)) || o->gen) continue;
         if ((oe = smp_cache_open_mono(o->key)) != NULL) { smp_cache_close(oe); continue; }
         smp_cache_write_mono(o->key, x + (size_t)(o->channel < ch ? o->channel : 0) * (size_t)n, n, r > 0 ? r : (int)rate);
+        InterlockedExchangeAdd64(&f->wrote_bytes, (LONG64)n * 4);
       }
     }
     if (skip >= n) {                                                /* an offset past the decoded end */
@@ -282,12 +343,16 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
       return NULL;
     }
     hf = e ? head_of(n - skip, rate) : n - skip;                    /* no cache: held whole */
-    p = new_pcm(n - skip, hf, 1);
+    i16 = e && smp_entry_bps(e) == 2;                               /* a 16-bit source: its head is int16 too */
+    p = new_pcm(n - skip, hf, !i16);
     if (!p) { free(x); if (e) smp_cache_close(e); return NULL; }
     p->rate = r > 0 ? (uint32_t)r : rate;
-    memcpy(p->data, mono + skip, (size_t)hf * sizeof(float));
+    if (i16) {
+      uint32_t i;
+      for (i = 0; i < hf; i++) ((int16_t *)p->data)[i] = (int16_t)(int)(mono[skip + i] * 32768.0f);
+    } else memcpy(p->data, mono + skip, (size_t)hf * sizeof(float));
     free(x);
-    if (hf < n - skip) { p->entry = e; p->skip = skip; }
+    if (hf < n - skip) stream_entry(p, e, skip);
     else if (e) smp_cache_close(e);
     return p;
   }
@@ -300,11 +365,11 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
   }
   n = (uint32_t)smp_entry_frames(e) - skip;
   hf = head_of(n, rate);
-  p = new_pcm(n, hf, 1);
+  p = new_pcm(n, hf, smp_entry_bps(e) == 4);                        /* in the file's own format */
   if (!p) { smp_cache_close(e); return NULL; }
-  if (smp_entry_read_mono(e, skip, (float *)p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
+  if (smp_entry_read_raw(e, skip, p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
   p->rate = smp_entry_rate(e) > 0 ? (uint32_t)smp_entry_rate(e) : rate;
-  if (hf < n) { p->entry = e; p->skip = skip; }
+  if (hf < n) stream_entry(p, e, skip);
   else smp_cache_close(e);
   return p;
 }
@@ -341,7 +406,7 @@ static int load_tail(SmpFont *f, const SmpSrc *c, SfPcm *p, uint32_t rate) {
   n = t1 - t0;
   if (!(b = calloc((size_t)n + 2 * SF_PCM_PAD, w))) return 0;
   if (p->entry) {
-    ok = smp_entry_read_mono(p->entry, (uint64_t)t0 + p->skip, (float *)(b + SF_PCM_PAD * w), (long)n) == (long)n;
+    ok = smp_entry_read_raw(p->entry, (uint64_t)t0 + p->skip, b + SF_PCM_PAD * w, (long)n) == (long)n;   /* its own format */
   } else if (p->h != INVALID_HANDLE_VALUE) {
     HANDLE h = font_handle(f, c->path_id);
     int bps = pcm_bytes(c->enc);
@@ -362,6 +427,25 @@ static int load_tail(SmpFont *f, const SmpSrc *c, SfPcm *p, uint32_t rate) {
   p->tail_start = t0; p->tail_frames = n;
   p->bytes += ((size_t)n + 2 * SF_PCM_PAD) * w;
   return 1;
+}
+
+/* The 0.4 s after a streaming sample's head, read and thrown away: Windows keeps it in the file cache, so the
+   streamer's first reads for a note come from memory even when the disk is cold (a chord's notes would otherwise
+   all wait for the disk at once, just as their heads run out). The pages are the file cache's, not this process's. */
+static void warm(SmpFont *f, const SmpSrc *c, const SfPcm *p, uint32_t rate) {
+  uint32_t wf = rate * 2 / WARM_DIV, left = p->frames - p->head_frames;
+  int fb = pcm_bytes(p->enc) * p->channels;
+  uint64_t off, nb;
+  uint8_t *b;
+  if (wf > left) wf = left;
+  if (!wf || p->h == INVALID_HANDLE_VALUE) return;
+  nb = (uint64_t)wf * (uint64_t)fb;
+  if (nb > (4u << 20)) nb = 4u << 20;
+  off = p->offset + (uint64_t)p->head_frames * (uint64_t)fb;
+  if (!(b = malloc((size_t)nb))) return;
+  if (p->entry) { DWORD got; smp_pread(p->h, off, b, (DWORD)nb, &got); }
+  else { HANDLE h = font_handle(f, c->path_id); if (h) read_at(h, off, b, nb); }
+  free(b);
 }
 
 /* loads sample s's head (all of it under 1 s); NULL with *broken set when the sample can never load (empty,
@@ -418,6 +502,7 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   if (ls > le) ls = le;
   p->loop_start = (uint32_t)ls; p->loop_end = (uint32_t)le;
   if (!load_tail(f, c, p, rate)) { free_pcm(p); return NULL; }   /* out of memory: tried again later */
+  if ((sfs_features() & SFS_F_WARM) && p->head_frames < p->frames) warm(f, c, p, rate);
   return p;
 }
 
@@ -448,6 +533,7 @@ static const char *font_name(const SmpFont *f) {
 /* pack_prepare's and the GigaStudio decode's cancel hook: the font is closing, or the loader is stopping */
 static int pack_cancel(void *arg) {
   SmpFont *f = arg;
+  InterlockedIncrement(&f->progress);       /* asked once a piece: the decode is going on (offline renders wait) */
   return f->closing || g_stop;
 }
 
@@ -538,6 +624,7 @@ static void pack_prepare(SmpFont *f) {
     /* writing a few hundred MB to a slow disk takes longer than decoding it: that is cancellable too */
     k = smp_cache_write_i16(f->pack_key, o, (uint64_t)frames, r > 0 ? r : 44100, pack_cancel, f);
     if (k == 4) { free(x); return; }                             /* closing: left NONE, nothing written */
+    if (k == 0) InterlockedExchangeAdd64(&f->wrote_bytes, (LONG64)frames * 2);
     if (k != 0 || !(e = smp_cache_open_i16(f->pack_key))) {
       free(x);
       set_problem(f, "the cache folder can't hold %s's unpacked samples%s", font_name(f), "");
@@ -551,11 +638,83 @@ static void pack_prepare(SmpFont *f) {
   f->pack_state = SF_PACK_READY;
 }
 
+/* The decode cache keeps to its limit in the Settings: trimmed after the loader's writes (every TRIM_EVERY bytes in
+   a long pass, and at the pass's end). Files held open (samples that stream from them) are never deleted. */
+static void trim_after_writes(SmpFont *f, int force) {
+  SmpSettings st;
+  LONG64 w = InterlockedExchange64(&f->wrote_bytes, 0);   /* written by the worker, trimmed by either thread */
+  if (!w || (!force && (uint64_t)w < TRIM_EVERY)) { if (w) InterlockedExchangeAdd64(&f->wrote_bytes, w); return; }
+  smp_settings_get(&st);
+  smp_cache_trim((uint64_t)(st.cache_limit_gb * 1024.0 * 1024.0 * 1024.0));
+}
+
 static void publish(SmpFont *f, int s, SfPcm *p) {
   InterlockedExchangePointer((PVOID volatile *)&f->pcm[s], p);
 }
 
-/* ---- the loader thread ---- */
+/* ---- the loader thread and the decode worker ---- */
+
+/* a load's outcome, on the loader thread: published, broken (never tried again) or left for a retry */
+static void take(SmpFont *f, int s, SfPcm *pc, int broken, int *retry) {
+  if (pc) {
+    f->held[s] = pc;
+    InterlockedIncrement(&f->nloaded);
+    InterlockedExchangeAdd64(&f->loaded_bytes, (LONG64)pc->bytes);
+    publish(f, s, pc);
+    f->state[s] = SF_ST_PUBLISHED;
+  } else if (broken) {
+    f->state[s] = SF_ST_BROKEN;                /* never tried again */
+    /* an SFZ's sample files are only probed at open; one that turns out not to decode is said here */
+    if ((f->is_sfz || f->is_gig) && broken == SF_BROKEN_DECODE)
+      set_problem(f, "%s can't be decoded (it may be damaged or in a format this can't read)%s", f->shdr[s].name, "");
+  } else {
+    *retry = 1;                                /* no file or no memory: tried again in RETRY_MS */
+  }
+  trim_after_writes(f, 0);
+}
+
+/* a job for the decode worker: sample s's decode, or (s = -1) the font's SF2Pack. Loader thread. */
+static void queue_decode(SmpFont *f, int s) {
+  if (s < 0 ? f->pack_q : f->dq[s]) return;
+  AcquireSRWLockExclusive(&g_lock);
+  if (g_njobs == g_capjobs) {
+    int nc = g_capjobs ? g_capjobs * 2 : 64;
+    Job *nj = realloc(g_jobs, (size_t)nc * sizeof *nj);
+    if (!nj) { ReleaseSRWLockExclusive(&g_lock); return; }   /* tried again on a later pass */
+    g_jobs = nj; g_capjobs = nc;
+  }
+  g_jobs[g_njobs].f = f; g_jobs[g_njobs].s = s; g_njobs++;
+  if (s < 0) InterlockedExchange(&f->pack_q, 1);
+  else InterlockedExchange8((volatile char *)&f->dq[s], SF_DQ_QUEUED);
+  ReleaseSRWLockExclusive(&g_lock);
+  WakeConditionVariable(&g_jcv);
+}
+
+
+/* Sample s, needed and not loaded: loaded now (its head from a PCM file, or from its decoded copy in the cache),
+   published, or marked broken (or left for a retry). A DECODED sample with no copy in the cache yet goes to the
+   decode worker instead: the loader never decodes, so one font's long decode never holds up another's heads. */
+static void load_one(SmpFont *f, int s, int *retry, int *cant_open, int *waiting) {
+  SfPcm *pc; int broken;
+  if (f->dq[s]) { *waiting = 1; return; }       /* the worker has it */
+  if (!font_handle(f, f->src[s].path_id)) { *cant_open = *retry = 1; return; }   /* tried again in RETRY_MS */
+  pc = load_sample(f, s, &broken);
+  InterlockedIncrement(&f->progress);
+  if (!pc && broken == SF_NEEDS_DECODE) { queue_decode(f, s); *waiting = 1; return; }
+  take(f, s, pc, broken, retry);
+}
+
+/* the samples pending voices asked for first (smp_sf_hint): loaded before the walk */
+static void serve_hints(SmpFont *f, int *retry, int *cant_open, int *waiting) {
+  int k;
+  for (k = 0; k < SF_HINTS; k++) {
+    LONG h = InterlockedExchange(&f->hint[k], 0), s = h - 1;
+    if (h <= 0 || s >= f->nshdr || f->closing || g_stop) continue;
+    if (!f->need[s] || f->state[s] != SF_ST_NONE || *cant_open) continue;
+    if (f->is_pack && f->pack_state != SF_PACK_READY) continue;
+    load_one(f, s, retry, cant_open, waiting);
+  }
+}
 
 /* one pass over font f; returns how long until it wants another pass (INFINITE when only a use() can change
    anything) */
@@ -564,7 +723,7 @@ static DWORD pass(SmpFont *f) {
   ULONGLONG now = GetTickCount64();
   ULONGLONG grace = (ULONGLONG)(DWORD)g_grace;
   DWORD next = INFINITE;
-  int s, p, k, aborted = 0, retry = 0, cant_open = 0;
+  int s, p, k, aborted = 0, retry = 0, cant_open = 0, waiting = 0;
 
   memset(f->need, 0, (size_t)f->nshdr);
   for (p = 0; p < f->nphdr; p++) {
@@ -573,10 +732,19 @@ static DWORD pass(SmpFont *f) {
     n = smp_sf_regions(f, p, &r);
     for (k = 0; k < n; k++) if (r[k].sample >= 0 && r[k].sample < f->nshdr) f->need[r[k].sample] = 1;
   }
+  /* what the decode worker finished: published like any load */
+  for (s = 0; s < f->nshdr; s++) if (f->dq[s] == SF_DQ_DONE) {
+    SfPcm *pc = f->dres[s]; int broken = f->dbroken[s];
+    f->dres[s] = NULL; f->dbroken[s] = 0;
+    InterlockedExchange8((volatile char *)&f->dq[s], SF_DQ_NONE);
+    if (f->state[s] == SF_ST_NONE) take(f, s, pc, broken, &retry);
+    else free_pcm(pc);
+  }
   if (f->is_pack && f->pack_state == SF_PACK_NONE && !f->closing && !g_stop) {   /* the pack first, once needed */
     for (s = 0; s < f->nshdr && !f->need[s]; s++) {}
-    if (s < f->nshdr) pack_prepare(f);
+    if (s < f->nshdr) queue_decode(f, -1);                      /* the worker unpacks it */
   }
+  serve_hints(f, &retry, &cant_open, &waiting);
 
   for (s = 0; s < f->nshdr; s++) {
     if (f->closing || g_stop) { aborted = 1; break; }
@@ -587,27 +755,13 @@ static DWORD pass(SmpFont *f) {
         f->state[s] = SF_ST_PUBLISHED;
       } else if (f->state[s] == SF_ST_NONE && f->is_pack && f->pack_state != SF_PACK_READY) {
         if (f->pack_state == SF_PACK_BROKEN) f->state[s] = SF_ST_BROKEN;   /* the pack never decodes */
+        else if (f->pack_q) waiting = 1;                                    /* the worker is unpacking it */
         else retry = 1;                                                     /* tried again in RETRY_MS */
       } else if (f->state[s] == SF_ST_NONE && cant_open) {
         retry = 1;
       } else if (f->state[s] == SF_ST_NONE) {
-        SfPcm *pc; int broken;
-        if (!font_handle(f, f->src[s].path_id)) { cant_open = retry = 1; continue; }   /* tried again in RETRY_MS */
-        pc = load_sample(f, s, &broken);
-        if (pc) {
-          f->held[s] = pc;
-          InterlockedIncrement(&f->nloaded);
-          InterlockedExchangeAdd64(&f->loaded_bytes, (LONG64)pc->bytes);
-          publish(f, s, pc);
-          f->state[s] = SF_ST_PUBLISHED;
-        } else if (broken) {
-          f->state[s] = SF_ST_BROKEN;                /* never tried again */
-          /* an SFZ's sample files are only probed at open; one that turns out not to decode is said here */
-          if ((f->is_sfz || f->is_gig) && broken == SF_BROKEN_DECODE)
-            set_problem(f, "%s can't be decoded (it may be damaged or in a format this can't read)%s", f->shdr[s].name, "");
-        } else {
-          retry = 1;                                 /* no file or no memory: tried again in RETRY_MS */
-        }
+        load_one(f, s, &retry, &cant_open, &waiting);
+        serve_hints(f, &retry, &cant_open, &waiting);   /* a pending voice's sample doesn't wait out the walk */
       }
       continue;
     }
@@ -637,13 +791,16 @@ static DWORD pass(SmpFont *f) {
     }
   }
   for (s = 0; s < f->npaths; s++) if (f->ph[s]) { CloseHandle(f->ph[s]); f->ph[s] = NULL; }
+  trim_after_writes(f, 1);
+  InterlockedIncrement(&f->progress);
   /* A pass that left a needed sample unloaded for now (the file can't be opened, or memory ran out) isn't done: it
      runs again in RETRY_MS, and the status still counts the presets as loading. But it is as done as it can be
      for now, so wait_idle stops waiting (an offline render goes on, silent where samples are missing, rather than
-     waiting 10 s a block); a later use() makes waiters wait for the next pass again. */
+     waiting a block); a later use() makes waiters wait for the next pass again. While the decode worker still has
+     samples of the font, the pass isn't done either (the worker wakes the loader when it finishes one). */
   if (retry && RETRY_MS < next) next = RETRY_MS;
-  if (!aborted && !retry) InterlockedExchange(&f->done_gen, gen);
-  if (!aborted && retry) InterlockedExchange(&f->stuck_gen, gen);
+  if (!aborted && !retry && !waiting) InterlockedExchange(&f->done_gen, gen);
+  if (!aborted && retry && !waiting) InterlockedExchange(&f->stuck_gen, gen);
   return next ? next : 1;
 }
 
@@ -677,6 +834,46 @@ static DWORD WINAPI loader(void *arg) {
   return 0;
 }
 
+/* The decode worker: one thread beside the loader, started and stopped with it, at the same below-normal
+   priority. It takes jobs in order (a sample's decode into the cache, or an SF2Pack's unpacking), runs the same
+   load_sample the loader would, with handles of its own, and leaves the result for the loader to publish. A
+   closing font's jobs are dropped, and its running decode stops at its next piece (f->closing). */
+static DWORD WINAPI decoder(void *arg) {
+  (void)arg;
+  t_decoder = 1;
+  for (;;) {
+    SmpFont *f = NULL; int s = 0;
+    AcquireSRWLockExclusive(&g_lock);
+    while (!g_stop && !g_njobs) SleepConditionVariableSRW(&g_jcv, &g_lock, INFINITE, 0);
+    if (g_stop) { ReleaseSRWLockExclusive(&g_lock); break; }
+    f = g_jobs[0].f; s = g_jobs[0].s;
+    memmove(g_jobs, g_jobs + 1, (size_t)(--g_njobs) * sizeof *g_jobs);
+    g_dbusy = f;
+    ReleaseSRWLockExclusive(&g_lock);
+    if (!f->closing && !g_stop) {
+      if (s < 0) {
+        pack_prepare(f);
+        InterlockedExchange(&f->pack_q, 0);
+      } else {
+        int broken = 0;
+        SfPcm *pc = load_sample(f, s, &broken);
+        InterlockedIncrement(&f->progress);
+        f->dres[s] = pc; f->dbroken[s] = (uint8_t)broken;
+        InterlockedExchange8((volatile char *)&f->dq[s], SF_DQ_DONE);   /* after the result: the loader takes it */
+      }
+    }
+    decoder_handles_close();
+    if (!f->closing) trim_after_writes(f, 1);       /* the cache keeps to its limit as the worker writes */
+    AcquireSRWLockExclusive(&g_lock);
+    g_dbusy = NULL;
+    ReleaseSRWLockExclusive(&g_lock);
+    WakeAllConditionVariable(&g_cv);
+    if (g_wake) SetEvent(g_wake);                   /* the loader publishes what came */
+  }
+  smp_pread_thread_done();
+  return 0;
+}
+
 /* ---- the registry ---- */
 
 static void free_font(SmpFont *f) {
@@ -687,6 +884,8 @@ static void free_font(SmpFont *f) {
     if (f->voices[s] > 0) { OutputDebugStringA("samplosis: a SoundFont was closed while a voice held a sample\n"); break; }
 #endif
   if (f->held) for (s = 0; s < f->nshdr; s++) free_pcm(f->held[s]);
+  if (f->dres) for (s = 0; s < f->nshdr; s++) free_pcm(f->dres[s]);   /* decoded, not yet taken by the loader */
+  free((void *)f->dq); free(f->dres); free(f->dbroken);
   if (f->fh) for (s = 0; s < f->npaths; s++) if (f->fh[s]) CloseHandle(f->fh[s]);
   if (f->pack_entry) smp_cache_close(f->pack_entry);
   free((void *)f->users); free((void *)f->voices); free((void *)f->pcm); free(f->fh); free(f->ph);
@@ -697,10 +896,14 @@ static void free_font(SmpFont *f) {
 
 /* the cache keys of the font's DECODED samples: the file's full path, size and modified time, the byte range and
    the channel, so a changed file never finds a stale copy */
-static void source_keys(SmpFont *f) {
+void sf_source_keys(SmpFont *f) {
   char path[2048 * 3], d[2048 * 3 + 160];
+  wchar_t *full = f->wpath ? NULL : sf_full_path(f->path);
+  const wchar_t *wp = f->wpath ? f->wpath : full;
   int s;
-  if (!WideCharToMultiByte(CP_UTF8, 0, f->wpath, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path);
+  f->keys_done = 1;
+  if (!wp || !WideCharToMultiByte(CP_UTF8, 0, wp, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path ? f->path : "");
+  free(full);
   if (f->is_pack) {
     /* the decoded pack: keyed by the file (sfpack1: the version of this layout); pack_prepare names its file */
     snprintf(d, sizeof d, "sfpack1|%s|%llu|%llu", path, (unsigned long long)f->size, (unsigned long long)f->mtime);
@@ -738,9 +941,13 @@ static int setup(SmpFont *f) {
   f->idle_since = calloc(ns, sizeof(ULONGLONG));
   f->fh = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
   f->ph = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
+  f->dq = calloc(ns, 1);
+  f->dres = calloc(ns, sizeof(SfPcm *));
+  f->dbroken = calloc(ns, 1);
   f->stuck_gen = -1;
-  if (!(f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since && f->fh && f->ph)) return 0;
-  source_keys(f);
+  if (!(f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since && f->fh && f->ph &&
+        f->dq && f->dres && f->dbroken)) return 0;
+  if (!f->keys_done) sf_source_keys(f);         /* normally done by the parse (on its thread) */
   return 1;
 }
 
@@ -827,7 +1034,11 @@ SmpFont *sf_register(SmpFont *f, wchar_t *full, char *err, int cap) {
     g_thread = CreateThread(NULL, 0, loader, NULL, 0, NULL);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_BELOW_NORMAL);
   }
-  if (!g_thread) {
+  if (g_thread && !g_dthread) {
+    g_dthread = CreateThread(NULL, 0, decoder, NULL, 0, NULL);
+    if (g_dthread) SetThreadPriority(g_dthread, THREAD_PRIORITY_BELOW_NORMAL);
+  }
+  if (!g_thread || !g_dthread) {
     ReleaseSRWLockExclusive(&g_lock);
     free_font(f);
     if (err && cap > 0) snprintf(err, cap, "can't start loading %s", path);
@@ -843,7 +1054,7 @@ no_memory:
 }
 
 void smp_sf_close(SmpFont *f) {
-  HANDLE t = NULL;
+  HANDLE t = NULL, dt = NULL;
   int i;
   if (!f) return;
   AcquireSRWLockExclusive(&g_lock);
@@ -854,16 +1065,32 @@ void smp_sf_close(SmpFont *f) {
     break;
   }
   InterlockedExchange(&f->closing, 1);              /* a pass on f stops at its next sample */
-  while (g_busy == f) SleepConditionVariableSRW(&g_cv, &g_lock, INFINITE, 0);
-  if (g_nfonts == 0 && g_thread) {                  /* the last font: the loader stops */
+  for (i = 0; i < g_njobs;) {                       /* the worker's jobs for f are dropped */
+    if (g_jobs[i].f == f) { memmove(g_jobs + i, g_jobs + i + 1, (size_t)(g_njobs - i - 1) * sizeof *g_jobs); g_njobs--; }
+    else i++;
+  }
+  /* A read the loader or the worker is stuck in for f (a dead network share, a disk that doesn't answer) is
+     cancelled, so the close doesn't wait on it; decodes stop on f->closing themselves. */
+  while (g_busy == f || g_dbusy == f) {
+    if (g_busy == f && g_thread) CancelSynchronousIo(g_thread);
+    if (g_dbusy == f && g_dthread) CancelSynchronousIo(g_dthread);
+    SleepConditionVariableSRW(&g_cv, &g_lock, 50, 0);
+  }
+  if (g_nfonts == 0 && g_thread) {                  /* the last font: the loader and the worker stop */
     t = g_thread; g_thread = NULL;
+    dt = g_dthread; g_dthread = NULL;
     InterlockedExchange(&g_stop, 1);
   }
   ReleaseSRWLockExclusive(&g_lock);
   if (g_wake) SetEvent(g_wake);                     /* wakes it to stop, or to walk the shifted list again */
   if (t) {
-    WaitForSingleObject(t, INFINITE);
+    WakeAllConditionVariable(&g_jcv);
+    while (WaitForSingleObject(t, 50) == WAIT_TIMEOUT) CancelSynchronousIo(t);   /* never stuck in a read either */
     CloseHandle(t);
+    if (dt) {
+      while (WaitForSingleObject(dt, 50) == WAIT_TIMEOUT) { WakeAllConditionVariable(&g_jcv); CancelSynchronousIo(dt); }
+      CloseHandle(dt);
+    }
     InterlockedExchange(&g_stop, 0);
   }
   /* the loader is done with f and it is out of the list; the caller guarantees no synth holds its samples */
@@ -911,10 +1138,7 @@ long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n) 
   if (n <= 0) return 0;
   if (p && frame < p->frames) {
     long want = (uint64_t)n < p->frames - frame ? n : (long)(p->frames - frame);
-    if (p->entry) {
-      got = smp_entry_read_mono(p->entry, frame + p->skip, out, want);
-      if (got < 0) got = 0;
-    } else if (p->h != INVALID_HANDLE_VALUE) {
+    if (p->h != INVALID_HANDLE_VALUE) {             /* a PCM file, or a DECODED sample's cache file */
       /* through a small buffer on the stack, a piece at a time: no allocation, and a failed read stops here */
       uint8_t buf[16384];
       int fb = pcm_bytes(p->enc) * p->channels;
@@ -932,6 +1156,37 @@ long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n) 
   }
   if (got < n) memset(out + got, 0, (size_t)(n - got) * sizeof(float));
   return got;
+}
+
+/* a pending voice's sample, loaded before the loader's walk gets to it (any thread, the audio thread too: an
+   Interlocked store and a SetEvent) */
+void smp_sf_hint(SmpFont *f, int sample) {
+  LONG w;
+  if (!f || sample < 0 || sample >= f->nshdr || f->pcm[sample]) return;
+  w = InterlockedIncrement(&f->hint_w);
+  InterlockedExchange(&f->hint[(w - 1) & (SF_HINTS - 1)], sample + 1);
+  SetEvent(g_wake);
+}
+
+/* An offline render's wait: until sample (or, when it is -1, every sample the presets in use need) is loaded, or
+   broken, or can't load for now; with no fixed cap while the loader keeps making progress on this font (samples
+   loaded, decode pieces), and giving up after STALL_MS without any. 0 done, 1 gave up. */
+int smp_sf_wait_loaded(SmpFont *f, int sample) {
+  LONG seen;
+  ULONGLONG since = GetTickCount64();
+  if (!f) return 0;
+  if (sample >= f->nshdr) sample = -1;
+  seen = f->progress;
+  for (;;) {
+    LONG u = InterlockedCompareExchange(&f->use_gen, 0, 0), pr;
+    if (sample >= 0 && (f->pcm[sample] || ((volatile uint8_t *)f->state)[sample] == SF_ST_BROKEN)) return 0;
+    if (InterlockedCompareExchange(&f->done_gen, 0, 0) == u || InterlockedCompareExchange(&f->stuck_gen, 0, 0) == u)
+      return 0;
+    pr = f->progress;
+    if (pr != seen) { seen = pr; since = GetTickCount64(); }
+    else if (GetTickCount64() - since >= STALL_MS) return 1;
+    Sleep(1);
+  }
 }
 
 /* pending retires (unneeded samples waiting out the grace or a holder) don't count as busy, and neither do

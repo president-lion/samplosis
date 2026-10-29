@@ -608,27 +608,43 @@ def test_font_switch_while_playing(lib, S, font, tmp_path):
                 k += 1
                 time.sleep(0.002)
 
+        def blocks_later(n, limit=30):
+            # waits until the player has rendered n more blocks: counted, not timed, so a busy machine (the
+            # player and the below-normal loader get little CPU) can't leave the windows below without sound
+            k0, t0 = len(out), time.time()
+            while len(out) < k0 + n and time.time() - t0 < limit:
+                time.sleep(0.01)
+
         th = threading.Thread(target=player)
         th.start()
         try:
-            time.sleep(0.4)
-            assert lib.smp_sf_loaded_samples(fa) >= 1  # A's piano is in use
-            assert lib.smp_synth_load(s, str(b_path).encode(), err, 512) == 1, err.value
             t0 = time.time()
-            while lib.smp_synth_collect(s) and time.time() - t0 < 3:
+            while lib.smp_sf_loaded_samples(fa) < 1 and time.time() - t0 < 30:
+                time.sleep(0.01)
+            assert lib.smp_sf_loaded_samples(fa) >= 1  # A's piano is in use
+            blocks_later(60)                           # three of A's notes heard
+            assert lib.smp_synth_load(s, str(b_path).encode(), err, 512) == 1, err.value
+            # (the waits end as soon as the thing happens; they are long only for a busy machine, where the
+            # below-normal loader that retires A's samples gets little CPU)
+            t0 = time.time()
+            while lib.smp_synth_collect(s) and time.time() - t0 < 30:
                 time.sleep(0.01)
             assert lib.smp_synth_collect(s) == 0       # the old font was closed once the audio thread let go
             t0 = time.time()
-            while lib.smp_sf_loaded_samples(fa) and time.time() - t0 < 3:
+            while lib.smp_sf_loaded_samples(fa) and time.time() - t0 < 30:
                 time.sleep(0.01)
             assert lib.smp_sf_loaded_samples(fa) == 0  # and nothing of A is in use any more
-            time.sleep(0.4)
+            assert lib.smp_synth_wait_loaded(s, 30000) == 0   # B's piano loaded (the loader may be slow when busy)
+            blocks_later(60)                           # then three of B's notes heard
         finally:
             stop.set()
             th.join()
         x = np.concatenate(out)
         assert np.all(np.isfinite(x))
-        freqs = [peak_freq(x[i:i + 2560]) for i in range(0, len(x) - 2560, 2560) if rms(x[i:i + 2560]) > 0.01]
+        # only windows that sound all through: one whose sound is a single block (the switch silences the rest)
+        # has its peak at DC after the Hann window, which made this test fail now and then
+        freqs = [peak_freq(x[i:i + 2560]) for i in range(0, len(x) - 2560, 2560)
+                 if min(rms(x[j:j + 256]) for j in range(i, i + 2560, 256)) > 0.01]
         assert any(abs(f - 440) < 5 for f in freqs) and any(abs(f - 880) < 5 for f in freqs)
         assert abs(freqs[-1] - 880) < 5
         # freeing the synth with notes sounding lets go of everything it held
@@ -1123,3 +1139,22 @@ def test_stream_font_switch_lifetime(lib, tmp_path):
     finally:
         lib.smp_sf_close(fa)
         lib.smp_sf_test_grace(0)
+
+
+def test_offline_waits_past_ten_seconds(lib, S):
+    """An offline render waits for a note's sample with no fixed cap while the loader isn't stalled: here the loader
+    is held back 11 s (longer than the old 10 s cap) and the note still starts on its frame."""
+    s = S.new()
+    lib.smp_sf_test_pause(1)
+    released = threading.Timer(11.0, lambda: lib.smp_sf_test_pause(0))
+    released.start()
+    try:
+        t = time.perf_counter()
+        x = S.render(s, "midi 192 0 0\nmidi 144 69 100 4800", 0.5)
+        waited = time.perf_counter() - t
+    finally:
+        released.cancel()
+        lib.smp_sf_test_pause(0)
+    assert waited >= 10.5, waited
+    assert onset(x) is not None and abs(onset(x) - 4800) < 64, onset(x)
+    assert abs(peak_freq(x[6000:20000, 0]) - 440) < 5

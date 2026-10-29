@@ -649,7 +649,10 @@ float *decode_audio_full(const char *path, int *chans, long *frames, int *rate, 
   if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
   b = slurp(path, &len);
   if (!b) { snprintf(err, (size_t)cap, "can't open %s", path); return NULL; }
+  t_cancel = cancel; t_cancel_arg = arg;                    /* the built-in decoders stop on cancel too */
   x = chain(b, len, raw ? path : NULL, &ch, &sr, &n, &lib, err, cap);
+  t_cancel = NULL; t_cancel_arg = NULL;
+  if (!x && !strcmp(err, CANCELLED)) { free(b); return NULL; }
   if (!x && !raw && len && strcmp(err, TOO_LONG)) {         /* Windows, then FFmpeg, after everything of our own */
     double start = 0, dur = 0;
     int edit = smp_mp4_edit(b, len, &start, &dur), specific = strcmp(err, NOT_SOUND) != 0, wr = 0;
