@@ -48,6 +48,12 @@ static size_t dec_max_floats = (size_t)1 << 29;            /* tests may lower it
 #define DEC_MAX_FLOATS dec_max_floats
 #define TOO_LONG "it's too long to load (over 2 GB decoded)"
 #define NOT_SOUND "it isn't a sound file Samplosis can read"
+#define CANCELLED "cancelled"
+
+/* decode_memory_ex's cancel hook, for the calling thread only: asked by grow_need once per chunk, so every decoder
+   stops within a chunk of being asked, without each one taking a parameter */
+static __declspec(thread) int (*t_cancel)(void *);
+static __declspec(thread) void *t_cancel_arg;
 
 /* codecs/mac_shim.cpp: open (a handle, or NULL and a message), read up to 4096 interleaved float frames (how many,
    0 at the end, -1 on a decoder failure), close */
@@ -211,8 +217,9 @@ static float *raw_read(const unsigned char *b, size_t len, unsigned *ch, unsigne
 
 /* A growing interleaved buffer. Every decoder reads into one in chunks, because a header's length can't be trusted
    (a damaged or crafted file may claim billions of frames). */
-typedef struct { float *x; size_t n, cap; int too_long; } Grow;   /* n and cap count floats */
+typedef struct { float *x; size_t n, cap; int too_long, cancelled; } Grow;   /* n and cap count floats */
 static int grow_need(Grow *g, size_t more) {
+  if (t_cancel && t_cancel(t_cancel_arg)) { g->cancelled = 1; return 0; }
   if (more > DEC_MAX_FLOATS || g->n + more > DEC_MAX_FLOATS) { g->too_long = 1; return 0; }
   if (g->n + more > g->cap) {
     size_t c = g->cap ? g->cap : 65536;
@@ -235,7 +242,7 @@ static void grow_hint(Grow *g, unsigned long long claimed_floats, size_t len) {
 /* a failed grow: the buffer freed and the reason */
 static float *grow_fail(Grow *g, char *err, int cap) {
   free(g->x); g->x = NULL;
-  snprintf(err, (size_t)cap, "%s", g->too_long ? TOO_LONG : "out of memory");
+  snprintf(err, (size_t)cap, "%s", g->cancelled ? CANCELLED : g->too_long ? TOO_LONG : "out of memory");
   return NULL;
 }
 #define DEC_CHUNK 4096                                        /* frames per read for the decoders that take a count */
@@ -487,6 +494,10 @@ static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsig
     : d == D_APE ? ape_read(b, len, ch, sr, n, err, cap) : NULL;
   if (!x) return NULL;
   if (!(*n && *ch && *sr)) { free(x); return NULL; }
+  if (*ch == 1) {                                    /* mono is already channel after channel: no second copy, */
+    float *y = realloc(x, sizeof(float) * (size_t)*n);   /* only the Grow's spare room handed back */
+    return y ? y : x;
+  }
   out = planar(x, *n, *ch);
   free(x);
   if (!out) snprintf(err, (size_t)cap, "out of memory");
@@ -503,7 +514,8 @@ static float *chain(const unsigned char *b, size_t len, const char *raw_name, un
   char why[300] = "";
   *lib = 0;
   if (first != D_NONE && (x = run(first, b, len, ch, sr, n, why, sizeof why))) { *lib = D_IS_LIBRARY(first); return x; }
-  if (!strcmp(why, TOO_LONG)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }   /* it read, but too much */
+  /* it read, but too much; or it was cancelled: either way no other decoder is tried */
+  if (!strcmp(why, TOO_LONG) || !strcmp(why, CANCELLED)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
   if (raw_name) {
     if ((x = raw_read(b, len, ch, sr, n, why, sizeof why))) return x;
     snprintf(err, (size_t)cap, "%s", why);
@@ -515,7 +527,7 @@ static float *chain(const unsigned char *b, size_t len, const char *raw_name, un
     if (order[i] == first) continue;
     why[0] = 0;
     if ((x = run(order[i], b, len, ch, sr, n, why, sizeof why))) return x;
-    if (!strcmp(why, TOO_LONG)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
+    if (!strcmp(why, TOO_LONG) || !strcmp(why, CANCELLED)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
   }
   snprintf(err, (size_t)cap, NOT_SOUND);
   return NULL;
@@ -533,12 +545,20 @@ static float *finish(float *x, unsigned ch, unsigned sr, unsigned long long n, i
   return x;
 }
 
-float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap) {
+float *decode_memory_ex(const void *bytes, size_t len, int *chans, long *frames, int *rate,
+                        int (*cancel)(void *), void *arg, char *err, int cap) {
   unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0;
-  float *x = bytes ? chain((const unsigned char *)bytes, len, NULL, &ch, &sr, &n, &lib, err, cap) : NULL;
+  float *x;
+  if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, CANCELLED); return NULL; }
+  t_cancel = cancel; t_cancel_arg = arg;
+  x = bytes ? chain((const unsigned char *)bytes, len, NULL, &ch, &sr, &n, &lib, err, cap) : NULL;
+  t_cancel = NULL; t_cancel_arg = NULL;
   if (!bytes) snprintf(err, (size_t)cap, "no audio");
   if (!x) return NULL;
   return finish(x, ch, sr, n, chans, frames, rate, err, cap);
+}
+float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap) {
+  return decode_memory_ex(bytes, len, chans, frames, rate, NULL, NULL, err, cap);
 }
 float *smp_decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap) {
   return decode_memory(bytes, len, chans, frames, rate, err, cap);

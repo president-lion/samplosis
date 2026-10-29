@@ -157,7 +157,7 @@ static void sf1_samples(SmpFont *f, const uint8_t *shdr, uint32_t n, const uint8
     s->rate = 44100; s->pitch = 60; s->correction = 0; s->link = 0;
     if (s->start == 0) in_rom = 0;                  /* the first sample in the file starts at 0 */
     s->type = in_rom ? (SF_ROM | SF_MONO) : SF_MONO;
-    if (!in_rom) {                                  /* awesfx's loop correction for SBK */
+    if (!in_rom && s->loop_start != s->loop_end) {  /* awesfx's loop correction for SBK (not for "no loop") */
       if (s->loop_start < 0xffffffffu) s->loop_start++;
       if (s->loop_end < 0xfffffffeu) s->loop_end += 2;
     }
@@ -323,7 +323,11 @@ static int build_sources(SmpFont *f, const char *path) {
     } else if (sh->type & SF_COMPRESSED) {
       c->kind = SMP_SRC_DECODED;
       c->offset = f->smpl_off + sh->start;
-      c->length = sh->end - sh->start;
+      /* The end is one past the stream's last byte in what MuseScore and Cognitone's sf2convert write (SF3, SF4),
+         but the stream's last byte itself in FluidSynth's SF3 text. One more byte is read when smpl has it: a
+         decoder stops at the junk byte (the next stream's first) after a whole stream, and a stream that ended one
+         byte later isn't cut short, which would cost it its last FLAC frame or Ogg page. */
+      c->length = sh->end - sh->start + (sh->end < f->smpl_size ? 1 : 0);
       f->has_long = 1;
     } else {
       c->kind = SMP_SRC_PCM_FILE;

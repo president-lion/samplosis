@@ -79,7 +79,8 @@ SMP_API long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long fra
 /* 16-bit cache files, for a decoded SF2Pack: the same 32-byte .smpc header (version 2, 1 channel), then int16 mono, so
    the pack's sample headers point into it as they would into an SF2's smpl chunk. Opening one pins it (trim never
    deletes it) until it is closed; the font reads it by its path (smp_cache_path) like any sample file. */
-SMP_API int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate);  /* 0 ok */
+/* 0 ok; 4 when cancel (may be NULL, asked between 4 MB pieces) said stop */
+SMP_API int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate, int (*cancel)(void *), void *arg);
 SMP_API SmpEntry *smp_cache_open_i16(uint64_t key);   /* NULL if missing, short, or not a 16-bit file */
 int smp_cache_path(uint64_t key, char *utf8, int cap); /* the .smpc file's full path for key; 0 when there is none */
 SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files and .part files over an hour old;
@@ -209,6 +210,10 @@ SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once eve
                                     keeps trying every 500 ms), 1 on timeout. Pending retires don't count as busy */
 SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
+/* a problem found after the font opened, in plain words (an SF2Pack that can't be unpacked: "can't unpack
+   x.sf2pack (it may be damaged)", "the cache folder can't hold x.sf2pack's unpacked samples"), or "" when there is
+   none. Any thread; the text doesn't change once set. */
+SMP_API const char *smp_sf_problem(const SmpFont *f);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */

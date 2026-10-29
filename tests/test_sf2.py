@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from conftest import SmpSfRegion, SmpSfSample, write_wav
+from conftest import SmpSettings, SmpSfRegion, SmpSfSample, write_wav
 from sf2make import write_sbk, write_sf2
 from test_sffont import pcm
 
@@ -548,6 +548,27 @@ def loaded(lib, path, expect):
         lib.smp_sf_close(f)
 
 
+def test_sf4_inclusive_end(lib, tmp_path):
+    """Cognitone's sf2convert writes a compressed sample's end one past its last byte; FluidSynth's SF3 text has it
+    on the last byte. A font written that way still plays every frame of each FLAC stream."""
+    samples = short_samples()
+    a, b = str(tmp_path / "t.sf2"), tmp_path / "t.sf4"
+    write_sf2(a, all_preset(3), samples)
+    write_sf2(str(b), all_preset(3), samples, sf4=True)
+    data = bytearray(b.read_bytes())
+    at = data.find(b"shdr") + 8
+    for i in range(len(samples)):
+        r = at + 46 * i
+        end = struct.unpack("<I", data[r + 24:r + 28])[0]
+        data[r + 24:r + 28] = struct.pack("<I", end - 1)
+    b.write_bytes(bytes(data))
+    want, _ = loaded(lib, a, 3)
+    got, _ = loaded(lib, str(b), 3)
+    for (da, la), (db, lb) in zip(want, got):
+        assert np.array_equal(da.astype(np.int32), db.astype(np.int32))
+        assert la == lb
+
+
 @pytest.mark.parametrize("flag", [True, 0x10])
 def test_sf4_matches_sf2(lib, tmp_path, flag):
     """SF4 (each sample its own FLAC stream, flagged 0x20 with ifil 4) and FLAC inside SF3 (flagged 0x10) play
@@ -610,8 +631,8 @@ def test_sf2pack_vorbis(lib, tmp_path, codec):
 
 
 def test_sf2pack_damaged_stream(lib, tmp_path):
-    """A pack whose stream can't be decoded opens (the headers are fine) but loads nothing, and says so by not
-    loading; nothing crashes."""
+    """A pack whose stream can't be decoded opens (the headers are fine) but loads nothing, and the font says why
+    (smp_sf_problem); nothing crashes."""
     samples = short_samples()
     b = tmp_path / "bad.sf2pack"
     write_sf2(str(b), all_preset(3), samples, pack="flac")
@@ -622,12 +643,104 @@ def test_sf2pack_damaged_stream(lib, tmp_path):
     f, err = sf_open(lib, b)
     assert f, err
     try:
+        assert lib.smp_sf_problem(f) == b""
         lib.smp_sf_use(f, 0, 1)
         assert lib.smp_sf_wait_idle(f, 10000) == 0
         assert lib.smp_sf_loaded_samples(f) == 0
+        assert lib.smp_sf_problem(f) == b"can't unpack bad.sf2pack (it may be damaged)"
         lib.smp_sf_use(f, 0, -1)
     finally:
         lib.smp_sf_close(f)
+
+
+def settings_now(lib):
+    s = SmpSettings()
+    lib.smp_settings_get(ctypes.byref(s))
+    return s
+
+
+def test_sf2pack_no_cache_folder(lib, tmp_path):
+    """With no usable cache folder a pack can't be unpacked: it fails before decoding anything, and says so. The
+    folder is the one in the Settings when the pack is first needed, not when the font opened."""
+    samples = short_samples()
+    b = tmp_path / "p.sf2pack"
+    write_sf2(str(b), all_preset(3), samples, pack="flac")
+    old = settings_now(lib)
+    blocker = tmp_path / "file"
+    blocker.write_bytes(b"x")                       # a file where the folder's parent should be: it can't be made
+    f, err = sf_open(lib, b)
+    assert f, err
+    try:
+        s = settings_now(lib)
+        s.cache_dir = str(blocker / "cache").encode()
+        assert lib.smp_settings_set(ctypes.byref(s)) == 0
+        d0 = lib.smp_sf_test_decodes()
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 10000) == 0
+        assert lib.smp_sf_loaded_samples(f) == 0
+        assert lib.smp_sf_test_decodes() == d0
+        assert lib.smp_sf_problem(f) == b"the cache folder can't hold p.sf2pack's unpacked samples"
+        lib.smp_sf_use(f, 0, -1)
+    finally:
+        lib.smp_sf_close(f)
+        assert lib.smp_settings_set(ctypes.byref(old)) == 0
+    # back to a good folder: a new open unpacks it
+    got, decodes = loaded(lib, str(b), 3)
+    assert decodes == 1
+
+
+@pytest.mark.parametrize("delay", [0.15, 0.6])
+def test_sf2pack_close_while_decoding(lib, delay):
+    """Closing a pack while the loader unpacks it returns at once (the read, the decode and the cache write are each
+    cancelled within a piece), and a later open unpacks it again and works. Here the decode takes about 0.4 s and
+    writing the 200 MB cache file to E: a few seconds: a close after 0.15 s lands in the decode, after 0.6 s in
+    the write."""
+    os.makedirs(STREAM_DIR, exist_ok=True)
+    old = settings_now(lib)
+    try:
+        s = settings_now(lib)
+        s.cache_dir = os.path.join(STREAM_DIR, "cache").encode()
+        assert lib.smp_settings_set(ctypes.byref(s)) == 0
+        rate = 44100
+        period = tone(100, 441.0, rate)                          # exactly one period: a cheap long sample
+        data = np.tile(period, 1_000_000)                        # 100 M frames, 200 MB of 16-bit data
+        path = os.path.join(STREAM_DIR, "slow.sf2pack")
+        write_sf2(path, all_preset(1), [dict(name="Long", data=data, rate=rate, pitch=60, correction=0, loop=None)],
+                  pack="flac")
+        del data
+        f, err = sf_open(lib, path)
+        assert f, err
+        lib.smp_sf_use(f, 0, 1)
+        time.sleep(delay)                                        # the loader is now decoding, or writing
+        t = time.perf_counter()
+        lib.smp_sf_use(f, 0, -1)
+        lib.smp_sf_close(f)
+        took = time.perf_counter() - t
+        assert took < 0.2, took
+        d1 = lib.smp_sf_test_decodes()                           # the decode may have ended; the cache write didn't
+        # opened again: decoded again (it takes well over a second, so the close above did cut it short)
+        f, err = sf_open(lib, path)
+        assert f, err
+        try:
+            lib.smp_sf_use(f, 0, 1)
+            t = time.perf_counter()
+            assert lib.smp_sf_wait_idle(f, 120000) == 0
+            decode_s = time.perf_counter() - t
+            assert decode_s > 1.0, decode_s
+            assert lib.smp_sf_test_decodes() == d1 + 1               # nothing was left in the cache: decoded again
+            assert lib.smp_sf_loaded_samples(f) == 1
+            assert lib.smp_sf_problem(f) == b""
+            got = pcm(lib, f, 0)
+            assert np.array_equal(got[0][:rate // 4], np.tile(period, rate // 400 + 1)[:rate // 4])
+            lib.smp_sf_use(f, 0, -1)
+        finally:
+            lib.smp_sf_close(f)
+    finally:
+        assert lib.smp_settings_set(ctypes.byref(old)) == 0
+        shutil.rmtree(STREAM_DIR, ignore_errors=True)
+
+
+STREAM_DIR = r"E:\samplepacks\_build\samplosis_stream_test"   # big fixtures go here, not to C: (nearly full)
 
 
 SBK_RATE = 44100
@@ -692,6 +805,34 @@ def test_sbk_minimal(lib, tmp_path):
             assert abs(np.sqrt(np.mean(out[0::2][4800:] ** 2))) < 1e-3   # hard right
             got = peak_hz(right[4800:], 48000)
             assert abs(got - hz) < hz * 0.005, (key, got)
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sbk_conventions(lib, tmp_path):
+    """Pins the SoundFont 1 choices: samplePitch 6950 (the sample sounds at key 69.5) is root 70 with +50 cents,
+    attenuation 64 of 127 is the amplitude ratio (6 dB, 60 centibels), and a sample with no loop (loop start equal
+    to loop end) gets no loop correction."""
+    path = str(tmp_path / "c.sbk")
+    samples = [dict(name="Sine 441", data=tone(22050, 441.0, SBK_RATE), loop=None)]
+    presets = [dict(name="Half", bank=0, program=0, gens={},
+                    instruments=[dict(name="Half", gens={}, zones=[dict(keys=(0, 127), sample=0,
+                                                                        gens={55: 6950, 48: 64, 54: 0})])])]
+    write_sbk(path, presets, samples)
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        (r,) = regions(lib, f, 0)
+        assert (r.gen[58], r.gen[52], r.gen[48]) == (70, 50, 60)
+        h = lib.smp_sf_sample(f, 0).contents
+        assert (h.loop_start, h.loop_end) == (0, 0)
+        n = 24000
+        out = np.zeros(2 * n, np.float32)
+        assert lib.smp_sf_test_note(f, 0, 70, 100, 48000.0, n, -1,
+                                    out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))) == 1
+        x = out[0::2].astype(np.float64)[2400:20000]
+        want = 441.0 * 2 ** (50 / 1200)                          # key 70 is half a semitone above the sample
+        assert abs(peak_hz(x, 48000) - want) < want * 0.002
     finally:
         lib.smp_sf_close(f)
 

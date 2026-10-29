@@ -101,6 +101,10 @@ struct SmpFont {
   int pack_state;                       /* SF_PACK_* */
   SmpEntry *pack_entry;                 /* open while the font is, so the cache file is never trimmed */
   uint64_t pack_frames;                 /* frames in the decoded pack (sample ends are clamped to it at load) */
+  /* a problem found after open (a pack that can't be unpacked), for smp_sf_problem: written once by the loader,
+     then has_problem is set */
+  volatile LONG has_problem;
+  char problem[300];
 };
 
 enum { SF_PACK_NONE, SF_PACK_READY, SF_PACK_BROKEN };

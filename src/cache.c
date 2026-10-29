@@ -61,18 +61,23 @@ static void make_dirs(wchar_t *p) { /* creates the folder p itself, and its pare
   CreateDirectoryW(p, NULL);
 }
 
-static int write_all(HANDLE h, const void *buf, uint64_t n) {
+/* cancel (may be NULL) is asked before every piece; then the pieces are 4 MB, so a slow disk stops soon */
+static int write_all(HANDLE h, const void *buf, uint64_t n, int (*cancel)(void *), void *arg) {
   const char *p = buf;
+  DWORD most = cancel ? (1u << 22) : (1u << 26);
   while (n) {
-    DWORD chunk = n > (1u << 26) ? (1u << 26) : (DWORD)n, w = 0;
+    DWORD chunk = n > most ? most : (DWORD)n, w = 0;
+    if (cancel && cancel(arg)) return 0;
     if (!WriteFile(h, p, chunk, &w, NULL) || w != chunk) return 0;
     p += chunk; n -= chunk;
   }
   return 1;
 }
 
-/* writes a cache file: the header (version ver), then bytes of data. 0 when it is there. */
-static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t frames, int rate, uint32_t ch, uint32_t ver) {
+/* writes a cache file: the header (version ver), then bytes of data. 0 when it is there; 4 when cancel said stop
+   (nothing is left behind). */
+static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t frames, int rate, uint32_t ch, uint32_t ver,
+                      int (*cancel)(void *), void *arg) {
   wchar_t dir[1100], part[1200], fin[1200];
   static volatile LONG counter;
   wchar_t ext[64];
@@ -84,8 +89,9 @@ static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t f
   unsigned char hdr[HDR] = {0};
   uint32_t v = ver, r = (uint32_t)rate;
   memcpy(hdr, "SMPC", 4); memcpy(hdr + 4, &v, 4); memcpy(hdr + 8, &ch, 4); memcpy(hdr + 12, &r, 4); memcpy(hdr + 16, &frames, 8);
-  int ok = write_all(h, hdr, HDR) && write_all(h, data, bytes);
+  int ok = write_all(h, hdr, HDR, NULL, NULL) && write_all(h, data, bytes, cancel, arg);
   CloseHandle(h);
+  if (!ok && cancel && cancel(arg)) { DeleteFileW(part); return 4; }
   if (ok && MoveFileExW(part, fin, MOVEFILE_REPLACE_EXISTING)) return 0;
   DeleteFileW(part);
   if (ok) { /* keys are content-addressed: a complete file already there (maybe held open) is as good as ours */
@@ -96,9 +102,11 @@ static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t f
   return 3;
 }
 
-int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) { return write_file(key, lr, frames * 8, frames, rate, 2, 1); }
-int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) { return write_file(key, x, frames * 4, frames, rate, 1, 1); }
-int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate) { return write_file(key, x, frames * 2, frames, rate, 1, 2); }
+int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) { return write_file(key, lr, frames * 8, frames, rate, 2, 1, NULL, NULL); }
+int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) { return write_file(key, x, frames * 4, frames, rate, 1, 1, NULL, NULL); }
+int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate, int (*cancel)(void *), void *arg) {
+  return write_file(key, x, frames * 2, frames, rate, 1, 2, cancel, arg);
+}
 
 int smp_cache_path(uint64_t key, char *utf8, int cap) {
   wchar_t fn[1200];

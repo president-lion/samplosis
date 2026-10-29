@@ -339,30 +339,103 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   return p;
 }
 
+/* the font's problem, said once: written before has_problem is set, so a reader that sees the flag sees the text */
+static void set_problem(SmpFont *f, const char *fmt, const char *a, const char *b) {
+  if (InterlockedCompareExchange(&f->has_problem, 0, 0)) return;
+  snprintf(f->problem, sizeof f->problem, fmt, a, b ? b : "");
+  InterlockedExchange(&f->has_problem, 1);
+}
+
+/* the font's file name, for its problem */
+static const char *font_name(const SmpFont *f) {
+  const char *b = f->path, *q;
+  for (q = f->path; *q; q++) if (*q == '\\' || *q == '/' || *q == ':') b = q + 1;
+  return b;
+}
+
+/* pack_prepare's cancel hook: the font is closing, or the loader is stopping */
+static int pack_cancel(void *arg) {
+  SmpFont *f = arg;
+  return f->closing || g_stop;
+}
+
+#define PACK_READ_CHUNK (16u << 20)        /* a pack's payload is read this much at a time, checking for a close */
+
 /* SF2Pack: the decoded pack, from the cache when it is there, else decoded now (once) and written there as 16-bit
-   mono. Sets pack_state to READY, or BROKEN when it can never be had (the stream doesn't decode, it is over the
-   decode limit, or the cache folder can't hold it); leaves it NONE when the file can't be read or memory ran out
-   for now, to be tried again. The decode runs on the loader thread. A pack too big for decode_memory's 2 GiB of
-   float (1 GiB of 16-bit data, SF_PACK_MAX_FRAMES) is refused by it, and the samples then never load. */
+   mono. The cache file's path (paths[1]) is taken from the cache folder in the Settings now, so a changed folder
+   counts. Ends with pack_state:
+   - READY: the samples can load;
+   - BROKEN, with the font's problem said, when it can never be had here: no usable cache folder (found before the
+     payload is read), the payload is empty, unreadable or over 2 GiB, the stream doesn't decode, or it is over the
+     decode limit (the parser refuses most of those at open);
+   - NONE, to be tried again in RETRY_MS: the font file can't be opened for now, or memory ran out; or the font is
+     closing (the read, the decode and the cache write are each cancelled within a piece, so smp_sf_close doesn't
+     wait for them).
+   The decode runs on the loader thread. Its memory: the compressed payload, plus 4 bytes per frame of mono float
+   (decode_memory keeps mono in its growing buffer; that grows by doubling only when the stream doesn't give its
+   length), then converted to int16 in place. */
 static void pack_prepare(SmpFont *f) {
-  SmpEntry *e = smp_cache_open_i16(f->pack_key);
+  SmpEntry *e;
+  char file[2048 * 3], why[256];
+  /* the cache file for the cache folder of now */
+  if (smp_cache_path(f->pack_key, file, (int)sizeof file)) {
+    if (!f->paths[1] || strcmp(f->paths[1], file)) {
+      char *d = _strdup(file);
+      if (!d) return;
+      free(f->paths[1]);
+      f->paths[1] = d;
+    }
+  }
+  e = f->paths[1] ? smp_cache_open_i16(f->pack_key) : NULL;
   if (!e) {
-    HANDLE h = font_handle(f, 0);
+    HANDLE h;
     uint8_t *bytes;
     float *x;
     int16_t *o;
-    int ch = 0, r = 0;
+    int ch = 0, r = 0, k;
     long frames = 0, i;
-    char err[256];
-    if (!h) return;                                             /* tried again in RETRY_MS */
-    if (f->smpl_size == 0 || f->smpl_size > 0x7fffffffu) { f->pack_state = SF_PACK_BROKEN; return; }
+    uint64_t got;
+    char err[256] = "";
+    if (!f->paths[1] || !smp_cache_ok(why, (int)sizeof why)) {
+      set_problem(f, "the cache folder can't hold %s's unpacked samples%s", font_name(f), "");
+      f->pack_state = SF_PACK_BROKEN;
+      return;
+    }
+    if (!(h = font_handle(f, 0))) return;                       /* tried again in RETRY_MS */
+    if (f->smpl_size == 0 || f->smpl_size > 0x7fffffffu) {
+      set_problem(f, "can't unpack %s (it may be damaged)%s", font_name(f), "");
+      f->pack_state = SF_PACK_BROKEN;
+      return;
+    }
     if (!(bytes = malloc((size_t)f->smpl_size))) return;
-    if (!read_at(h, f->smpl_off, bytes, f->smpl_size)) { free(bytes); f->pack_state = SF_PACK_BROKEN; return; }
-    x = decode_memory(bytes, (size_t)f->smpl_size, &ch, &frames, &r, err, sizeof err);
+    for (got = 0; got < f->smpl_size; got += PACK_READ_CHUNK) {
+      uint64_t k = f->smpl_size - got < PACK_READ_CHUNK ? f->smpl_size - got : PACK_READ_CHUNK;
+      if (pack_cancel(f)) { free(bytes); return; }               /* closing: left NONE */
+      if (!read_at(h, f->smpl_off + got, bytes + got, k)) {
+        free(bytes);
+        set_problem(f, "can't unpack %s (it may be damaged)%s", font_name(f), "");
+        f->pack_state = SF_PACK_BROKEN;
+        return;
+      }
+    }
+    x = decode_memory_ex(bytes, (size_t)f->smpl_size, &ch, &frames, &r, pack_cancel, f, err, sizeof err);
     free(bytes);
-    if (!x) { f->pack_state = SF_PACK_BROKEN; return; }
+    if (!x) {
+      if (!strcmp(err, "cancelled")) return;                     /* closing: left NONE */
+      if (!strcmp(err, "out of memory")) return;                 /* tried again in RETRY_MS */
+      /* the decoder's own reason when it says something particular (too long, a library's message), else plain */
+      if (!err[0] || strstr(err, "isn't a sound file")) set_problem(f, "can't unpack %s (it may be damaged)%s", font_name(f), "");
+      else set_problem(f, "can't unpack %s (%s)", font_name(f), err);
+      f->pack_state = SF_PACK_BROKEN;
+      return;
+    }
     InterlockedIncrement(&g_decodes);
-    if (frames <= 0 || (unsigned long)frames > SF_PACK_MAX_FRAMES || ch <= 0) { free(x); f->pack_state = SF_PACK_BROKEN; return; }
+    if (frames <= 0 || (unsigned long)frames > SF_PACK_MAX_FRAMES || ch <= 0) {
+      free(x);
+      set_problem(f, "can't unpack %s (it's too long to load)%s", font_name(f), "");
+      f->pack_state = SF_PACK_BROKEN;
+      return;
+    }
     /* the first channel (channel after channel, so its frames come first) to int16, in place: frame i's int16 goes
        where float i/2 was, which has been read already. FLAC and WavPack give back exactly the packed values. */
     o = (int16_t *)x;
@@ -370,13 +443,16 @@ static void pack_prepare(SmpFont *f) {
       float v = x[i] * 32768.0f;
       o[i] = (int16_t)(v >= 32767.0f ? 32767 : v <= -32768.0f ? -32768 : (int)floorf(v + 0.5f));
     }
-    if (smp_cache_write_i16(f->pack_key, o, (uint64_t)frames, r > 0 ? r : 44100) != 0) {
+    /* writing a few hundred MB to a slow disk takes longer than decoding it: that is cancellable too */
+    k = smp_cache_write_i16(f->pack_key, o, (uint64_t)frames, r > 0 ? r : 44100, pack_cancel, f);
+    if (k == 4) { free(x); return; }                             /* closing: left NONE, nothing written */
+    if (k != 0 || !(e = smp_cache_open_i16(f->pack_key))) {
       free(x);
-      f->pack_state = SF_PACK_BROKEN;                           /* no cache folder to stream it from */
+      set_problem(f, "the cache folder can't hold %s's unpacked samples%s", font_name(f), "");
+      f->pack_state = SF_PACK_BROKEN;
       return;
     }
     free(x);
-    if (!(e = smp_cache_open_i16(f->pack_key))) { f->pack_state = SF_PACK_BROKEN; return; }
   }
   f->pack_entry = e;
   f->pack_frames = smp_entry_frames(e);
@@ -526,17 +602,14 @@ static void free_font(SmpFont *f) {
 
 /* the cache keys of the font's DECODED samples: the file's full path, size and modified time, the byte range and
    the channel, so a changed file never finds a stale copy */
-static int source_keys(SmpFont *f) {
+static void source_keys(SmpFont *f) {
   char path[2048 * 3], d[2048 * 3 + 160];
   int s;
   if (!WideCharToMultiByte(CP_UTF8, 0, f->wpath, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path);
   if (f->is_pack) {
-    /* the decoded pack: keyed by the file (sfpack1: the version of this layout), named by the cache folder now */
-    char file[2048 * 3];
+    /* the decoded pack: keyed by the file (sfpack1: the version of this layout); pack_prepare names its file */
     snprintf(d, sizeof d, "sfpack1|%s|%llu|%llu", path, (unsigned long long)f->size, (unsigned long long)f->mtime);
     f->pack_key = smp_key(d);
-    if (smp_cache_path(f->pack_key, file, (int)sizeof file) && !(f->paths[1] = _strdup(file))) return 0;
-    /* no cache folder: paths[1] stays NULL, the pack can't be written, and its samples never load */
   }
   for (s = 0; s < f->nshdr; s++) {
     SmpSrc *c = &f->src[s];
@@ -557,7 +630,6 @@ static int source_keys(SmpFont *f) {
              (unsigned long long)mtime, (unsigned long long)c->offset, (unsigned long long)c->length, (unsigned)c->channel);
     c->key = smp_key(d);
   }
-  return 1;
 }
 
 static int setup(SmpFont *f) {
@@ -573,7 +645,8 @@ static int setup(SmpFont *f) {
   f->ph = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
   f->stuck_gen = -1;
   if (!(f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since && f->fh && f->ph)) return 0;
-  return source_keys(f);
+  source_keys(f);
+  return 1;
 }
 
 /* the file's full path as a new wide string, or NULL */
@@ -749,6 +822,11 @@ int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
 }
 
 int smp_sf_loaded_samples(const SmpFont *f) { return f ? (int)f->nloaded : 0; }
+
+const char *smp_sf_problem(const SmpFont *f) {
+  if (!f || !InterlockedCompareExchange((volatile LONG *)&f->has_problem, 0, 0)) return "";
+  return f->problem;
+}
 
 uint64_t smp_sf_loaded_bytes(const SmpFont *f) {
   return f ? (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&f->loaded_bytes, 0, 0) : 0;

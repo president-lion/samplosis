@@ -27,6 +27,10 @@ float *decode_audio(const char *path, int *chans, long *frames, int *rate, char 
    and WavPack). Free the result with free(). smp_decode_memory is the same call exported (free its result with
    smp_free). */
 float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap);
+/* decode_memory, and cancel (may be NULL) is asked with arg once per decoded chunk: a nonzero answer stops the
+   decode with NULL and "cancelled" in err */
+float *decode_memory_ex(const void *bytes, size_t len, int *chans, long *frames, int *rate,
+                        int (*cancel)(void *), void *arg, char *err, int cap);
 SMP_API float *smp_decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap);
 
 /* the extensions the sampler lists in Browse and the File combo box (".wav", ...); returns how many. Some need a

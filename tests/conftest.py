@@ -227,6 +227,7 @@ def lib(settings_file):
     for name, res, args in (("smp_sf_stream_read", c_long, [vp, c_u64, fp, c_long]),
                             ("smp_sf_test_whole", None, [c_int]),
                             ("smp_sf_test_decodes", c_long, []),
+                            ("smp_sf_problem", c_char_p, [vp]),
                             ("smp_synth_underruns", c_long, [vp]),
                             ("smp_synth_test_stream_pause", None, [vp, c_int]),
                             ("smp_synth_set_offline", None, [vp, c_int]),
