@@ -1,0 +1,4 @@
+WavPack 5.9.0 (decoder only, with DSD and pre-4.0 files)
+https://github.com/dbry/WavPack/releases/download/5.9.0/wavpack-5.9.0.tar.xz
+SHA-256 b5291bc4e6d69ebbd3da3800c5bf4a70f19bb92679b23e09b3b612c1e648d1ff (matches the GitHub release digest)
+Kept: the unpack and open sources of src/ and the headers. Licence: 3-clause BSD, see COPYING.

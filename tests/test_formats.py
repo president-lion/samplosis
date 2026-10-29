@@ -6,9 +6,11 @@ import subprocess
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from conftest import SmpSettings, write_wav
 from test_cache import point_cache
+from test_plugin import P  # noqa: F401 (the fixture)
 from test_sample import load, whole
 
 FFMPEG = shutil.which("ffmpeg")
@@ -256,3 +258,190 @@ def test_raw_holding_real_mp3_bytes(lib, tmp_path):
     assert s, err
     assert s.contents.frames == len(b) // 4                      # raw s16 stereo, not about 44100 decoded frames
     lib.smp_sample_free(s)
+
+
+# --- library decoders: Opus (opusfile), WavPack, Monkey's Audio ---
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def tone_ape_source():
+    """What fixtures/tone.ape holds: two_tones' signal in float64, 22050 frames at 44100 Hz, rounded to 16 bits (see
+    fixtures/README.md)."""
+    t = np.arange(22050) / 44100
+    x = np.stack([0.5 * np.sin(2 * np.pi * 220 * t), 0.3 * np.sin(2 * np.pi * 331 * t)], axis=1)
+    return np.round(x * 32767).astype(np.int16)
+
+
+def decode_mem(lib, b):
+    """decode_memory on bytes: (frames x channels float32, rate), or (None, the reason)."""
+    lib.decode_memory.restype = ctypes.POINTER(ctypes.c_float)
+    lib.decode_memory.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+    lib.smp_free.restype = None
+    lib.smp_free.argtypes = [ctypes.c_void_p]
+    ch, n, r = ctypes.c_int(), ctypes.c_long(), ctypes.c_int()
+    err = ctypes.create_string_buffer(300)
+    p = lib.decode_memory(b, len(b), ctypes.byref(ch), ctypes.byref(n), ctypes.byref(r), err, 300)
+    if not p:
+        return None, err.value.decode()
+    x = np.ctypeslib.as_array(p, shape=(ch.value * n.value,)).copy().reshape(ch.value, n.value).T
+    lib.smp_free(p)
+    return x, r.value
+
+
+def corr(a, b):
+    return float(np.dot(a, b) / np.sqrt(np.dot(a, a) * np.dot(b, b)))
+
+
+@need_ffmpeg
+@pytest.mark.parametrize("chans", [1, 2])
+def test_opus(lib, tmp_path, chans):
+    point_cache(lib, tmp_path / "cache")
+    src = two_tones(48000, 48000)[:, :chans]
+    w = tmp_path / "src.wav"
+    write_wav(w, src, 48000)
+    f = tmp_path / ("tone %d.opus" % chans)
+    ffmpeg("-i", w, "-c:a", "libopus", "-b:a", "160k", f)
+    b = f.read_bytes()
+    assert b[:4] == b"OggS" and b"OpusHead" in b[:100]
+    s, err = load(lib, f)
+    assert s, err
+    try:
+        assert s.contents.rate == 48000 and s.contents.by == 1
+        assert abs(int(s.contents.frames) - len(src)) <= 312       # the encoder's pre-skip at most
+        got = whole(lib, s.contents.fwd)
+        n = min(len(got), len(src))
+        for c in range(chans):
+            assert corr(got[:n, c], src[:n, c]) > 0.99
+    finally:
+        lib.smp_sample_free(s)
+    x, r = decode_mem(lib, b)                                      # from memory too (SoundFont streams)
+    assert x is not None, r
+    assert r == 48000 and x.shape[1] == chans and abs(len(x) - len(src)) <= 312
+
+
+@need_ffmpeg
+@pytest.mark.parametrize("subtype", ["PCM_16", "PCM_24", "FLOAT"])
+def test_wavpack(lib, tmp_path, subtype):
+    point_cache(lib, tmp_path / "cache")
+    w = tmp_path / "src.wav"
+    sf.write(str(w), two_tones(22050), 44100, subtype=subtype)
+    src, _ = sf.read(str(w), dtype="float32")                      # exactly what the lossless file holds
+    f = tmp_path / ("tone %s.wv" % subtype)
+    ffmpeg("-i", w, "-c:a", "wavpack", f)
+    b = f.read_bytes()
+    assert b[:4] == b"wvpk"
+    s, err = load(lib, f)
+    assert s, err
+    try:
+        assert s.contents.rate == 44100 and s.contents.frames == len(src) and s.contents.by == 1
+        assert np.array_equal(whole(lib, s.contents.fwd), src)     # bit-exact
+    finally:
+        lib.smp_sample_free(s)
+    x, r = decode_mem(lib, b)
+    assert x is not None, r
+    assert r == 44100 and np.array_equal(x, src)
+
+
+def test_ape(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    src = tone_ape_source().astype(np.float32) / 32768
+    s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
+    assert s, err
+    try:
+        assert s.contents.rate == 44100 and s.contents.frames == len(src) and s.contents.by == 1
+        assert np.array_equal(whole(lib, s.contents.fwd), src)     # bit-exact
+    finally:
+        lib.smp_sample_free(s)
+
+
+def test_library_decoders_refuse_damage(lib, tmp_path):
+    # cut short or scribbled on: refused with a reason or some audio, never a crash
+    point_cache(lib, tmp_path / "cache")
+    good = open(os.path.join(FIXTURES, "tone.ape"), "rb").read()
+    rnd = np.random.default_rng(7)
+    for i, cut in enumerate((8, 40, 100, len(good) // 2, len(good) - 5)):
+        g = tmp_path / ("cut%d.ape" % i)
+        g.write_bytes(good[:cut])
+        n = try_load(lib, g)
+        assert n is None or n > 0
+    for i in range(4):
+        b = bytearray(good)
+        for k in rnd.integers(64, len(b), 40):
+            b[k] = int(rnd.integers(0, 256))
+        g = tmp_path / ("junk%d.ape" % i)
+        g.write_bytes(bytes(b))
+        n = try_load(lib, g)
+        assert n is None or n > 0
+    for magic in (b"wvpk", b"MAC ", b"OggS\0\2" + b"\0" * 20 + b"\x01\x13OpusHead"):
+        g = tmp_path / "fake.bin"
+        g.write_bytes(magic + bytes(range(256)) * 4)
+        n = try_load(lib, g)
+        assert n is None or n > 0
+    if FFMPEG:                                                     # Opus and WavPack, damaged the same ways
+        w = tmp_path / "src.wav"
+        write_wav(w, two_tones(24000, 48000), 48000)
+        for ext, codec in ((".opus", "libopus"), (".wv", "wavpack")):
+            f = tmp_path / ("good" + ext)
+            ffmpeg("-i", w, "-c:a", codec, f)
+            good = f.read_bytes()
+            for i, cut in enumerate((8, 40, 100, len(good) // 2, len(good) - 5)):
+                g = tmp_path / ("cut%d%s" % (i, ext))
+                g.write_bytes(good[:cut])
+                n = try_load(lib, g)
+                assert n is None or n > 0
+            for i in range(4):
+                b = bytearray(good)
+                for k in rnd.integers(64, len(b), 40):
+                    b[k] = int(rnd.integers(0, 256))
+                g = tmp_path / ("junk%d%s" % (i, ext))
+                g.write_bytes(bytes(b))
+                n = try_load(lib, g)
+                assert n is None or n > 0
+
+
+def test_ape_exception_is_caught(lib, tmp_path):
+    # a C++ exception inside Monkey's Audio never crosses into C: the load is refused with a plain reason
+    point_cache(lib, tmp_path / "cache")
+    lib.smp_debug_decode_flags.restype = None
+    lib.smp_debug_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_debug_decode_flags(1)
+    try:
+        s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
+        assert not s and "Monkey's Audio" in err, err
+    finally:
+        lib.smp_debug_decode_flags(0)
+    s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
+    assert s, err
+    lib.smp_sample_free(s)
+
+
+@need_ffmpeg
+def test_status_says_library(P, tmp_path):
+    # a library decode says nothing extra: not Windows, not FFmpeg
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(24000, 48000), 48000)
+    files = [os.path.join(FIXTURES, "tone.ape")]
+    for ext, codec in ((".opus", "libopus"), (".wv", "wavpack")):
+        f = tmp_path / ("tone A3" + ext)
+        ffmpeg("-i", w, "-c:a", codec, f)
+        files.append(str(f))
+    for f in files:
+        y, d, r = P.play(P.script(f), "on 57 100 0\noff 57 4800", 9600)
+        st = d["status"]
+        assert st == "Ready: " + os.path.basename(f), st
+        assert "Windows" not in st and "FFmpeg" not in st
+
+
+def test_float_wav_non_finite_is_silence(lib, tmp_path):
+    # NaN, infinities and absurd values from a damaged file never reach the cache or the engine
+    point_cache(lib, tmp_path / "cache")
+    vals = np.array([0.5, np.nan, np.inf, -np.inf, 2e6, -0.25, -3e9, 0.0], dtype=np.float32)
+    f = tmp_path / "nan.wav"
+    write_wav(f, vals, 44100)
+    s, err = load(lib, f)
+    assert s, err
+    got = whole(lib, s.contents.fwd)[:, 0]
+    lib.smp_sample_free(s)
+    assert list(got) == [0.5, 0, 0, 0, 0, -0.25, 0, 0]

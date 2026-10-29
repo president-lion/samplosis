@@ -4,11 +4,16 @@
       through dr_flac; MP3 through dr_mp3; Ogg Vorbis through stb_vorbis. All four are public domain (or MIT-0),
       single files in decode/ (dr_libs 8159355, stb 003501f). CAF (Apple's Core Audio Format) with PCM or float
       audio is read here.
-   2. raw PCM, for files ending .raw or .pcm: headerless samples read as the Settings say (rate, channels, format,
+   2. the library decoders, picked by the first bytes too: Opus (an Ogg file whose first packet is OpusHead) through
+      opusfile, libopus and libogg; WavPack ("wvpk"); Monkey's Audio ("MAC ") through the C++ SDK behind
+      codecs/mac_shim.cpp. All are BSD licensed and vendored in codecs/ (each folder's VERSION.txt names the
+      release).
+   3. raw PCM, for files ending .raw or .pcm: headerless samples read as the Settings say (rate, channels, format,
       byte order).
-   3. when the first bytes say nothing, the built-in decoders are tried one after another (MP3 last: it finds frames
+   4. when the first bytes say nothing, the built-in decoders are tried one after another (MP3 last: it finds frames
       in nearly anything).
-   Later stages add decoders after these. Never called on the audio thread. */
+   Later stages add decoders after these. Whatever decodes a file, its result passes one place (finish): a sample
+   that isn't finite, or is absurdly large (a damaged file), becomes silence. Never called on the audio thread. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +31,16 @@
 #define STB_VORBIS_NO_PUSHDATA_API
 #define STB_VORBIS_NO_STDIO
 #include "decode/stb_vorbis.c"
+#include <opusfile.h>
+#include <wavpack.h>
 #include "decode.h"
+
+/* codecs/mac_shim.cpp: interleaved float, or NULL and a message */
+float *smp_ape_decode(const unsigned char *b, size_t len, unsigned *ch, unsigned *sr, unsigned long long *n, char *err, int cap);
+void smp_ape_set_debug_flags(long f);
+/* tests: 1 = the Monkey's Audio decoder throws inside its guard */
+SMP_API void smp_debug_decode_flags(long f) { smp_ape_set_debug_flags(f & 1); }
+SMP_API void smp_free(void *p) { free(p); }
 
 /* the sampler's extensions: what Browse and the File combo box list */
 static const wchar_t *const audio_ext[] = {
@@ -85,8 +99,8 @@ static float *pcm_planar(const unsigned char *p, uint64_t n, int ch, int bytes, 
       const unsigned char *s = p + ((size_t)i * ch + c) * bytes;
       uint64_t u = 0; float v;
       for (k = 0; k < bytes; k++) u |= (uint64_t)s[big ? k : bytes - 1 - k] << (8 * (bytes - 1 - k));
-      if (is_float && bytes == 4) { uint32_t w = (uint32_t)u; float f; memcpy(&f, &w, 4); v = isfinite(f) ? f : 0.0f; }
-      else if (is_float) { double d; memcpy(&d, &u, 8); v = isfinite(d) && fabs(d) < 1e30 ? (float)d : 0.0f; }
+      if (is_float && bytes == 4) { uint32_t w = (uint32_t)u; memcpy(&v, &w, 4); }   /* finish() makes NaN safe */
+      else if (is_float) { double d; memcpy(&d, &u, 8); v = fabs(d) < 1e30 ? (float)d : 0.0f; }
       else if (is_unsigned) v = ((float)u - 128.0f) / 128.0f;
       else {
         int64_t sv = (int64_t)(u << (64 - 8 * bytes)) >> (64 - 8 * bytes);   /* sign-extend */
@@ -166,8 +180,138 @@ static float *raw_read(const unsigned char *b, size_t len, unsigned *ch, unsigne
   }
 }
 
-/* the built-in decoders */
-enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF };
+/* A growing interleaved buffer, for decoders that can't say their length for sure (a damaged file may lie). */
+typedef struct { float *x; size_t n, cap; } Grow;            /* n and cap count floats */
+static int grow_need(Grow *g, size_t more) {
+  if (g->n + more > g->cap) {
+    size_t c = g->cap ? g->cap : 65536;
+    float *y;
+    while (c < g->n + more) c *= 2;
+    if (!(y = realloc(g->x, c * sizeof(float)))) return 0;
+    g->x = y; g->cap = c;
+  }
+  return 1;
+}
+
+/* Opus through opusfile, always at 48000 Hz (opusfile drops the encoder's pre-skip). A chained file whose links have
+   different channel counts reads as stereo. */
+#define OPUS_CHUNK (5760 * 8)                                 /* 120 ms of 8 channels, the most one call gives */
+static float *opus_read(const unsigned char *b, size_t len, unsigned *ch, unsigned *sr, unsigned long long *n, char *err, int cap) {
+  int e = 0, links, i, c, same = 1;
+  OggOpusFile *of = op_open_memory(b, len, &e);
+  Grow g = {0};
+  ogg_int64_t total;
+  if (!of) { snprintf(err, (size_t)cap, "it's an Opus file Samplosis can't read (it may be damaged)"); return NULL; }
+  links = op_link_count(of);
+  c = op_channel_count(of, 0);
+  for (i = 1; i < links; i++) if (op_channel_count(of, i) != c) same = 0;
+  if (!same) c = 2;
+  if (c < 1 || c > 8) {
+    op_free(of);
+    snprintf(err, (size_t)cap, "it's an Opus file with %d channels, which Samplosis can't read", c);
+    return NULL;
+  }
+  total = op_pcm_total(of, -1);
+  if (total > 0 && total < 0x7FFFFFFF && (unsigned long long)total * c < (unsigned long long)len * 2048 + 4800000)
+    grow_need(&g, (size_t)total * c + OPUS_CHUNK);           /* a hint: the right size for a good file */
+  for (;;) {
+    int got;
+    if (!grow_need(&g, OPUS_CHUNK)) { free(g.x); op_free(of); snprintf(err, (size_t)cap, "out of memory"); return NULL; }
+    got = same ? op_read_float(of, g.x + g.n, OPUS_CHUNK, NULL) : op_read_float_stereo(of, g.x + g.n, OPUS_CHUNK);
+    if (got == OP_HOLE) continue;                             /* a gap in a damaged file: read on past it */
+    if (got <= 0) break;
+    g.n += (size_t)got * c;
+    if (g.n / c > 0x7FFFFFFF) break;
+  }
+  op_free(of);
+  if (!g.n) { free(g.x); snprintf(err, (size_t)cap, "it's an Opus file without its audio, or it's damaged"); return NULL; }
+  *ch = (unsigned)c; *sr = 48000; *n = g.n / c;
+  return g.x;
+}
+
+/* WavPack from memory: a reader over the bytes that never goes outside them */
+typedef struct { const unsigned char *b; int64_t len, at; } WvMem;
+static int32_t wv_read(void *id, void *data, int32_t k) {
+  WvMem *m = id; int64_t left = m->at < m->len ? m->len - m->at : 0;
+  if (k < 0) k = 0;
+  if (k > left) k = (int32_t)left;
+  if (k) memcpy(data, m->b + m->at, (size_t)k);
+  m->at += k;
+  return k;
+}
+static int32_t wv_write(void *id, void *data, int32_t k) { (void)id; (void)data; (void)k; return 0; }
+static int64_t wv_pos(void *id) { return ((WvMem *)id)->at; }
+static int wv_seek_to(WvMem *m, int64_t to) { if (to < 0 || to > m->len) return -1; m->at = to; return 0; }
+static int wv_set_abs(void *id, int64_t pos) { return wv_seek_to(id, pos); }
+static int wv_set_rel(void *id, int64_t d, int mode) {
+  WvMem *m = id;
+  return wv_seek_to(m, (mode == SEEK_SET ? 0 : mode == SEEK_CUR ? m->at : m->len) + d);
+}
+static int wv_push_back(void *id, int c) { WvMem *m = id; if (m->at <= 0) return EOF; m->at--; return c; }
+static int64_t wv_length(void *id) { return ((WvMem *)id)->len; }
+static int wv_can_seek(void *id) { (void)id; return 1; }
+static int wv_truncate(void *id) { (void)id; return -1; }
+static int wv_close(void *id) { (void)id; return 0; }
+
+/* WavPack: integer samples of 1 to 4 bytes, or float (normalized to +/-1); DSD files read as PCM */
+static float *wavpack_read(const unsigned char *b, size_t len, unsigned *ch, unsigned *sr, unsigned long long *n, char *err, int cap) {
+  static WavpackStreamReader64 rd = {wv_read, wv_write, wv_pos, wv_set_abs, wv_set_rel, wv_push_back, wv_length,
+                                     wv_can_seek, wv_truncate, wv_close};
+  WvMem m = {b, (int64_t)len, 0};
+  char why[90] = "";
+  WavpackContext *w = WavpackOpenFileInputEx64(&rd, &m, NULL, why, OPEN_NORMALIZE | OPEN_DSD_AS_PCM, 0);
+  int c, bytes, is_float;
+  uint32_t rate, i, got;
+  int64_t total;
+  int32_t *buf;
+  Grow g = {0};
+  double scale;
+  if (!w) { snprintf(err, (size_t)cap, "it's a WavPack file Samplosis can't read (it may be damaged)"); return NULL; }
+  c = WavpackGetNumChannels(w); bytes = WavpackGetBytesPerSample(w); rate = WavpackGetSampleRate(w);
+  is_float = (WavpackGetMode(w) & MODE_FLOAT) != 0;
+  if (c < 1 || c > 64 || bytes < 1 || bytes > 4 || rate < 1 || rate > 1000000) {
+    WavpackCloseFile(w);
+    snprintf(err, (size_t)cap, "it's a WavPack file with a format Samplosis can't read");
+    return NULL;
+  }
+  scale = 1.0 / (double)(1u << (8 * bytes - 1));
+  total = WavpackGetNumSamples64(w);
+  if (total > 0 && total < 0x7FFFFFFF && (unsigned long long)total * c < (unsigned long long)len * 1024 + 4800000)
+    grow_need(&g, (size_t)total * c);                        /* a hint: the right size for a good file */
+  if (!(buf = malloc(sizeof(int32_t) * 4096 * (size_t)c))) {
+    WavpackCloseFile(w); free(g.x); snprintf(err, (size_t)cap, "out of memory"); return NULL;
+  }
+  while ((got = WavpackUnpackSamples(w, buf, 4096)) > 0) {
+    if (!grow_need(&g, (size_t)got * c)) {
+      free(buf); free(g.x); WavpackCloseFile(w); snprintf(err, (size_t)cap, "out of memory"); return NULL;
+    }
+    for (i = 0; i < got * (uint32_t)c; i++) {
+      float v;
+      if (is_float) memcpy(&v, &buf[i], 4);
+      else v = (float)((double)buf[i] * scale);
+      g.x[g.n + i] = v;
+    }
+    g.n += (size_t)got * c;
+    if (g.n / c > 0x7FFFFFFF) break;
+  }
+  free(buf);
+  WavpackCloseFile(w);
+  if (!g.n) { free(g.x); snprintf(err, (size_t)cap, "it's a WavPack file without its audio, or it's damaged"); return NULL; }
+  *ch = (unsigned)c; *sr = rate; *n = g.n / c;
+  return g.x;
+}
+
+/* the built-in decoders, then the library ones */
+enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF, D_OPUS, D_WAVPACK, D_APE };
+#define D_IS_LIBRARY(d) ((d) >= D_OPUS)
+
+/* an Ogg file whose first packet is OpusHead: the first page's header is 27 bytes, then its segment table */
+static int is_ogg_opus(const unsigned char *b, size_t len) {
+  size_t at;
+  if (len < 27 || memcmp(b, "OggS", 4)) return 0;
+  at = 27 + (size_t)b[26];
+  return at + 8 <= len && !memcmp(b + at, "OpusHead", 8);
+}
 
 /* which decoder the first bytes ask for, or D_NONE. strict: container magics only (a raw file's first bytes can
    look like an MPEG frame sync or "ID3" by chance) */
@@ -178,18 +322,22 @@ static int sniff(const unsigned char *b, size_t len, int strict) {
   if (len >= 16 && !memcmp(b, w64, 16)) return D_WAV;
   if (len >= 8 && !memcmp(b, "caff", 4)) return D_CAF;
   if (len >= 4 && !memcmp(b, "fLaC", 4)) return D_FLAC;
+  if (is_ogg_opus(b, len)) return D_OPUS;
   if (len >= 4 && !memcmp(b, "OggS", 4)) return D_VORBIS;
+  if (len >= 32 && !memcmp(b, "wvpk", 4)) return D_WAVPACK;
+  if (len >= 32 && !memcmp(b, "MAC ", 4)) return D_APE;
   if (strict) return D_NONE;
-  if (len >= 10 && !memcmp(b, "ID3", 3)) {                 /* an ID3 tag first: FLAC or MP3 after it */
+  if (len >= 10 && !memcmp(b, "ID3", 3)) {                 /* an ID3 tag first: FLAC, Monkey's Audio or MP3 after it */
     size_t skip = 10 + ((size_t)(b[6] & 127) << 21 | (size_t)(b[7] & 127) << 14 | (size_t)(b[8] & 127) << 7 | (b[9] & 127));
     if (b[5] & 0x10) skip += 10;
+    if (skip + 4 <= len && !memcmp(b + skip, "MAC ", 4)) return D_APE;
     return skip + 4 <= len && !memcmp(b + skip, "fLaC", 4) ? D_FLAC : D_MP3;
   }
   if (len >= 2 && b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) return D_MP3;
   return D_NONE;
 }
 
-/* one built-in decoder on the bytes: float channel after channel, or NULL */
+/* one decoder on the bytes: float channel after channel, or NULL */
 static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsigned *sr, unsigned long long *n, char *err, int cap) {
   float *x = NULL, *out;
   *ch = 0; *sr = 0; *n = 0;
@@ -199,6 +347,16 @@ static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsig
       free(out); out = NULL;
       snprintf(err, (size_t)cap, "it's a CAF file without its audio, or it's cut short");
     }
+    return out;
+  }
+  if (D_IS_LIBRARY(d)) {                             /* interleaved from the library, with its own message */
+    x = d == D_OPUS ? opus_read(b, len, ch, sr, n, err, cap)
+      : d == D_WAVPACK ? wavpack_read(b, len, ch, sr, n, err, cap)
+      : smp_ape_decode(b, len, ch, sr, n, err, cap);
+    if (!x) return NULL;
+    out = *n && *ch && *sr ? planar(x, *n, *ch) : NULL;
+    free(x);
+    if (!out) snprintf(err, (size_t)cap, "out of memory");
     return out;
   }
   if (d == D_WAV) x = drwav_open_memory_and_read_pcm_frames_f32(b, len, ch, sr, n, NULL);
@@ -224,49 +382,61 @@ static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsig
   return out;
 }
 
-/* The built-in chain on bytes in memory: the decoder the first bytes ask for, then (raw_ok and a raw name) raw PCM,
-   then the others in turn. A decoder's own message (CAF's) is kept when nothing reads it. */
+/* The chain on bytes in memory: the decoder the first bytes ask for, then (a raw name) raw PCM, then the built-in
+   decoders in turn. A decoder's own message (CAF's, or a library's) is kept when nothing reads it. *lib says a
+   library decoded it. */
 static float *chain(const unsigned char *b, size_t len, const char *raw_name, unsigned *ch, unsigned *sr,
-                    unsigned long long *n, char *err, int cap) {
+                    unsigned long long *n, int *lib, char *err, int cap) {
   static const int order[] = {D_WAV, D_FLAC, D_VORBIS, D_MP3};
   int first = sniff(b, len, raw_name != NULL), i; float *x;
   char why[300] = "";
-  if (first != D_NONE && (x = run(first, b, len, ch, sr, n, why, sizeof why))) return x;
+  *lib = 0;
+  if (first != D_NONE && (x = run(first, b, len, ch, sr, n, why, sizeof why))) { *lib = D_IS_LIBRARY(first); return x; }
   if (raw_name) {
     if ((x = raw_read(b, len, ch, sr, n, why, sizeof why))) return x;
     snprintf(err, (size_t)cap, "%s", why);
     return NULL;
   }
-  if (first == D_CAF) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
+  if (first == D_CAF || D_IS_LIBRARY(first)) { snprintf(err, (size_t)cap, "%s", why); return NULL; }
   for (i = 0; i < 4; i++)
     if (order[i] != first && (x = run(order[i], b, len, ch, sr, n, why, sizeof why))) return x;
   snprintf(err, (size_t)cap, "it isn't a sound file Samplosis can read");
   return NULL;
 }
 
-float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap) {
-  unsigned ch = 0, sr = 0; unsigned long long n = 0;
-  float *x = bytes ? chain((const unsigned char *)bytes, len, NULL, &ch, &sr, &n, err, cap) : NULL;
-  if (!bytes) snprintf(err, (size_t)cap, "no audio");
-  if (!x) return NULL;
+/* The one place every decoder's output passes: too long is refused, and a sample that isn't finite or is absurdly
+   large (|x| > 1e6, from a damaged file) becomes 0, so it never reaches the cache or the engine. */
+static float *finish(float *x, unsigned ch, unsigned sr, unsigned long long n, int *chans, long *frames, int *rate,
+                     char *err, int cap) {
+  size_t i, k = (size_t)n * ch;
+  if (n > 0x7FFFFFFF) { free(x); snprintf(err, (size_t)cap, "it's too long to load"); return NULL; }
+  for (i = 0; i < k; i++)
+    if (!(fabsf(x[i]) <= 1e6f)) x[i] = 0.0f;                  /* NaN fails the test too */
   *chans = (int)ch; *frames = (long)n; *rate = (int)sr;
   return x;
+}
+
+float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap) {
+  unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0;
+  float *x = bytes ? chain((const unsigned char *)bytes, len, NULL, &ch, &sr, &n, &lib, err, cap) : NULL;
+  if (!bytes) snprintf(err, (size_t)cap, "no audio");
+  if (!x) return NULL;
+  return finish(x, ch, sr, n, chans, frames, rate, err, cap);
 }
 
 float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
                        int (*cancel)(void *), void *arg, char *err, int cap) {
   size_t len = 0; unsigned char *b; float *x;
-  unsigned ch = 0, sr = 0; unsigned long long n = 0;
+  unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0;
   if (by) *by = SMP_DEC_BUILTIN;
   if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
   b = slurp(path, &len);
   if (!b) { snprintf(err, (size_t)cap, "can't open %s", path); return NULL; }
-  x = chain(b, len, smp_is_raw_name(path) ? path : NULL, &ch, &sr, &n, err, cap);
+  x = chain(b, len, smp_is_raw_name(path) ? path : NULL, &ch, &sr, &n, &lib, err, cap);
   free(b);
   if (!x) return NULL;
-  if (n > 0x7FFFFFFF) { free(x); snprintf(err, (size_t)cap, "it's too long to load"); return NULL; }
-  *chans = (int)ch; *frames = (long)n; *rate = (int)sr;
-  return x;
+  if (by && lib) *by = SMP_DEC_LIBRARY;
+  return finish(x, ch, sr, n, chans, frames, rate, err, cap);
 }
 
 float *decode_audio(const char *path, int *chans, long *frames, int *rate, char *err, int cap) {

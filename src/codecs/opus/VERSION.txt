@@ -1,0 +1,5 @@
+libopus 1.6.1 (decoder only, float build)
+https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+SHA-256 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1 (matches Xiph SHA256SUMS.txt)
+Only the decoder sources and their headers are kept, plus celt/entenc.c (the CELT and SILK code refers to the
+range encoder). Licence: 3-clause BSD, see COPYING.

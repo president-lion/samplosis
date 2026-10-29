@@ -1,8 +1,10 @@
 # Samplosis
 
 An accessible sampler for REAPER, written in C as a CLAP instrument for Windows. The window is made of plain Windows
-controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It includes Rubber Band (GPL) and
-Signalsmith Stretch (MIT, see src\signalsmith).
+controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It includes Rubber Band (GPL),
+Signalsmith Stretch (MIT, see src\signalsmith), and these decoders, all 3-clause BSD, each with its licence in its
+folder under src\codecs: libopus, opusfile and libogg (Xiph.Org), WavPack (David Bryant) and the Monkey's Audio SDK
+(Matthew T. Ashland).
 
 ## What it does
 
@@ -12,8 +14,8 @@ a project saved before the SoundFont player existed loads as it was.
 
 The Sampler:
 
-- Load one audio file (wav, flac, ogg, mp3 and the other formats the bundled decoders read) with the Browse button,
-  by dragging it onto the window, or from a saved REAPER project.
+- Load one audio file (wav, flac, ogg, mp3, opus, wv, ape and the other formats the bundled decoders read) with the
+  Browse button, by dragging it onto the window, or from a saved REAPER project.
 - The root note comes from a note name in the file name ("Guitar C3.wav", "Pad F#2.flac") or, if there is none,
   from pitch detection on the audio.
 - Notes keep their length. With Keep length on, a note played above or below the root is made by a time stretcher
