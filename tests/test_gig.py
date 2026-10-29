@@ -585,3 +585,60 @@ def test_gig_unicode_path(lib, tmp_path):
         assert len(x) >= 11025 and np.max(np.abs(x - want[:len(x)])) <= 1
     finally:
         lib.smp_sf_close(f)
+
+
+def model(lib, f):
+    """Everything a player sees of a font, copied out: presets, each region's fields, conditions, modulators and
+    curve, and the samples' headers."""
+    out = [presets(lib, f)]
+    for p in range(lib.smp_sf_preset_count(f)):
+        for r in regions(lib, f, p):
+            c = r.cond
+            curve = [c.amp_velcurve[v] for v in range(128)] if c.amp_velcurve else None
+            out.append((r.lokey, r.hikey, r.lovel, r.hivel, r.sample, tuple(r.gen), mods(r.imod, r.nimod),
+                        r.npmod, curve, c.trigger, c.seq_len, c.seq_pos, c.sw_last, c.pair, r.rr_set))
+    for i in range(lib.smp_sf_sample_count(f)):
+        h = lib.smp_sf_sample(f, i).contents
+        out.append((h.name, h.start, h.end, h.rate, h.pitch, h.loop_start, h.loop_end))
+    return out
+
+
+def test_gig_parse_cache(lib, tmp_path):
+    """The second open of an unchanged .gig reads its parse from the cache folder (no libgig) and gives the same
+    model; a changed file, or a damaged cache file, is parsed again."""
+    from test_cache import point_cache
+    cache = tmp_path / "cache"
+    point_cache(lib, cache)
+    lib.smp_sf_test_gig_cache_hits.restype = ctypes.c_long
+    path = pitch_gig(tmp_path)
+    f = opened(lib, path)
+    try:
+        first = model(lib, f)
+    finally:
+        lib.smp_sf_close(f)
+    gigp = [p for p in os.listdir(cache) if p.endswith(".gigp")]
+    assert len(gigp) == 1
+    hits = lib.smp_sf_test_gig_cache_hits()
+    f = opened(lib, path)
+    try:
+        assert lib.smp_sf_test_gig_cache_hits() == hits + 1
+        assert model(lib, f) == first
+        left = note(lib, f, 0, 69, n=12000)[0][:, 0]                    # and it plays the same
+        assert abs(peak_hz(left[2400:], OUT) - 441.0) < 441 * 0.004
+    finally:
+        lib.smp_sf_close(f)
+    (cache / gigp[0]).write_bytes(b"SGPC" + bytes(range(256)) * 4)       # damaged: parsed again, the same
+    f = opened(lib, path)
+    try:
+        assert lib.smp_sf_test_gig_cache_hits() == hits + 1
+        assert model(lib, f) == first
+    finally:
+        lib.smp_sf_close(f)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))       # changed: another key, parsed again
+    f = opened(lib, path)
+    try:
+        assert lib.smp_sf_test_gig_cache_hits() == hits + 1
+        assert model(lib, f) == first
+    finally:
+        lib.smp_sf_close(f)

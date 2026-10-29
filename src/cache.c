@@ -307,7 +307,9 @@ HANDLE smp_entry_handle(const SmpEntry *e) { return e->h; }
 int smp_entry_bps(const SmpEntry *e) { return e->bps ? e->bps : 4; }
 uint64_t smp_entry_data_offset(const SmpEntry *e, uint64_t frame) { return HDR + frame * (uint64_t)(e->bps ? e->bps : 4); }
 
-typedef struct { uint64_t key, size, time; int sfzp; } Item;   /* sfzp: an SFZ probe cache file (sfsfz.c) */
+typedef struct { uint64_t key, size, time; int sfzp; } Item;   /* sfzp: 1 an SFZ probe cache file (sfsfz.c), 2 a
+                                                                  GigaStudio parse cache file (gigshim.cpp) */
+static const wchar_t *const kinds[3] = {L".smpc", L".sfzp", L".gigp"};
 static int by_time(const void *a, const void *b) {
   const Item *x = a, *y = b;
   return x->time < y->time ? -1 : x->time > y->time;
@@ -333,8 +335,8 @@ static void trim_parts(const wchar_t *dir) {
   FindClose(f);
 }
 
-/* The cache's files, oldest first: the .smpc sample files and the .sfzp SFZ probe caches (small, but those of
-   instruments long gone are trimmed like the rest) */
+/* The cache's files, oldest first: the .smpc sample files, the .sfzp SFZ probe caches and the .gigp GigaStudio parse
+   caches (small, but those of instruments long gone are trimmed like the rest) */
 uint64_t smp_cache_trim(uint64_t limit) {
   wchar_t dir[1100], pat[1200];
   int pass;
@@ -343,8 +345,8 @@ uint64_t smp_cache_trim(uint64_t limit) {
   Item *items = NULL; size_t n = 0, cap = 0;
   uint64_t total = 0, pinned = 0; /* open files are never deleted and do not count against the limit */
   WIN32_FIND_DATAW fd;
-  for (pass = 0; pass < 2; pass++) {
-    swprintf(pat, 1200, pass ? L"%s\\*.sfzp" : L"%s\\*.smpc", dir);
+  for (pass = 0; pass < 3; pass++) {
+    swprintf(pat, 1200, L"%s\\*%s", dir, kinds[pass]);
     HANDLE f = FindFirstFileW(pat, &fd);
     if (f == INVALID_HANDLE_VALUE) continue;
     do {
@@ -369,7 +371,7 @@ uint64_t smp_cache_trim(uint64_t limit) {
   for (size_t i = 0; i < n && total > limit; i++) {
     if (!items[i].size) continue;
     wchar_t fn[1200];
-    file_w(items[i].key, items[i].sfzp ? L".sfzp" : L".smpc", fn, 1200);
+    file_w(items[i].key, kinds[items[i].sfzp], fn, 1200);
     if (DeleteFileW(fn)) total -= items[i].size;
   }
   LeaveCriticalSection(&cs);

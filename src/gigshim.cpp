@@ -1038,17 +1038,238 @@ float *decode_guarded(Decode *d) {
 
 } /* namespace */
 
+/* ---- the parse cache ----
+   A big .gig's parse reads libgig's chunk headers all through the file: on a cold USB hard disk that is many seconds
+   (a project's state load parses on the main thread). So what a parse makes is kept in the cache folder, one small
+   file per .gig (<key>.gigp, key: "gigparse1|its full path|size|modified time"), with each extension file's size and
+   time; the next open of the unchanged file reads that instead of opening libgig. Any doubt (another version, other
+   struct sizes, counts the file can't hold, an extension file changed) and the cache is ignored and the file parsed.
+   The cache is trimmed with the rest of the cache folder. */
+namespace {
+
+const uint32_t GPC_VERSION = 1;
+
+bool gpc_path(const SmpFont *f, const char *path, wchar_t *out, int cap) {
+  wchar_t w[2048], full[2048];
+  char u[2048 * 3], d[2048 * 3 + 80], file[2048 * 3];
+  if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048)) return false;
+  DWORD n = GetFullPathNameW(w, 2048, full, nullptr);
+  if (!n || n >= 2048) return false;
+  CharLowerBuffW(full, n);
+  if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, u, (int)sizeof u, nullptr, nullptr)) return false;
+  snprintf(d, sizeof d, "gigparse%u|%s|%llu|%llu", GPC_VERSION, u, (unsigned long long)f->size, (unsigned long long)f->mtime);
+  if (!smp_cache_path(smp_key(d), file, (int)sizeof file)) return false;
+  size_t L = strlen(file);
+  if (L < 5 || strcmp(file + L - 5, ".smpc")) return false;
+  memcpy(file + L - 5, ".gigp", 6);                              /* not a .smpc: the cache's own reads skip it */
+  return MultiByteToWideChar(CP_UTF8, 0, file, -1, out, cap) > 0;
+}
+
+bool file_stamp(const char *p, uint64_t &size, uint64_t &mtime) {
+  wchar_t w[2048]; WIN32_FILE_ATTRIBUTE_DATA a;
+  if (!MultiByteToWideChar(CP_UTF8, 0, p, -1, w, 2048) || !GetFileAttributesExW(w, GetFileExInfoStandard, &a)) return false;
+  size = (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+  mtime = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+  return true;
+}
+
+struct GOut {
+  std::vector<uint8_t> b;
+  void raw(const void *p, size_t n) { const uint8_t *q = (const uint8_t *)p; b.insert(b.end(), q, q + n); }
+  void u32(uint32_t v) { raw(&v, 4); }
+  void u64(uint64_t v) { raw(&v, 8); }
+};
+
+struct GIn {
+  const uint8_t *p; size_t n, at; bool ok;
+  bool raw(void *d, size_t k) { if (!ok || k > n - at) return ok = false; memcpy(d, p + at, k); at += k; return true; }
+  uint32_t u32() { uint32_t v = 0; raw(&v, 4); return v; }
+  uint64_t u64() { uint64_t v = 0; raw(&v, 8); return v; }
+};
+
+const uint32_t SIZES[] = {(uint32_t)sizeof(SfPhdr), (uint32_t)sizeof(SmpSfRegion), (uint32_t)sizeof(SmpSfMod),
+                          (uint32_t)sizeof(SmpSfSample), (uint32_t)sizeof(SmpSrc)};
+
+/* the region block's layout, as the parse makes it: regions, preset starts, modulators, curves */
+void block_layout(int nr, int np, size_t nmods, size_t ncurve_floats, size_t &mod_at, size_t &cur_at, size_t &total) {
+  size_t sreg = (size_t)nr * sizeof(SmpSfRegion), sst = ((size_t)np + 1) * sizeof(int);
+  mod_at = (sreg + sst + 7) & ~(size_t)7;
+  cur_at = (mod_at + nmods * sizeof(SmpSfMod) + 7) & ~(size_t)7;
+  total = cur_at + ncurve_floats * sizeof(float);
+}
+
+void gpc_save(const SmpFont *f, const char *path) {
+  wchar_t file[2048];
+  if (!gpc_path(f, path, file, 2048)) return;
+  /* the block's modulator and curve parts: from the first region's pointers (the parse puts them in one block) */
+  size_t mod_at, cur_at, total, nmods = 0, ncurve = 0;
+  const char *block = (const char *)f->regions;
+  block_layout(f->nregions, f->nphdr, 0, 0, mod_at, cur_at, total);
+  for (int i = 0; i < f->nregions; i++) {
+    const SmpSfRegion *r = &f->regions[i];
+    if (r->imod) { size_t e = (size_t)(r->imod - (const SmpSfMod *)(block + mod_at)) + (size_t)r->nimod; if (e > nmods) nmods = e; }
+  }
+  block_layout(f->nregions, f->nphdr, nmods, 0, mod_at, cur_at, total);
+  for (int i = 0; i < f->nregions; i++) {
+    const float *c = f->regions[i].cond.amp_velcurve;
+    if (c) { size_t e = (size_t)(c - (const float *)(block + cur_at)) + 128; if (e > ncurve) ncurve = e; }
+  }
+  GOut o;
+  o.raw("SGPC", 4); o.u32(GPC_VERSION);
+  for (uint32_t s : SIZES) o.u32(s);
+  o.u32((uint32_t)f->nphdr); o.u32((uint32_t)f->nregions); o.u32((uint32_t)f->nshdr); o.u32((uint32_t)f->npaths);
+  o.u64(nmods); o.u64(ncurve);
+  o.u32((uint32_t)f->has_long); o.u32((uint32_t)f->sfz_ignored); o.u32((uint32_t)f->dls_boosts);
+  o.raw(f->sfz_first_ignored, sizeof f->sfz_first_ignored);
+  for (int k = 0; k < f->npaths; k++) {                          /* the paths, and the extension files' stamps */
+    uint32_t L = (uint32_t)strlen(f->paths[k]); uint64_t sz = 0, mt = 0;
+    if (k > 0 && !file_stamp(f->paths[k], sz, mt)) return;
+    o.u32(L); o.raw(f->paths[k], L); o.u64(sz); o.u64(mt);
+  }
+  o.raw(f->phdr, (size_t)f->nphdr * sizeof(SfPhdr));
+  o.raw(f->shdr, (size_t)f->nshdr * sizeof(SmpSfSample));
+  o.raw(f->src, (size_t)f->nshdr * sizeof(SmpSrc));
+  o.raw(f->rstart, ((size_t)f->nphdr + 1) * sizeof(int));
+  for (int i = 0; i < f->nregions; i++) {                        /* each region, its pointers as indices */
+    SmpSfRegion r = f->regions[i];
+    int64_t mi = r.imod ? (int64_t)(r.imod - (const SmpSfMod *)(block + mod_at)) : -1;
+    int64_t ci = r.cond.amp_velcurve ? (int64_t)(r.cond.amp_velcurve - (const float *)(block + cur_at)) : -1;
+    r.imod = nullptr; r.pmod = nullptr; r.cond.amp_velcurve = nullptr;
+    o.raw(&r, sizeof r); o.u64((uint64_t)mi); o.u64((uint64_t)ci);
+  }
+  o.raw(block + mod_at, nmods * sizeof(SmpSfMod));
+  o.raw(block + cur_at, ncurve * sizeof(float));
+  /* the cache folder (and its parents) first, then the file written whole under a temporary name and moved
+     over: a reader never sees half a file */
+  {
+    wchar_t dir[2048];
+    wcsncpy_s(dir, 2048, file, _TRUNCATE);
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (slash) {
+      *slash = 0;
+      for (wchar_t *c = dir + 1; *c; c++)
+        if (*c == L'\\' || *c == L'/') { wchar_t t = *c; *c = 0; CreateDirectoryW(dir, nullptr); *c = t; }
+      CreateDirectoryW(dir, nullptr);
+    }
+  }
+  wchar_t part[2100];
+  swprintf(part, 2100, L"%s.%lu.part", file, GetCurrentThreadId());
+  HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  DWORD put = 0;
+  BOOL ok = WriteFile(h, o.b.data(), (DWORD)o.b.size(), &put, nullptr) && put == (DWORD)o.b.size();
+  CloseHandle(h);
+  if (!ok || !MoveFileExW(part, file, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part);
+}
+
+/* 1 when f was filled from the cache (everything sf_parse_gig fills); 0: parse it */
+volatile LONG g_gpc_hits;                /* tests: opens served by the parse cache */
+
+int gpc_load(SmpFont *f, const char *path) {
+  wchar_t file[2048];
+  if (!gpc_path(f, path, file, 2048)) return 0;
+  HANDLE h = CreateFileW(file, GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  LARGE_INTEGER sz; std::vector<uint8_t> b; DWORD got = 0;
+  bool read = GetFileSizeEx(h, &sz) && sz.QuadPart > 16 && sz.QuadPart < (512 << 20);
+  if (read) { b.resize((size_t)sz.QuadPart); read = ReadFile(h, b.data(), (DWORD)b.size(), &got, nullptr) && got == b.size(); }
+  if (read) { FILETIME ft; GetSystemTimeAsFileTime(&ft); SetFileTime(h, nullptr, nullptr, &ft); }   /* used: trimmed last */
+  CloseHandle(h);
+  if (!read) return 0;
+  GIn in = {b.data(), b.size(), 0, true};
+  char magic[4];
+  in.raw(magic, 4);
+  if (!in.ok || memcmp(magic, "SGPC", 4) || in.u32() != GPC_VERSION) return 0;
+  for (uint32_t s : SIZES) if (in.u32() != s) return 0;
+  uint32_t np = in.u32(), nr = in.u32(), ns = in.u32(), npaths = in.u32();
+  uint64_t nmods = in.u64(), ncurve = in.u64();
+  uint32_t has_long = in.u32(), ign = in.u32(), boosts = in.u32();
+  char first[sizeof f->sfz_first_ignored];
+  in.raw(first, sizeof first);
+  /* counts the file can't hold aren't believed */
+  if (!in.ok || !np || !npaths || np > b.size() / sizeof(SfPhdr) || nr > b.size() / sizeof(SmpSfRegion) ||
+      ns > b.size() / sizeof(SmpSrc) || npaths > b.size() / 20 || nmods > b.size() / sizeof(SmpSfMod) ||
+      ncurve > b.size() / sizeof(float)) return 0;
+  std::vector<std::string> paths(npaths);
+  for (uint32_t k = 0; k < npaths; k++) {
+    uint32_t L = in.u32();
+    if (!in.ok || L > 4096 || L > in.n - in.at) return 0;
+    paths[k].assign((const char *)in.p + in.at, L); in.at += L;
+    uint64_t s0 = in.u64(), m0 = in.u64(), s1, m1;
+    if (!in.ok) return 0;
+    if (k > 0 && (!file_stamp(paths[k].c_str(), s1, m1) || s1 != s0 || m1 != m0)) return 0;   /* an extension changed */
+  }
+  size_t mod_at, cur_at, total;
+  block_layout((int)nr, (int)np, (size_t)nmods, (size_t)ncurve, mod_at, cur_at, total);
+  SfPhdr *phdr = (SfPhdr *)calloc((size_t)np + 1, sizeof *phdr);
+  int *order = (int *)calloc((size_t)np + 1, sizeof *order);
+  SmpSfSample *shdr = (SmpSfSample *)calloc(ns ? ns : 1, sizeof *shdr);
+  SmpSrc *src = (SmpSrc *)calloc(ns ? ns : 1, sizeof *src);
+  char *block = (char *)calloc(1, total ? total : 1);
+  char **pl = (char **)calloc(npaths, sizeof *pl);
+  bool ok = phdr && order && shdr && src && block && pl;
+  for (uint32_t k = 0; ok && k < npaths; k++) ok = (pl[k] = _strdup(paths[k].c_str())) != nullptr;
+  ok = ok && in.raw(phdr, (size_t)np * sizeof *phdr) && in.raw(shdr, (size_t)ns * sizeof *shdr) &&
+       in.raw(src, (size_t)ns * sizeof *src) && in.raw(block + (size_t)nr * sizeof(SmpSfRegion), ((size_t)np + 1) * sizeof(int));
+  SmpSfRegion *regs = (SmpSfRegion *)block;
+  for (uint32_t i = 0; ok && i < nr; i++) {
+    uint64_t mi, ci;
+    ok = in.raw(&regs[i], sizeof regs[i]);
+    mi = in.u64(); ci = in.u64();
+    if (!ok || !in.ok) { ok = false; break; }
+    if ((int64_t)mi >= 0) {
+      if (mi + (uint64_t)(regs[i].nimod < 0 ? 0 : regs[i].nimod) > nmods) { ok = false; break; }
+      regs[i].imod = (const SmpSfMod *)(block + mod_at) + mi;
+    } else regs[i].nimod = 0;
+    regs[i].pmod = nullptr; regs[i].npmod = 0;
+    if ((int64_t)ci >= 0) {
+      if (ci + 128 > ncurve) { ok = false; break; }
+      regs[i].cond.amp_velcurve = (const float *)(block + cur_at) + ci;
+    }
+    if (regs[i].sample >= (int)ns) { ok = false; break; }
+  }
+  ok = ok && in.raw(block + mod_at, (size_t)nmods * sizeof(SmpSfMod)) && in.raw(block + cur_at, (size_t)ncurve * sizeof(float));
+  const int *rs = (const int *)(block + (size_t)nr * sizeof(SmpSfRegion));
+  for (uint32_t p = 0; ok && p <= np; p++) ok = rs[p] >= 0 && rs[p] <= (int)nr && (p == 0 || rs[p] >= rs[p - 1]);
+  for (uint32_t s = 0; ok && s < ns; s++) ok = src[s].path_id >= 0 && src[s].path_id < (int)npaths;
+  if (!ok) {
+    free(phdr); free(order); free(shdr); free(src); free(block);
+    if (pl) { for (uint32_t k = 0; k < npaths; k++) free(pl[k]); free(pl); }
+    return 0;
+  }
+  f->nphdr = (int)np; f->phdr = phdr; f->order = order;
+  f->nshdr = (int)ns; f->shdr = shdr; f->src = src;
+  f->paths = pl; f->npaths = (int)npaths;
+  f->regions = regs; f->rstart = (int *)rs; f->nregions = (int)nr;
+  f->has_long = (int)has_long; f->sfz_ignored = (int)ign; f->dls_boosts = (int)boosts;
+  memcpy(f->sfz_first_ignored, first, sizeof first);
+  f->sfz_first_ignored[sizeof first - 1] = 0;
+  if (!sf_build_order(f)) return -1;
+  InterlockedIncrement(&g_gpc_hits);
+  return 1;
+}
+
+} /* namespace */
+
 extern "C" int sf_gig_crashed(void) { return g_crashed != 0; }
+extern "C" __declspec(dllexport) long smp_sf_test_gig_cache_hits(void) { return g_gpc_hits; }
 
 extern "C" int sf_parse_gig(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   int r;
   if (why && wcap > 0) why[0] = 0;
   if (g_crashed) { say(why, wcap, CRASHED); return -1; }
+  {
+    int c = gpc_load(f, path);                              /* opened before and unchanged: no libgig at all */
+    if (c > 0) return 1;
+    if (c < 0) { say(why, wcap, "out of memory"); return -1; }
+  }
   lock_gig();
   if (g_crashed) { ReleaseSRWLockExclusive(&g_lock); say(why, wcap, CRASHED); return -1; }   /* a decode crashed meanwhile */
   r = parse_guarded(f, path, cancel, carg, why, wcap);
   if (g_crashed) ReleaseSRWLockExclusive(&g_lock);        /* nothing pending is freed after a crash */
   else unlock_gig();
+  if (r > 0) { try { gpc_save(f, path); } catch (...) {} }   /* the next open reads this instead */
   return r;
 }
 

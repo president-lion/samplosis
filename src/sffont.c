@@ -72,6 +72,7 @@
 #define SF_NEEDS_DECODE 3                  /* a load's *broken on the loader: not in the cache, the worker decodes it */
 enum { SF_DQ_NONE, SF_DQ_QUEUED, SF_DQ_DONE };
 #define WARM_DIV 5                         /* heads load with 2/WARM_DIV s (0.4 s) after them read into the file cache */
+#define PREFETCH_CHUNK (4u << 20)          /* a GigaStudio wave's bytes are read into the file cache this much at a time */
 #define TRIM_EVERY (256ull << 20)          /* a long pass trims the cache after this many decoded bytes written */
 #define STALL_MS 60000                     /* an offline render stops waiting for a font whose loader shows no progress
                                               this long (FFmpeg's own stall timer is as long) */
@@ -270,7 +271,19 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
     float *x; int ch = 0, r = 0; long frames = 0; char err[256];
     const float *mono;
     if (c->giga) {
-      /* a compressed GigaStudio wave: libgig decodes it (gigshim.cpp), a piece at a time, stopping for a close */
+      /* a compressed GigaStudio wave: libgig decodes it (gigshim.cpp), a piece at a time, stopping for a close.
+         libgig reads it a frame (a few KB) at a time on a random-access handle, which on a cold hard disk is a
+         wait per frame; the wave's bytes are read through first, in big sequential pieces, into the file cache. */
+      HANDLE h = c->length > 1 ? font_handle(f, c->path_id) : NULL;
+      if (h) {
+        uint8_t *buf = malloc(PREFETCH_CHUNK);
+        uint64_t at;
+        for (at = 0; buf && at < c->length && !pack_cancel(f); at += PREFETCH_CHUNK) {
+          uint64_t k = c->length - at < PREFETCH_CHUNK ? c->length - at : PREFETCH_CHUNK;
+          if (!read_at(h, c->offset + at, buf, k)) break;
+        }
+        free(buf);
+      }
       x = sf_gig_decode(f, c, &ch, &frames, &r, pack_cancel, f, err, sizeof err);
       if (!x && (f->closing || g_stop)) return NULL;                 /* cancelled: not broken */
       if (!x && sf_gig_crashed()) { set_problem(f, "%s%s", err, ""); *broken = 1; return NULL; }   /* said plainly */
