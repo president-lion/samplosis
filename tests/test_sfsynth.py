@@ -15,9 +15,10 @@ SR = 44100      # the samples' rate
 OUT = 48000     # the output rate
 FP = ctypes.POINTER(ctypes.c_float)
 _count = itertools.count()
+MAXV = 1088     # voice slots: more than sf_voices' top (1024), so stolen voices can fade
 
 # generator ids (SF2.04)
-RELEASE_VOL, EXCL, MODES, ROOTKEY = 38, 57, 54, 58
+PAN, RELEASE_VOL, EXCL, MODES, ROOTKEY = 17, 38, 57, 54, 58
 P_VOLUME, P_VOICES, P_EFFECTS, P_TRANSPOSE = 31, 32, 33, 34
 
 
@@ -38,7 +39,7 @@ def preset(name, bank, program, zones):
 def write_font(path, base_pitch=69):
     """The fixture font. At key 69: piano 440 Hz (bank 0 program 0, 1 s release), bass 220 Hz (0:33), the drum
     kit 880 Hz (128:0; key 46 an open hi-hat at 440 Hz and key 42 a closed one at 880 Hz, both exclusive class 1),
-    and a looping organ at 330 Hz (0:16). base_pitch moves the piano's sample (font B in the switch test)."""
+    a looping organ at 330 Hz (0:16), a two-region (stereo) piano at 0:1, and a second kit at 128:25 (220 Hz). base_pitch moves the piano's sample (font B in the switch test)."""
     samples = [
         dict(name="piano", data=sine(440, 2.0), rate=SR, pitch=base_pitch, loop=None),
         dict(name="bass", data=sine(440, 2.0), rate=SR, pitch=81, loop=None),
@@ -51,7 +52,9 @@ def write_font(path, base_pitch=69):
     presets = [preset("Piano", 0, 0, [zone(0, gens={RELEASE_VOL: 0})]),
                preset("Bass", 0, 33, [zone(1)]),
                preset("Kit", 128, 0, kit),
-               preset("Organ", 0, 16, [zone(3, gens={MODES: 1})])]
+               preset("Organ", 0, 16, [zone(3, gens={MODES: 1})]),
+               preset("Stereo", 0, 1, [zone(0, gens={PAN: -500}), zone(0, gens={PAN: 500})]),
+               preset("Kit2", 128, 25, [zone(1)])]
     write_sf2(path, presets, samples)
 
 
@@ -153,6 +156,8 @@ def test_program_fallback(lib, S):
     s = S.new()
     assert abs(freq_of(S, s, "midi 176 0 8 0\nmidi 192 33 0\nmidi 144 69 100 0") - 220) < 1    # bank 0's bass
     assert abs(freq_of(S, s, "midi 201 99 0\nmidi 153 69 100 0") - 880) < 2                    # kit 99: 128:0
+    # an XG drum bank (127) with a kit the font has at 128: 128:25 before 128:0
+    assert abs(freq_of(S, s, "midi 176 0 127 0\nmidi 192 25 0\nmidi 144 69 100 0") - 220) < 1
     assert abs(freq_of(S, s, "midi 176 0 50 0\nmidi 192 120 0\nmidi 144 69 100 0") - 440) < 1  # the first preset
     # XG style: CC0 0 and CC32 naming a bank the font has (bank 0 here, so a no-op), or one it lacks (ignored)
     assert abs(freq_of(S, s, "midi 176 0 0 0\nmidi 176 32 5 0\nmidi 192 33 0\nmidi 144 69 100 0") - 220) < 1
@@ -179,10 +184,13 @@ def test_one_preset_mode(lib, S):
     x = S.render(s, "midi 144 69 100 0", 0.3)
     assert np.max(np.abs(x)) < 1e-6                                              # channel 1 isn't listened to
     assert abs(freq_of(S, s, "midi 194 0 0\nmidi 146 69 100 0") - 220) < 1       # program changes are ignored
-    assert abs(freq_of(S, s, "midi 194 0 0\nmidi 146 69 100 0") - 220) < 1
+    assert abs(freq_of(S, s, "midi 194 16 0\nmidi 146 69 100 4800") - 220) < 1   # and stay ignored for later notes
     r, err = S.apply(s, "sf_mode one\nsf_preset 0 33\nsf_channel 10\n")         # channel 10: no drum rule
     assert r == 0, err
     assert abs(freq_of(S, s, "midi 153 69 100 0") - 220) < 1
+    r, err = S.apply(s, "sf_mode one\nsf_preset 127 99\n")                      # bank 127 is drums here too
+    assert r == 0, err
+    assert abs(freq_of(S, s, "midi 144 69 100 0") - 880) < 2
 
 
 def test_exclusive_class(lib, S):
@@ -268,6 +276,12 @@ def test_controllers(lib, S):
     assert abs(freq_of(S, s, rpn2 + "midi 144 69 100 0") - 440 * 2 ** (2 / 12)) < 1
     nrpn = "midi 176 99 0 0\nmidi 176 98 0 0\nmidi 176 6 100 0\n"
     assert abs(freq_of(S, s, nrpn + "midi 144 69 100 0") - 440) < 1
+    # CC121 recentres the bend and nulls the RPN selection (a CC6 after it changes nothing); CC122 isn't a note-off
+    assert abs(freq_of(S, s, "midi 224 127 127 0\nmidi 176 121 0 0\nmidi 144 69 100 0") - 440) < 1
+    assert abs(freq_of(S, s, "midi 176 101 0 0\nmidi 176 100 0 0\nmidi 176 121 0 0\nmidi 176 6 12 0\n"
+                             "midi 224 127 127 0\nmidi 144 69 100 0") - 440 * 2 ** (2 * 8191 / 8192 / 12)) < 1
+    x = S.render(s, "midi 144 69 100 0\nmidi 176 122 0 4800", 0.5)
+    assert rms(seg(x, 0.3, 0.45)) > 0.05
     # a bend arriving mid-note moves the sounding note
     x = S.render(s, "midi 144 69 100 0\nmidi 224 127 127 24000", 1.0)
     assert abs(peak_freq(seg(x, 0.6, 0.95)) - 440 * 2 ** (2 * 8191 / 8192 / 12)) < 1
@@ -277,7 +291,7 @@ def voices(lib, s):
     peak = ctypes.c_int()
     n = lib.smp_synth_voices(s, ctypes.byref(peak))
     keys = []
-    for i in range(1024):
+    for i in range(MAXV):
         c, k, rel = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
         if lib.smp_synth_test_voice(s, i, ctypes.byref(c), ctypes.byref(k), ctypes.byref(rel)):
             keys.append(k.value)
@@ -297,6 +311,52 @@ def test_voice_limit_and_stealing(lib, S):
     S.render(s, ev + "\nmidi 128 45 0 4800\nmidi 144 70 30 7200", 0.3)
     n, peak, keys = voices(lib, s)
     assert n == 16 and keys == sorted([k for k in range(40, 56) if k != 45] + [70])
+
+
+def test_chord_at_the_limit(lib, S):
+    """a chord at the voice limit keeps every voice it starts: a new voice in its delay or attack isn't 'quiet',
+    and a note-on never steals the voices it just started (here 4 keys x 2 regions on channel 2)"""
+    s = S.new()
+    lib.smp_synth_set_param(s, P_VOICES, 16)
+    held = "\n".join("midi 144 %d 100 0" % k for k in range(40, 56))
+    chord = "\n".join("midi 145 %d 100 24000" % k for k in (60, 64, 67, 72))
+    S.render(s, held + "\nmidi 193 1 0\n" + chord, 0.6)
+    n, peak, keys = voices(lib, s)
+    chans = []
+    for i in range(MAXV):
+        c, k, rel = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        if lib.smp_synth_test_voice(s, i, ctypes.byref(c), ctypes.byref(k), ctypes.byref(rel)):
+            chans.append((c.value, k.value))
+    assert n == 16 and peak == 16
+    assert sorted(k for c, k in chans if c == 1) == [60, 60, 64, 64, 67, 67, 72, 72]
+    # at the very top, stolen voices still have slots to fade in
+    lib.smp_synth_set_param(s, P_VOICES, 1024)
+    S.render(s, "\n".join("midi 144 %d 100 %d" % (k % 128, k) for k in range(1100)), 0.1)
+    assert lib.smp_synth_voices(s, None) <= 1024
+
+
+def test_used_presets_released_at_reset(lib, S):
+    """the state's sf_used presets are let go at a reset; the song's own (the channels' power-on presets, piano
+    and the kit) stay, so only the bass's sample goes"""
+    lib.smp_sf_test_grace(20)
+    try:
+        s = S.new()
+        r, err = S.apply(s, "sf_used 0:0 0:33 128:0\n")
+        assert r == 0, err
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        f = lib.smp_synth_font(s)
+        assert lib.smp_sf_loaded_samples(f) == 3
+        S.render(s, "midi 144 69 100 0", 0.1)
+        time.sleep(0.3)
+        assert lib.smp_sf_loaded_samples(f) == 3       # still held: no reset, and 10 s haven't passed
+        S.render(s, "reset 0", 0.1)
+        t0 = time.time()
+        while lib.smp_sf_loaded_samples(f) != 2 and time.time() - t0 < 3:
+            time.sleep(0.01)
+        assert lib.smp_sf_loaded_samples(f) == 2
+        assert "0:33" not in S.write(s)
+    finally:
+        lib.smp_sf_test_grace(0)
 
 
 def test_outputs(lib, S):
@@ -362,6 +422,12 @@ def test_state_lines_roundtrip(lib, S, font):
     missing = str(font.parent / "nope" / "missing.sf2")
     r, err = S.apply(s2, 'soundfont "%s"\nsf_mode all\n' % missing)
     assert r != 0 and missing in err, err
+    assert S.write(s2) == w1
+    # a path too long for the player is an error, not cut short; a long line of ours is checked even indented
+    r, err = S.apply(s2, 'sf_mode all\nsoundfont "%s"\n' % ("C:\\" + "x" * 1030 + ".sf2"))
+    assert r != 0 and err.startswith("line 2: "), err
+    r, err = S.apply(s2, "sf_mode all\n   sf_used " + "0:0 " * 400 + "\n")
+    assert r != 0 and err.startswith("line 2: "), err
     assert S.write(s2) == w1
     # defaults: absent lines go back to them; no font yet writes no soundfont line
     s3 = S.new(load=False)

@@ -33,7 +33,8 @@
 
 #define NCH 16
 #define NOUT 16
-#define MAXV 1024                 /* the voice array, allocated once */
+#define MAXV 1088                 /* the voice array, allocated once: more than sf_voices' top (1024), so
+                                     voices stolen at the limit still have slots to fade out in */
 #define MAXEV 4096                /* queued MIDI events per block */
 #define MAXUSED 1024              /* presets in an sf_used line */
 #define KILL_MS 5.0               /* a stolen or killed voice fades out over this */
@@ -106,6 +107,7 @@ struct SmpSynth {
   Chan ch[NCH];
   SmpSfVoice *v; Slot *sl;
   uint64_t age;
+  uint64_t protect;               /* during a note-on: voices this old or newer were started by it (0: none) */
   Ev ev[MAXEV]; int nev;
   float *rev, *cho;               /* effect sends of output 1 (Task 6 processes them) */
   double gain;                    /* the volume gain at the end of the last block */
@@ -193,10 +195,12 @@ static int has_bank(const SmpFont *f, int bank) {
   return 0;
 }
 
-/* the program fallback: the exact bank and program; then bank 0 with the same program (for drums, bank 128
-   program 0); then the first preset in the font */
+/* the program fallback: the exact bank and program; then bank 0 with the same program (for drums, a bank of 127
+   or more: bank 128 with the same program, as XG's kits are numbered, then bank 128 program 0); then the first
+   preset in the font */
 static int lookup(const SmpFont *f, int bank, int program, int drum) {
   int p = smp_sf_find_preset(f, bank, program);
+  if (p < 0 && drum) p = smp_sf_find_preset(f, 128, program);
   if (p < 0) p = drum ? smp_sf_find_preset(f, 128, 0) : smp_sf_find_preset(f, 0, program);
   if (p < 0 && smp_sf_preset_count(f) > 0) p = 0;
   return p;
@@ -208,7 +212,7 @@ static int want_preset(const SmpSynth *s, int c) {
   if (!f) return -1;
   if (s->cfg.mode == MODE_ONE) {
     if (!listens(s, c)) return -1;
-    return lookup(f, s->cfg.bank, s->cfg.program, s->cfg.bank >= 128);
+    return lookup(f, s->cfg.bank, s->cfg.program, s->cfg.bank >= 127);
   }
   if (s->cfg.pin[c] >= 0) {
     bank = s->cfg.pin[c] / 128;
@@ -248,13 +252,21 @@ static void release_voice(SmpSynth *s, int i) {
   if (s->sl[i].st == V_LIVE) smp_sfv_release(&s->v[i]);
 }
 
-/* the voice to steal: released voices first, then the quietest, then the oldest */
+/* how loud a voice counts for stealing. One still in its delay or attack is judged by the level it is rising
+   to (its attenuation), not by its envelope so far, or every new note of a chord would look the quietest. */
+static double steal_level(const SmpSfVoice *v) {
+  if (!v->released && v->venv.stage <= SMP_SFV_ATTACK) return v->atten_gain * (v->killing ? v->fade : 1);   /* delay, attack */
+  return smp_sfv_level(v);
+}
+
+/* the voice to steal: released voices first, then the quietest, then the oldest. Never one the note-on being
+   handled has just started (as FluidSynth does), so a chord or a layered note keeps all its voices. */
 static int victim(const SmpSynth *s, int except) {
   int i, best = -1, brel = 0; double blev = 0;
   for (i = 0; i < MAXV; i++) {
     int rel; double lev;
-    if (i == except || !sounding(s, i)) continue;
-    rel = s->v[i].released; lev = smp_sfv_level(&s->v[i]);
+    if (i == except || !sounding(s, i) || (s->protect && s->sl[i].age >= s->protect)) continue;
+    rel = s->v[i].released; lev = steal_level(&s->v[i]);
     if (best < 0 || rel > brel || (rel == brel && (lev < blev || (lev == blev && s->sl[i].age < s->sl[best].age)))) {
       best = i; brel = rel; blev = lev;
     }
@@ -348,11 +360,13 @@ static void note_on(SmpSynth *s, int c, int key, int vel) {
     for (i = 0; i < MAXV; i++)
       if (s->sl[i].st != V_FREE && s->sl[i].chan == c && s->sl[i].excl == r->gen[G_EXCL]) kill_voice(s, i, KILL_MS);
   }
+  s->protect = s->age + 1;                      /* the voices this note-on starts are never its victims */
   for (k = 0; k < n; k++) {
     const SmpSfRegion *r = &regs[k];
     if (key < r->lokey || key > r->hikey || vel < r->lovel || vel > r->hivel) continue;
     start_region(s, c, key, vel, r);
   }
+  s->protect = 0;
 }
 
 /* the voices of channel c whose keys are up and whose pedals have let go are released */
@@ -406,7 +420,8 @@ static void control(SmpSynth *s, int c, int n, int v) {
   if (n >= 120) {
     if (n == 120) sound_off(s, c);
     else if (n == 121) { chan_controllers(h); tuning(h); let_go(s, c); update_chan(s, c); }
-    else all_notes_off(s, c);                  /* 123, and the mode messages 124..127 that imply it */
+    else if (n >= 123) all_notes_off(s, c);    /* 123, and the mode messages 124..127 that imply it */
+    /* 122, Local Control, has nothing to do in a synth without a keyboard */
     return;
   }
   h->c.cc[n] = (uint8_t)v;
@@ -532,6 +547,7 @@ SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap) {
   SmpFont *f, *old;
   if (err && cap > 0) err[0] = 0;
   if (!s || !path) { if (err && cap > 0) snprintf(err, (size_t)cap, "no player or no path"); return 0; }
+  if (strlen(path) >= sizeof s->path) { if (err && cap > 0) snprintf(err, (size_t)cap, "the path is too long"); return 0; }
   f = smp_sf_open(path, err, cap);
   if (!f) return 0;
   if (s->nret == s->cret) {                    /* room on the retired list first, so nothing can fail later */
@@ -800,7 +816,9 @@ SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int
     len = (size_t)(eol - p);
     lineno++;
     if (len >= sizeof buf) {                   /* a long line is somebody else's unless it is ours */
-      if (!strncmp(p, "sf_", 3) || !strncmp(p, "soundfont", 9)) { fail(err, cap, lineno, "the line is too long"); return 1; }
+      const char *q = p;
+      while (q < eol && isspace((unsigned char)*q)) q++;
+      if (!strncmp(q, "sf_", 3) || !strncmp(q, "soundfont", 9)) { fail(err, cap, lineno, "the line is too long"); return 1; }
       p = *eol ? eol + 1 : eol; continue;
     }
     memcpy(buf, p, len); buf[len] = 0;
@@ -821,6 +839,7 @@ SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int
       *end = 0;
       if (!*q) { fail(err, cap, lineno, "soundfont: the path is empty"); return 1; }
       if (end[1]) { snprintf(m, sizeof m, "soundfont: unexpected '%s' after the path", end + 1); fail(err, cap, lineno, m); return 1; }
+      if (strlen(q) >= sizeof path) { fail(err, cap, lineno, "soundfont: the path is too long"); return 1; }
       snprintf(path, sizeof path, "%s", q); has_path = 1; path_line = lineno;
       continue;
     }

@@ -210,7 +210,7 @@ SMP_API SmpFont *smp_synth_font(const SmpSynth *s);   /* main thread: the font l
 SMP_API int smp_synth_voices(const SmpSynth *s, int *peak);   /* sounding voices (not counting ones fading out
                                     after a steal or kill); peak: the most since the last render_test */
 SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released);   /* tests: 1 when
-                                    voice slot i (0..1023) is sounding, with its channel (0..15), key and release */
+                                    voice slot i (0..1087) is sounding, with its channel (0..15), key and release */
 #ifdef __cplusplus
 }
 #endif

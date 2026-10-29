@@ -21,6 +21,8 @@ typedef struct SmpSfChan {
 /* samples between control updates (envelopes, LFOs, modulators, filter coefficients) */
 #define SMP_SFV_CTL 32
 
+/* envelope stages, in order: delay, attack, hold, decay, sustain, release, done */
+enum { SMP_SFV_DELAY, SMP_SFV_ATTACK };
 typedef struct { int stage; double t, val; } SmpSfEnv;           /* t: samples into the stage */
 typedef struct { double t, delay, phase, inc, val; } SmpSfLfo;    /* t: samples since the start, up to delay */
 

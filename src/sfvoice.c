@@ -26,7 +26,7 @@ enum {
   G_PITCH = 59      /* "initial pitch": no generator, only the default pitch wheel modulator's destination */
 };
 
-/* envelope stages */
+/* envelope stages (the first two are SMP_SFV_DELAY and SMP_SFV_ATTACK in sfvoice.h, which the player reads) */
 enum { E_DELAY, E_ATTACK, E_HOLD, E_DECAY, E_SUSTAIN, E_RELEASE, E_DONE };
 
 /* the EMU factor on initialAttenuation that FluidSynth applies to the generator (not to modulators) */
