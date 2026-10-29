@@ -35,6 +35,11 @@ typedef struct Plug {
   volatile LONG gui_any;             /* the window changed parameters: tell the host in the next flush or process */
   volatile LONG gui_pending[SMP_NALLPARAMS];
   struct Gui *gui;
+  struct Loader *loader;             /* the window's sample loads, on a worker thread (made at the first) */
+  int loading;                       /* one of them is under way: its file is loading_path */
+  char loading_path[1100], loading_name[256];
+  long load_failed;                  /* how many have failed; the last one's "Can't load x: why" is load_err */
+  char load_err[1900];
 } Plug;
 
 extern const char *const smp_param_label[SMP_NALLPARAMS];    /* "Root note", "Volume", ... "SoundFont volume" */
@@ -42,8 +47,14 @@ extern const char *const smp_param_label[SMP_NALLPARAMS];    /* "Root note", "Vo
 void smp_plug_set_param(Plug *P, int id, double v);   /* from the window: the engine (ids below SMP_NPARAMS) or the
                                                          SoundFont player (31 to 34) at once, then the host is told */
 double smp_plug_get_param(Plug *P, int id);
-int smp_plug_load(Plug *P, const char *path, char *err, int cap);   /* 1 loaded; 0 and a plain reason */
-int smp_plug_sample_path(Plug *P, char *path, int cap);  /* 1 a sample, 2 a missing one, 0 none */
+/* A sample loads in the background: 1 started (a load still under way is cancelled), 0 and a plain reason. The
+   window's call returns at once; the status says "Loading x.wav", or "Decoding x.dsf with FFmpeg". dropped: when it
+   loads, the sampler plays. */
+int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap);
+/* A finished background load swapped in (main thread): 1 loaded, -1 it failed (load_failed counts up, load_err says
+   why), 0 nothing finished. on_main_thread asks too, and tells the window. */
+int smp_plug_poll_load(Plug *P);
+int smp_plug_sample_path(Plug *P, char *path, int cap);  /* 1 a sample (or the one loading), 2 a missing one, 0 none */
 void smp_plug_sample_text(Plug *P, char *out, int cap);  /* "Guitar C3.wav, 2.40 s, root C3 from the file name" */
 void smp_plug_status_text(Plug *P, char *out, int cap);  /* "Keep length: 40 of 128 copies ready", or a reason; with
                                     the SoundFont player playing, "Ready: GM.sf2, 412 presets", "Loading samples for
@@ -66,4 +77,5 @@ int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program);  /* the p
 
 extern const clap_plugin_gui_t smp_gui_ext;
 void smp_gui_close(Plug *P);
+void smp_gui_loaded(Plug *P);                      /* a background load finished: the window shows it */
 #endif

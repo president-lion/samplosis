@@ -112,6 +112,10 @@ static void find_root(SmpSample *s, const char *path, int use_sidecar, double de
 }
 
 SmpSample *smp_sample_load(const char *path, char *err, int cap) {
+  return smp_sample_load_ex(path, NULL, NULL, NULL, err, cap);
+}
+
+SmpSample *smp_sample_load_ex(const char *path, int (*cancel)(void *), void (*stage)(void *), void *arg, char *err, int cap) {
   uint64_t size, mtime, key; SmpEntry *e; SmpSample *s;
   double detected = -2; SmpDecBy by = SMP_DEC_BUILTIN;
   if (!path || !stat_src(path, &size, &mtime)) {
@@ -129,7 +133,7 @@ SmpSample *smp_sample_load(const char *path, char *err, int cap) {
   {
     int ch = 0, rate = 0; long n = 0, i; float *x, *lr;
     g_decodes++;
-    x = decode_audio_ex(path, &ch, &n, &rate, &by, NULL, NULL, err, cap);
+    x = decode_audio_full(path, &ch, &n, &rate, &by, cancel, stage, arg, err, cap);
     if (!x) return NULL;
     lr = malloc(sizeof(float) * 2 * (size_t)n);
     if (!lr) { free(x); snprintf(err, (size_t)cap, "out of memory reading %s", path); return NULL; }

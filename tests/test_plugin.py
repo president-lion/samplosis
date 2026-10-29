@@ -535,12 +535,12 @@ MAIN_ORDER = [
 ]
 
 
-def gui(P, tmp_path, text, actions):
+def gui(P, tmp_path, text, actions, env=None):
     """Opens the window on a state and runs actions; returns the printed lines."""
     st = P.state_file(text, "gui_state.txt")
     sc = tmp_path / "gui_script.txt"
-    sc.write_text("\n".join(actions) + "\n")
-    code, out, err = host("gui", st, sc, timeout=120)
+    sc.write_text("\n".join(actions) + "\n", encoding="utf-8")
+    code, out, err = host("gui", st, sc, timeout=120, env=env)
     assert code == 0, out + err
     return out
 
@@ -892,3 +892,101 @@ def test_gui_channel_from_song(P, tmp_path):
     assert f[7] == ["ComboBox", "Channel", "All channels"]           # Shift+Tab skips the hidden channel combos
     assert st[3] == 'soundfont "%s"' % font                          # not loaded: the window had gone
     assert "alive: plugin\n" in out and "closed" in out
+
+
+# ---- the window loads in the background ----
+FFMPEG = __import__("shutil").which("ffmpeg")
+
+
+def fake_ff(tmp_path, mode):
+    """tests\fakeff.exe as ffmpeg.exe and ffprobe.exe in a folder named mode (which says how it behaves)."""
+    import shutil
+    d = tmp_path / mode
+    d.mkdir()
+    for n in ("ffmpeg.exe", "ffprobe.exe"):
+        shutil.copyfile(os.path.join(ROOT, "tests", "fakeff.exe"), d / n)
+    return d
+
+
+def set_ffmpeg(lib, path):
+    from conftest import SmpSettings
+    s = SmpSettings()
+    lib.smp_settings_get(ctypes.byref(s))
+    s.ffmpeg_path = str(path).encode()
+    assert lib.smp_settings_set(ctypes.byref(s)) == 0
+
+
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg isn't installed")
+def test_gui_load_does_not_block(P, tmp_path):
+    # Browse an FFmpeg-only file: the window's call returns at once with "Decoding ...", the old sample still plays,
+    # and the new one is swapped in when FFmpeg is done (the test flag holds FFmpeg back 1.5 s)
+    src = P.sample("src.wav")
+    f = tmp_path / "tone A3.tta"
+    subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-y", "-i", str(src), "-c:a", "tta", str(f)], check=True, timeout=60)
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % f, "focus Browse", "clock", "key enter", "clock",
+                                  "pump 300", "read Status", "read Sample", "wait", "read Status", "read Sample",
+                                  "state", "counts"],
+              env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
+    r = [x[1] for x in got(out, "read")]
+    ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
+    assert ms[1] < 500, out                                         # the key returned at once
+    assert r[0] == "Decoding tone A3.tta with FFmpeg", out
+    assert r[1].startswith("tone A3.wav, "), out                    # the old sample until the new one is ready
+    assert r[2] == "Ready: tone A3.tta (decoded by FFmpeg)", out
+    assert r[3].startswith("tone A3.tta, "), out
+    assert ('state: sample "%s"' % f) in out
+    assert got(out, "counts")[0][0] == "beeps 0"
+
+
+def test_background_load_cancel(lib, P, tmp_path):
+    # a second load while FFmpeg still works on the first: the first FFmpeg is killed and the second sample loads;
+    # then the plugin is destroyed while a third decode runs, and nothing is left running
+    d = fake_ff(tmp_path, "hang")
+    junk = tmp_path / "first.tta"
+    junk.write_bytes(b"nothing we read" * 100)
+    third = tmp_path / "third.tta"
+    third.write_bytes(b"nothing we read" * 100)
+    second = P.sample("second A3.wav")
+    text = P.script(P.sample())
+    pids = d / "pids.txt"
+    set_ffmpeg(lib, d / "ffmpeg.exe")
+    try:
+        out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % junk, "focus Browse", "key enter", "pump 1500",
+                                      "read Status", "pids %s" % pids, "dialog pick %s" % second, "focus Browse",
+                                      "key enter", "wait", "pids %s" % pids, "read Status", "read Sample", "pump 600",
+                                      "read Sample", "state", "dialog pick %s" % third, "focus Browse", "key enter",
+                                      "pump 1000", "pids %s" % pids, "alive"])
+    finally:
+        set_ffmpeg(lib, "")
+    r = [x[1] for x in got(out, "read")]
+    p = [ln for ln in out.splitlines() if ln.startswith("pids: ")]
+    assert r[0] == "Decoding first.tta with FFmpeg", out
+    assert p[0] == "pids: 1 of 2 running", out                     # ffprobe ended, ffmpeg hangs
+    assert p[1] == "pids: 0 of 2 running", out                     # the newer load killed it
+    assert r[1] == "Ready: second A3.wav" and r[2].startswith("second A3.wav, ") and r[3] == r[2], out
+    assert ('state: sample "%s"' % second) in out
+    assert p[2] == "pids: 1 of 4 running", out                     # the third decode, when the plugin goes
+    assert "alive: plugin\n" in out and "closed" in out
+    import time
+    t = time.perf_counter()
+    while time.perf_counter() - t < 5:
+        n = sum(1 for x in pids.read_text().split() if _running(int(x)))
+        if not n:
+            break
+        time.sleep(0.1)
+    assert n == 0
+
+
+def _running(pid):
+    k32 = ctypes.WinDLL("kernel32")
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x00100000, False, pid)
+    if not h:
+        return False
+    try:
+        return k32.WaitForSingleObject(h, 0) == 0x102
+    finally:
+        k32.CloseHandle(h)

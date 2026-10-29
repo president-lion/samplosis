@@ -15,8 +15,9 @@ a project saved before the SoundFont player existed loads as it was.
 The Sampler:
 
 - Load one audio file (wav, flac, ogg, mp3, opus, wv, ape and the other formats the bundled decoders read, and m4a,
-  aac, wma and whatever else Windows itself decodes) with the Browse button, by dragging it onto the window, or
-  from a saved REAPER project.
+  aac, wma and whatever else Windows itself decodes; with FFmpeg installed, also dsf, tta and anything else it
+  decodes) with the Browse button, by dragging it onto the window, or from a saved REAPER project. Files from the
+  window load in the background: the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" until it's ready.
 - The root note comes from a note name in the file name ("Guitar C3.wav", "Pad F#2.flac") or, if there is none,
   from pitch detection on the audio.
 - Notes keep their length. With Keep length on, a note played above or below the root is made by a time stretcher

@@ -16,7 +16,8 @@
    5. a file (never bytes in memory) that nothing above read, and that isn't a raw name, goes to Windows Media
       Foundation (mfdecode.c, on a helper thread with a stall timer): AAC, WMA, and whatever else this machine's
       Windows decodes. by says Windows.
-   Later stages add decoders after these. Whatever decodes a file, its result passes one place (finish): a sample
+   6. what Windows doesn't read either goes to FFmpeg, when it's installed (ffdecode.c, run as a child process with a
+      stall timer): DSD (.dsf, .dff), TTA, Matroska, and anything else FFmpeg decodes. by says FFmpeg. Whatever decodes a file, its result passes one place (finish): a sample
    that isn't finite, or is absurdly large (a damaged file), becomes silence. Never called on the audio thread. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@
 #include <wavpack.h>
 #include "decode.h"
 #include "mfdecode.h"
+#include "ffdecode.h"
 
 /* The size limit, in one place for every decoder: 2 GiB of decoded float. A long recording still fits; anything
    bigger is refused with TOO_LONG. */
@@ -54,11 +56,13 @@ int smp_ape_read(void *h, float *out, int frames);
 void smp_ape_close(void *h);
 void smp_ape_set_debug_flags(long f);
 /* TESTS ONLY: 1 = Monkey's Audio throws inside its guard; 2 = the size limit is 65536 floats instead of 2 GiB;
-   4, 8, 16, 32 and 64 are the Windows stage's (SMP_MF_TEST_* in mfdecode.h) */
+   4, 8, 16, 32 and 64 are the Windows stage's (SMP_MF_TEST_* in mfdecode.h); 128, 256 and 512 the FFmpeg stage's
+   (SMP_FF_TEST_* in ffdecode.h) */
 SMP_API void smp_test_only_decode_flags(long f) {
   smp_ape_set_debug_flags(f & 1);
   smp_mf_set_test_flags(f & (SMP_MF_TEST_SLOW | SMP_MF_TEST_NO_MF | SMP_MF_TEST_BUFFER_FAILS_FIRST |
                              SMP_MF_TEST_BUFFER_FAILS_THIRD | SMP_MF_TEST_BUSY));
+  smp_ff_set_test_flags(f & (SMP_FF_TEST_STALL_SHORT | SMP_FF_TEST_MISSING | SMP_FF_TEST_SLOW_START));
   dec_max_floats = f & 2 ? 65536 : (size_t)1 << 29;
 }
 SMP_API void smp_free(void *p) { free(p); }
@@ -66,7 +70,9 @@ SMP_API void smp_free(void *p) { free(p); }
 /* the sampler's extensions: what Browse and the File combo box list */
 static const wchar_t *const audio_ext[] = {
   L".wav", L".flac", L".mp3", L".ogg", L".aif", L".aiff", L".aifc", L".w64", L".rf64", L".caf", L".raw", L".pcm",
-  L".opus", L".wv", L".ape", L".m4a", L".aac", L".mp4", L".wma", L".ac3", L".amr", L".3gp", L".alac"};
+  L".opus", L".wv", L".ape", L".m4a", L".aac", L".mp4", L".wma", L".ac3", L".amr", L".3gp", L".alac",
+  L".dsf", L".dff", L".tta", L".mka", L".webm", L".au", L".snd", L".mpc", L".spx", L".oga", L".m4b", L".eac3",
+  L".dts", L".mlp", L".thd", L".voc", L".mov", L".mkv"};
 int smp_audio_extensions(const wchar_t ***list) {
   *list = (const wchar_t **)audio_ext;
   return (int)(sizeof audio_ext / sizeof audio_ext[0]);
@@ -551,9 +557,9 @@ static int windows_name(const char *path) {
    message unless that was only "not a sound file" and Windows knows better (no decoder for it, damaged), or Windows
    stopped (too long, too slow, cancelled). */
 static float *windows_stage(const char *path, int edit, double start, double dur, unsigned *ch, unsigned *sr,
-                            unsigned long long *n, int (*cancel)(void *), void *arg, char *err, int cap) {
+                            unsigned long long *n, int (*cancel)(void *), void *arg, int *res, char *err, int cap) {
   char why[300] = ""; float *g = NULL, *x = NULL; size_t floats = 0; int trimmed = 0;
-  int r = smp_mf_decode(path, DEC_MAX_FLOATS, &g, &floats, ch, sr, &trimmed, cancel, arg, why, sizeof why);
+  int r = *res = smp_mf_decode(path, DEC_MAX_FLOATS, &g, &floats, ch, sr, &trimmed, cancel, arg, why, sizeof why);
   if (r == SMP_MF_OK) {
     *n = floats / *ch;
     if (edit && !trimmed && start >= 0 && start < 1e6 && dur >= 0 && dur < 1e7) {
@@ -581,8 +587,32 @@ static float *windows_stage(const char *path, int edit, double start, double dur
   return x;
 }
 
-float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
-                       int (*cancel)(void *), void *arg, char *err, int cap) {
+/* The FFmpeg stage on a file nothing else read. Its result, channel after channel, or NULL. err becomes FFmpeg's
+   reason only when the earlier message was a general one (not specific: our own decoder didn't know the format), and
+   "FFmpeg isn't installed" only when it was the plain "not a sound file"; it stays as it was when FFmpeg can't open
+   the file either. Stopping (cancelled, too slow, too long) always says so. */
+static float *ffmpeg_stage(const char *path, unsigned *ch, unsigned *sr, unsigned long long *n, int (*cancel)(void *),
+                           void (*stage)(void *), void *arg, int specific, char *err, int cap) {
+  char why[300] = ""; float *g = NULL, *x = NULL; size_t floats = 0;
+  int r = smp_ff_decode(path, DEC_MAX_FLOATS, &g, &floats, ch, sr, cancel, stage, arg, why, sizeof why);
+  if (r == SMP_FF_OK) {
+    *n = floats / *ch;
+    if (!(x = planar(g, *n, *ch))) snprintf(err, (size_t)cap, "out of memory");
+  } else if (r == SMP_FF_TOO_LONG) {
+    snprintf(err, (size_t)cap, TOO_LONG);
+  } else if (r == SMP_FF_STOPPED) {
+    snprintf(err, (size_t)cap, "%s", why);
+  } else if (r == SMP_FF_MISSING && !strcmp(err, NOT_SOUND)) {
+    snprintf(err, (size_t)cap, "FFmpeg isn't installed; this format needs it");
+  } else if (r == SMP_FF_FAILED && !specific) {
+    snprintf(err, (size_t)cap, "%s", why);
+  }
+  free(g);
+  return x;
+}
+
+float *decode_audio_full(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
+                         int (*cancel)(void *), void (*stage)(void *), void *arg, char *err, int cap) {
   size_t len = 0; unsigned char *b; float *x;
   unsigned ch = 0, sr = 0; unsigned long long n = 0; int lib = 0, raw = smp_is_raw_name(path);
   if (by) *by = SMP_DEC_BUILTIN;
@@ -590,18 +620,29 @@ float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, Sm
   b = slurp(path, &len);
   if (!b) { snprintf(err, (size_t)cap, "can't open %s", path); return NULL; }
   x = chain(b, len, raw ? path : NULL, &ch, &sr, &n, &lib, err, cap);
-  if (!x && !raw && len && strcmp(err, TOO_LONG)) {         /* the Windows stage, after everything of our own */
+  if (!x && !raw && len && strcmp(err, TOO_LONG)) {         /* Windows, then FFmpeg, after everything of our own */
     double start = 0, dur = 0;
-    int edit = smp_mp4_edit(b, len, &start, &dur);
+    int edit = smp_mp4_edit(b, len, &start, &dur), specific = strcmp(err, NOT_SOUND) != 0, wr = 0;
     free(b);
     if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
-    if (!(x = windows_stage(path, edit, start, dur, &ch, &sr, &n, cancel, arg, err, cap))) return NULL;
+    if ((x = windows_stage(path, edit, start, dur, &ch, &sr, &n, cancel, arg, &wr, err, cap)) != NULL) {
+      if (by) *by = SMP_DEC_WINDOWS;
+    } else {
+      if (wr == SMP_MF_TOO_LONG) return NULL;
+      if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); return NULL; }
+      if (!(x = ffmpeg_stage(path, &ch, &sr, &n, cancel, stage, arg, specific, err, cap))) return NULL;
+      if (by) *by = SMP_DEC_FFMPEG;
+    }
     if (cap > 0) err[0] = 0;                                /* the chain's refusal no longer applies */
-    if (by) *by = SMP_DEC_WINDOWS;
   } else free(b);
   if (!x) return NULL;
   if (by && lib) *by = SMP_DEC_LIBRARY;
   return finish(x, ch, sr, n, chans, frames, rate, err, cap);
+}
+
+float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
+                       int (*cancel)(void *), void *arg, char *err, int cap) {
+  return decode_audio_full(path, chans, frames, rate, by, cancel, NULL, arg, err, cap);
 }
 
 float *decode_audio(const char *path, int *chans, long *frames, int *rate, char *err, int cap) {

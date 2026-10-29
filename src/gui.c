@@ -108,6 +108,7 @@ typedef struct Gui {
   Drop drop; int ole_init, drop_registered;
   wchar_t dropped[1100];                      /* the file a drop noted, loaded on WM_DROPPED */
   int modal;                                  /* file or folder dialogs open (see modal_begin) */
+  long fails_seen;                            /* the plugin's failed background loads the window has told of */
 } Gui;
 
 /* ---- tests (tests\host.c): beeps are counted, and can be kept quiet ---- */
@@ -627,6 +628,11 @@ static void show_page(Gui *g, int page, HWND to);
 static void file_list(Gui *g, int kind, bool rescan);
 static void refresh(Gui *g) {
   int id;
+  smp_plug_poll_load(g->P);                   /* a background load that finished is swapped in */
+  if (g->P->load_failed != g->fails_seen) {   /* one that failed: the reason in Status for a while, and a beep */
+    g->fails_seen = g->P->load_failed;
+    say_note(g, g->P->load_err); beep();
+  }
   if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
   if (g->page != PG_SETTINGS && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
     show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* the tab follows what plays (it refreshes) */
@@ -648,18 +654,27 @@ static bool font_name(const wchar_t *n) {
    other kind gives that player's error), or LOAD_DROPPED: by its extension, a .sf2 or .sf3 as the SoundFont
    (which then plays), anything else as the sample (which then plays) */
 enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
+/* A sample loads in the background (the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" meanwhile, and
+   a failure is told when it comes, in refresh); a SoundFont loads here (it reads only its headers). */
 static void load_path_w(Gui *g, const wchar_t *w, int how) {
   char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT, dropped = how == LOAD_DROPPED;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
-  if (!(sf ? smp_plug_load_font(g->P, u, err, sizeof err) : smp_plug_load(g->P, u, err, sizeof err))) {
+  if (!sf) {
+    if (!smp_plug_load_start(g->P, u, dropped, err, sizeof err)) {
+      const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
+      if (b2 > base) base = b2;
+      snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
+      say_note(g, msg); beep();
+    } else g->note[0] = 0;
+    refresh(g);
+    return;
+  }
+  if (!smp_plug_load_font(g->P, u, err, sizeof err)) {
     const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
     if (b2 > base) base = b2;
     snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
     say_note(g, msg); beep();
-  } else {
-    g->note[0] = 0;
-    if (dropped && !sf) smp_plug_set_plays(g->P, 0);
-  }
+  } else g->note[0] = 0;
   refresh(g);
 }
 
@@ -1248,6 +1263,11 @@ static bool build(Gui *g, HWND parent) {
   return true;
 }
 
+void smp_gui_loaded(Plug *P) {
+  Gui *g = P ? P->gui : NULL;
+  if (g && g->win && !g->closing && !g->modal) refresh(g);   /* during a dialog, the timer does it afterwards */
+}
+
 void smp_gui_close(Plug *P) {
   Gui *g = P ? P->gui : NULL;
   if (!g) return;
@@ -1288,6 +1308,7 @@ static bool g_create(const clap_plugin_t *p, const char *api, bool floating) {
   P->gui = calloc(1, sizeof(Gui));
   if (!P->gui) return false;
   P->gui->P = P;
+  P->gui->fails_seen = P->load_failed;        /* failures from before the window opened aren't told again */
   return true;
 }
 static void g_destroy(const clap_plugin_t *p) { smp_gui_close(plug(p)); }

@@ -86,6 +86,9 @@ typedef struct SmpSample {
                                            2 Windows, 3 FFmpeg */
 } SmpSample;
 SMP_API SmpSample *smp_sample_load(const char *path, char *err, int cap);   /* NULL and a plain message on failure */
+/* the same, for a worker thread: cancel (may be NULL) is asked now and then and a nonzero answer stops the decode
+   ("cancelled"); stage (may be NULL) is called with arg just before FFmpeg runs */
+SmpSample *smp_sample_load_ex(const char *path, int (*cancel)(void *), void (*stage)(void *), void *arg, char *err, int cap);
 SMP_API SmpSample *smp_sample_load_known(const char *path, uint64_t src_key, int root, char *err, int cap); /* source may be gone */
 SMP_API SmpEntry *smp_sample_reversed(SmpSample *s);                        /* makes or opens the reversed copy */
 SMP_API void smp_sample_free(SmpSample *s);

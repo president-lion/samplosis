@@ -7,7 +7,9 @@
 
    Threads. The engine is made in init (48 kHz) so state loaded before activate has somewhere to go; activate at
    another rate makes a new engine from the old one's text. State load, activate, deactivate, on_main_thread and
-   destroy are on the main thread; the sample is loaded there, synchronously (from the cache, or decoded once).
+   destroy are on the main thread; a state's sample is loaded there, synchronously (from the cache, or decoded once),
+   so a project opens with its sample. The window's loads (Browse, the File combo box, a drop) decode on a worker
+   thread instead and are swapped in on the main thread when ready (see "the window's sample loads" below).
    Process runs on the audio thread: it splits the block at each event, so parameter changes and notes land on
    their exact frame, and touches nothing but the engine. Replaced samples are freed by smp_engine_collect on the
    main thread: after a state load the audio thread asks the host for a few main-thread callbacks (request_callback
@@ -49,6 +51,8 @@ static const clap_plugin_descriptor_t desc = {
   "A sampler you can use with a screen reader: one sample across the keyboard", features};
 
 static Plug *plug_of(const clap_plugin_t *p) { return p && p->desc == &desc ? (Plug *)p->plugin_data : NULL; }
+static void loader_cancel(Plug *P);      /* the window's background loads (below) */
+static void loader_stop(Plug *P);
 
 /* ---- the instrument as text ---- */
 static char *engine_text(const SmpEngine *e) {
@@ -355,6 +359,7 @@ static void p_deactivate(const clap_plugin_t *p) {
 static void p_destroy(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   smp_gui_close(P);                      /* a host that didn't destroy the window first */
+  loader_stop(P);                        /* a window load still decoding is cancelled */
   smp_engine_free(P->e);
   smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
   free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used);
@@ -632,6 +637,7 @@ done:
 
 static void p_main(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
+  if (smp_plug_poll_load(P) && P->gui) smp_gui_loaded(P);   /* a window load finished: swapped in here */
   if (P->e) smp_engine_collect(P->e);
   if (P->collect_left > 0) InterlockedDecrement(&P->collect_left);
   /* a replaced font closes once the audio thread has let go of it: keep asking until it has */
@@ -750,6 +756,7 @@ static bool st_load(const clap_plugin_t *p, const clap_istream_t *s) {
     got += (size_t)k;
   }
   buf[got] = 0;
+  loader_cancel(P);                      /* the project's state is newer than a window load still under way */
   ok = apply_text(P, buf);
   free(buf);
   return ok != 0;
@@ -814,11 +821,9 @@ double smp_plug_get_param(Plug *P, int id) {
   return P->s ? smp_synth_get_param(P->s, id) : smp_param_info(id)->def;
 }
 
-int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
-  SmpSample *s; char *t;
-  if (!P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
-  s = smp_sample_load(path, err, cap);
-  if (!s) return 0;
+/* a loaded sample becomes the sampler's (main thread) */
+static void take_sample(Plug *P, SmpSample *s) {
+  char *t;
   smp_engine_set_sample(P->e, s);        /* the root follows the sample's */
   P->missing = 0;
   t = engine_text(P->e);
@@ -828,12 +833,170 @@ int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
   tell_host(P, SMP_P_ROOT);
   mark_dirty(P);
   ask_collect(P);
+}
+
+/* ---- the window's sample loads, in the background ----
+   One worker thread per instance, made at the first load. The window hands it a job and returns at once; a newer
+   job cancels the one running (the cancel reaches Windows' and FFmpeg's waits) and replaces one not yet started. The
+   worker decodes into the cache (smp_sample_load_ex), leaves the result in `done` and asks the host for a
+   main-thread callback; the sample is swapped into the engine there, or by the window's timer, never on the worker.
+   The Loader is shared by the plugin and the worker, each holding a reference, and the worker holds one on this DLL
+   (dropped by FreeLibraryAndExitThread), so destroy can give up waiting for a worker stuck on a dead disk: the
+   worker then finds `quit`, frees its result and the Loader, and touches nothing of the plugin's. host is used only
+   under the lock while quit isn't set (destroy sets it before it returns). */
+typedef struct Loader Loader;
+typedef struct Job {
+  Loader *L;
+  volatile LONG cancel;                  /* a newer load, a state load or destroy: stop */
+  long serial;
+  int dropped;
+  char path[1100];
+  SmpSample *s;
+  char err[700];
+} Job;
+struct Loader {
+  SRWLOCK lock; CONDITION_VARIABLE cv;
+  int quit;
+  Job *want, *busy, *done;               /* the next job, the one decoding, a finished one not yet taken */
+  long serial;                           /* the newest job's (main thread writes it, under the lock) */
+  volatile LONG ffmpeg;                  /* the serial of a job that got to FFmpeg */
+  const clap_host_t *host;
+  volatile LONG refs;
+  HMODULE self;
+  HANDLE thread;
+};
+static void job_free(Job *j) { if (j) { smp_sample_free(j->s); free(j); } }
+static void loader_release(Loader *L) { if (!InterlockedDecrement(&L->refs)) free(L); }
+static int job_cancelled(void *a) { return InterlockedCompareExchange(&((Job *)a)->cancel, 0, 0) != 0; }
+static void job_at_ffmpeg(void *a) { Job *j = a; InterlockedExchange(&j->L->ffmpeg, j->serial); }
+
+static DWORD WINAPI load_worker(void *arg) {
+  Loader *L = arg; HMODULE self = L->self;
+  AcquireSRWLockExclusive(&L->lock);
+  for (;;) {
+    Job *j;
+    while (!L->quit && !L->want) SleepConditionVariableSRW(&L->cv, &L->lock, INFINITE, 0);
+    if (L->quit) break;
+    j = L->want; L->want = NULL; L->busy = j;
+    ReleaseSRWLockExclusive(&L->lock);
+    j->s = smp_sample_load_ex(j->path, job_cancelled, job_at_ffmpeg, j, j->err, sizeof j->err);
+    AcquireSRWLockExclusive(&L->lock);
+    L->busy = NULL;
+    if (j->cancel || L->quit) job_free(j);   /* nobody wants it now */
+    else {
+      job_free(L->done);
+      L->done = j;
+      if (L->host && L->host->request_callback) L->host->request_callback(L->host);
+    }
+  }
+  ReleaseSRWLockExclusive(&L->lock);
+  loader_release(L);
+  FreeLibraryAndExitThread(self, 0);       /* drops the worker's hold on the DLL; never returns */
+}
+
+static Loader *loader_of(Plug *P) {
+  Loader *L;
+  if (P->loader) return P->loader;
+  if (!(L = calloc(1, sizeof *L))) return NULL;
+  InitializeSRWLock(&L->lock); InitializeConditionVariable(&L->cv);
+  L->host = P->host;
+  L->refs = 2;                             /* the plugin's and the worker's */
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)(void *)load_worker, &L->self))
+    L->thread = CreateThread(NULL, 0, load_worker, L, 0, NULL);
+  if (!L->thread) {
+    if (L->self) FreeLibrary(L->self);
+    free(L);
+    return NULL;
+  }
+  SetThreadPriority(L->thread, THREAD_PRIORITY_BELOW_NORMAL);
+  return P->loader = L;
+}
+
+/* every job dropped: the one waiting and a finished one freed, the one decoding told to stop (main thread) */
+static void loader_cancel(Plug *P) {
+  Loader *L = P->loader;
+  P->loading = 0;
+  if (!L) return;
+  AcquireSRWLockExclusive(&L->lock);
+  job_free(L->want); L->want = NULL;
+  job_free(L->done); L->done = NULL;
+  if (L->busy) InterlockedExchange(&L->busy->cancel, 1);
+  ReleaseSRWLockExclusive(&L->lock);
+}
+
+/* destroy: cancel, tell the worker to end, wait a little for it (it ends on its own if it can't now) */
+static void loader_stop(Plug *P) {
+  Loader *L = P->loader;
+  if (!L) return;
+  loader_cancel(P);
+  P->loader = NULL;
+  AcquireSRWLockExclusive(&L->lock);
+  L->quit = 1; L->host = NULL;
+  ReleaseSRWLockExclusive(&L->lock);
+  WakeAllConditionVariable(&L->cv);
+  WaitForSingleObject(L->thread, 2000);
+  CloseHandle(L->thread);
+  loader_release(L);
+}
+
+static const char *base_name(const char *path) {
+  const char *b = path, *q;
+  for (q = path; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
+  return b;
+}
+
+int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap) {
+  Loader *L; Job *j;
+  if (!P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
+  if (strlen(path) >= sizeof j->path) { snprintf(err, (size_t)cap, "its path is too long"); return 0; }
+  if (!(L = loader_of(P)) || !(j = calloc(1, sizeof *j))) { snprintf(err, (size_t)cap, "out of memory"); return 0; }
+  j->L = L; j->dropped = dropped;
+  strcpy(j->path, path);
+  AcquireSRWLockExclusive(&L->lock);
+  job_free(L->want);
+  job_free(L->done); L->done = NULL;
+  if (L->busy) InterlockedExchange(&L->busy->cancel, 1);
+  j->serial = ++L->serial;
+  L->want = j;
+  ReleaseSRWLockExclusive(&L->lock);
+  WakeConditionVariable(&L->cv);
+  P->loading = 1;
+  snprintf(P->loading_path, sizeof P->loading_path, "%s", path);
+  snprintf(P->loading_name, sizeof P->loading_name, "%s", base_name(path));
   return 1;
+}
+
+int smp_plug_poll_load(Plug *P) {
+  Loader *L = P->loader; Job *j; int r;
+  if (!L) return 0;
+  AcquireSRWLockExclusive(&L->lock);
+  j = L->done; L->done = NULL;
+  ReleaseSRWLockExclusive(&L->lock);
+  if (!j) return 0;
+  P->loading = 0;
+  if (j->s && P->e) {
+    take_sample(P, j->s);
+    j->s = NULL;
+    if (j->dropped) smp_plug_set_plays(P, 0);   /* a dropped sample: the sampler plays */
+    r = 1;
+  } else {
+    snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path), j->err);
+    P->load_failed++;
+    r = -1;
+  }
+  job_free(j);
+  return r;
+}
+
+SMP_API int smp_test_plugin_loading(const clap_plugin_t *p) {   /* tests: a window load is under way */
+  Plug *P = plug_of(p);
+  return P && P->loading;
 }
 
 int smp_plug_sample_path(Plug *P, char *path, int cap) {
   const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
   char line[1200];
+  if (P->loading) { snprintf(path, (size_t)cap, "%s", P->loading_path); return 1; }
   if (s) { snprintf(path, (size_t)cap, "%s", s->path); return 1; }
   if (P->missing && P->text && sample_line(P->text, line, sizeof line, path, cap) == 2) return 2;
   if (cap > 0) path[0] = 0;
@@ -854,6 +1017,11 @@ void smp_plug_sample_text(Plug *P, char *out, int cap) {
 
 void smp_plug_status_text(Plug *P, char *out, int cap) {
   int ready = 0, total = 0; char why[600] = "";
+  if (P->loading && P->loader) {         /* a background load: what it's doing */
+    int ff = InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
+    snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
+    return;
+  }
   if (P->plays && !P->bad && P->e && P->s) { sf_status(P, out, cap); return; }
   if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }
   if (smp_engine_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_engine_render_status(P->e, &ready, &total, why, sizeof why)) {

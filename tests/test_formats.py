@@ -168,7 +168,18 @@ def try_load(lib, path):
 
 
 def test_caf_malformed(lib, tmp_path):
+    # our CAF reader alone (FFmpeg, the last stage, is off: it reads some of these)
     point_cache(lib, tmp_path / "cache")
+    lib.smp_test_only_decode_flags.restype = None
+    lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_test_only_decode_flags(256)
+    try:
+        caf_malformed(lib, tmp_path)
+    finally:
+        lib.smp_test_only_decode_flags(0)
+
+
+def caf_malformed(lib, tmp_path):
     good = caf()
     f = tmp_path / "ok.caf"
     f.write_bytes(good)
@@ -545,7 +556,7 @@ def test_ape_exception_is_caught(lib, tmp_path):
     point_cache(lib, tmp_path / "cache")
     lib.smp_test_only_decode_flags.restype = None
     lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
-    lib.smp_test_only_decode_flags(1)
+    lib.smp_test_only_decode_flags(1 | 256)                        # FFmpeg off: it reads Monkey's Audio too
     try:
         s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
         assert not s and "Monkey's Audio" in err, err
@@ -804,7 +815,7 @@ def test_windows_deadline(lib, tmp_path):
     point_cache(lib, tmp_path / "cache")
     f, _ = windows_file(tmp_path, "stuck.m4a", ["-c:a", "aac"])
     lib.smp_test_only_mf_helpers.restype = ctypes.c_long
-    mf_flags(lib, 4)
+    mf_flags(lib, 4 | 256)                                         # FFmpeg off: it would read the file
     try:
         t = time.perf_counter()
         s, err = load(lib, f)
@@ -836,7 +847,7 @@ def test_windows_buffer_fails(lib, tmp_path):
     for flag, name in ((16, "first.m4a"), (32, "third.m4a")):
         g = tmp_path / name
         g.write_bytes(f.read_bytes())                              # a new name, so not the cached copy
-        mf_flags(lib, flag)
+        mf_flags(lib, flag | 256)                                  # FFmpeg off: it would read the file
         try:
             s, err = load(lib, g)
         finally:
@@ -859,12 +870,12 @@ def test_windows_missing(lib, tmp_path):
     f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
     other = tmp_path / "tone.xyz"
     other.write_bytes(f.read_bytes())
-    mf_flags(lib, 8)
+    mf_flags(lib, 8 | 256)                                         # no FFmpeg either, or it would read both
     try:
         s, err = load(lib, f)
         assert not s and err == "Windows Media Foundation isn't installed", err
         s, err = load(lib, other)
-        assert not s and err == "it isn't a sound file Samplosis can read", err
+        assert not s and err == "FFmpeg isn't installed; this format needs it", err
     finally:
         mf_flags(lib, 0)
     s, err = load(lib, f)
@@ -1005,7 +1016,7 @@ k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 path, m4a = sys.argv[1], sys.argv[2]
 dll = ctypes.CDLL(path)
 dll.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
-dll.smp_test_only_decode_flags(4)                  # the helper sleeps 3 s; the stall timer is 0.5 s
+dll.smp_test_only_decode_flags(4 | 256)            # the helper sleeps 3 s; the stall timer is 0.5 s; no FFmpeg
 err = ctypes.create_string_buffer(512)
 dll.smp_sample_load.restype = ctypes.c_void_p
 s = dll.smp_sample_load(m4a.encode(), err, 512)
@@ -1041,7 +1052,7 @@ def test_windows_busy(lib, tmp_path):
     # another helper stuck starting Media Foundation: this load gives up quickly with a plain reason
     point_cache(lib, tmp_path / "cache")
     f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
-    mf_flags(lib, 64)
+    mf_flags(lib, 64 | 256)                                        # FFmpeg off: it would read the file
     try:
         t = time.perf_counter()
         s, err = load(lib, f)
@@ -1053,3 +1064,158 @@ def test_windows_busy(lib, tmp_path):
     s, err = load(lib, f)
     assert s, err
     lib.smp_sample_free(s)
+
+
+# --- FFmpeg: the last stage, for files nothing earlier reads ---
+FAKEFF = os.path.join(ROOT, "tests", "fakeff.exe")
+FF_STALL_SHORT, FF_MISSING, FF_SLOW_START = 128, 256, 512      # smp_test_only_decode_flags bits
+NOT_SOUND = "it isn't a sound file Samplosis can read"
+
+
+def write_dsf(path, secs=0.1, freqs=(220, 331), amp=0.5):
+    """A DSD64 .dsf file (ffmpeg can't write one): a first-order sigma-delta of a tone on each side."""
+    rate, blk = 2822400, 4096
+    n = int(rate * secs)
+    chans = []
+    for fr in freqs:
+        x = (amp * np.sin(2 * np.pi * fr * np.arange(n) / rate)).tolist()
+        bits = bytearray(n)
+        acc = 0.0
+        for i, v in enumerate(x):
+            y = 1.0 if acc >= 0 else -1.0
+            bits[i] = y > 0
+            acc += v - y
+        nb = (n + 7) // 8
+        pad = (nb + blk - 1) // blk * blk
+        chans.append(np.packbits(np.pad(np.frombuffer(bytes(bits), np.uint8), (0, pad * 8 - n)), bitorder="little"))
+    data = b"".join(c[i * blk:(i + 1) * blk].tobytes() for i in range(len(chans[0]) // blk) for c in chans)
+    body = (b"fmt " + struct.pack("<QIIIIIIQII", 52, 1, 0, 2, 2, rate, 1, n, blk, 0) +
+            b"data" + struct.pack("<Q", 12 + len(data)) + data)
+    open(path, "wb").write(b"DSD " + struct.pack("<QQQ", 28, 28 + len(body), 0) + body)
+
+
+def fake_ffmpeg(tmp_path, mode):
+    """A folder named mode holding the fake as ffmpeg.exe and ffprobe.exe (the folder's name says how it behaves)."""
+    d = tmp_path / mode
+    d.mkdir()
+    for n in ("ffmpeg.exe", "ffprobe.exe"):
+        shutil.copyfile(FAKEFF, d / n)
+    return d
+
+
+def pids_running(folder):
+    """(running, all) of the processes the fake started from folder"""
+    p = folder / "pids.txt"
+    pids = [int(x) for x in p.read_text().split()] if p.exists() else []
+    k32 = ctypes.WinDLL("kernel32")
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    running = 0
+    for pid in pids:
+        h = k32.OpenProcess(0x00100000, False, pid)                # SYNCHRONIZE
+        if h:
+            running += k32.WaitForSingleObject(h, 0) == 0x102      # WAIT_TIMEOUT: still going
+            k32.CloseHandle(h)
+    return running, len(pids)
+
+
+@need_ffmpeg
+@pytest.mark.parametrize("name,args", [("tone.tta", ["-c:a", "tta"]), ("tone wavpack.mka", ["-c:a", "wavpack"]),
+                                       ("tóne #1 50% üж.tta", ["-c:a", "tta"])])
+def test_ffmpeg_decodes_odd_format(lib, tmp_path, name, args):
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, name, args)
+    check_tones(lib, f, src, 44100, by=BY_FFMPEG, corr_min=0.9999, max_lag=0)
+
+
+@need_ffmpeg
+def test_ffmpeg_decodes_dsf(lib, tmp_path):
+    # DSD at its own rate over 8 (352800 Hz), as FFmpeg decodes it
+    point_cache(lib, tmp_path / "cache")
+    f = tmp_path / "tone A3.dsf"
+    write_dsf(f)
+    s, err = load(lib, f)
+    assert s, err
+    try:
+        assert s.contents.by == BY_FFMPEG and s.contents.rate == 352800
+        got = whole(lib, s.contents.fwd)
+    finally:
+        lib.smp_sample_free(s)
+    assert abs(len(got) - 35280) <= 4096
+    t = np.arange(len(got)) / 352800
+    for c, fr in enumerate((220, 331)):
+        assert corr(got[:, c], np.sin(2 * np.pi * fr * t)) > 0.99, c
+
+
+@need_ffmpeg
+def test_ffmpeg_refuses_junk(lib, tmp_path):
+    # random bytes FFmpeg can't open either: the plain message, not FFmpeg's
+    point_cache(lib, tmp_path / "cache")
+    f = tmp_path / "junk.tta"
+    f.write_bytes(bytes(np.random.default_rng(3).integers(0, 256, 3000, dtype=np.uint8)))
+    s, err = load(lib, f)
+    assert not s and err == NOT_SOUND, err
+
+
+@need_ffmpeg
+def test_ffmpeg_missing(lib, tmp_path):
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "tone.tta", ["-c:a", "tta"])
+    mf_flags(lib, FF_MISSING)
+    try:
+        s, err = load(lib, f)
+    finally:
+        mf_flags(lib, 0)
+    assert not s and err == "FFmpeg isn't installed; this format needs it", err
+    s, err = load(lib, f)
+    assert s and s.contents.by == BY_FFMPEG, err
+    lib.smp_sample_free(s)
+
+
+def test_ffmpeg_timeout(lib, tmp_path):
+    # an FFmpeg that never writes: the reason within the (shortened) stall timer, and no process left behind
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "hang")
+    f = tmp_path / "stuck.tta"
+    f.write_bytes(b"not anything" * 100)
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    mf_flags(lib, FF_STALL_SHORT)
+    try:
+        t = time.perf_counter()
+        s, err = load(lib, f)
+        secs = time.perf_counter() - t
+    finally:
+        mf_flags(lib, 0)
+        settings(lib, ffmpeg_path="")
+    assert not s and err == "FFmpeg took too long to decode it", err
+    assert secs < 3, secs
+    assert pids_running(d) == (0, 2)                              # ffprobe ended; ffmpeg was killed
+
+
+def test_ffmpeg_garbage(lib, tmp_path):
+    # an FFmpeg that writes random bytes and fails: its own reason (trimmed), and no audio
+    point_cache(lib, tmp_path / "cache")
+    d = fake_ffmpeg(tmp_path, "garbage")
+    f = tmp_path / "bad.tta"
+    f.write_bytes(b"not anything" * 100)
+    settings(lib, ffmpeg_path=str(d / "ffmpeg.exe"))
+    try:
+        s, err = load(lib, f)
+    finally:
+        settings(lib, ffmpeg_path="")
+    assert not s and err == "Error while decoding stream: Invalid data found when processing input", err
+    assert pids_running(d) == (0, 2)
+
+
+@need_ffmpeg
+def test_ffmpeg_too_long(lib, tmp_path):
+    # the same 2 GB ceiling (lowered by the test flag): FFmpeg is stopped, and the plain too-long message
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "long.tta", ["-c:a", "tta"])
+    mf_flags(lib, 2)
+    try:
+        s, err = load(lib, f)
+    finally:
+        mf_flags(lib, 0)
+    assert not s and err == "it's too long to load (over 2 GB decoded)", err

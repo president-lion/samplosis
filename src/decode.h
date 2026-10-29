@@ -4,7 +4,8 @@
    UTF-8. Built in: WAV in any encoding with RIFF, RIFX, RF64 and Wave64 (W64) containers, AIFF and AIFF-C, FLAC,
    MP3, Ogg Vorbis, CAF (PCM and float), and raw PCM (.raw, .pcm) read as the Settings say. From the vendored
    libraries in codecs/: Opus, WavPack and Monkey's Audio. From Windows Media Foundation, for files only: AAC, WMA
-   and whatever else this machine's Windows decodes. A sample that isn't finite, or is absurdly large, comes back as
+   and whatever else this machine's Windows decodes. Last, for files only, the ffmpeg.exe the user installed: DSD,
+   TTA, Matroska and whatever else FFmpeg decodes. A sample that isn't finite, or is absurdly large, comes back as
    0. */
 #include <stddef.h>
 #include <wchar.h>
@@ -13,10 +14,13 @@
 typedef enum { SMP_DEC_BUILTIN, SMP_DEC_LIBRARY, SMP_DEC_WINDOWS, SMP_DEC_FFMPEG } SmpDecBy;
 
 /* The decode chain: the built-in and library decoders by the file's first bytes, then raw PCM by the extension,
-   then (not for raw names) Windows. by says what decoded it (may be NULL); cancel, when it isn't NULL, is asked now
-   and then and a nonzero answer stops the decode. */
+   then (not for raw names) Windows, then FFmpeg. by says what decoded it (may be NULL); cancel, when it isn't NULL,
+   is asked now and then and a nonzero answer stops the decode ("cancelled"). */
 float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
                        int (*cancel)(void *), void *arg, char *err, int cap);
+/* decode_audio_ex, and stage (may be NULL) is called with arg just before FFmpeg runs, for a status that says so */
+float *decode_audio_full(const char *path, int *chans, long *frames, int *rate, SmpDecBy *by,
+                         int (*cancel)(void *), void (*stage)(void *), void *arg, char *err, int cap);
 /* decode_audio_ex with no by and no cancel */
 float *decode_audio(const char *path, int *chans, long *frames, int *rate, char *err, int cap);
 /* Bytes in memory: the built-in and library decoders only, for compressed SoundFont streams (FLAC, Ogg Vorbis, Opus
@@ -39,5 +43,6 @@ SMP_API int smp_ffmpeg_find(char *out, int cap);     /* the same, UTF-8 */
 /* free() for memory the decode layer gave out, for callers outside the plugin (the tests) */
 SMP_API void smp_free(void *p);
 /* TESTS ONLY: 1 = the Monkey's Audio decoder throws inside its guard (the shim must catch it); 2 = the size
-   limit is 65536 floats instead of 2 GiB; 0 = normal */
+   limit is 65536 floats instead of 2 GiB; 4 to 64 the Windows stage's (mfdecode.h); 128 to 512 the FFmpeg
+   stage's (ffdecode.h); 0 = normal */
 SMP_API void smp_test_only_decode_flags(long f);

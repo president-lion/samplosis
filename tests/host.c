@@ -42,7 +42,12 @@
      pump <ms>               let the window's timers run
      dialog <pick|closegui|destroy> <path>   the next file or folder dialog returns path at once; closegui first
                              destroys the window, destroy the whole plugin (as REAPER can while a dialog is open)
-     alive                   "alive: plugin" or "alive: plugin destroyed" (the host got this far) */
+     alive                   "alive: plugin" or "alive: plugin destroyed" (the host got this far)
+     async <on|off>          on: keys and drops don't wait for the background load they start (see settle)
+     wait                    wait for the background load to be swapped in (up to 20 s)
+     clock                   "clock: <n> ms" since the last clock
+     pids <file>             "pids: <running> of <all> running" for the process ids listed in the file
+   SAMPLOSIS_TEST_DECODE_FLAGS passes its number to smp_test_only_decode_flags. */
 #include <windows.h>
 #include <oleacc.h>
 #include <shlobj.h>
@@ -444,6 +449,18 @@ static void key(WPARAM vk, int shift, int ctrl) {
   SendMessageW(GetFocus(), WM_KEYUP, vk, 0xC0000001);
   ks[VK_SHIFT] = 0; ks[VK_CONTROL] = 0; SetKeyboardState(ks);
 }
+/* The window's loads run in the background. Unless "async on", every key, character or drop then waits (up to 20 s,
+   with the window's messages and the host's main-thread callbacks running) until the load it started is swapped in,
+   so the other tests read what they always read. */
+typedef int (*LoadingFn)(const clap_plugin_t *);
+static int async_loads;
+static void settle(const clap_plugin_t *p, int always) {
+  LoadingFn loading = (LoadingFn)GetProcAddress(dll, "smp_test_plugin_loading");
+  DWORD end = GetTickCount() + 20000;
+  if ((async_loads && !always) || !loading || plugin_gone) return;
+  while (loading(p) && (int)(end - GetTickCount()) > 0) { main_thread(p); pump(10); }
+  main_thread(p);
+}
 static DWORD WINAPI watchdog(LPVOID arg) { (void)arg; Sleep(90000); printf("HUNG\n"); ExitProcess(3); return 0; }
 
 static int cmd_gui(const clap_plugin_t *p, const char *state, const char *actions) {
@@ -504,10 +521,10 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       for (i = 0; i < 12; i++)
         if (!strcmp(k, keys[i].n)) { key(keys[i].vk, strstr(arg, "shift") != NULL, strstr(arg, "ctrl") != NULL); found = 1; }
       if (!found) { printf("error: no key %s\n", k); return 1; }
-      pump(60); say();
+      pump(60); settle(p, 0); say();
     } else if (!strcmp(a, "char")) {
       SendMessageW(GetFocus(), WM_CHAR, (WPARAM)(unsigned char)arg[0], 1);
-      pump(60); say();
+      pump(60); settle(p, 0); say();
     } else if (!strcmp(a, "say")) say();
     else if (!strcmp(a, "focus")) {
       HWND c = find_named(arg);
@@ -599,7 +616,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       memcpy((char *)df + sizeof(DROPFILES), wp, (k + 1) * sizeof(wchar_t));
       GlobalUnlock(hg);
       SendMessageW(plugwin, WM_DROPFILES, (WPARAM)hg, 0);   /* the window calls DragFinish, which frees it */
-      pump(100);
+      pump(100); settle(p, 0);
     } else if (!strcmp(a, "counts")) printf("counts: beeps %ld | request_flush %d | mark_dirty %d\n", beeps(), flushes, dirties);
     else if (!strcmp(a, "pump")) pump(atoi(arg));
     else if (!strcmp(a, "dialog")) {     /* the next file or folder dialog: returns the path at once */
@@ -610,6 +627,21 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       dialog(p, act, arg + used);
       if (act == 3) plugin_gone = 1;
     } else if (!strcmp(a, "alive")) printf("alive: %s\n", plugin_gone ? "plugin destroyed" : "plugin");
+    else if (!strcmp(a, "async")) async_loads = !strcmp(arg, "on");
+    else if (!strcmp(a, "wait")) settle(p, 1);
+    else if (!strcmp(a, "clock")) {           /* milliseconds since the last clock */
+      static DWORD last; DWORD now = GetTickCount();
+      printf("clock: %lu ms\n", last ? now - last : 0); last = now;
+    } else if (!strcmp(a, "pids")) {          /* of the process ids listed in a file, how many still run */
+      FILE *pf = fopen(arg, "r"); unsigned long pid; int all = 0, running = 0;
+      while (pf && fscanf(pf, "%lu", &pid) == 1) {
+        HANDLE ph = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        all++;
+        if (ph) { running += WaitForSingleObject(ph, 0) == WAIT_TIMEOUT; CloseHandle(ph); }
+      }
+      if (pf) fclose(pf);
+      printf("pids: %d of %d running\n", running, all);
+    }
     else { printf("error: unknown action %s\n", a); return 1; }
   }
   free(text);
@@ -636,6 +668,10 @@ int main(int argc, char **argv) {
   if (getenv("SAMPLOSIS_TEST_GRACE_MS")) {       /* tests: how soon an unneeded SoundFont sample is freed */
     void (*grace)(int) = (void (*)(int))GetProcAddress(dll, "smp_sf_test_grace");
     if (grace) grace(atoi(getenv("SAMPLOSIS_TEST_GRACE_MS")));
+  }
+  if (getenv("SAMPLOSIS_TEST_DECODE_FLAGS")) {   /* tests: smp_test_only_decode_flags (FFmpeg held back, ...) */
+    void (*flags)(long) = (void (*)(long))GetProcAddress(dll, "smp_test_only_decode_flags");
+    if (flags) flags(atol(getenv("SAMPLOSIS_TEST_DECODE_FLAGS")));
   }
   entry = (const clap_plugin_entry_t *)GetProcAddress(dll, "clap_entry");
   if (!entry || !entry->init(argv[1])) { printf("error: no clap_entry\n"); return 1; }
