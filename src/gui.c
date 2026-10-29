@@ -173,6 +173,7 @@ static void gb_text(double gb, char *out, int cap) {
   else snprintf(out, (size_t)cap, "%.1f GB", gb);
 }
 static void set_limit(Gui *g, double gb);
+static void say_note(Gui *g, const char *msg);
 
 /* ---- sliders ---- */
 static void sl_range(const Slider *s, double *lo, double *hi, double *step) {
@@ -356,6 +357,11 @@ static void choose(Gui *g, int id, int k) {
   else if (id == ID_RAWEND) s.raw_endian = k;
   if (smp_settings_set(&s)) beep();             /* not save_settings: the cache folder needs no rescan */
   show_settings(g);
+  if (id == ID_RAWRATE || id == ID_RAWCH || id == ID_RAWFMT || id == ID_RAWEND) {
+    char path[1100];                            /* the loaded raw sample stays as it was read: Status says so */
+    if (smp_plug_sample_path(g->P, path, sizeof path) == 1 && smp_is_raw_name(path))
+      say_note(g, "Raw settings apply the next time a raw file loads");
+  }
 }
 static void clear_cache(Gui *g) {             /* every file not in use */
   smp_cache_trim(0);

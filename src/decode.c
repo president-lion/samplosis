@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -84,8 +85,8 @@ static float *pcm_planar(const unsigned char *p, uint64_t n, int ch, int bytes, 
       const unsigned char *s = p + ((size_t)i * ch + c) * bytes;
       uint64_t u = 0; float v;
       for (k = 0; k < bytes; k++) u |= (uint64_t)s[big ? k : bytes - 1 - k] << (8 * (bytes - 1 - k));
-      if (is_float && bytes == 4) { uint32_t w = (uint32_t)u; float f; memcpy(&f, &w, 4); v = f; }
-      else if (is_float) { double d; memcpy(&d, &u, 8); v = (float)d; }
+      if (is_float && bytes == 4) { uint32_t w = (uint32_t)u; float f; memcpy(&f, &w, 4); v = isfinite(f) ? f : 0.0f; }
+      else if (is_float) { double d; memcpy(&d, &u, 8); v = isfinite(d) && fabs(d) < 1e30 ? (float)d : 0.0f; }
       else if (is_unsigned) v = ((float)u - 128.0f) / 128.0f;
       else {
         int64_t sv = (int64_t)(u << (64 - 8 * bytes)) >> (64 - 8 * bytes);   /* sign-extend */
@@ -123,7 +124,8 @@ static float *caf_read(const unsigned char *b, size_t len, unsigned *ch, unsigne
         return NULL;
       }
       bytes = chans ? (int)((bpp ? bpp : chans * ((bits + 7) / 8)) / chans) : 0;
-      if (!chans || chans > 64 || rate < 1 || rate > 1e6 || (fpp && fpp != 1) ||
+      if (!chans || chans > 64 || !(rate >= 1 && rate <= 1e6) || (fpp && fpp != 1) ||
+          (bpp && bpp != (uint32_t)bytes * chans) ||
           (is_float ? !((bits == 32 && bytes == 4) || (bits == 64 && bytes == 8))
                     : !(bits >= 1 && bytes >= 1 && bytes <= 4 && (uint32_t)bytes == (bits + 7) / 8))) {
         snprintf(err, (size_t)cap, "it's a CAF file with %u-bit %s samples in %d bytes, which Samplosis can't read",
@@ -133,6 +135,7 @@ static float *caf_read(const unsigned char *b, size_t len, unsigned *ch, unsigne
       if (data < 4) break;
       *ch = chans; *sr = (unsigned)(rate + 0.5);
       *n = (data - 4) / ((uint64_t)bytes * chans);
+      if (!*n) break;                                               /* no whole frame: cut short */
       {
         float *x = pcm_planar(b + body + 4, *n, (int)chans, bytes, is_float, 0, !little);
         if (!x) snprintf(err, (size_t)cap, "out of memory");
@@ -166,14 +169,17 @@ static float *raw_read(const unsigned char *b, size_t len, unsigned *ch, unsigne
 /* the built-in decoders */
 enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF };
 
-/* which decoder the first bytes ask for, or D_NONE */
-static int sniff(const unsigned char *b, size_t len) {
+/* which decoder the first bytes ask for, or D_NONE. strict: container magics only (a raw file's first bytes can
+   look like an MPEG frame sync or "ID3" by chance) */
+static int sniff(const unsigned char *b, size_t len, int strict) {
   static const unsigned char w64[16] = {'r', 'i', 'f', 'f', 0x2E, 0x91, 0xCF, 0x11, 0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00};
-  if (len >= 12 && (!memcmp(b, "RIFF", 4) || !memcmp(b, "RIFX", 4) || !memcmp(b, "RF64", 4) || !memcmp(b, "FORM", 4))) return D_WAV;
+  if (len >= 12 && (!memcmp(b, "RIFF", 4) || !memcmp(b, "RIFX", 4) || !memcmp(b, "RF64", 4) || !memcmp(b, "BW64", 4) ||
+                    !memcmp(b, "FORM", 4))) return D_WAV;
   if (len >= 16 && !memcmp(b, w64, 16)) return D_WAV;
   if (len >= 8 && !memcmp(b, "caff", 4)) return D_CAF;
   if (len >= 4 && !memcmp(b, "fLaC", 4)) return D_FLAC;
   if (len >= 4 && !memcmp(b, "OggS", 4)) return D_VORBIS;
+  if (strict) return D_NONE;
   if (len >= 10 && !memcmp(b, "ID3", 3)) {                 /* an ID3 tag first: FLAC or MP3 after it */
     size_t skip = 10 + ((size_t)(b[6] & 127) << 21 | (size_t)(b[7] & 127) << 14 | (size_t)(b[8] & 127) << 7 | (b[9] & 127));
     if (b[5] & 0x10) skip += 10;
@@ -187,7 +193,14 @@ static int sniff(const unsigned char *b, size_t len) {
 static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsigned *sr, unsigned long long *n, char *err, int cap) {
   float *x = NULL, *out;
   *ch = 0; *sr = 0; *n = 0;
-  if (d == D_CAF) return caf_read(b, len, ch, sr, n, err, cap);
+  if (d == D_CAF) {                                  /* the same final check as the others: some audio */
+    out = caf_read(b, len, ch, sr, n, err, cap);
+    if (out && !(*n && *ch && *sr)) {
+      free(out); out = NULL;
+      snprintf(err, (size_t)cap, "it's a CAF file without its audio, or it's cut short");
+    }
+    return out;
+  }
   if (d == D_WAV) x = drwav_open_memory_and_read_pcm_frames_f32(b, len, ch, sr, n, NULL);
   else if (d == D_FLAC) x = drflac_open_memory_and_read_pcm_frames_f32(b, len, ch, sr, n, NULL);
   else if (d == D_MP3) {
@@ -216,7 +229,7 @@ static float *run(int d, const unsigned char *b, size_t len, unsigned *ch, unsig
 static float *chain(const unsigned char *b, size_t len, const char *raw_name, unsigned *ch, unsigned *sr,
                     unsigned long long *n, char *err, int cap) {
   static const int order[] = {D_WAV, D_FLAC, D_VORBIS, D_MP3};
-  int first = sniff(b, len), i; float *x;
+  int first = sniff(b, len, raw_name != NULL), i; float *x;
   char why[300] = "";
   if (first != D_NONE && (x = run(first, b, len, ch, sr, n, why, sizeof why))) return x;
   if (raw_name) {

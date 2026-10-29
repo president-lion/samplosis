@@ -659,7 +659,9 @@ def test_gui_file_combo(P, tmp_path):
 
 
 def test_gui_settings_page(P, tmp_path, settings_file):
-    text = P.script(P.sample())
+    raw = tmp_path / "take.raw"                     # a raw sample: changing a raw setting says it applies next time
+    raw.write_bytes((np.sin(np.arange(44100) / 20) * 8000).astype("<i2").repeat(2).tobytes())
+    text = P.script(raw)
     with open(settings_file) as fh:
         before = fh.read()
     try:
@@ -675,7 +677,7 @@ def test_gui_settings_page(P, tmp_path, settings_file):
                                       "key tab", "key tab", "key tab",
                                       "key tab shift", "key tab shift", "key tab shift", "focus Back", "key tab",
                                       "focus Browse for FFmpeg", "dialog pick %s" % fake, "key enter", "read FFmpeg",
-                                      "focus Back", "key enter", "focus Back", "say"])
+                                      "focus Back", "key enter", "read Status", "focus Back", "say"])
         f = got(out, "focus")
         assert f[0] == ["ComboBox", "Stretcher", "Signalsmith Stretch, fast"]
         assert f[1] == f[2] == ["ComboBox", "Stretcher", "Rubber Band, slower"]   # Down stops at the last
@@ -700,6 +702,7 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert f[30][:2] == ["Button", "after"]                              # past the end: out of the plugin
         assert f[31][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
         assert got(out, "read")[0] == ["FFmpeg", str(fake)]
+        assert got(out, "read")[1] == ["Status", "Raw settings apply the next time a raw file loads"]
         assert f[32][:2] == ["Button", "Settings"]           # Back: on the Settings button again
         assert f[33][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
         with open(settings_file) as fh:
