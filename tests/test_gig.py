@@ -45,10 +45,10 @@ def make_gig(tmp_path, name, samples, lines):
         rawp = tmp_path / ("%s_w%d.raw" % (name, i))
         rawp.write_bytes(raw16(data) if bits == 16 else raw24(data))
         desc.append("sample name=%s rate=%d channels=%d bits=%d data=%s %s" % (
-            s["name"], s.get("rate", RATE), ch, bits, rawp, s.get("extra", "")))
+            s["name"], s.get("rate", RATE), ch, bits, rawp.name, s.get("extra", "")))
     desc += lines
     dp = tmp_path / (name + ".txt")
-    dp.write_text("\n".join(desc) + "\n")
+    dp.write_text("\n".join(desc) + "\n", encoding="utf-8")
     out = tmp_path / (name + ".gig")
     r = subprocess.run([GIGMAKE, str(dp), str(out)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
@@ -460,14 +460,16 @@ def each(data, cid):
 
 
 @pytest.mark.parametrize("field", ["ptbl_count", "wsmp_loops", "3lnk_size_and_count", "info_size", "3gnm_size",
-                                   "3ewg_triggers", "riff_size"])
+                                   "3ewg_triggers", "riff_size", "compressed_tail"])
 def test_gig_field_damage_bounded(lib, tmp_path, field):
     """A damaged count or size field never allocates what it claims or writes past an array: in a child process,
     the open (and loading every sample) grows peak committed memory by under 64 MB, and the child doesn't crash."""
-    src = structure_gig(tmp_path)
+    src = pitch_gig(tmp_path) if field == "compressed_tail" else structure_gig(tmp_path)
 
     def fn(data):
         hits = 0
+        if field == "compressed_tail":                  # a compressed wave ending 1 byte after a frame's mode byte
+            return compressed_tail(data)
         if field == "ptbl_count":                       # WavePoolCount (was: 4 bytes x the count allocated, twice)
             for i in each(data, b"ptbl"):
                 set32(data, i + 12, 0xFFFFFFFF); hits += 1
@@ -496,6 +498,36 @@ def test_gig_field_damage_bounded(lib, tmp_path, field):
     assert got["grow_mb"] < 64, got
     if not got["opened"]:
         assert got["err"].startswith(field + ".gig isn't a GigaStudio file this can read ("), got
+
+
+def compressed_tail(data):
+    """Rewrites the compressed wave's frame modes so its data chunk ends 1 byte after the last frame's mode byte, with
+    that frame in mode 5 (a 12-byte header that can't fit): libgig counted about 2^61 samples there (the subtraction
+    wrapped), which became a 256 MB decode. Returns 1 when done."""
+    import collections
+    i = data.find(b"ewav")
+    ci = data.rfind(b"data", 0, i)                     # the compressed wave's data chunk comes before its ewav
+    size = struct.unpack_from("<I", data, ci + 4)[0]
+    body, target = ci + 8, size - 2
+    step = {m: 1 + b for m, b in enumerate([4096, 2052, 768, 524, 396, 268])}
+    reach = {0: None}
+    q = collections.deque([0])
+    while q:                                           # frame modes whose sizes add up to the target
+        at = q.popleft()
+        for m in (1, 5, 4, 3, 2):
+            n = at + step[m]
+            if n <= target and n not in reach:
+                reach[n] = (at, m)
+                q.append(n)
+    if target not in reach:
+        return 0
+    at = target
+    while at:
+        prev, m = reach[at]
+        data[body + prev] = m
+        at = prev
+    data[body + target] = 5
+    return 1
 
 
 def test_gig_crash_flag_parse(lib, tmp_path):
@@ -544,7 +576,7 @@ def test_gig_unicode_path(lib, tmp_path):
     d = tmp_path / "日本語 Жито"
     d.mkdir()
     p = d / "Γκιγκ.gig"
-    p.write_bytes(open(pitch_gig(tmp_path), "rb").read())
+    os.replace(pitch_gig(d), p)                 # written there by gigmake itself (wide paths, UTF-8 description)
     f = opened(lib, str(p))
     try:
         assert len(presets(lib, f)) == 4

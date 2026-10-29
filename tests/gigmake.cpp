@@ -1,10 +1,10 @@
 /* gigmake.cpp: writes a GigaStudio file with libgig itself, for the GigaStudio tests (built by "build.bat test").
 
-   gigmake DESC OUT.gig
+   gigmake DESC OUT.gig       (paths may be any Unicode; DESC is UTF-8)
 
    DESC is a text file, one item per line, as name=value words (the first word says what the line is):
      sample name=N rate=R channels=1|2 bits=16|24 data=RAWFILE [unity=K] [loop=FIRST,LAST] [compressed=1]
-       RAWFILE holds the frames, interleaved little-endian PCM. compressed=1 (16-bit only) stores the wave the way
+       RAWFILE (relative to DESC's folder, or absolute) holds the frames, interleaved little-endian PCM. compressed=1 (16-bit only) stores the wave the way
        GigaStudio compresses it (an ewav chunk, then frames of 2048 points: mode 1, 8-bit second differences, where
        they fit, else mode 0, plain 16-bit), which libgig can read but not write.
      instrument name=N [program=P] [bank=MSB] [banklsb=LSB] [drum=1] [bend=SEMITONES] [fine=CENTS] [swlo=K swhi=K]
@@ -20,6 +20,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <windows.h>
 #include "gig.h"
 
 /* a wave's protected list chunk and data chunk, through pointers to member named by a derived class */
@@ -108,11 +109,29 @@ static gig::dimension_t dim_type(const std::string &t) {
 
 struct Pending { gig::Sample *s; std::vector<uint8_t> bytes; size_t frames; bool raw; };
 
-int main(int argc, char **argv) {
+/* a UTF-8 path opened with its wide form, so paths outside the system code page work */
+static FILE *open_u8(const std::string &u8) {
+  int n = MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, NULL, 0);
+  if (n <= 0) return NULL;
+  std::wstring w((size_t)n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, &w[0], n);
+  return _wfopen(w.c_str(), L"rb");
+}
+
+static std::string u8_of(const wchar_t *w) {
+  int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+  std::string s(n > 0 ? (size_t)n : 1, '\0');
+  if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, NULL, NULL);
+  return std::string(s.c_str());
+}
+
+/* the arguments come wide and go on as UTF-8 (libgig opens UTF-8 paths; the description file is UTF-8 too) */
+int wmain(int argc, wchar_t **wargv) {
+  std::string argv1 = argc > 1 ? u8_of(wargv[1]) : "", argv2 = argc > 2 ? u8_of(wargv[2]) : "";
   if (argc != 3) { fprintf(stderr, "usage: gigmake DESC OUT.gig\n"); return 2; }
   try {
-    FILE *fd = fopen(argv[1], "rb");
-    if (!fd) { fprintf(stderr, "can't read %s\n", argv[1]); return 2; }
+    FILE *fd = open_u8(argv1);
+    if (!fd) { fprintf(stderr, "can't read %s\n", argv1.c_str()); return 2; }
     std::string text;
     char buf[4096];
     size_t got;
@@ -146,8 +165,13 @@ int main(int argc, char **argv) {
           pair2(kv, "loop", a, b);
           s->Loops = 1; s->LoopStart = (uint32_t)a; s->LoopEnd = (uint32_t)b; s->LoopSize = s->LoopEnd - s->LoopStart + 1;
         }
-        FILE *fr = fopen(kv["data"].c_str(), "rb");
-        if (!fr) { fprintf(stderr, "can't read %s\n", kv["data"].c_str()); return 2; }
+        std::string dp = kv["data"];
+        if (!dp.empty() && dp.find(':') == std::string::npos && dp[0] != '\\' && dp[0] != '/') {   /* relative: beside DESC */
+          size_t cut = argv1.find_last_of("\\/");
+          if (cut != std::string::npos) dp = argv1.substr(0, cut + 1) + dp;
+        }
+        FILE *fr = open_u8(dp);
+        if (!fr) { fprintf(stderr, "can't read %s\n", dp.c_str()); return 2; }
         Pending p;
         p.s = s;
         while ((got = fread(buf, 1, sizeof buf, fr)) > 0) p.bytes.insert(p.bytes.end(), buf, buf + got);
@@ -250,7 +274,7 @@ int main(int argc, char **argv) {
         throw gig::Exception("unknown line " + kind);
       }
     }
-    file.Save(argv[2]);
+    file.Save(argv2);
     /* the wave data, straight into the saved file */
     for (auto &p : pend) {
       if (p.raw) {

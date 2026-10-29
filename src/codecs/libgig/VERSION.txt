@@ -39,3 +39,5 @@ file-sized allocations the GigaStudio tests and review found), and for Unicode p
   make a read or LoadChunkData() reach past its parent or allocate more than the file holds.
 - RIFF.cpp: paths are UTF-8, opened with CreateFileW (CreateFileU8), so file names outside the system code page
   open; extension files are found from the same UTF-8 folder.
+- gig.cpp Sample::ScanCompressedSample: a last frame whose headers don't fit in the bytes left (a data chunk
+  ending 1 to 11 bytes after a mode byte) counted about 2^61 samples (the subtraction wrapped); it now counts 0.

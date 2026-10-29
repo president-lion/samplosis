@@ -721,6 +721,9 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
       uint64_t room = fsize > off ? (fsize - off) / s->FrameSize : 0;
       if (frames > room) frames = room;
     }
+    /* a compressed wave can't hold more frames than its data allows: at best 2048 frames in 268 bytes (GigaStudio's
+       densest frame), so a damaged frame count is held to that before anything is sized by it */
+    if (!pcm && frames > (len / 268 + 1) * 2048) frames = (len / 268 + 1) * 2048;
     /* one length rule for every wave: one longer than 2^26 frames (25 minutes at 44.1 kHz) is cut there, and
        counted; sf_gig_decode reads no further */
     if (frames > MAX_DECODE_FRAMES) { frames = MAX_DECODE_FRAMES; cut = 1; }
@@ -953,8 +956,10 @@ float *decode(Decode &d) {
   }
   gig::Sample *s = g->file->GetSample(d.c->index);
   if (!s || !s->SamplesTotal || !s->Channels || !s->Compressed) { say(d.err, d.cap, "the wave is missing"); return nullptr; }
-  /* the same length rule as the parse: cut at 2^26 frames */
-  uint64_t n = s->SamplesTotal > MAX_DECODE_FRAMES ? MAX_DECODE_FRAMES : s->SamplesTotal;
+  /* the same rules as the parse: no more frames than the data can hold (2048 in 268 bytes at best), cut at 2^26 */
+  uint64_t n = s->SamplesTotal, most = (SampleData::of(s)->GetSize() / 268 + 1) * 2048;
+  if (n > most) n = most;
+  if (n > MAX_DECODE_FRAMES) n = MAX_DECODE_FRAMES;
   int ch = (int)s->Channels, bytes = s->BitDepth == 24 ? 3 : 2;
   if (ch > 2) { say(d.err, d.cap, "the wave has more than two channels"); return nullptr; }
   d.out = (float *)malloc((size_t)n * ch * sizeof(float));
@@ -1018,6 +1023,7 @@ float *decode_guarded(Decode *d) {
   } __except (seh_filter(GetExceptionCode())) {
     d->f->gig = nullptr;                                  /* leaked: it may be half-built */
     d->out = nullptr; d->raw = nullptr;                   /* (leaked too: the heap isn't trusted now) */
+    d->dbuf.pStart = nullptr;
     tripped(d->err, d->cap);
     if (d->locked) { d->locked = false; ReleaseSRWLockExclusive(&g_lock); }
     return nullptr;
@@ -1033,6 +1039,7 @@ extern "C" int sf_parse_gig(SmpFont *f, const char *path, int (*cancel)(void *),
   if (why && wcap > 0) why[0] = 0;
   if (g_crashed) { say(why, wcap, CRASHED); return -1; }
   lock_gig();
+  if (g_crashed) { ReleaseSRWLockExclusive(&g_lock); say(why, wcap, CRASHED); return -1; }   /* a decode crashed meanwhile */
   r = parse_guarded(f, path, cancel, carg, why, wcap);
   if (g_crashed) ReleaseSRWLockExclusive(&g_lock);        /* nothing pending is freed after a crash */
   else unlock_gig();

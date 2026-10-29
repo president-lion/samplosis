@@ -656,9 +656,10 @@ namespace {
                 const file_offset_t frameSize = bytesPerFrame[mode_l] + bytesPerFrame[mode_r];
 
                 if (pCkData->RemainingBytes() <= frameSize) {
-                    SamplesInLastFrame =
-                        ((pCkData->RemainingBytes() - headerSize[mode_l] - headerSize[mode_r]) << 3) /
-                        (bitsPerSample[mode_l] + bitsPerSample[mode_r]);
+                    // Samplosis: a last frame whose headers don't fit holds no samples (the subtraction wrapped
+                    // around to about 2^61 samples)
+                    const file_offset_t rem = pCkData->RemainingBytes(), hdr = headerSize[mode_l] + headerSize[mode_r];
+                    SamplesInLastFrame = rem > hdr ? ((rem - hdr) << 3) / (bitsPerSample[mode_l] + bitsPerSample[mode_r]) : 0;
                     SamplesTotal += SamplesInLastFrame;
                     break;
                 }
@@ -675,8 +676,9 @@ namespace {
                 const file_offset_t frameSize = bytesPerFrame[mode];
 
                 if (pCkData->RemainingBytes() <= frameSize) {
-                    SamplesInLastFrame =
-                        ((pCkData->RemainingBytes() - headerSize[mode]) << 3) / bitsPerSample[mode];
+                    // Samplosis: as above, for mono
+                    const file_offset_t rem = pCkData->RemainingBytes(), hdr = headerSize[mode];
+                    SamplesInLastFrame = rem > hdr ? ((rem - hdr) << 3) / bitsPerSample[mode] : 0;
                     SamplesTotal += SamplesInLastFrame;
                     break;
                 }
