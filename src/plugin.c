@@ -36,6 +36,8 @@
 #define COLLECT_ROUNDS 8
 #define NOUTS 16                 /* stereo output ports */
 #define SF_BLOCK 4096            /* the SoundFont player's piece size; it splits longer blocks itself */
+#define SWITCH_MS 15.0           /* after a switch of players, the old one plays out its fade this long (voices fade
+                                    over 5 ms, the SoundFont player's effect tails over 10 ms) */
 
 /* Plug (plugin_int.h) is shared with the window (gui.c). */
 
@@ -348,7 +350,7 @@ static void p_destroy(const clap_plugin_t *p) {
   smp_gui_close(P);                      /* a host that didn't destroy the window first */
   smp_engine_free(P->e);
   smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
-  free(P->text); free(P->scratch); free(P->sf_line); free(P->sf_used);
+  free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used);
   free(P);
 }
 
@@ -356,10 +358,12 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
   Plug *P = p->plugin_data;
   (void)minf;
   if (rate <= 0) return false;
-  free(P->scratch);
+  free(P->scratch); free(P->fade_buf);
   P->maxf = maxf ? maxf : 4096;
   P->scratch = malloc(sizeof(float) * 2 * P->maxf);   /* also a stereo pair when the host's main output isn't one */
-  if (!P->scratch) return false;
+  P->fade_buf = malloc(sizeof(float) * 2 * P->maxf);
+  if (!P->scratch || !P->fade_buf) { free(P->scratch); free(P->fade_buf); P->scratch = P->fade_buf = NULL; return false; }
+  P->switch_left = 0;
   if (!P->e || !P->s || rate != P->rate) {   /* new players at this rate, with the same instrument */
     char *t = state_text(P);
     SmpSynth *old = P->s, *s = smp_synth_new(rate, SF_BLOCK);
@@ -559,14 +563,21 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   uint32_t n = pr->frames_count, ne = pr->in_events ? pr->in_events->size(pr->in_events) : 0, i, pos = 0;
   const clap_audio_buffer_t *ob;
   float *l, *r;
-  int plays = P->plays;
-  if (P->e && P->s && InterlockedExchange(&P->silence, 0)) {   /* plays changed: the other player goes quiet */
+  int plays = P->plays, fading;
+  if (P->e && P->s && InterlockedExchange(&P->silence, 0)) {   /* plays changed: the other player fades out */
     if (plays) smp_engine_reset(P->e, 0); else smp_synth_flush(P->s, 0);
+    P->switch_left = (uint32_t)(SWITCH_MS * 0.001 * P->rate);
   }
+  fading = P->switch_left > 0 && n <= P->maxf;      /* the old player's fade is heard on output 1 */
+  P->switch_left = P->switch_left > n ? P->switch_left - n : 0;
   if (plays && P->e && P->s) {
-    /* the sampler runs on silently, so its fades end and its replaced samples can be freed */
-    if (n <= P->maxf) smp_engine_process(P->e, P->scratch, P->scratch + P->maxf, (int)n);
+    /* the sampler runs on silently, so its fades end and its replaced samples can be freed; just after a switch
+       its fade is added to output 1 (when the host gave a stereo pair there) */
+    const clap_audio_buffer_t *b0 = pr->audio_outputs_count ? &pr->audio_outputs[0] : NULL;
+    if (n <= P->maxf) smp_engine_process(P->e, P->fade_buf, P->fade_buf + P->maxf, (int)n);
     process_synth(P, pr);
+    if (fading && b0 && b0->data32 && b0->channel_count >= 2 && b0->data32[0] && b0->data32[1])
+      for (i = 0; i < n; i++) { b0->data32[0][i] += P->fade_buf[i]; b0->data32[1][i] += P->fade_buf[P->maxf + i]; }
     goto done;
   }
   if (!pr->audio_outputs_count) { block_lost(P, pr); return CLAP_PROCESS_CONTINUE; }
@@ -594,7 +605,15 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   if (r == P->scratch && l == ob->data32[0]) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
   for (i = 2; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
   zero_ports(pr, 1, n);                  /* the sampler writes output 1 only */
-  if (P->s) smp_synth_skip(P->s, (int)n);   /* the SoundFont player still takes its font, so replaced ones close */
+  if (P->s && fading) {                  /* just after a switch: the SoundFont player's fade, into output 1 */
+    float *o[2 * NOUTS];
+    memset(o, 0, sizeof o);
+    o[0] = P->fade_buf; o[1] = P->fade_buf + P->maxf;
+    smp_synth_process(P->s, o, (int)n);
+    if (r == P->scratch)                 /* a mono output (folded above): the fade folded too */
+      for (i = 0; i < n; i++) l[i] += 0.5f * (P->fade_buf[i] + P->fade_buf[P->maxf + i]);
+    else for (i = 0; i < n; i++) { l[i] += P->fade_buf[i]; r[i] += P->fade_buf[P->maxf + i]; }
+  } else if (P->s) smp_synth_skip(P->s, (int)n);   /* it still takes its font, so replaced ones close */
 done:
   emit_gui_params(P, pr->out_events);
   if (P->collect_left > 0) {

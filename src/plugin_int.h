@@ -27,6 +27,9 @@ typedef struct Plug {
   int missing;                       /* its sample couldn't be loaded: silent, and saving writes text's sample line */
   char status[1400];
   float *scratch; uint32_t maxf;     /* the right channel when a host gives a mono output */
+  float *fade_buf;                   /* audio thread: a stereo pair (2 * maxf) the player switched away from plays
+                                        its fade into */
+  uint32_t switch_left;              /* audio thread: frames the old player still plays out after a switch */
   volatile LONG collect_left;        /* main-thread callbacks still wanted to free replaced samples */
   uint32_t since;                    /* audio thread: frames since it last asked for one */
   volatile LONG gui_any;             /* the window changed parameters: tell the host in the next flush or process */

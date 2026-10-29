@@ -352,6 +352,25 @@ def test_plugin_old_state_is_sampler(P):
     assert saved_state(out).startswith("plays sampler\n" + text)
 
 
+def test_plugin_switch_fades(P, tmp_path):
+    # switching players during playback: the old player's voices fade out (5 ms; its effect tails 10 ms) on
+    # output 1 instead of stopping dead
+    base = P.script(P.sample()) + 'soundfont "%s"\nsf_used 0:0\n' % P.font()
+    sf_state = "plays soundfont\n" + base
+    sampler_state = "plays sampler\n" + base
+    P.state_file(sampler_state, "to_sampler.txt")
+    P.state_file(sf_state, "to_sf.txt")
+    at = 47 * 256
+    for start, switch, note in ((sf_state, "to_sampler.txt", "midi 144 57 100 0"), (sampler_state, "to_sf.txt", "on 57 100 0")):
+        y, d, r = P.play(start, "%s\nstate %s %d" % (note, tmp_path / switch, at), 24000)
+        x = y[:, 0]
+        assert np.max(np.abs(x[at - 256:at])) > 0.05, switch
+        assert np.max(np.abs(x[at:at + 48])) > 0.02, switch               # still sounding, fading
+        step = np.max(np.abs(np.diff(x[at - 8:at + 8])))
+        assert step < 0.05, (switch, step)                                  # no click at the switch
+        assert np.max(np.abs(y[at + 768:])) == 0, switch                  # gone after the fade
+
+
 def test_plugin_note_off_any_channel(P):
     # a CLAP note-off with channel -1 (any) and a real key ends that key on every channel
     f = P.font()
