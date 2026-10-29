@@ -577,7 +577,10 @@ def test_gui_file_combo(P, tmp_path):
     text = P.script(d / "B.wav")
     out = gui(P, tmp_path, text, ["read File", "list File", "focus File", "key down", "read Sample", "read Status",
                                   "counts", "key end", "read Sample", "key down", "key home", "read Sample",
-                                  "key up", "state", "counts"])
+                                  "key up", "state", "counts",
+                                  # with its list open: the failed choice, then the list closes
+                                  "key down", "dropdown open", "key down", "dropdown close", "say", "read Sample",
+                                  "counts"])
     r = [x[1] for x in got(out, "read")]
     f = got(out, "focus")
     assert r[0] == "B.wav"
@@ -592,6 +595,10 @@ def test_gui_file_combo(P, tmp_path):
     assert ('sample "%s"' % (d / "a.wav")) in out
     c = got(out, "counts")[1]
     assert c[0] == "beeps 1" and c[2] != "mark_dirty 0"
+    # the list open: bad.wav chosen there fails; when the list closes the combo box is back on the loaded B.wav
+    assert f[5] == ["ComboBox", "File", "B.wav"] and f[6] == ["ComboBox", "File", "bad.wav"]
+    assert f[7] == ["ComboBox", "File", "B.wav"], out
+    assert r[5].startswith("B.wav, ") and got(out, "counts")[2][0] == "beeps 2"
 
 
 def test_gui_settings_page(P, tmp_path, settings_file):

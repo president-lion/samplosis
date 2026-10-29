@@ -33,7 +33,8 @@
      midi <status> <d1> <d2> one block of 256 frames through the plugin with that MIDI event at frame 0 (the plugin
                              is activated at 48 kHz first, and deactivated at the end)
      drop <path>             drop the file on the plugin's window (WM_DROPFILES)
-     load <state.txt>        the host loads another state while the window is open ("load: ok")
+     dropdown <open|close>   open or close the focused combo box's list (CB_SHOWDROPDOWN)
+     load <state.txt>      the host loads another state while the window is open ("load: ok")
      list <name>             a combo box's entries: "list: <name> | <entry> | <entry> ..."
      counts                  "counts: beeps N | request_flush N | mark_dirty N"
      pump <ms>               let the window's timers run
@@ -564,6 +565,8 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       pr.frames_count = BLOCK; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
       p->process(p, &pr);
       main_thread(p);
+    } else if (!strcmp(a, "dropdown")) {    /* open or close the focused combo box's list (silent) */
+      SendMessageW(GetFocus(), CB_SHOWDROPDOWN, !strcmp(arg, "open"), 0); pump(60);
     } else if (!strcmp(a, "load")) {
       if (load_state(p, arg) < 0) return 1;
       main_thread(p); pump(30);

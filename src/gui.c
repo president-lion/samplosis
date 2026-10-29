@@ -636,7 +636,8 @@ static void file_list(Gui *g, int kind, bool rescan) {
   HWND c = g->file[kind];
   char path[1100], key[1110]; wchar_t w[1100], pat[1200], *slash, *name = NULL, **names = NULL, one[1200];
   WIN32_FIND_DATAW fd; HANDLE f; int n = 0, cap = 0, i, at = -1, rc, same;
-  if (!c || SendMessageW(c, CB_GETDROPPEDSTATE, 0, 0)) return;
+  if (!c) return;
+  if (SendMessageW(c, CB_GETDROPPEDSTATE, 0, 0)) { g->file_key[kind][0] = 0; return; }   /* again once it closes */
   rc = K->path(g->P, path, sizeof path);
   snprintf(key, sizeof key, "%d%s", rc, path);
   if (!rescan && !strcmp(key, g->file_key[kind])) return;
@@ -646,7 +647,8 @@ static void file_list(Gui *g, int kind, bool rescan) {
     for (slash = w; *slash; slash++) if (*slash == L'/') *slash = L'\\';
     slash = wcsrchr(w, L'\\');
     name = slash ? slash + 1 : w;
-    if (slash) *slash = 0; else w[0] = 0;
+    if (slash) *slash = 0;
+    else if (rc == 1) rc = 3;                 /* a name without a folder: just that entry, no folder to list */
   } else rc = 0;
   if (rc == 1) {                              /* the folder's files of this kind, and the loaded one */
     wcscpy(g->file_dir[kind], w);
@@ -929,6 +931,8 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (k >= 0) choose(g, id, (int)k);
       } else if (code == CBN_SELCHANGE && (id == ID_FILE || id == ID_SFFILE)) {
         file_chosen(g, id == ID_SFFILE, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
+      } else if (code == CBN_CLOSEUP && (id == ID_FILE || id == ID_SFFILE)) {
+        file_list(g, id == ID_SFFILE, true);   /* its list closed: back on the loaded file (a choice that failed) */
       } else if (code == CBN_SELCHANGE && (id == ID_SFMODE || id == ID_SFPRESET || id == ID_SFCHANNEL ||
                                            (id >= ID_CHAN && id < ID_CHAN + NCH) || (id >= ID_OUT && id < ID_OUT + NCH))) {
         sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
