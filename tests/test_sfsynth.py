@@ -179,6 +179,55 @@ def test_pending_note_starts_when_loaded(lib, S):
     assert t is not None and 1000 <= t < 1000 + 200, t
 
 
+def test_pending_drop_is_real_time(lib, S):
+    """a note waiting for its sample is dropped after 1 s of real time, not of rendered frames: a render that
+    runs faster than real time without saying it is offline still gets the first notes after a program change"""
+    lib.smp_sf_test_pause.argtypes = [ctypes.c_int]
+    s = S.new()
+    assert lib.smp_synth_wait_loaded(s, 5000) == 0
+    bufs = [np.zeros(256, np.float32) for _ in range(32)]
+    arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+
+    def run(blocks):
+        peak = 0.0
+        for _ in range(blocks):
+            lib.smp_synth_process(s, arr, 256)
+            peak = max(peak, float(np.max(np.abs(bufs[0]))))
+        return peak
+
+    def until_sound(secs):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            if run(1) > 0.01:
+                return True
+            time.sleep(0.005)
+        return False
+
+    try:
+        lib.smp_sf_test_pause(1)
+        lib.smp_synth_midi(s, bytes([0xC1, 33]), 2, 0)          # the bass: not loaded
+        lib.smp_synth_midi(s, bytes([0x91, 69, 100]), 3, 0)
+        t0 = time.time()
+        assert run(400) == 0                                    # 2.1 s of audio, rendered in far less real time
+        assert time.time() - t0 < 0.8
+        lib.smp_sf_test_pause(0)
+        assert until_sound(3)                                   # late, but not lost
+        lib.smp_synth_midi(s, bytes([0xB1, 120, 0]), 3, 0)
+        run(10)
+        # a note that waits longer than 1 s of real time is dropped
+        lib.smp_sf_test_pause(1)
+        lib.smp_synth_midi(s, bytes([0xC1, 16]), 2, 0)          # the organ: not loaded
+        lib.smp_synth_midi(s, bytes([0x91, 69, 100]), 3, 0)
+        run(1)
+        time.sleep(1.2)
+        run(1)
+        lib.smp_sf_test_pause(0)
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        assert run(40) == 0
+    finally:
+        lib.smp_sf_test_pause(0)
+
+
 def test_one_preset_mode(lib, S):
     s = S.new()
     r, err = S.apply(s, "sf_mode one\nsf_preset 0 33\nsf_channel 3\n")

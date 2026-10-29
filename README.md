@@ -165,9 +165,16 @@ FluidSynth's, so its character differs) and the chorus depth is 8 ms. SoundFont 
 
 The state keeps an `sf_used` line: the presets in use when it was saved. They load as soon as the project loads, so the
 first notes aren't late. A program change right before the first notes loads that preset at once: in real time the
-first notes can be late by the load time (notes that wait more than a second are dropped), and in a render to file
-REAPER's offline mode makes the player wait, so the render is exact. A preset's samples are freed 2 seconds after no
-channel needs them.
+first notes can be late by the load time (a note that waits more than a second of real time is dropped). A preset's
+samples are freed 2 seconds after no channel needs them.
+
+Renders to file. An exact render relies on REAPER telling the plugin it renders offline: a call to the CLAP render
+extension's set with the offline mode (clap.render) before the render starts. Then the player waits for
+its samples at every block and every note, so each note starts on its frame. A host that renders faster than real
+time without saying so gets a real-time render played fast: the first notes after a program change may be late (by
+the load time), but they are never lost unless loading takes more than a second of real (wall-clock) time. If the
+font file disappears while a project is open, an offline render doesn't wait for it: the samples already loaded
+play, and the ones it can't read are silent (the player keeps trying to load them every half second).
 
 ### Status texts
 

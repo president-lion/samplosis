@@ -39,6 +39,8 @@
 #define MAXEV 4096                /* queued MIDI events per block */
 #define MAXUSED 1024              /* presets in an sf_used line */
 #define KILL_MS 5.0               /* a stolen or killed voice fades out over this */
+#define PENDING_MS 1000           /* a voice waiting for its sample is dropped after this much real time (not in an
+                                     offline render, which never drops one) */
 #define HOLD_SECONDS 10.0         /* sf_used presets are let go this long after the state loaded */
 #define G_EXCL 57                 /* exclusiveClass */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
@@ -77,7 +79,7 @@ typedef struct {
   int excl;                       /* the region's exclusive class */
   uint64_t age;                   /* when it started; smaller is older */
   const SmpSfRegion *reg;         /* the region a pending voice waits to start */
-  long waited;                    /* frames a pending voice has waited */
+  ULONGLONG since;                 /* when a pending voice began to wait (GetTickCount64, real time) */
 } Slot;
 
 typedef struct { SmpFont *f; LONG64 a0; } Retired;
@@ -323,6 +325,7 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   memset(t, 0, sizeof *t);
   t->chan = c; t->key = key; t->vel = vel; t->keydown = 1; t->reg = r; t->excl = r->gen[G_EXCL];
   t->st = V_PENDING;
+  t->since = GetTickCount64();
   if (try_start(s, i)) return;
   if (s->offline || s->render_offline) {   /* an offline render waits, so the note starts on its frame */
     smp_sf_wait_idle(s->cur, 10000);
@@ -666,8 +669,10 @@ static void block_start(SmpSynth *s, int n) {
     Slot *t = &s->sl[i];
     if (t->st != V_PENDING) continue;
     if (try_start(s, i)) continue;
-    t->waited += n;
-    if (t->waited > (long)s->rate) slot_free(s, i);   /* older than 1 s: dropped */
+    /* waiting longer than PENDING_MS of real time: dropped. Timed in real time, not in frames, so a render that
+       runs faster than real time without telling us (no clap.render) still gets its late notes; an offline
+       render never drops one (it waits for the loader, and a missing file must not lose later notes either) */
+    if (!s->offline && !s->render_offline && GetTickCount64() - t->since > PENDING_MS) slot_free(s, i);
   }
   limit(s, -1);                                 /* sf_voices may have been lowered */
 }
