@@ -122,6 +122,9 @@ struct SmpSynth {
   int offline;                    /* wait for the loader (the offline test render) */
   volatile LONG render_offline;   /* wait for the loader (the host renders offline: smp_synth_set_offline) */
   int test_wait;                  /* render_test's waiting, on by default */
+  int dormant;                    /* the player isn't playing (smp_synth_skip: the sampler plays). The channels'
+                                     presets aren't used (their samples can be freed), but chan_preset still says
+                                     what each channel would play; the next process uses them again */
   volatile LONG peak;
 };
 
@@ -672,7 +675,9 @@ static void block_start(SmpSynth *s, int n) {
     InterlockedExchangePointer((PVOID volatile *)&s->cur, w);
     changed = 1;
   }
-  if (changed) resolve_all(s);
+  if (s->dormant) {                             /* only what the channels would play, without using it */
+    if (changed) for (i = 0; i < NCH; i++) InterlockedExchange(&s->chan_preset[i], want_preset(s, i));
+  } else if (changed) resolve_all(s);
   if (s->used_state == U_HELD && s->used_armed && InterlockedExchangeAdd(&s->used_left, -n) - n <= 0)
     used_release(s, U_AUDIO);
   for (i = 0; i < MAXV; i++) {
@@ -692,8 +697,15 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
   double g0, g1, vol;
   if (!s || !outs || n <= 0 || !outs[0] || !outs[1]) { if (s) s->nev = 0; return; }
   for (i = 0; i < 2 * NOUT; i++) if (outs[i]) memset(outs[i], 0, sizeof(float) * (size_t)n);
-  if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);   /* offline: voices waiting start now */
-  block_start(s, n);
+  if (s->dormant) {                             /* playing again: the channels' presets are used again */
+    block_start(s, n);
+    s->dormant = 0;
+    resolve_all(s);
+    if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);
+  } else {
+    if (s->render_offline && s->cur) smp_sf_wait_idle(s->cur, 10000);   /* offline: voices waiting start now */
+    block_start(s, n);
+  }
   for (i = 1; i < s->nev; i++) {               /* stable sort by offset */
     Ev x = s->ev[i];
     for (j = i - 1; j >= 0 && s->ev[j].at > x.at; j--) s->ev[j + 1] = s->ev[j];
@@ -796,6 +808,14 @@ SMP_API void smp_synth_skip(SmpSynth *s, int n) {
   s->nev = 0;
   block_start(s, n < 0 ? 0 : n);
   for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; }
+  if (!s->dormant) {                           /* not playing: let the channels' presets and the sf_used ones go */
+    for (i = 0; i < NCH; i++) {
+      if (s->ch[i].preset >= 0 && s->cur) smp_sf_use(s->cur, s->ch[i].preset, -1);
+      s->ch[i].preset = -1;                    /* chan_preset keeps what the channel would play */
+    }
+    s->dormant = 1;
+  }
+  used_release(s, U_AUDIO);                    /* also a state loaded while dormant: nothing would arm its hold */
   InterlockedIncrement64(&s->epoch);
 }
 
@@ -1074,6 +1094,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   wav_header(f, (uint32_t)frames, s->rate, nch);
   /* every render starts from silence, with every channel at power-on */
   block_start(s, 0);
+  s->dormant = 0;
   for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; }
   for (i = 0; i < NCH; i++) chan_defaults(&s->ch[i]);
   resolve_all(s);

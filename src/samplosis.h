@@ -224,8 +224,11 @@ SMP_API void smp_synth_set_offline(SmpSynth *s, int on);   /* any thread: an off
                                     clap.render): process waits for the loader at each block and at notes whose
                                     samples aren't loaded, so the render is exact. Off: real time, never waits */
 SMP_API void smp_synth_skip(SmpSynth *s, int n);   /* audio thread: a block the player doesn't play (the sampler
-                                    plays). It takes the font and configuration, counts down sf_used, ends every
-                                    voice at once and drops the queued events, so replaced fonts can still close */
+                                    plays). It takes the font and configuration, ends every voice at once and drops
+                                    the queued events, so replaced fonts can still close. The player goes dormant:
+                                    the channels' presets and the sf_used ones are let go (their samples are freed
+                                    after the grace time; the font stays open), and the next process uses the
+                                    channels' presets again */
 SMP_API int smp_synth_loading(const SmpSynth *s);   /* main thread: presets in use whose samples are still
                                     loading (0 when the loader has caught up) */
 SMP_API int smp_synth_channel_preset(const SmpSynth *s, int ch, int *bank, int *program);   /* main thread: the

@@ -439,6 +439,44 @@ def test_used_presets_held_until_10s_after_first_note(lib, S):
         lib.smp_sf_test_grace(0)
 
 
+def test_dormant_lets_presets_go(lib, S):
+    """while the sampler plays (smp_synth_skip each block), the channels' presets and the sf_used ones are let go,
+    so their samples are freed; playing again uses the channels' presets again"""
+    lib.smp_synth_skip.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.smp_sf_loaded_bytes.restype = ctypes.c_uint64
+    lib.smp_sf_test_grace(20)
+    try:
+        s = S.new()
+        r, err = S.apply(s, "sf_used 0:33\n")
+        assert r == 0, err
+        bufs = [np.zeros(256, np.float32) for _ in range(32)]
+        arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+        lib.smp_synth_midi(s, bytes([0xC1, 16]), 2, 0)          # channel 2: the organ
+        lib.smp_synth_process(s, arr, 256)
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        f = lib.smp_synth_font(s)
+        before = lib.smp_sf_loaded_bytes(f)
+        assert lib.smp_sf_loaded_samples(f) == 4               # piano, kit, organ, and the held bass
+        for _ in range(4):
+            lib.smp_synth_skip(s, 256)
+        t0 = time.time()
+        while lib.smp_sf_loaded_bytes(f) != 0 and time.time() - t0 < 3:
+            time.sleep(0.01)
+            lib.smp_synth_skip(s, 256)
+        assert lib.smp_sf_loaded_bytes(f) == 0
+        assert "sf_used 0:0 0:16 128:0" in S.write(s)            # what the channels would play is still saved
+        lib.smp_synth_process(s, arr, 256)                       # playing again
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        assert lib.smp_sf_loaded_samples(f) == 3               # the channels' presets: piano, kit, organ
+        assert 0 < lib.smp_sf_loaded_bytes(f) < before
+        lib.smp_synth_midi(s, bytes([0x91, 69, 100]), 3, 0)     # and the organ plays
+        lib.smp_synth_process(s, arr, 256)
+        lib.smp_synth_process(s, arr, 256)
+        assert np.max(np.abs(bufs[0])) > 0.01
+    finally:
+        lib.smp_sf_test_grace(0)
+
+
 def test_outputs(lib, S):
     s = S.new()
     r, err = S.apply(s, "sf_output 2 3\n")
