@@ -40,6 +40,9 @@ typedef struct Plug {
   int loading_font;                  /* and it is a SoundFont (the SoundFont page's), not a sample */
   char loading_path[1100], loading_name[256];
   long load_failed;                  /* how many have failed; the last one's "Can't load x: why" is load_err */
+  long load_notes;                   /* how many were stopped by a load of the other kind; the last one's "Stopped
+                                        loading x to load y" is load_note */
+  char load_note[1200];
   char load_err[1900];
 } Plug;
 

@@ -52,6 +52,9 @@ typedef struct {
   uint32_t skip;             /* DECODED: the sample starts this many frames into the decoded file (an SFZ start
                                 head, see sfsfz.c); the cache file holds the whole channel, so the key leaves it out */
   uint8_t gen;               /* SF_GEN_*: a sample made in memory instead of read (SFZ's *sine, *silence, *noise) */
+  uint8_t guessed;           /* DECODED: the loader made it one of a stereo pair without knowing the file's channels
+                                (an SFZ sample of a format with no header probe); a mono decode then fills both, at
+                                1/sqrt(2) each, so the pair sounds as a centred mono sample would */
 } SmpSrc;
 enum { SF_GEN_NONE = 0, SF_GEN_SINE, SF_GEN_SILENCE, SF_GEN_NOISE };
 /* the made samples' lengths and rates: a 1024-frame sine cycle at the rate that makes it C4 (261.63 Hz), so it plays

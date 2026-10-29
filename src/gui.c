@@ -109,6 +109,7 @@ typedef struct Gui {
   wchar_t dropped[1100];                      /* the file a drop noted, loaded on WM_DROPPED */
   int modal;                                  /* file or folder dialogs open (see modal_begin) */
   long fails_seen;                            /* the plugin's failed background loads the window has told of */
+  long notes_seen;                            /* and its loads stopped by a load of the other kind */
 } Gui;
 
 /* ---- tests (tests\host.c): beeps are counted, and can be kept quiet ---- */
@@ -632,6 +633,10 @@ static void refresh(Gui *g) {
   if (g->P->load_failed != g->fails_seen) {   /* one that failed: the reason in Status for a while, and a beep */
     g->fails_seen = g->P->load_failed;
     say_note(g, g->P->load_err); beep();
+  }
+  if (g->P->load_notes != g->notes_seen) {    /* a load stopped for one of the other kind: said in Status, no beep */
+    g->notes_seen = g->P->load_notes;
+    say_note(g, g->P->load_note);
   }
   if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
   if (g->page != PG_SETTINGS && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
@@ -1310,6 +1315,7 @@ static bool g_create(const clap_plugin_t *p, const char *api, bool floating) {
   if (!P->gui) return false;
   P->gui->P = P;
   P->gui->fails_seen = P->load_failed;        /* failures from before the window opened aren't told again */
+  P->gui->notes_seen = P->load_notes;
   return true;
 }
 static void g_destroy(const clap_plugin_t *p) { smp_gui_close(plug(p)); }

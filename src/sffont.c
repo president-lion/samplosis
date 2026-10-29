@@ -63,6 +63,7 @@
 #define RETRY_MS 500                       /* how often a load that failed for now (no file, no memory) is retried */
 #define MAX_DECODED_FRAMES (1u << 26)      /* a decoded sample's limit (25 minutes at 44.1 kHz), against lying headers */
 #define MIN_HEAD 1024                      /* the shortest head, for samples with absurdly low rates */
+#define SF_BROKEN_DECODE 2                 /* a load's *broken: the decoder couldn't read the file at all */
 
 static SRWLOCK g_lock = SRWLOCK_INIT;      /* guards the list, g_busy and g_thread */
 static CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;   /* signalled when the loader lets go of a font */
@@ -229,17 +230,24 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
     } else {
       x = decode_audio(f->paths[c->path_id], &ch, &frames, &r, err, sizeof err);
     }
-    if (!x) { *broken = 1; return NULL; }
+    if (!x) { *broken = SF_BROKEN_DECODE; return NULL; }
     InterlockedIncrement(&g_decodes);
-    if (frames <= 0 || frames > (long)MAX_DECODED_FRAMES || ch <= 0) { free(x); *broken = 1; return NULL; }
+    if (frames <= 0 || frames > (long)MAX_DECODED_FRAMES || ch <= 0) { free(x); *broken = SF_BROKEN_DECODE; return NULL; }
     n = (uint32_t)frames;
+    if (c->guessed && ch == 1) {
+      /* taken as stereo without knowing (an SFZ sample of a format with no header probe), and mono after all: both
+         halves of the pair play this one channel, hard left and right, so each gets 1/sqrt(2), the level a centred
+         mono sample has in each ear */
+      long i;
+      for (i = 0; i < frames; i++) x[i] *= 0.70710678f;
+    }
     mono = x + (size_t)(c->channel < ch ? c->channel : 0) * (size_t)n;   /* channel after channel */
     /* every decoded sample goes to the cache, short ones too, so the next open decodes nothing */
     if (smp_cache_write_mono(c->key, mono, n, r > 0 ? r : (int)rate) == 0) e = smp_cache_open_mono(c->key);
     /* A whole sample file (SFZ, Decent Sampler) in stereo: the loader made its other channel the sample next to
        this one, so that one's cache file is written now too, from the same decode, rather than decoding the file
        a second time when it loads. */
-    if (!c->length && ch > 1) {
+    if (!c->length && (ch > 1 || c->guessed)) {
       int s = (int)(c - f->src), k;
       for (k = s - 1; k <= s + 1; k += 2) {
         const SmpSrc *o;
@@ -247,12 +255,17 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
         if (k < 0 || k >= f->nshdr) continue;
         o = &f->src[k];
         if (o->kind != SMP_SRC_DECODED || o->length || o->path_id != c->path_id || o->channel == c->channel ||
-            o->channel >= ch || o->gen) continue;
+            (o->channel >= ch && !(c->guessed && ch == 1)) || o->gen) continue;
         if ((oe = smp_cache_open_mono(o->key)) != NULL) { smp_cache_close(oe); continue; }
-        smp_cache_write_mono(o->key, x + (size_t)o->channel * (size_t)n, n, r > 0 ? r : (int)rate);
+        smp_cache_write_mono(o->key, x + (size_t)(o->channel < ch ? o->channel : 0) * (size_t)n, n, r > 0 ? r : (int)rate);
       }
     }
-    if (skip >= n) { free(x); if (e) smp_cache_close(e); *broken = 1; return NULL; }
+    if (skip >= n) {                                                /* an offset past the decoded end */
+      free(x); if (e) smp_cache_close(e);
+      set_problem(f, "%s is shorter than a region's offset, so that region is silent%s", f->shdr[c - f->src].name, "");
+      *broken = 1;
+      return NULL;
+    }
     if (!e && skip) {
       /* No cache: a base sample is held whole, but a start head (an SFZ offset into the same file) would hold a
          second copy of nearly all of it, one per offset. Refused instead, with the reason. */
@@ -271,8 +284,12 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
     else if (e) smp_cache_close(e);
     return p;
   }
-  if (smp_entry_frames(e) == 0 || smp_entry_frames(e) > MAX_DECODED_FRAMES || smp_entry_frames(e) <= skip) {
-    smp_cache_close(e); *broken = 1; return NULL;
+  if (smp_entry_frames(e) == 0 || smp_entry_frames(e) > MAX_DECODED_FRAMES) { smp_cache_close(e); *broken = 1; return NULL; }
+  if (smp_entry_frames(e) <= skip) {
+    smp_cache_close(e);
+    set_problem(f, "%s is shorter than a region's offset, so that region is silent%s", f->shdr[c - f->src].name, "");
+    *broken = 1;
+    return NULL;
   }
   n = (uint32_t)smp_entry_frames(e) - skip;
   hf = head_of(n, rate);
@@ -579,7 +596,7 @@ static DWORD pass(SmpFont *f) {
         } else if (broken) {
           f->state[s] = SF_ST_BROKEN;                /* never tried again */
           /* an SFZ's sample files are only probed at open; one that turns out not to decode is said here */
-          if (f->is_sfz && f->src[s].kind == SMP_SRC_DECODED && !f->src[s].gen)
+          if (f->is_sfz && broken == SF_BROKEN_DECODE)
             set_problem(f, "%s can't be decoded (it may be damaged or in a format this can't read)%s", f->shdr[s].name, "");
         } else {
           retry = 1;                                 /* no file or no memory: tried again in RETRY_MS */

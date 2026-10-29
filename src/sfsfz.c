@@ -134,6 +134,7 @@ typedef struct Head { uint32_t at; int id[2]; struct Head *next; } Head;
 /* what a probe learns about a file, and what the probe cache keeps of it */
 typedef struct {
   int kind, enc, channels, block, pitch;
+  int guessed;                       /* channels taken as 2 without knowing (no header probe for the format) */
   uint32_t rate, frames, ls, le;     /* rate 0: unknown; frames SF_UNKNOWN_FRAMES: unknown; le exclusive, 0 0: none */
   uint64_t offset;                   /* PCM_FILE: the first frame's byte offset */
 } Info;
@@ -771,14 +772,35 @@ static int dead_root(P *p, const wchar_t *root) {
   return dead;
 }
 
-/* errors that say the file isn't there (or can't be opened) rather than that its share or drive can't be reached */
-static int local_error(DWORD e) {
-  return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND || e == ERROR_INVALID_NAME || e == ERROR_ACCESS_DENIED ||
-         e == ERROR_SHARING_VIOLATION || e == ERROR_DIRECTORY || e == ERROR_FILENAME_EXCED_RANGE;
+/* Errors that say a share or a drive can't be reached (every other file under it would wait for the same timeout),
+   as against an error about the file itself */
+static int network_error(DWORD e) {
+  return e == ERROR_BAD_NETPATH || e == ERROR_BAD_NET_NAME || e == ERROR_NETNAME_DELETED || e == ERROR_UNEXP_NET_ERR ||
+         e == ERROR_NETWORK_UNREACHABLE || e == ERROR_HOST_UNREACHABLE || e == ERROR_SEM_TIMEOUT || e == ERROR_NOT_READY ||
+         e == ERROR_INVALID_DRIVE;
 }
 
-static void give_up_root(P *p, const wchar_t *root) {
-  if (!root[0]) return;
+/* tests: the next probes of files whose path contains g_fail_part fail with g_fail_code (smp_sf_test_probe_error) */
+static wchar_t g_fail_part[64]; static DWORD g_fail_code;
+SMP_API void smp_sf_test_probe_error(const char *name_part, unsigned long code) {
+  g_fail_part[0] = 0; g_fail_code = 0;
+  if (name_part && name_part[0] && MultiByteToWideChar(CP_UTF8, 0, name_part, -1, g_fail_part, 64)) g_fail_code = code;
+}
+static int injected(const wchar_t *path, DWORD *e) {
+  if (!g_fail_code || !g_fail_part[0] || !wcsstr(path, g_fail_part)) return 0;
+  *e = g_fail_code;
+  return 1;
+}
+
+/* A root is given up only after a network or not-ready error, and only for a share (\\server\share) or a drive
+   Windows calls remote or removable: one odd error on a local disk never makes its other files missing. */
+static void give_up_root(P *p, const wchar_t *root, DWORD e) {
+  if (!root[0] || !network_error(e)) return;
+  if (!(root[0] == L'\\' && root[1] == L'\\')) {
+    wchar_t r[4] = {root[0], L':', L'\\', 0};
+    UINT t = GetDriveTypeW(r);
+    if (t != DRIVE_REMOTE && t != DRIVE_REMOVABLE) return;
+  }
   AcquireSRWLockExclusive(&p->dead_lock);
   if (p->ndead < MAX_DEAD) { wcsncpy(p->dead[p->ndead], root, WPATH / 4 - 1); p->dead[p->ndead][WPATH / 4 - 1] = 0; p->ndead++; }
   ReleaseSRWLockExclusive(&p->dead_lock);
@@ -805,12 +827,13 @@ static void probe(P *p, File *fl) {
   HANDLE h;
   uint8_t b[12];
   int ok = 0;
+  DWORD e = 0;
   path_root(fl->wpath, root, WPATH / 4);
   if (dead_root(p, root)) { fl->status = F_MISSING; return; }
-  if (!GetFileAttributesExW(fl->wpath, GetFileExInfoStandard, &a)) {
-    DWORD e = GetLastError();
-    if (!local_error(e)) give_up_root(p, root);
-    fl->status = e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION ? F_UNREADABLE : F_MISSING;
+  if (injected(fl->wpath, &e) || !GetFileAttributesExW(fl->wpath, GetFileExInfoStandard, &a)) {
+    if (!e) e = GetLastError();
+    give_up_root(p, root, e);
+    fl->status = e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND || network_error(e) ? F_MISSING : F_UNREADABLE;
     return;
   }
   if (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { fl->status = F_UNREADABLE; return; }
@@ -823,8 +846,8 @@ static void probe(P *p, File *fl) {
   h = CreateFileW(fl->wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) {
-    DWORD e = GetLastError();
-    if (!local_error(e)) give_up_root(p, root);
+    e = GetLastError();
+    give_up_root(p, root, e);
     fl->status = e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? F_MISSING : F_UNREADABLE;
     return;
   }
@@ -839,7 +862,7 @@ static void probe(P *p, File *fl) {
     else if (!memcmp(b, "OggS", 4)) ok = probe_ogg(h, size, &fl->in);
     else if (!memcmp(b, "wvpk", 4)) ok = probe_wv(h, &fl->in);
     else if (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) ok = probe_mp3(h, size, &fl->in);
-    if (!ok) { int pitch = fl->in.pitch; unknown_info(&fl->in); fl->in.pitch = pitch; }
+    if (!ok) { int pitch = fl->in.pitch; unknown_info(&fl->in); fl->in.pitch = pitch; fl->in.guessed = 1; }
     if (fl->in.kind != SMP_SRC_PCM_FILE) fl->in.kind = SMP_SRC_DECODED;
     if (fl->in.channels <= 0) fl->in.channels = 2;
     fl->status = F_OK;   /* any other format is left to the loader's decoder, which says if it can't */
@@ -873,10 +896,24 @@ static void probe_all(P *p) {
 }
 
 /* ---- the probe cache: one small file per .sfz next to the decode cache ----
-   "SFZP" u32 version (1), u32 count, then per entry: u16 path length (wchar_t), the lower-case path, u64 size,
-   u64 mtime, and Info's fields (i32 kind, enc, channels, block, pitch; u32 rate, frames, ls, le; u64 offset). */
+   "SFZP" u32 version (2), u32 count, then per entry: u16 path length (wchar_t), the lower-case path, u64 size,
+   u64 mtime, and Info's fields (i32 kind, enc, channels, block, pitch, guessed; u32 rate, frames, ls, le; u64
+   offset): PCACHE_ENTRY bytes after the path. */
 
 #define PCACHE_MAX_ENTRIES (1 << 20)
+#define PCACHE_VERSION 2
+#define PCACHE_ENTRY (16 + 24 + 16 + 8)
+#define PCACHE_MIN (2 + 2 + PCACHE_ENTRY)          /* the smallest entry: a one-character path */
+
+/* tests: what the last SFZ open did with its probe cache */
+static volatile LONG g_probed, g_cached, g_wrote;
+static char g_pcache_path[WPATH * 3];
+SMP_API void smp_sf_test_sfz_stats(int *probed, int *cached, int *wrote, char *path, int cap) {
+  if (probed) *probed = (int)g_probed;
+  if (cached) *cached = (int)g_cached;
+  if (wrote) *wrote = (int)g_wrote;
+  if (path && cap > 0) snprintf(path, (size_t)cap, "%s", g_pcache_path);
+}
 
 static int pcache_path(const wchar_t *sfz, wchar_t *out, int cap) {
   char u[WPATH * 3], d[WPATH * 3 + 16], file[WPATH * 3];
@@ -896,29 +933,32 @@ static int pcache_path(const wchar_t *sfz, wchar_t *out, int cap) {
 static void pcache_read(P *p, const wchar_t *sfz) {
   wchar_t path[WPATH]; HANDLE h; LARGE_INTEGER sz; uint8_t *b = NULL; DWORD got = 0; uint64_t at = 12; uint32_t n, k;
   if (!pcache_path(sfz, path, WPATH)) return;
+  WideCharToMultiByte(CP_UTF8, 0, path, -1, g_pcache_path, (int)sizeof g_pcache_path, NULL, NULL);
   h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return;
   if (GetFileSizeEx(h, &sz) && sz.QuadPart >= 12 && sz.QuadPart < (256 << 20) && (b = malloc((size_t)sz.QuadPart)) != NULL &&
-      ReadFile(h, b, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart && !memcmp(b, "SFZP", 4) && le32(b + 4) == 1 &&
-      (n = le32(b + 8)) <= PCACHE_MAX_ENTRIES && (p->cache = calloc(n ? n : 1, sizeof *p->cache)) != NULL) {
+      ReadFile(h, b, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart && !memcmp(b, "SFZP", 4) &&
+      le32(b + 4) == PCACHE_VERSION && (n = le32(b + 8)) <= PCACHE_MAX_ENTRIES && n <= got / PCACHE_MIN &&
+      (p->cache = calloc(n ? n : 1, sizeof *p->cache)) != NULL) {   /* a count the file can't hold: not believed */
     for (k = 0; k < n; k++) {
       Cached *c = &p->cache[k]; unsigned L; const uint8_t *q;
       if (at + 2 > got) break;
       L = le16(b + at);
-      if (!L || at + 2 + (uint64_t)L * 2 + 16 + 40 + 8 > got || !(c->lw = malloc(((size_t)L + 1) * sizeof(wchar_t)))) break;
+      if (!L || at + 2 + (uint64_t)L * 2 + PCACHE_ENTRY > got || !(c->lw = malloc(((size_t)L + 1) * sizeof(wchar_t)))) break;
       memcpy(c->lw, b + at + 2, (size_t)L * 2); c->lw[L] = 0;
       q = b + at + 2 + (size_t)L * 2;
       memcpy(&c->size, q, 8); memcpy(&c->mtime, q + 8, 8); q += 16;
       c->in.kind = (int)le32(q); c->in.enc = (int)le32(q + 4); c->in.channels = (int)le32(q + 8);
-      c->in.block = (int)le32(q + 12); c->in.pitch = (int)le32(q + 16); c->in.rate = le32(q + 20);
-      c->in.frames = le32(q + 24); c->in.ls = le32(q + 28); c->in.le = le32(q + 32); memcpy(&c->in.offset, q + 36, 8);
+      c->in.block = (int)le32(q + 12); c->in.pitch = (int)le32(q + 16); c->in.guessed = le32(q + 20) == 1;
+      c->in.rate = le32(q + 24); c->in.frames = le32(q + 28); c->in.ls = le32(q + 32); c->in.le = le32(q + 36);
+      memcpy(&c->in.offset, q + 40, 8);
       /* a damaged entry ends the reading: what it says could make a sample read past its file */
       if ((c->in.kind != SMP_SRC_PCM_FILE && c->in.kind != SMP_SRC_DECODED) || c->in.channels < 1 || c->in.channels > 255 ||
           c->in.enc < 0 || c->in.enc > SMP_PCM_S24BE || c->in.block < 0 || c->in.block > 255 * 4 || !c->in.frames ||
           c->in.le > c->in.frames || c->in.ls > c->in.le || c->in.pitch < 0 || c->in.pitch > 127 ||
           (c->in.kind == SMP_SRC_PCM_FILE && (!c->in.block || !c->in.rate ||
            c->in.offset + (uint64_t)c->in.frames * (uint64_t)c->in.block > c->size))) { free(c->lw); c->lw = NULL; break; }
-      at += 2 + (uint64_t)L * 2 + 16 + 44;
+      at += 2 + (uint64_t)L * 2 + PCACHE_ENTRY;
       p->ncache++;
     }
   }
@@ -944,7 +984,7 @@ static void pcache_write(P *p, const wchar_t *sfz) {
   uint8_t *b; size_t cap = 12, at = 12; uint32_t n = 0; int k;
   HANDLE h; DWORD w = 0;
   if (!p->probed || !pcache_path(sfz, path, WPATH) || !smp_cache_ok(why, (int)sizeof why)) return;
-  for (k = 0; k < p->nfiles; k++) if (p->files[k].status == F_OK && p->files[k].lw) cap += 2 + wcslen(p->files[k].lw) * 2 + 60;
+  for (k = 0; k < p->nfiles; k++) if (p->files[k].status == F_OK && p->files[k].lw) cap += 2 + wcslen(p->files[k].lw) * 2 + PCACHE_ENTRY;
   if (!(b = malloc(cap))) return;
   for (k = 0; k < p->nfiles && n < PCACHE_MAX_ENTRIES; k++) {
     const File *fl = &p->files[k]; size_t L; uint8_t *q;
@@ -955,15 +995,15 @@ static void pcache_write(P *p, const wchar_t *sfz) {
     q += 2 + L * 2;
     memcpy(q, &fl->size, 8); memcpy(q + 8, &fl->mtime, 8); q += 16;
     {
-      int32_t iv[5] = {fl->in.kind, fl->in.enc, fl->in.channels, fl->in.block, fl->in.pitch};
+      int32_t iv[6] = {fl->in.kind, fl->in.enc, fl->in.channels, fl->in.block, fl->in.pitch, fl->in.guessed ? 1 : 0};
       uint32_t uv[4] = {fl->in.rate, fl->in.frames, fl->in.ls, fl->in.le};
-      memcpy(q, iv, 20); memcpy(q + 20, uv, 16); memcpy(q + 36, &fl->in.offset, 8);
+      memcpy(q, iv, 24); memcpy(q + 24, uv, 16); memcpy(q + 40, &fl->in.offset, 8);
     }
-    at += 2 + L * 2 + 16 + 44;
+    at += 2 + L * 2 + PCACHE_ENTRY;
     n++;
   }
   memcpy(b, "SFZP", 4);
-  { uint32_t v = 1; memcpy(b + 4, &v, 4); memcpy(b + 8, &n, 4); }
+  { uint32_t v = PCACHE_VERSION; memcpy(b + 4, &v, 4); memcpy(b + 8, &n, 4); }
   _snwprintf(part, WPATH + 39, L"%s.%lu.part", path, GetCurrentThreadId());
   part[WPATH + 39] = 0;
   h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -971,6 +1011,7 @@ static void pcache_write(P *p, const wchar_t *sfz) {
     int ok = WriteFile(h, b, (DWORD)at, &w, NULL) && w == (DWORD)at;
     CloseHandle(h);
     if (!ok || !MoveFileExW(part, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part);
+    else InterlockedExchange(&g_wrote, 1);
   }
   free(b);
 }
@@ -1108,6 +1149,7 @@ static int new_sample(P *p, File *fl, int ch, uint32_t at) {
   h->rate = fl->in.rate ? fl->in.rate : 44100;   /* unknown: the loaded rate counts (SmpSfView.rate) */
   h->pitch = (uint8_t)clampi(fl->in.pitch, 0, 127); h->type = SF_MONO;
   c->kind = (SmpSrcKind)fl->in.kind; c->path_id = fl->path_id; c->gen = (uint8_t)fl->gen;
+  c->guessed = (uint8_t)(fl->in.guessed && fl->in.kind == SMP_SRC_DECODED);
   c->channels = (uint8_t)clampi(fl->in.channels, 1, 255); c->channel = (uint8_t)ch;
   if (fl->in.kind == SMP_SRC_PCM_FILE) { c->offset = fl->in.offset + (uint64_t)at * (uint64_t)fl->in.block; c->enc = (uint8_t)fl->in.enc; }
   else c->skip = at;
@@ -1573,7 +1615,7 @@ static void strip_comments(char *t, size_t n) {
 
 /* reads and processes one file (the root at depth 0); 0 with why when the root can't be read */
 static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wcap) {
-  HANDLE h; LARGE_INTEGER sz; DWORD got = 0; char *t; size_t n, i, a;
+  HANDLE h; LARGE_INTEGER sz; DWORD got = 0; char *t; size_t n, i, a, lines = 0;
   wchar_t dir[WPATH], *slash;
   int k;
   if (depth > MAX_DEPTH || (depth > 0 && p->nincludes >= MAX_INCLUDES) || cancelled(p)) return 0;
@@ -1602,7 +1644,7 @@ static int process_file(P *p, const wchar_t *wpath, int depth, char *why, int wc
     if (i == n || t[i] == '\n') {
       do_line(p, t + a, i - a, dir, depth);
       a = i + 1;
-      if ((i & 0xFFF) == 0 && p->cancel && cancelled(p)) break;
+      if ((++lines & 0xFFF) == 0 && p->cancel && cancelled(p)) break;   /* every 4096 lines */
     }
   }
   free(t);
@@ -1691,8 +1733,14 @@ int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
   p->collect = 1;
   if (!process_file(p, full, 0, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
+  InterlockedExchange(&g_wrote, 0); g_pcache_path[0] = 0;
   pcache_read(p, full);
   probe_all(p);
+  {
+    int k, cached = 0;
+    for (k = 0; k < p->nfiles; k++) cached += p->files[k].from_cache;
+    InterlockedExchange(&g_probed, p->probed); InterlockedExchange(&g_cached, cached);
+  }
   if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
   restart_text(p);
   p->collect = 0;

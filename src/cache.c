@@ -245,7 +245,7 @@ long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames) {
   return (long)(got / 4);
 }
 
-typedef struct { uint64_t key, size, time; } Item;
+typedef struct { uint64_t key, size, time; int sfzp; } Item;   /* sfzp: an SFZ probe cache file (sfsfz.c) */
 static int by_time(const void *a, const void *b) {
   const Item *x = a, *y = b;
   return x->time < y->time ? -1 : x->time > y->time;
@@ -271,22 +271,31 @@ static void trim_parts(const wchar_t *dir) {
   FindClose(f);
 }
 
+/* The cache's files, oldest first: the .smpc sample files and the .sfzp SFZ probe caches (small, but those of
+   instruments long gone are trimmed like the rest) */
 uint64_t smp_cache_trim(uint64_t limit) {
   wchar_t dir[1100], pat[1200];
+  int pass;
   if (!dir_w(dir, 1100)) return 0;
   trim_parts(dir);
-  swprintf(pat, 1200, L"%s\\*.smpc", dir);
   Item *items = NULL; size_t n = 0, cap = 0;
   uint64_t total = 0, pinned = 0; /* open files are never deleted and do not count against the limit */
   WIN32_FIND_DATAW fd;
-  HANDLE f = FindFirstFileW(pat, &fd);
-  if (f != INVALID_HANDLE_VALUE) {
+  for (pass = 0; pass < 2; pass++) {
+    swprintf(pat, 1200, pass ? L"%s\\*.sfzp" : L"%s\\*.smpc", dir);
+    HANDLE f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) continue;
     do {
       if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-      if (n == cap) { cap = cap ? cap * 2 : 256; items = realloc(items, cap * sizeof *items); if (!items) { FindClose(f); return 0; } }
+      if (n == cap) {
+        Item *ni; cap = cap ? cap * 2 : 256;
+        if (!(ni = realloc(items, cap * sizeof *items))) { FindClose(f); free(items); return 0; }
+        items = ni;
+      }
       items[n].key = wcstoull(fd.cFileName, NULL, 16);
       items[n].size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
       items[n].time = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+      items[n].sfzp = pass;
       total += items[n].size; n++;
     } while (FindNextFileW(f, &fd));
     FindClose(f);
@@ -294,11 +303,11 @@ uint64_t smp_cache_trim(uint64_t limit) {
   qsort(items, n, sizeof *items, by_time);
   lock();
   for (size_t i = 0; i < n; i++)
-    if (is_open_locked(items[i].key)) { pinned += items[i].size; total -= items[i].size; items[i].size = 0; items[i].time = 0; }
+    if (!items[i].sfzp && is_open_locked(items[i].key)) { pinned += items[i].size; total -= items[i].size; items[i].size = 0; items[i].time = 0; }
   for (size_t i = 0; i < n && total > limit; i++) {
     if (!items[i].size) continue;
     wchar_t fn[1200];
-    file_w(items[i].key, L".smpc", fn, 1200);
+    file_w(items[i].key, items[i].sfzp ? L".sfzp" : L".smpc", fn, 1200);
     if (DeleteFileW(fn)) total -= items[i].size;
   }
   LeaveCriticalSection(&cs);

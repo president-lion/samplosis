@@ -965,6 +965,13 @@ static int load_job(Plug *P, const char *path, int dropped, int font, char *err,
   if (!font && !P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
   if (strlen(path) >= sizeof j->path) { snprintf(err, (size_t)cap, "its path is too long"); return 0; }
   if (!(L = loader_of(P)) || !(j = calloc(1, sizeof *j))) { snprintf(err, (size_t)cap, "out of memory"); return 0; }
+  if (P->loading && P->loading_font != font) {
+    /* the one worker serves both pages: a load of the other kind still running is stopped, and that is said (a
+       newer load of the same kind replacing an older one is what was asked, so it isn't) */
+    snprintf(P->load_note, sizeof P->load_note, "Stopped loading %s to load %s", P->loading_name, base_name(path));
+    snprintf(P->status, sizeof P->status, "%s", P->load_note);
+    P->load_notes++;
+  }
   j->L = L; j->dropped = dropped; j->font = font;
   strcpy(j->path, path);
   AcquireSRWLockExclusive(&L->lock);
@@ -997,6 +1004,7 @@ int smp_plug_poll_load(Plug *P) {
     if (f && take_font(P, f, j->path, err, sizeof err)) r = 1;
     else {
       snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path), err[0] ? err : j->err);
+      snprintf(P->status, sizeof P->status, "%s", P->load_err);   /* kept for a window opened later */
       P->load_failed++;
       r = -1;
     }

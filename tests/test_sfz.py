@@ -697,3 +697,90 @@ def test_sfz_decoded_lengths(lib, tmp_path):
         walk(lib, f)
     finally:
         lib.smp_sf_close(f)
+
+
+def sfz_stats(lib):
+    probed, cached, wrote = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    path = ctypes.create_string_buffer(2048)
+    lib.smp_sf_test_sfz_stats(ctypes.byref(probed), ctypes.byref(cached), ctypes.byref(wrote), path, 2048)
+    return probed.value, cached.value, wrote.value, path.value.decode()
+
+
+def test_sfz_probe_cache(lib, tmp_path):
+    """The second open reuses every probe cache entry and doesn't rewrite the file; a sample file that changed
+    (size and time) is probed again; a damaged probe cache is ignored safely (everything is probed, and it is
+    written again)."""
+    lib.smp_sf_test_sfz_stats.restype = None
+    for i in range(12):
+        write_wav(tmp_path / ("s%d.wav" % i), sine(RATE // 10, 300.0 + 50 * i), loop=(100, 999) if i % 2 else None)
+    path = write_sfz(tmp_path / "pc.sfz", "".join("<region> sample=s%d.wav key=%d\n" % (i, 40 + i) for i in range(12)))
+
+    def opened_regions():
+        f = opened(lib, path)
+        try:
+            return [(r.lokey, r.gen[54], lib.smp_sf_sample(f, r.sample).contents.loop_end) for r in regions(lib, f, 0)]
+        finally:
+            lib.smp_sf_close(f)
+
+    first = opened_regions()
+    probed, cached, wrote, pc = sfz_stats(lib)
+    assert (probed, cached, wrote) == (12, 0, 1) and pc.endswith(".sfzp") and os.path.exists(pc)
+    stamp = os.stat(pc).st_mtime_ns
+    assert opened_regions() == first
+    assert sfz_stats(lib)[:3] == (0, 12, 0) and os.stat(pc).st_mtime_ns == stamp      # every entry, no rewrite
+    write_wav(tmp_path / "s3.wav", sine(RATE // 5, 450.0))                            # changed: longer, no loop
+    again = opened_regions()
+    assert sfz_stats(lib)[:3] == (1, 11, 1)
+    assert again[3][1:] == (0, 0) and again[:3] == first[:3]
+    for junk in (b"SFZP\x02\0\0\0\xff\xff\xff\x7f" + b"\x01" * 50, b"", os.urandom(3000),
+                 open(pc, "rb").read()[:-7]):
+        with open(pc, "wb") as f:
+            f.write(junk)
+        assert opened_regions() == again
+        probed, cached, wrote, _ = sfz_stats(lib)
+        assert probed + cached == 12 and wrote == (probed > 0)
+
+
+def test_sfz_odd_error_keeps_the_drive(lib, tmp_path):
+    """A local sample that fails with an odd error (or even a network or not-ready one: the disk is local) is
+    counted alone; the other files on the same drive still load."""
+    lib.smp_sf_test_probe_error.restype = None
+    lib.smp_sf_test_probe_error.argtypes = [ctypes.c_char_p, ctypes.c_ulong]
+    for n in ("odd.wav", "a.wav", "b.wav", "c.wav"):
+        write_wav(tmp_path / n, sine(RATE // 10, 440.0))
+    path = write_sfz(tmp_path / "od.sfz", "<region> sample=odd.wav key=60\n<region> sample=a.wav key=61\n"
+                                          "<region> sample=b.wav key=62\n<region> sample=c.wav key=63\n")
+    try:
+        for code, says in ((1117, "1 sample can't be read (first: odd.wav)"),     # ERROR_IO_DEVICE
+                           (21, "Missing 1 sample (first: odd.wav)"),             # ERROR_NOT_READY
+                           (59, "Missing 1 sample (first: odd.wav)")):            # ERROR_UNEXP_NET_ERR
+            lib.smp_sf_test_probe_error(b"odd.wav", code)
+            os.utime(tmp_path / "a.wav")                                          # probed afresh, not from the cache
+            f = opened(lib, path)
+            try:
+                assert [r.lokey for r in regions(lib, f, 0)] == [61, 62, 63], code
+                assert lib.smp_sf_problem(f).decode() == says
+            finally:
+                lib.smp_sf_close(f)
+    finally:
+        lib.smp_sf_test_probe_error(None, 0)
+
+
+def test_sfz_guessed_mono_is_centred(lib, tmp_path):
+    """A format with no header probe (CAF) is taken as stereo; when it decodes as mono, both halves of the pair
+    play it at 1/sqrt(2), the level of a centred mono sample, from one decode."""
+    sf.write(str(tmp_path / "m.caf"), sine(RATE // 2, 440.0), RATE, format="CAF", subtype="PCM_16")
+    write_wav(tmp_path / "m.wav", sine(RATE // 2, 440.0))
+    path = write_sfz(tmp_path / "g.sfz", "<region> sample=m.caf key=60\n<region> sample=m.wav key=61 pitch_keycenter=61\n")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.lokey for x in r] == [60, 60, 61] and [x.cond.pair for x in r] == [0, 1, 0]
+        before = lib.smp_sf_test_decodes()
+        g, nv = note(lib, f, 60)
+        assert nv == 2 and lib.smp_sf_test_decodes() - before == 1
+        m, _ = note(lib, f, 61)
+        for ch in (0, 1):
+            assert abs(db(rms(g[2000:20000, ch]), rms(m[2000:20000, ch]))) < 0.2, ch
+    finally:
+        lib.smp_sf_close(f)

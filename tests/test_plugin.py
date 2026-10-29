@@ -973,6 +973,25 @@ def test_gui_load_does_not_block(P, tmp_path):
     assert got(out, "counts")[1][0] == "beeps 1"
 
 
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg isn't installed")
+def test_gui_load_of_other_kind_is_told(P, tmp_path):
+    # a sample still decoding when a .sfz is dropped: the one worker stops the sample's load, and Status says so
+    src = P.sample("src.wav")
+    f = tmp_path / "tone A3.tta"
+    subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-y", "-i", str(src), "-c:a", "tta", str(f)], check=True, timeout=60)
+    (tmp_path / "s.wav").write_bytes(open(src, "rb").read())
+    sfz = tmp_path / "kit.sfz"
+    sfz.write_text("<region> sample=s.wav key=60\n")
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["async on", "drop %s" % f, "pump 200", "drop %s" % sfz, "pump 300", "read Status",
+                                  "wait", "read SoundFont", "counts"],
+              env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
+    r = [x[1] for x in got(out, "read")]
+    assert r[0] == "Stopped loading tone A3.tta to load kit.sfz", out
+    assert r[1] == "kit.sfz, 1 preset", out
+    assert got(out, "counts")[0][0] == "beeps 0"
+
+
 def test_background_load_cancel(lib, P, tmp_path):
     # a second load while FFmpeg still works on the first: the first FFmpeg is killed and the second sample loads;
     # then the plugin is destroyed while a third decode runs, and nothing is left running
