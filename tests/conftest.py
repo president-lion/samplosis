@@ -62,7 +62,7 @@ class SmpSfCond(ctypes.Structure):
                 ("gain", ctypes.c_float), ("amp_velcurve", ctypes.POINTER(ctypes.c_float)),
                 ("polyphony", ctypes.c_uint16), ("note_polyphony", ctypes.c_uint16),
                 ("one_shot", u8), ("fil_type", u8), ("fil_unity", u8), ("pair", u8),
-                ("end_frame", ctypes.c_uint32)]
+                ("end_frame", ctypes.c_uint32), ("rt_linear", ctypes.c_float)]
 
 
 class SmpSfRegion(ctypes.Structure):
@@ -249,7 +249,7 @@ def lib(settings_file):
     # stage 3 (streaming); looked up only when present, so an older build still loads
     for name, res, args in (("smp_sf_stream_read", c_long, [vp, c_u64, fp, c_long]),
                             ("smp_sf_test_whole", None, [c_int]),
-                            ("smp_sf_test_decodes", c_long, []),
+                            ("smp_sf_test_decodes", c_long, []), ("smp_sf_test_gig_guards", c_long, []),
                             ("smp_sf_problem", c_char_p, [vp]),
                             ("smp_sf_ignored", c_int, [vp, c_char_p, c_int]),
                             ("smp_synth_underruns", c_long, [vp]),

@@ -1,0 +1,414 @@
+"""GigaStudio (.gig) through libgig (gigshim.cpp): instruments become presets, dimension regions become regions with
+conditions, uncompressed waves play from the file and compressed ones are decoded by libgig. The .gig files are
+written by libgig itself, through tests\\gigmake.exe (built by build.bat test)."""
+import ctypes
+import math
+import os
+import random
+import subprocess
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from test_sf2 import load_all, mods, peak_hz, presets, regions, sf_open
+from test_sffont import pcm
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GIGMAKE = os.path.join(HERE, "gigmake.exe")
+RATE = 44100
+OUT = 48000
+
+
+def sine(n, freq, rate=RATE, amp=0.5):
+    return amp * np.sin(2 * np.pi * freq * np.arange(n) / rate)
+
+
+def raw16(x):
+    return np.clip(np.round(np.asarray(x) * 32767), -32768, 32767).astype("<i2").tobytes()
+
+
+def raw24(x):
+    v = np.clip(np.round(np.asarray(x).reshape(-1) * 8388607), -8388608, 8388607).astype("<i4")
+    return b"".join(int(s).to_bytes(4, "little", signed=True)[:3] for s in v)
+
+
+def make_gig(tmp_path, name, samples, lines):
+    """samples: dicts of name, data (frames, or frames x 2), bits, and extra words; lines: the instrument lines"""
+    desc = []
+    for i, s in enumerate(samples):
+        data = np.asarray(s["data"], dtype=np.float64)
+        ch = 1 if data.ndim == 1 else data.shape[1]
+        bits = s.get("bits", 16)
+        rawp = tmp_path / ("%s_w%d.raw" % (name, i))
+        rawp.write_bytes(raw16(data) if bits == 16 else raw24(data))
+        desc.append("sample name=%s rate=%d channels=%d bits=%d data=%s %s" % (
+            s["name"], s.get("rate", RATE), ch, bits, rawp, s.get("extra", "")))
+    desc += lines
+    dp = tmp_path / (name + ".txt")
+    dp.write_text("\n".join(desc) + "\n")
+    out = tmp_path / (name + ".gig")
+    r = subprocess.run([GIGMAKE, str(dp), str(out)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return str(out)
+
+
+def opened(lib, path):
+    f, err = sf_open(lib, path)
+    assert f, err
+    return f
+
+
+def note(lib, f, preset, key, vel=100, n=24000, release_at=-1):
+    out = (ctypes.c_float * (2 * n))()
+    nv = lib.smp_sf_test_note(f, preset, key, vel, float(OUT), n, release_at, out)
+    assert nv >= 0
+    return np.frombuffer(out, dtype=np.float32).reshape(n, 2).astype(np.float64).copy(), nv
+
+
+def rms(x):
+    return float(np.sqrt(np.mean(np.square(x)) + 1e-30))
+
+
+def db(a, b):
+    return 20 * math.log10(a / b)
+
+
+def ignored(lib, f):
+    first = ctypes.create_string_buffer(128)
+    n = lib.smp_sf_ignored(f, first, 128)
+    return n, first.value.decode("utf-8", "replace")
+
+
+def head(lib, f, preset, sample):
+    """a sample's loaded head in int16 units, with its preset in use"""
+    lib.smp_sf_use(f, preset, 1)
+    try:
+        assert lib.smp_sf_wait_idle(f, 10000) == 0
+        got = pcm(lib, f, sample)
+        assert got is not None
+        return np.asarray(got[0], dtype=np.float64)
+    finally:
+        lib.smp_sf_use(f, preset, -1)
+
+
+def tc(seconds):
+    return round(1200 * math.log2(seconds))
+
+
+def walk(lib, f):
+    ns = lib.smp_sf_sample_count(f)
+    for i in range(lib.smp_sf_preset_count(f)):
+        assert lib.smp_sf_preset_info(f, i, None, None, None, 0)
+        for r in regions(lib, f, i):
+            assert r.lokey <= r.hikey <= 127 and r.lovel <= r.hivel <= 127
+            assert 0 <= r.sample < ns
+            assert len(mods(r.imod, r.nimod)) == r.nimod
+
+
+# ---- the presets-and-pitch file ----
+
+def pitch_gig(tmp_path):
+    samples = [
+        # 0: 16-bit mono, 441 Hz, unity A4, looped over whole cycles
+        dict(name="Sine441", data=sine(RATE, 441.0), extra="unity=69 loop=4410,30869"),
+        # 1: 24-bit stereo: 330.75 Hz left, 661.5 Hz right, unity E4
+        dict(name="Stereo24", bits=24, data=np.stack([sine(22050, 330.75), sine(22050, 661.5)], axis=1),
+             extra="unity=64"),
+        # 2: compressed 16-bit mono, 220.5 Hz, unity A3 (a second and a half, so it streams from the cache)
+        dict(name="Packed", data=sine(66150, 220.5, amp=0.25), extra="unity=57 compressed=1"),
+    ]
+    lines = [
+        # written out of order: the font lists them by bank, then program
+        "instrument name=Kit program=0 drum=1",
+        "region lo=36 hi=36 keygroup=1",
+        "dimreg i=0 sample=2 unity=36",
+        "instrument name=Strings program=48 bank=2 bend=12",
+        "region lo=0 hi=127",
+        "dimreg i=0 sample=1 fine=50 att=6",
+        "instrument name=Piano program=0",
+        "region lo=0 hi=127",
+        "dimreg i=0 sample=0 attack=0.2 release=0.5 sustain=500 decay1=1.0 loop=4410,26460",
+        "instrument name=Lsb program=3 banklsb=5",
+        "region lo=0 hi=127",
+        "dimreg i=0 sample=0 pitchtrack=0 eg3=300 lfo3=5:40",
+    ]
+    return make_gig(tmp_path, "pitch", samples, lines)
+
+
+def test_gig_presets_and_pitch(lib, tmp_path):
+    f = opened(lib, pitch_gig(tmp_path))
+    try:
+        assert presets(lib, f) == [(0, 0, "Piano"), (2, 48, "Strings"), (5, 3, "Lsb"), (128, 0, "Kit")]
+        assert lib.smp_sf_sample_count(f) == 4                     # one per channel
+        names = [lib.smp_sf_sample(f, i).contents.name.decode() for i in range(4)]
+        assert names == ["Sine441", "Stereo24", "Stereo24", "Packed"]
+        h = lib.smp_sf_sample(f, 0).contents
+        assert (h.start, h.end, h.rate, h.pitch, h.loop_start, h.loop_end) == (0, RATE, RATE, 69, 4410, 30870)
+        walk(lib, f)
+
+        (r,) = regions(lib, f, 0)                                  # Piano
+        g = r.gen
+        assert g[58] == 69 and g[54] == 1                          # root key, looped
+        assert (g[2], g[3]) == (0, 26460 + 4410 - 30870)            # the dimension region's loop through offsets
+        assert g[34] == tc(0.2) and g[38] == tc(0.5)               # EG1 attack and release
+        assert g[37] == round(-200 * math.log10(0.5))              # sustain 50 %: 60 cB
+        assert g[36] == tc(1.0 * 96 / 6.0)                         # decay 1 reaches the sustain in 1 s
+        assert r.cond.amp_veltrack == 100 and r.cond.amp_velcurve
+        curve = [r.cond.amp_velcurve[v] for v in range(128)]
+        assert all(0 <= c <= 1 for c in curve) and curve[127] > curve[40] > curve[1]
+        wheel = [m for m in mods(r.imod, r.nimod) if m[0] == 0x020E]
+        assert wheel == [(0x020E, 59, 200, 0, 0)]                  # the instrument's bend range, 2 semitones
+
+        left, right = note(lib, f, 0, 69, n=24000)[0].T
+        assert abs(peak_hz(left[2400:], OUT) - 441.0) < 441 * 0.004
+        assert abs(rms(left[12000:]) - rms(right[12000:])) < 1e-3  # a mono wave sits in the middle
+        # the wave's data comes straight from the file, exact
+        x = head(lib, f, 0, 0)
+        want = np.round(sine(RATE, 441.0) * 32767)
+        assert len(x) >= 11025 and np.max(np.abs(x - want[:len(x)])) <= 1
+
+        rs = regions(lib, f, 1)                                    # Strings: a 24-bit stereo pair
+        assert len(rs) == 2 and [x.sample for x in rs] == [1, 2]
+        assert (rs[0].gen[17], rs[1].gen[17]) == (-500, 500)
+        assert (rs[0].cond.pair, rs[1].cond.pair) == (0, 1)
+        assert 100 * rs[0].gen[51] + rs[0].gen[52] == 50            # fine tune 50 cents
+        assert abs(rs[0].gen[48] * 0.4 - 60) <= 1                  # 6 dB of attenuation
+        assert [m for m in mods(rs[0].imod, rs[0].nimod) if m[0] == 0x020E] == [(0x020E, 59, 1200, 0, 0)]
+        (lr, _) = note(lib, f, 1, 64, n=24000)
+        want = 330.75 * 2 ** (50 / 1200)
+        assert abs(peak_hz(lr[2400:, 0], OUT) - want) < want * 0.004
+        assert abs(peak_hz(lr[2400:, 1], OUT) - 2 * want) < 2 * want * 0.004
+
+        (r,) = regions(lib, f, 3)                                  # Kit: the compressed wave, decoded by libgig
+        assert r.gen[57] == 1                                      # the key group
+        (lr, _) = note(lib, f, 3, 36, n=24000)
+        assert abs(peak_hz(lr[2400:, 0], OUT) - 220.5) < 220.5 * 0.004
+        x = head(lib, f, 3, 3)
+        want = np.round(sine(66150, 220.5, amp=0.25) * 32767)
+        assert len(x) >= 11025 and np.max(np.abs(x - want[:len(x)])) <= 1     # lossless
+
+        (r,) = regions(lib, f, 2)                                  # Lsb: bank from the LSB, pitch tracking off
+        assert r.gen[56] == 0 and r.gen[6] == 40 and abs(r.gen[24] - round(1200 * math.log2(5 / 8.176))) <= 1
+        n, first = ignored(lib, f)
+        assert n == 1 and first == "EG3 (pitch envelope)"
+    finally:
+        lib.smp_sf_close(f)
+
+
+# ---- dimensions ----
+
+class Player:
+    def __init__(self, lib, tmp_path, path):
+        self.lib, self.tmp = lib, tmp_path
+        err = ctypes.create_string_buffer(512)
+        self.s = lib.smp_synth_new(float(OUT), 256)
+        lib.smp_synth_set_param(self.s, 33, 0)                               # no effects
+        assert lib.smp_synth_load(self.s, path.encode(), err, 512) == 1, err.value
+
+    def render(self, events, secs):
+        out = self.tmp / "r.wav"
+        assert self.lib.smp_synth_render_test(self.s, "\n".join(events).encode(), int(secs * OUT), 256,
+                                              str(out).encode(), 0) == 0
+        x, _ = sf.read(str(out), dtype="float32", always_2d=True)
+        return x[:, 0]
+
+    def program(self, prog):
+        return "midi %d %d 0 0" % (0xC0, prog)
+
+    def free(self):
+        self.lib.smp_synth_free(self.s)
+
+
+def on(k, v, t):
+    return "midi %d %d %d %d" % (0x90, k, v, int(round(t * OUT)))
+
+
+def off(k, t):
+    return "midi %d %d 0 %d" % (0x80, k, int(round(t * OUT)))
+
+
+def tone(x, f):
+    w = np.hanning(len(x))
+    t = np.arange(len(x)) / OUT
+    return 2 * abs(np.sum(x * w * np.exp(-2j * np.pi * f * t))) / np.sum(w)
+
+
+FREQS = [300.0, 500.0, 700.0, 900.0, 1100.0, 1300.0]
+
+
+def tones_gig(tmp_path, name, lines):
+    samples = [dict(name="T%d" % fq, data=sine(RATE, fq), extra="unity=60") for fq in FREQS]
+    return make_gig(tmp_path, name, samples, lines)
+
+
+def test_gig_velocity_and_round_robin(lib, tmp_path):
+    """A velocity split (gig3 upper limit 40) with a round robin of two inside each zone: four dimension regions,
+    velocity ranges from libgig's own lookup, seq_len 2 and seq_pos 1 and 2, and the player cycling them. Layers
+    all sound, random splits 0..1, keyswitches become sw_* per key."""
+    path = tones_gig(tmp_path, "vel", [
+        "instrument name=VelRR program=0",
+        "region lo=60 hi=60",
+        "dim type=velocity bits=1 zones=2",
+        "dim type=roundrobin bits=1 zones=2",
+        # index = velocity zone (bit 0) + 2 x round robin zone (bit 1)
+        "dimreg i=0 sample=0 upper=0:40", "dimreg i=1 sample=1 upper=0:127",
+        "dimreg i=2 sample=2 upper=0:40", "dimreg i=3 sample=3 upper=0:127",
+        "instrument name=Layers program=1",
+        "region lo=60 hi=60",
+        "dim type=layer bits=1 zones=2",
+        "dimreg i=0 sample=0", "dimreg i=1 sample=4",
+        "instrument name=Random program=2",
+        "region lo=60 hi=60",
+        "dim type=random bits=2 zones=4",
+        "dimreg i=0 sample=0", "dimreg i=1 sample=1", "dimreg i=2 sample=2", "dimreg i=3 sample=3",
+        "instrument name=Switch program=3 swlo=24 swhi=25",
+        "region lo=60 hi=60",
+        "dim type=keyboard bits=1 zones=2",
+        "dimreg i=0 sample=0", "dimreg i=1 sample=5",
+        "instrument name=Pair program=4",
+        "region lo=60 hi=60",
+        "dim type=samplechannel bits=1 zones=2",
+        "dimreg i=0 sample=0", "dimreg i=1 sample=1",
+        "instrument name=Wheel program=5",
+        "region lo=60 hi=60",
+        "dim type=modwheel bits=1 zones=2",
+        "dimreg i=0 sample=0", "dimreg i=1 sample=2",
+    ])
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        got = sorted((x.lovel, x.hivel, x.cond.seq_len, x.cond.seq_pos, x.sample) for x in r)
+        assert got == [(0, 40, 2, 1, 0), (0, 40, 2, 2, 2), (41, 127, 2, 1, 1), (41, 127, 2, 2, 3)]
+        r = regions(lib, f, 1)
+        assert sorted(x.sample for x in r) == [0, 4] and all(x.cond.seq_len == 0 for x in r)
+        r = regions(lib, f, 2)
+        assert [(x.cond.lorand, x.cond.hirand) for x in r] == [(0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)]
+        r = regions(lib, f, 3)
+        assert sorted((x.cond.sw_lokey, x.cond.sw_hikey, x.cond.sw_last, x.cond.sw_default, x.sample) for x in r) == \
+            [(24, 25, 24, 24, 0), (24, 25, 25, 24, 5)]
+        r = regions(lib, f, 4)                     # two mono waves in a samplechannel dimension: a left-right pair
+        assert [(x.sample, x.gen[17], x.cond.pair) for x in r] == [(0, -500, 0), (1, 500, 1)]
+        r = regions(lib, f, 5)                     # the mod wheel dimension: CC1 ranges
+        got = [(x.cond.locc_n, x.cond.locc[0].cc, x.cond.locc[0].lo, x.cond.locc[0].hi, x.sample) for x in r]
+        assert got == [(1, 1, 0, 63, 0), (1, 1, 64, 127, 2)]
+        walk(lib, f)
+    finally:
+        lib.smp_sf_close(f)
+    p = Player(lib, tmp_path, path)
+    try:
+        def heard(ev, secs, starts, cands):
+            x = p.render([p.program(prog)] + ev, secs)
+            return [[fq for fq in cands if tone(x[int((t + 0.05) * OUT):int((t + 0.18) * OUT)], fq) > 0.02]
+                    for t in starts]
+        prog = 0
+        ev = []
+        for i in range(4):
+            ev += [on(60, 100 if i < 2 else 20, 0.5 * i), off(60, 0.5 * i + 0.2)]
+        assert heard(ev, 2.2, [0, 0.5, 1.0, 1.5], FREQS[:4]) == [[500.0], [900.0], [300.0], [700.0]]
+        prog = 1
+        assert heard([on(60, 100, 0), off(60, 0.3)], 0.5, [0], FREQS) == [[300.0, 1100.0]]
+        prog = 3
+        ev = [on(60, 100, 0), off(60, 0.2), on(25, 100, 0.4), off(25, 0.45), on(60, 100, 0.5), off(60, 0.7),
+              on(24, 100, 0.9), off(24, 0.95), on(60, 100, 1.0), off(60, 1.2)]
+        assert heard(ev, 1.4, [0, 0.5, 1.0], FREQS) == [[300.0], [1300.0], [300.0]]
+        prog = 5
+        ev = [on(60, 100, 0), off(60, 0.2), "midi %d 1 100 %d" % (0xB0, int(0.4 * OUT)), on(60, 100, 0.5), off(60, 0.7)]
+        assert heard(ev, 0.9, [0, 0.5], FREQS) == [[300.0], [700.0]]
+    finally:
+        p.free()
+
+
+def test_gig_release_trigger(lib, tmp_path):
+    """A release trigger dimension: zone 0 plays at note-on, zone 1 at note-off with GigaStudio's release trigger
+    decay as a straight fall of 0.01053 x (256 >> 4) of full level a second held (as LinuxSampler plays it)."""
+    path = tones_gig(tmp_path, "rel", [
+        "instrument name=Rel program=0",
+        "region lo=60 hi=60",
+        "dim type=releasetrigger bits=1 zones=2",
+        "dimreg i=0 sample=1", "dimreg i=1 sample=3 rtdecay=4",
+    ])
+    f = opened(lib, path)
+    k = 0.01053 * (256 >> 4)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.cond.trigger, x.sample) for x in r] == [(0, 1), (1, 3)]
+        assert abs(r[1].cond.rt_linear - k) < 1e-6 and r[0].cond.rt_linear == 0
+    finally:
+        lib.smp_sf_close(f)
+    p = Player(lib, tmp_path, path)
+    try:
+        x = p.render([on(60, 100, 0), off(60, 0.3)], 0.7)
+        assert tone(x[int(0.05 * OUT):int(0.25 * OUT)], 500.0) > 0.02
+        assert tone(x[int(0.05 * OUT):int(0.25 * OUT)], 900.0) < 0.005    # not before the note-off
+        assert tone(x[int(0.35 * OUT):int(0.55 * OUT)], 900.0) > 0.02
+        a = p.render([on(60, 100, 0), off(60, 0.1)], 0.6)
+        b = p.render([on(60, 100, 0), off(60, 3.1)], 3.6)
+        la = tone(a[int(0.2 * OUT):int(0.4 * OUT)], 900.0)
+        lb = tone(b[int(3.2 * OUT):int(3.4 * OUT)], 900.0)
+        want = 20 * math.log10((1 - k * 0.1) / (1 - k * 3.1))
+        assert abs(db(la, lb) - want) < 0.7, (db(la, lb), want)
+    finally:
+        p.free()
+
+
+def structure_gig(tmp_path):
+    """a small file that is nearly all structure (tiny waves, many dimensions), so damage lands in the headers"""
+    samples = [dict(name="A", data=sine(300, 441.0), extra="unity=69 loop=10,200"),
+               dict(name="B", bits=24, data=np.stack([sine(200, 330.0), sine(200, 660.0)], axis=1)),
+               dict(name="C", data=sine(5000, 220.5, amp=0.25), extra="compressed=1")]
+    lines = ["instrument name=VelRR program=0", "region lo=60 hi=60", "dim type=velocity bits=1 zones=2",
+             "dim type=roundrobin bits=1 zones=2", "dimreg i=0 sample=0 upper=0:40", "dimreg i=1 sample=1 upper=0:127",
+             "dimreg i=2 sample=2 upper=0:40", "dimreg i=3 sample=0 upper=0:127",
+             "instrument name=Rel program=1 swlo=24 swhi=25", "region lo=0 hi=127",
+             "dim type=releasetrigger bits=1 zones=2", "dim type=keyboard bits=1 zones=2", "dimreg i=0 sample=1",
+             "dimreg i=1 sample=2 rtdecay=3", "dimreg i=2 sample=0 lfo3=5:30 vcf=100:20", "dimreg i=3 sample=2 eg3=100",
+             "instrument name=Ch program=2", "region lo=0 hi=127", "dim type=samplechannel bits=1 zones=2",
+             "dimreg i=0 sample=0", "dimreg i=1 sample=0"]
+    return make_gig(tmp_path, "structure", samples, lines)
+
+
+@pytest.mark.parametrize("kind", ["data", "structure"])
+def test_gig_corrupt(lib, tmp_path, kind):
+    """Every 97th truncation and 300 seeded corruptions of a small .gig with a compressed wave (one mostly wave data,
+    one mostly headers): libgig's exceptions are caught, and each opens or gives NULL with a reason, never a crash or
+    a hang, and without needing the last-resort guard; every 7th variant that opens loads its samples too."""
+    data = open(pitch_gig(tmp_path) if kind == "data" else structure_gig(tmp_path), "rb").read()
+    step = 97 if kind == "data" else 31
+    variants = [data[:cut] for cut in range(0, len(data), step)]
+    rng = random.Random(1234)
+    for _ in range(300 if kind == "data" else 600):
+        b = bytearray(data)
+        for _ in range(8):
+            b[rng.randrange(len(b))] = rng.randrange(256)
+        variants.append(bytes(b))
+    path = tmp_path / "bad.gig"
+    opened_n = refused = 0
+    guards = lib.smp_sf_test_gig_guards()
+    for k, v in enumerate(variants):
+        path.write_bytes(v)
+        f, err = sf_open(lib, path)
+        if f:
+            opened_n += 1
+            walk(lib, f)
+            if k % 7 == 0:
+                load_all(lib, f)
+            lib.smp_sf_close(f)
+        else:
+            refused += 1
+            assert err.startswith("bad.gig isn't a GigaStudio file this can read (") or                 err.startswith("bad.gig isn't a SoundFont") or err.startswith("can't open"), err
+            assert err.endswith(")") or "SoundFont" in err or "open" in err
+    assert opened_n > 0 and refused > 0
+    assert lib.smp_sf_test_gig_guards() == guards       # libgig itself handled them: no last-resort guard was needed
+
+
+def test_gig_named_dls_giga_chunks_go_to_libgig(lib, tmp_path):
+    """A RIFF "DLS " file with Giga chunks but another name goes to libgig too (the DLS loader hands it over)."""
+    src = pitch_gig(tmp_path)
+    other = tmp_path / "renamed.dls"
+    other.write_bytes(open(src, "rb").read())
+    f = opened(lib, str(other))
+    try:
+        assert len(presets(lib, f)) == 4
+    finally:
+        lib.smp_sf_close(f)

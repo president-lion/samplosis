@@ -50,7 +50,7 @@
      was that key.
    - CC ranges (locc): each controller within its range at the moment the region would start.
    - Release triggers: at note-off, or when the sustain pedal (or the sostenuto that caught the key) lets go, with
-     the note-on's velocity and the time from the note-on to then (rt_decay; sfvoice.c). They count against the
+     the note-on's velocity and the time from the note-on to then (rt_decay, rt_linear; sfvoice.c). They count against the
      voice limit and can be stolen, but no note-off or pedal releases them: they play their sample through its own
      envelope (one whose sample loops is released at once, so it can't drone on). A key struck again while its
      release waits for the pedal drops that waiting release: the new note's own note-off (or the pedal after it)

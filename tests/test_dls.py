@@ -292,8 +292,9 @@ def test_windows_gm_dls_opens(lib):
 
 @pytest.mark.parametrize("kind", ["3gri", "3gnl", "einf", "ewav", "3gix", "ptbl8"])
 def test_gigastudio_refused(lib, tmp_path, kind):
-    """GigaStudio files are RIFF "DLS " too; until they have a loader they are refused plainly, not played as
-    noise (their compressed waves' fmt says PCM)."""
+    """GigaStudio files are RIFF "DLS " too: one with any Giga marker (or the .gig name) goes to libgig
+    (gigshim.cpp), never to the DLS loader, which would play its compressed waves as noise. These hand-made files
+    aren't real GigaStudio files, so libgig gives a GigaStudio reason, or reads them as gig files."""
     waves = [dict(WAVES[0])]
     extra, ptbl8 = [], False
     if kind in ("3gri", "3gnl"):
@@ -307,8 +308,19 @@ def test_gigastudio_refused(lib, tmp_path, kind):
     path = str(tmp_path / "t.gig")
     D.write_dls(path, INSTRUMENTS[2:3], waves, extra=extra, ptbl8=ptbl8)
     f, err = sf_open(lib, path)
-    assert not f
-    assert err == "t.gig is a GigaStudio file; this can't read it yet", err
+    if f:
+        assert lib.smp_sf_preset_count(f) >= 1
+        lib.smp_sf_close(f)
+    else:
+        assert err.startswith("t.gig isn't a GigaStudio file this can read ("), err
+    # the same file under another name: the DLS loader finds the marker and hands it over
+    other = str(tmp_path / "t.dls")
+    os.replace(path, other)
+    f, err = sf_open(lib, other)
+    if f:
+        lib.smp_sf_close(f)
+    else:
+        assert err.startswith("t.dls isn't a GigaStudio file this can read ("), err
 
 
 def one(lib, tmp_path, name, art, level):

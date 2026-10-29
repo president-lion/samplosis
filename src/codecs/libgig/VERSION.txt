@@ -1,0 +1,21 @@
+libgig 4.6.0 (Christian Schoenebeck, LinuxSampler project): the RIFF, DLS and gig readers and writers
+https://download.linuxsampler.org/packages/libgig-4.6.0.tar.bz2
+SHA-256 fc331202210919e3172c4d36ab24231dea3667d8722141f0c7939ca545119d01 (the same file as Debian's
+https://deb.debian.org/debian/pool/main/libg/libgig/libgig_4.6.0.orig.tar.bz2)
+Kept from src/: RIFF, DLS, gig, helper and Serialization (.cpp and .h), sysdef.h, and srx/ (Serialization's
+formats). gig.cpp needs Serialization for its archive support, which Samplosis doesn't use. Not kept: SF, Akai,
+Korg, typeinfo, the tools and the tests.
+Licence: GNU GPL version 2 or (at your option) any later version, as each source file's header says; see COPYING.
+Built by build.bat with /EHsc /Zc:__cplusplus /std:c++14 /DNOMINMAX /DWIN32 /DPACKAGE /DVERSION, and /wd4716 for
+Serialization.cpp's _stringToNumber<T> template (no return after an assert; never reached here).
+
+Local changes (each marked "Samplosis" in the source), for damaged files the GigaStudio tests found crashing:
+- gig.cpp File::LoadGroups: a 3gnm chunk whose data doesn't load (NULL), is empty, or has no NUL was passed to
+  strcmp; now only its first byte is looked at, after checking the data loaded.
+- gig.cpp Sample::ScanCompressedSample: a compressed wave with no data chunk dereferenced NULL; now it throws.
+- DLS.cpp Sample::Sample and Sample::GetSize: a fmt chunk with a bit depth under 8 (or no channels) made FrameSize
+  0 and the sample count a division by zero; now the count is 0.
+- gig.cpp Region::UpdateVelocityTable: dimension definitions that disagree (over 8 bits, more zones than the bits
+  allow, over 256 dimension regions, or a missing dimension region) made it read past the dimension region array,
+  dereference NULL, write past its 128-entry table, or step backwards without end; such a region now gets no
+  custom velocity table, each index is checked, and the table index stops at 127.

@@ -194,6 +194,10 @@ typedef struct {
                                    it, and the player counts and stops the two as one voice */
   uint32_t end_frame;           /* the region ends at this frame of its sample (clamped to the loaded length); 0: the
                                    end generators say (SFZ's end, so a decode shorter than its header still fits) */
+  /* added for GigaStudio (Task 11) */
+  float rt_linear;              /* a release trigger's level falls by this fraction of full per second held, in a
+                                   straight line, to silence (GigaStudio's release trigger decay as LinuxSampler
+                                   plays it: 1 - rt_linear x seconds); 0 = none */
 } SmpSfCond;
 enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3 };   /* 2-pole lowpass, highpass, bandpass, notch */
 typedef struct {
@@ -261,7 +265,8 @@ SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
    sample that doesn't decode). */
 SMP_API const char *smp_sf_problem(const SmpFont *f);
 /* SFZ: how many different opcodes (and headers, as "<name>") the file used that this can't play, and the first of
-   them in first (may be NULL); 0 for every other format. Any thread. */
+   them in first (may be NULL); GigaStudio: the same for its settings and dimensions (by plain names, such as "EG3
+   (pitch envelope)"); 0 for every other format. Any thread. */
 SMP_API int smp_sf_ignored(const SmpFont *f, char *first, int cap);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
@@ -269,6 +274,8 @@ SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time b
 SMP_API void smp_sf_test_whole(int on);                     /* tests: samples loaded from now on are held whole (as
                                     in stage 2), so a render can be compared with a streamed one */
 SMP_API long smp_sf_test_decodes(void);                     /* tests: compressed SoundFont samples decoded so far */
+SMP_API long smp_sf_test_gig_guards(void);                  /* tests: crashes inside libgig that gigshim.cpp's last-resort
+                                    guards turned into refusals (0 when libgig handled every damaged file itself) */
 /* sfvoice.c, tests: plays one note of a preset (public index) on a default channel (GM reset controllers, bend
    centred, a 200 cent bend range), every region the key and velocity match, and writes frames of stereo into
    out_lr (frames * 2 floats, interleaved). The note is released at frame release_at (negative: never). Uses the

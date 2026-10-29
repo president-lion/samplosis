@@ -5,7 +5,8 @@ controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It i
 Signalsmith Stretch (MIT, see src\signalsmith), and these decoders, all 3-clause BSD, each with its licence in its
 folder under src\codecs: libopus, opusfile and libogg (Xiph.Org), WavPack (David Bryant) and the Monkey's Audio SDK
 (Matthew T. Ashland). It also includes yxml (Yoran Heling, MIT, see src\codecs\yxml), which reads Decent Sampler
-presets.
+presets, and libgig (Christian Schoenebeck, GPL version 2 or later, see src\codecs\libgig), which reads GigaStudio
+files.
 
 ## What it does
 

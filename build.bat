@@ -28,12 +28,25 @@ cl /nologo /c /O2 /w /MT /MP /EHsc /std:c++17 /DPLATFORM_WINDOWS /DWIN32 /I "%CO
 cl /nologo /c /O2 /w /MT /I "%CODECS%\yxml" /Fo"%CO%\\" "%CODECS%\yxml\yxml.c" || exit /b 1
 rem Our shim around Monkey's Audio: /EHsc, and every exception is caught inside it
 cl /nologo /c /O2 /W3 /MT /EHsc /std:c++17 /DPLATFORM_WINDOWS /DWIN32 /I "%CODECS%\mac\Source\Shared" /I "%CODECS%\mac\Source\MACLib" /Fo"%OBJ%\mac_shim.obj" "%CODECS%\mac_shim.cpp" || exit /b 1
+rem libgig 4.6.0 (GPL 2 or later; src\codecs\libgig\VERSION.txt), the GigaStudio reader, in a folder of its own. MSVC
+rem needs /Zc:__cplusplus (libgig checks for C++11), NOMINMAX (windows.h's min and max), WIN32, and PACKAGE and
+rem VERSION (otherwise from autotools' config.h); /wd4716 for a Serialization template that never returns (unused).
+rem gig.cpp needs Serialization (and its srx folder and dbghelp, which the plugin delay-loads) for its archive support
+set "GIGF=/EHsc /Zc:__cplusplus /std:c++14 /DNOMINMAX /DWIN32"
+set "GO=%OBJ%\libgig"
+if not exist "%GO%" mkdir "%GO%"
+del /q "%GO%\*.obj" 2>nul
+cl /nologo /c /O2 /w /wd4716 /MT /MP %GIGF% "/DPACKAGE=\"libgig\"" "/DVERSION=\"4.6.0\"" /I "%CODECS%\libgig" /Fo"%GO%\\" "%CODECS%\libgig\RIFF.cpp" "%CODECS%\libgig\DLS.cpp" "%CODECS%\libgig\gig.cpp" "%CODECS%\libgig\helper.cpp" "%CODECS%\libgig\Serialization.cpp" "%CODECS%\libgig\srx\*.cpp" || exit /b 1
+rem Our shim around libgig: every exception is caught inside it
+cl /nologo /c /O2 /W3 /MT %GIGF% /I src /Fo"%OBJ%\gigshim.obj" src\gigshim.cpp || exit /b 1
 rem The plugin. Media Foundation (mfdecode.c) is delay-loaded, so the plugin loads on Windows without it (an N
 rem edition); mfdecode.c looks for its DLLs before the first call
-cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /MP /I "%CLAPINC%" /I "%CODECS%\opusfile\include" /I "%CODECS%\ogg\include" /I "%CODECS%\opus\include" /I "%CODECS%\wavpack\include" /I "%CODECS%\yxml" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\stretch.obj" "%OBJ%\mac_shim.obj" "%CO%\*.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib oleacc.lib mfplat.lib mfreadwrite.lib mfuuid.lib delayimp.lib /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll || exit /b 1
+cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /LD /MT /MP /I "%CLAPINC%" /I "%CODECS%\opusfile\include" /I "%CODECS%\ogg\include" /I "%CODECS%\opus\include" /I "%CODECS%\wavpack\include" /I "%CODECS%\yxml" /Fo"%OBJ%\\" src\*.c "%OBJ%\rb.obj" "%OBJ%\stretch.obj" "%OBJ%\mac_shim.obj" "%OBJ%\gigshim.obj" "%CO%\*.obj" "%GO%\*.obj" /Fe:samplosis.clap /link /NOLOGO user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib ole32.lib uuid.lib oleacc.lib rpcrt4.lib dbghelp.lib mfplat.lib mfreadwrite.lib mfuuid.lib delayimp.lib /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll /DELAYLOAD:dbghelp.dll || exit /b 1
 if /i "%1"=="test" (
   cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /I "%CLAPINC%" /I src /Fo"%OBJ%\\" tests\host.c /Fe:tests\host.exe /link /NOLOGO user32.lib ole32.lib oleaut32.lib oleacc.lib || exit /b 1
   rem a stand-in ffmpeg.exe and ffprobe.exe for the FFmpeg stage's tests (it hangs, writes garbage or fails)
   cl /nologo /D_CRT_SECURE_NO_WARNINGS /O2 /W3 /MT /Fo"%OBJ%\\" tests\fakeff.c /Fe:tests\fakeff.exe || exit /b 1
+  rem the GigaStudio tests' writer: libgig itself writes their .gig files
+  cl /nologo /O2 /W3 /MT %GIGF% /I "%CODECS%\libgig" /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\gigmake.obj" tests\gigmake.cpp "%GO%\*.obj" /Fe:tests\gigmake.exe /link /NOLOGO rpcrt4.lib dbghelp.lib || exit /b 1
 )
 del samplosis.exp samplosis.lib 2>nul

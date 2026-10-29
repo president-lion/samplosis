@@ -654,7 +654,7 @@ static void refresh(Gui *g) {
 static bool font_name(const wchar_t *n) {
   const wchar_t *dot = wcsrchr(n, L'.');
   return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3") || !_wcsicmp(dot, L".sfz") ||
-                 !_wcsicmp(dot, L".dspreset"));
+                 !_wcsicmp(dot, L".dspreset") || !_wcsicmp(dot, L".gig"));
 }
 /* a file to load: LOAD_SAMPLE or LOAD_FONT (as the page's Browse or File combo box asks: a file of the
    other kind gives that player's error), or LOAD_DROPPED: by its extension, a .sf2 or .sf3 as the SoundFont
@@ -717,7 +717,7 @@ typedef struct {
 } FileKind;
 static const FileKind kinds[2] = {
   {smp_plug_sample_path, audio_name, NULL, L"Load a sample"},             /* filter: audio_filter() */
-  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3;*.sfz;*.dspreset\0All files\0*.*\0", L"Load a SoundFont"},
+  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3;*.sfz;*.dspreset;*.gig\0All files\0*.*\0", L"Load a SoundFont"},
 };
 
 /* The File combo box: the files of its kind in the loaded file's folder, by name (alphabetical, ignoring case),

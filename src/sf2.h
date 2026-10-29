@@ -55,6 +55,9 @@ typedef struct {
   uint8_t guessed;           /* DECODED: the loader made it one of a stereo pair without knowing the file's channels
                                 (an SFZ sample of a format with no header probe); a mono decode then fills both, at
                                 1/sqrt(2) each, so the pair sounds as a centred mono sample would */
+  uint8_t giga;              /* DECODED: a compressed GigaStudio wave, which libgig decodes (gigshim.cpp); offset and
+                                length are its data chunk's (they key the cache), index is its place in the wave pool */
+  uint32_t index;
 } SmpSrc;
 enum { SF_GEN_NONE = 0, SF_GEN_SINE, SF_GEN_SILENCE, SF_GEN_NOISE };
 /* the made samples' lengths and rates: a 1024-frame sine cycle at the rate that makes it C4 (261.63 Hz), so it plays
@@ -76,8 +79,12 @@ struct SmpFont {
   int dls_boosts;                       /* DLS: regions with a gain above 0 (see sfdls.c) */
   int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
   int is_ds;                            /* Decent Sampler (sfds.c, through sfsfz.c's builder): is_sfz is set too */
-  int sfz_ignored;                      /* SFZ: different opcodes and headers used that this can't play */
-  char sfz_first_ignored[64];           /* SFZ: the first of them */
+  int is_gig;                           /* GigaStudio (gigshim.cpp, through libgig): filled as DLS is */
+  void *gig;                            /* GigaStudio: the loader's libgig file for decoding compressed waves, opened
+                                           when the first is needed (sf_gig_decode), freed by sf_free; or NULL */
+  int sfz_ignored;                      /* SFZ and GigaStudio: different opcodes, headers or settings used that this
+                                           can't play */
+  char sfz_first_ignored[64];           /* SFZ and GigaStudio: the first of them */
   SfPhdr *phdr; int nphdr;
   SfBag *pbag; int npbag;
   SmpSfMod *pmod; int npmod;
@@ -206,8 +213,16 @@ wchar_t *sf_full_path(const char *path);
 #define SF_MAX_REGIONS (1 << 17)
 #define SF_MAX_POOL_MODS (1 << 20)
 /* sfdls.c: fills f from a DLS file (RIFF form "DLS ", already checked) open on h: 1 when it did, 0 with why when it
-   can't, -1 for a GigaStudio file (which this can't read yet) */
+   can't, -1 for a GigaStudio file (sf2.c then hands it to sf_parse_gig) */
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
+/* gigshim.cpp (C++, every exception caught inside): fills f from a GigaStudio file through libgig: 1 when it did, 0
+   with why (a reason to put in brackets, or "cancelled"). Any thread. sf_gig_decode decodes a compressed wave
+   (c->giga) on the loader thread: float, channel after channel, as decode_audio gives, or NULL with err; cancel is
+   asked between pieces. sf_gig_free frees the font's libgig file (sf_free calls it). */
+int sf_parse_gig(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
+float *sf_gig_decode(SmpFont *f, const SmpSrc *c, int *chans, long *frames, int *rate, int (*cancel)(void *),
+                     void *carg, char *err, int cap);
+void sf_gig_free(SmpFont *f);
 /* sfsfz.c: fills f from an SFZ file (f->size, mtime and path set): 1 when it did; 0 with why (a reason to put in
    brackets) or -1 with why (the whole reason) when it can't. Main thread (it reads every sample file's header). */
 int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);

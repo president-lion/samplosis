@@ -399,6 +399,7 @@ static double xf_out(int x, int lo, int hi) { return x <= lo ? 1 : x >= hi ? 0 :
      at the softest velocity: gain = 1 + t c, so -100 % is 1 - c (silent at 127) and the gain is continuous through
      0 % (sfzformat.com only says negative values invert the tracking; this is the form that meets 0 % smoothly);
    - a release trigger's rt_decay: -rt_decay dB per second the note was held;
+   - a release trigger's rt_linear (GigaStudio's): 1 - rt_linear x the seconds held, never below 0;
    - amp_velcurve (SFZ's amp_velcurve_N), when set, is the curve c instead of (vel / 127)^2;
    - gain: a plain factor (SFZ's volume above 0 dB, which initialAttenuation can't say). */
 static double xf_pos(const SmpSfRegion *r, int key, int vel) {
@@ -424,6 +425,7 @@ static double cond_gain(const SmpSfRegion *r, int key, int vel, double held) {
     g *= t >= 0 ? 1 - t * (1 - cv) : 1 + t * cv;
   }
   if (held >= 0 && c->rt_decay > 0) g *= pow(10.0, -c->rt_decay * held / 20.0);
+  if (held >= 0 && c->rt_linear > 0) g *= clampd(1 - c->rt_linear * held, 0, 1);
   if (c->gain > 0 && c->gain != 1) g *= c->gain;
   return g;
 }

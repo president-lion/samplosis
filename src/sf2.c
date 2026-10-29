@@ -955,15 +955,25 @@ SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *
     if (err && cap > 0) snprintf(err, cap, "%s isn't a SoundFont", base_name(path));
     goto done;
   }
-  if (!memcmp(h + 8, "DLS ", 4)) {   /* Downloadable Sounds: sfdls.c builds the same model */
-    f->is_dls = 1;
+  if (!memcmp(h + 8, "DLS ", 4)) {
+    /* Downloadable Sounds: sfdls.c builds the same model. A GigaStudio file is RIFF "DLS " too: named .gig, or with
+       Giga chunks that sfdls.c finds, it goes to libgig instead (gigshim.cpp). */
+    const char *dot = strrchr(base_name(path), '.');
+    int r = -1;
     f->path = _strdup(path);
     if (!f->path) snprintf(why, sizeof why, "out of memory");
     else {
-      int r = sf_parse_dls(f, s.h, s.size, path, why, sizeof why);
-      if (r > 0) { ok = 1; goto done; }
+      if (!dot || _stricmp(dot, ".gig")) {
+        f->is_dls = 1;
+        r = sf_parse_dls(f, s.h, s.size, path, why, sizeof why);
+        if (r > 0) { ok = 1; goto done; }
+      }
       if (r < 0) {
-        if (err && cap > 0) snprintf(err, cap, "%s is a GigaStudio file; this can't read it yet", base_name(path));
+        f->is_dls = 0;
+        f->is_gig = 1;
+        why[0] = 0;
+        if (sf_parse_gig(f, path, cancel, carg, why, sizeof why) > 0) { ok = 1; goto done; }
+        if (err && cap > 0) snprintf(err, cap, "%s isn't a GigaStudio file this can read (%s)", base_name(path), why);
         goto done;
       }
     }
@@ -1073,6 +1083,7 @@ done:
 void sf_free(SmpFont *f) {
   int i;
   if (!f) return;
+  sf_gig_free(f);
   if (f->paths) for (i = 0; i < f->npaths; i++) free(f->paths[i]);
   free(f->paths); free(f->src);
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
@@ -1083,8 +1094,8 @@ void sf_free(SmpFont *f) {
 }
 
 int smp_sf_ignored(const SmpFont *f, char *first, int cap) {
-  if (first && cap > 0) snprintf(first, (size_t)cap, "%s", f && f->is_sfz ? f->sfz_first_ignored : "");
-  return f && f->is_sfz ? f->sfz_ignored : 0;
+  if (first && cap > 0) snprintf(first, (size_t)cap, "%s", f && (f->is_sfz || f->is_gig) ? f->sfz_first_ignored : "");
+  return f && (f->is_sfz || f->is_gig) ? f->sfz_ignored : 0;
 }
 
 int smp_sf_preset_count(const SmpFont *f) { return f ? f->nphdr : 0; }
