@@ -31,66 +31,91 @@ enum { E_DELAY, E_ATTACK, E_HOLD, E_DECAY, E_SUSTAIN, E_RELEASE, E_DONE };
 
 /* the EMU factor on initialAttenuation that FluidSynth applies to the generator (not to modulators) */
 #define ATTEN_FACTOR 0.4
-#define FLOOR_DB (-100.0)
+/* The volume envelope's range, as FluidSynth has it (measured against it in Task 7): decay and release fall
+   96 dB in their time, a sustain of 1000 cB is the bottom of that range (so sustain cB scale by 0.96 dB / 10),
+   and the envelope is done at the bottom. */
+#define ENV_DB 96.0
+#define FLOOR_DB (-ENV_DB)
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
 
-/* timecents to samples. -12000 and below is the shortest the spec allows, about 1 ms. */
-static double tc_samples(double tc, double rate) { return rate * pow(2.0, clampd(tc, -12000, 8000) / 1200.0); }
+/* timecents to samples, limited to lo..hi timecents: -12000 is the shortest the spec allows (about 1 ms);
+   the upper limit is 5000 for delays and holds (after the key scaling) and 8000 for the rest, as the spec's
+   ranges and FluidSynth have it */
+static double tc_samples(double tc, double lo, double hi, double rate) { return rate * pow(2.0, clampd(tc, lo, hi) / 1200.0); }
 
 /* absolute cents to Hz */
 static double abs_hz(double cents) { return 8.176 * pow(2.0, cents / 1200.0); }
 
 /* ---- modulators (SF2.04 section 8.2) ---- */
 
-/* The concave curve, as SF2.04 section 8.2.4 draws it and FluidSynth tabulates it (fluid_conv.c,
-   fluid_concave): concave(x) = -20/96 * log10((1 - x)^2), for x from 0 to 1, limited to 1. It is the curve
-   whose 960 cB make an amplitude of x^2 (40 * log10(x) dB). Convex is its mirror: convex(x) = 1 - concave(1 - x). */
-static double concave(double x) {
-  double y;
-  if (x <= 0) return 0;
-  if (x >= 1) return 1;
-  y = -20.0 / 96.0 * log10((1 - x) * (1 - x));
-  return y > 1 ? 1 : y;
+/* The concave and convex curves, as SF2.04 section 8.2.4 draws them, on 128 steps the way FluidSynth tabulates
+   them (measured against it in Task 7): step i of 0..127 is concave(i) = -20/96 * log10(((127 - i) / 127)^2),
+   the curve whose 960 cB make an amplitude of ((127 - i) / 127)^2, and convex(i) = 1 - concave(127 - i); step 0
+   is 0 and step 127 is 1. Between steps the value is interpolated. So a 7-bit controller at v through the
+   default concave, negative CC7 modulator gives exactly an amplitude of (v / 127)^2, full at 127. */
+static double curve_step(int i, int cvx) {
+  if (i <= 0) return 0;
+  if (i >= 127) return 1;
+  return cvx ? 1 + 5.0 / 12.0 * log10(i / 127.0) : -5.0 / 12.0 * log10((127 - i) / 127.0);
 }
-static double convex(double x) { return 1 - concave(1 - x); }
+static double curve(double x, int cvx) {       /* x: a fractional step */
+  int i;
+  if (x < 0) return 0;
+  i = (int)x;
+  if (i >= 127) return 1;
+  return curve_step(i, cvx) + (curve_step(i + 1, cvx) - curve_step(i, cvx)) * (x - i);
+}
 
-typedef struct { const SmpSfChan *c; int key, vel; } ModCtx;
+typedef struct { const SmpSfChan *c; int key, vel, poly_key; } ModCtx;
 
 /* a modulator source, mapped through its curve, polarity and direction (the four flags of section 8.2.1).
-   7-bit sources count in 128ths (64 is the middle), the pitch wheel in 16384ths, and the pitch wheel
-   sensitivity as cents / 12700 (so the default pitch wheel modulator's 12700 gives the bend range in cents).
-   "No controller" is 1, as the spec says. */
+   The mapping is FluidSynth's (measured in Task 7), which reads the spec's 127/128 ranges literally:
+   - a source counts in 128ths (the pitch wheel in 16384ths), so 64 is the exact middle;
+   - the negative direction is (127 - v) / 128, so it never reaches 1 either;
+   - the curves take 128 times that as their step, and stop at 127/128;
+   - bipolar is 2x - 1, except that the top value stays as it is.
+   The pitch wheel sensitivity is the bend range in cents / 12700, so the default pitch wheel modulator's
+   12700 gives the range exactly. "No controller" is 1, as the spec says and FluidSynth 2.6 does. */
 static double source(unsigned s, const ModCtx *m) {
   unsigned idx = s & 127, type = s >> 10, bip = (s >> 9) & 1, neg = (s >> 8) & 1;
-  double x;
-  if (s & 0x80) x = m->c->cc[idx] / 128.0;
+  double v, range = 128, top, x;
+  if (s & 0x80) v = m->c->cc[idx];
   else switch (idx) {
     case 0: return 1.0;
-    case 2: x = m->vel / 128.0; break;
-    case 3: x = m->key / 128.0; break;
-    case 10: x = m->c->poly[m->key & 127] / 128.0; break;
-    case 13: x = m->c->pressure / 128.0; break;
-    case 14: x = m->c->bend / 16384.0; break;
-    case 16: x = m->c->bend_range_cents / 12700.0; break;
+    case 2: v = m->vel; break;
+    case 3: v = m->key; break;
+    case 10: v = m->c->poly[m->poly_key & 127]; break;
+    case 13: v = m->c->pressure; break;
+    case 14: v = m->c->bend; range = 16384; break;
+    case 16: v = m->c->bend_range_cents * 128.0 / 12700.0; break;
     default: return 0;
   }
-  if (neg) x = 1 - x;
+  top = (range - 1) / range;
+  x = neg ? top - v / range : v / range;
   if (!bip) {
     switch (type) {
-      case 1: return concave(x);
-      case 2: return convex(x);
+      case 1: return fmin(curve(128 * x, 0), top);
+      case 2: return fmin(curve(128 * x, 1), top);
       case 3: return x >= 0.5 ? 1 : 0;
       default: return x;
     }
   }
-  switch (type) {          /* bipolar: the curve runs both ways out from the middle */
-    case 1: return x >= 0.5 ? concave(2 * x - 1) : -concave(1 - 2 * x);
-    case 2: return x >= 0.5 ? convex(2 * x - 1) : -convex(1 - 2 * x);
-    case 3: return x >= 0.5 ? 1 : -1;
-    default: return 2 * x - 1;
+  if (x != top) x = 2 * x - 1;     /* bipolar: the curve runs both ways out from the middle */
+  switch (type) {
+    case 1: return x >= 0 ? fmin(curve(128 * x, 0), top) : -curve(-128 * x, 0);
+    case 2: return x >= 0 ? fmin(curve(128 * x, 1), top) : -curve(-128 * x, 1);
+    case 3: return x >= 0 ? 1 : -1;
+    default: return x;
   }
 }
+
+/* The velocity to filter cutoff default as FluidSynth defines it (a switch on velocity as the amount source).
+   FluidSynth makes that modulator give 0, whether it is its own default or a font's copy, because the spec's
+   version makes every softer note duller and fonts are voiced for players that don't do it. The parser puts
+   it in the defaults in this form, and it is skipped here the same way. */
+#define VEL2FC_SRC 0x0102
+#define VEL2FC_AMT_SRC 0x0C02
 
 static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m) {
   int i;
@@ -98,6 +123,7 @@ static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m) 
     const SmpSfMod *d = &list[i];
     double y;
     if (d->dest >= SMP_SF_NGEN) continue;     /* the parser drops these; be safe */
+    if (d->src == VEL2FC_SRC && d->dest == 8 && d->amt_src == VEL2FC_AMT_SRC) continue;
     y = d->amount * source(d->src, m) * source(d->amt_src, m);
     if (d->trans == 2) y = fabs(y);
     sum[d->dest] += y;
@@ -108,9 +134,9 @@ static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m) 
 static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   const SmpSfRegion *r = v->reg;
   ModCtx m;
-  double *g = v->g, rate = v->rate, q_db, peak;
+  double *g = v->g, rate = v->rate, q_db;
   int i, k;
-  m.c = c; m.key = v->key; m.vel = v->vel;
+  m.c = c; m.key = v->pkey; m.vel = v->vel; m.poly_key = v->key;   /* the key source is keynum when set, as in FluidSynth */
   memset(v->mod, 0, sizeof v->mod);
   add_mods(v->mod, r->imod, r->nimod, &m);
   add_mods(v->mod, r->pmod, r->npmod, &m);
@@ -135,43 +161,43 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->rev_send = clampd(g[G_REVERB], 0, 1000) / 1000.0;
   v->cho_send = clampd(g[G_CHORUS], 0, 1000) / 1000.0;
 
-  /* The filter's Q. The spec: initialFilterQ is the height in cB of the resonance above the DC gain, and 0 or
-     less is not resonant. Q is chosen so the response's peak is exactly that high: for a 2-pole lowpass the
-     peak is M = Q / sqrt(1 - 1/(4 Q^2)), so Q^2 = (M^2 + M sqrt(M^2 - 1)) / 2. At 0 cB that is 1/sqrt(2), a
-     Butterworth with no peak, and it rises smoothly from there. As SF2.01 asks (and FluidSynth does), the gain
-     drops by half the peak in dB, a factor 1/sqrt(M). */
+  /* The filter's Q, as FluidSynth reads initialFilterQ (measured in Task 7): Q cB, less 3.01 dB, as a linear
+     Q, so 0 is a Butterworth (1/sqrt(2)) and the resonance is Q cB over a non-resonant filter's response at the
+     cutoff (a peak of about 7.2 dB at 100 cB). The gain is multiplied by 1/sqrt(Q), as SF2.01 asks: half the
+     resonance in dB. At Q 0 that raises every voice by 1.5 dB, which FluidSynth does and fonts are voiced for. */
   q_db = clampd(g[G_Q], 0, 960) / 10.0;
-  peak = pow(10.0, q_db / 20.0);
-  v->q_lin = sqrt((peak * peak + peak * sqrt(peak * peak - 1)) / 2);
-  v->q_gain = 1.0 / sqrt(peak);
+  v->q_lin = pow(10.0, (q_db - 3.01) / 20.0);
+  v->q_gain = 1.0 / sqrt(v->q_lin);
 
   /* LFOs */
-  v->modlfo.delay = tc_samples(g[G_DELAY_MODLFO], rate);
+  v->modlfo.delay = tc_samples(g[G_DELAY_MODLFO], -12000, 5000, rate);
   v->modlfo.inc = abs_hz(clampd(g[G_FREQ_MODLFO], -16000, 4500)) / rate;
-  v->viblfo.delay = tc_samples(g[G_DELAY_VIBLFO], rate);
+  v->viblfo.delay = tc_samples(g[G_DELAY_VIBLFO], -12000, 5000, rate);
   v->viblfo.inc = abs_hz(clampd(g[G_FREQ_VIBLFO], -16000, 4500)) / rate;
 
-  /* envelopes; hold and decay scale with the key, (60 - key) * value timecents */
+  /* Envelopes; hold and decay scale with the key, (60 - key) * value timecents. The volume envelope's release
+     is at least -7200 timecents (16 ms), as in FluidSynth, so a note-off never clicks. Its sustain is on the
+     96 dB scale (see ENV_DB): sustainVolEnv 1000 cB is the bottom. */
   k = 60 - v->pkey;
-  v->v_delay = tc_samples(g[G_DELAY_VOLENV], rate);
-  v->v_attack = tc_samples(g[G_ATTACK_VOLENV], rate);
-  v->v_hold = tc_samples(g[G_HOLD_VOLENV] + k * g[G_KEY_VOLENV_HOLD], rate);
-  v->v_decay = tc_samples(g[G_DECAY_VOLENV] + k * g[G_KEY_VOLENV_DECAY], rate);
-  v->v_sus_db = -clampd(g[G_SUSTAIN_VOLENV], 0, 1440) / 10.0;
-  v->v_release = tc_samples(g[G_RELEASE_VOLENV], rate);
-  v->m_delay = tc_samples(g[G_DELAY_MODENV], rate);
-  v->m_attack = tc_samples(g[G_ATTACK_MODENV], rate);
-  v->m_hold = tc_samples(g[G_HOLD_MODENV] + k * g[G_KEY_MODENV_HOLD], rate);
-  v->m_decay = tc_samples(g[G_DECAY_MODENV] + k * g[G_KEY_MODENV_DECAY], rate);
+  v->v_delay = tc_samples(g[G_DELAY_VOLENV], -12000, 5000, rate);
+  v->v_attack = tc_samples(g[G_ATTACK_VOLENV], -12000, 8000, rate);
+  v->v_hold = tc_samples(g[G_HOLD_VOLENV] + k * g[G_KEY_VOLENV_HOLD], -12000, 5000, rate);
+  v->v_decay = tc_samples(g[G_DECAY_VOLENV] + k * g[G_KEY_VOLENV_DECAY], -12000, 8000, rate);
+  v->v_sus_db = -ENV_DB * clampd(g[G_SUSTAIN_VOLENV], 0, 1000) / 1000.0;
+  v->v_release = tc_samples(g[G_RELEASE_VOLENV], -7200, 8000, rate);
+  v->m_delay = tc_samples(g[G_DELAY_MODENV], -12000, 5000, rate);
+  v->m_attack = tc_samples(g[G_ATTACK_MODENV], -12000, 8000, rate);
+  v->m_hold = tc_samples(g[G_HOLD_MODENV] + k * g[G_KEY_MODENV_HOLD], -12000, 5000, rate);
+  v->m_decay = tc_samples(g[G_DECAY_MODENV] + k * g[G_KEY_MODENV_DECAY], -12000, 8000, rate);
   v->m_sus = 1 - clampd(g[G_SUSTAIN_MODENV], 0, 1000) / 1000.0;
-  v->m_release = tc_samples(g[G_RELEASE_MODENV], rate);
+  v->m_release = tc_samples(g[G_RELEASE_MODENV], -12000, 8000, rate);
 }
 
 /* ---- envelopes and LFOs, stepped n samples at a time ---- */
 
 /* The volume envelope. Delay and attack keep val as an amplitude (the attack is linear in amplitude); from the
-   hold on, val is in dB. Decay and release fall 100 dB per their time (linear in dB), the decay down to the
-   sustain level, the release to -100 dB, where the envelope is done. */
+   hold on, val is in dB. Decay and release fall ENV_DB (96 dB) per their time (linear in dB), the decay down to
+   the sustain level, the release to -96 dB, where the envelope is done. */
 static void venv_step(SmpSfVoice *v, double n) {
   SmpSfEnv *e = &v->venv;
   while (n > 0 && e->stage != E_DONE) {
@@ -190,7 +216,7 @@ static void venv_step(SmpSfVoice *v, double n) {
         if (n < d) { e->t += n; n = 0; } else { n -= d > 0 ? d : 0; e->stage = E_DECAY; e->t = 0; e->val = 0; }
         break;
       case E_DECAY: {
-        double step = 100.0 / v->v_decay, target = v->v_sus_db;
+        double step = ENV_DB / v->v_decay, target = v->v_sus_db;
         d = (e->val - target) / step;
         if (n < d) { e->val -= n * step; n = 0; } else { n -= d > 0 ? d : 0; e->val = target; e->stage = E_SUSTAIN; }
         if (e->val <= FLOOR_DB) e->stage = E_DONE;   /* a silent sustain: nothing more to hear */
@@ -202,7 +228,7 @@ static void venv_step(SmpSfVoice *v, double n) {
         n = 0;
         break;
       case E_RELEASE:
-        e->val -= n * 100.0 / v->v_release;
+        e->val -= n * ENV_DB / v->v_release;
         if (e->val <= FLOOR_DB) { e->val = FLOOR_DB; e->stage = E_DONE; }
         n = 0;
         break;
@@ -220,7 +246,8 @@ static double venv_amp(const SmpSfEnv *e) {
   }
 }
 
-/* the modulation envelope: the same shape on a 0..1 scale, linear throughout */
+/* the modulation envelope: the same stages on a 0..1 scale, linear throughout; its attack is heard through the
+   convex curve (menv_out), as FluidSynth does */
 static void menv_step(SmpSfVoice *v, double n) {
   SmpSfEnv *e = &v->menv;
   while (n > 0 && e->stage != E_DONE) {
@@ -270,13 +297,14 @@ static void lfo_step(SmpSfLfo *o, double n) {
 
 /* ---- the control update ---- */
 
+/* the modulation envelope's value as it reaches pitch and cutoff */
+static double menv_out(const SmpSfEnv *e) { return e->stage == E_ATTACK ? curve(127 * e->val, 1) : e->val; }
+
+/* The filter always runs, as in FluidSynth: the cutoff is kept within the spec's 1500 to 13500 cents and
+   under 0.45 times the output rate, so at the top it is a gentle anti-alias filter, with the Q gain. */
 static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
   double hz, w, cs, alpha, a0;
-  if (fc_cents >= 13500 && v->g[G_Q] <= 0) {     /* bypassed, as FluidSynth does: a straight wire */
-    c[0] = 1; c[1] = c[2] = c[3] = c[4] = 0;
-    return;
-  }
-  hz = clampd(abs_hz(fc_cents), 20, 0.45 * v->rate);
+  hz = clampd(abs_hz(clampd(fc_cents, 1500, 13500)), 5, 0.45 * v->rate);
   w = 2 * PI * hz / v->rate;
   cs = cos(w);
   alpha = sin(w) / (2 * v->q_lin);
@@ -290,26 +318,21 @@ static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
 
 static void control(SmpSfVoice *v) {
   const double inv = 1.0 / SMP_SFV_CTL, *g = v->g;
-  double amp, cents, ratio, gain, c[5];
-  int wire;
+  double amp, cents, ratio, gain, c[5], me;
   venv_step(v, SMP_SFV_CTL);
   menv_step(v, SMP_SFV_CTL);
   lfo_step(&v->modlfo, SMP_SFV_CTL);
   lfo_step(&v->viblfo, SMP_SFV_CTL);
   if (v->venv.stage == E_DONE) v->ending = 1;    /* this stretch fades to 0, then the voice ends */
 
-  cents = v->cents0 + v->menv.val * g[G_MODENV_PITCH] + v->modlfo.val * g[G_MODLFO_PITCH] +
+  me = menv_out(&v->menv);
+  cents = v->cents0 + me * g[G_MODENV_PITCH] + v->modlfo.val * g[G_MODLFO_PITCH] +
           v->viblfo.val * g[G_VIBLFO_PITCH];
   ratio = pow(2.0, cents / 1200.0) * v->ratio_k;
   amp = venv_amp(&v->venv);
   gain = amp * v->atten_gain * pow(10.0, v->modlfo.val * g[G_MODLFO_VOL] / 200.0);
   v->level = amp * v->atten_gain;
-  filter_target(v, g[G_FC] + v->menv.val * g[G_MODENV_FC] + v->modlfo.val * g[G_MODLFO_FC], c);
-  wire = c[0] == 1 && c[1] == 0 && c[2] == 0 && c[3] == 0 && c[4] == 0;
-  if (wire && fabs(v->b0 - 1) < 1e-9 && fabs(v->b1) < 1e-9 && fabs(v->b2) < 1e-9 && fabs(v->a1) < 1e-9 &&
-      fabs(v->a2) < 1e-9) {       /* stepped back to a wire: snap to it exactly, so the filter can switch off */
-    v->b0 = 1; v->b1 = v->b2 = v->a1 = v->a2 = 0;
-  }
+  filter_target(v, g[G_FC] + me * g[G_MODENV_FC] + v->modlfo.val * g[G_MODLFO_FC], c);
 
   if (!v->primed) {               /* the first update: pitch and filter start where they are, gain from 0 */
     v->primed = 1;
@@ -324,8 +347,6 @@ static void control(SmpSfVoice *v) {
   v->d_gcho = (gain * v->cho_send - v->gcho) * inv;
   v->d_b0 = (c[0] - v->b0) * inv; v->d_b1 = (c[1] - v->b1) * inv; v->d_b2 = (c[2] - v->b2) * inv;
   v->d_a1 = (c[3] - v->a1) * inv; v->d_a2 = (c[4] - v->a2) * inv;
-  v->filt_on = !(wire && v->b0 == 1 && v->b1 == 0 && v->b2 == 0 && v->a1 == 0 && v->a2 == 0);
-  if (!v->filt_on) v->x1 = v->x2 = v->y1 = v->y2 = 0;
 }
 
 /* ---- the voice ---- */
@@ -421,10 +442,13 @@ double smp_sfv_level(const SmpSfVoice *v) {
 }
 
 /* one frame at index i of the sample, as int16 scaled to -1..1: wrapped into the loop while looping, 0 past
-   the end otherwise (the pad makes a frame or two before the start readable) */
+   the end otherwise (the pad makes a frame or two before the start readable). Once the loop has wrapped, the
+   point before the loop start is the loop's last frame, so the interpolation is seamless across the joint
+   (FluidSynth does the same). */
 static __inline float frame_at(const SmpSfVoice *v, int64_t i) {
   if (v->looping) {
     if (i >= v->le) i = v->ls + (i - v->le) % (v->le - v->ls);
+    else if (i < v->ls && v->looped) i = v->le - 1 - (v->ls - 1 - i) % (v->le - v->ls);
   } else if (i >= v->end) return 0;
   return v->data[i] * (1.0f / 32768.0f);
 }
@@ -438,7 +462,7 @@ static int run(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m)
     float t = (float)(v->pos - (double)i0);
     float c1 = 0.5f * (x2 - x0), c2 = x0 - 2.5f * x1 + 2.0f * x2 - 0.5f * x3, c3 = 0.5f * (x3 - x0) + 1.5f * (x1 - x2);
     double y = ((c3 * t + c2) * t + c1) * t + x1, f = v->fade;
-    if (v->filt_on) {
+    {
       double o = v->b0 * y + v->b1 * v->x1 + v->b2 * v->x2 - v->a1 * v->y1 - v->a2 * v->y2;
       v->x2 = v->x1; v->x1 = y; v->y2 = v->y1; v->y1 = o;
       y = o;
@@ -452,7 +476,10 @@ static int run(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int m)
     v->pos += v->ratio;
     v->ratio += v->d_ratio;
     if (v->looping) {
-      if (v->pos >= (double)v->le) v->pos -= (double)(v->le - v->ls) * floor((v->pos - v->ls) / (double)(v->le - v->ls));
+      if (v->pos >= (double)v->le) {
+        v->pos -= (double)(v->le - v->ls) * floor((v->pos - v->ls) / (double)(v->le - v->ls));
+        v->looped = 1;
+      }
     } else if (v->pos >= (double)v->end) return 0;
     if (v->killing && (v->fade -= v->fade_step) <= 0) return 0;
   }

@@ -163,23 +163,24 @@ def test_volume_envelope(lib, tmp_path):
     e = env_of(render(lib, tmp_path, dc_sample(), {MODES: 1, ATTACK_VOL: tc(0.1), DELAY_VOL: tc(0.1)}, secs=0.5))
     assert np.max(np.abs(e[:int(0.095 * OUT)])) < 1e-4
     assert abs(first_at_or_above(e, 0.999 * e.max()) - 0.2) < 0.005
-    # sustain 200 cB: -20 dB once the decay is done; hold 0.2 s holds the top for 0.2 s after the attack
+    # sustain 200 cB: -19.2 dB once the decay is done (FluidSynth's 96 dB scale, measured against it in Task 7:
+    # 1000 cB is the bottom, 96 dB down); hold 0.2 s holds the top for 0.2 s after the attack
     e = env_of(render(lib, tmp_path, dc_sample(),
                       {MODES: 1, ATTACK_VOL: tc(0.1), HOLD_VOL: tc(0.2), DECAY_VOL: tc(1.0), SUSTAIN_VOL: 200},
                       secs=1.0))
     top = e.max()
     fall = np.nonzero((e < 0.99 * top) & (np.arange(len(e)) > 0.1 * OUT))[0][0] / OUT
     assert abs(fall - 0.3) < 0.005, fall
-    # the decay is linear in dB: 100 dB per decay time, so -20 dB takes 0.2 s
-    assert abs(db(e[int(0.4 * OUT)] / top) - (-10)) < 0.5
-    assert abs(db(np.mean(e[int(0.8 * OUT):]) / top) - (-20)) < 0.5
-    # release 0.5 s from full level reaches -100 dB (and the voice ends) 0.5 s after the note-off
+    # the decay is linear in dB: 96 dB per decay time, so 0.1 s in it is -9.6 dB
+    assert abs(db(e[int(0.4 * OUT)] / top) - (-9.6)) < 0.5
+    assert abs(db(np.mean(e[int(0.8 * OUT):]) / top) - (-19.2)) < 0.2
+    # release 0.5 s from full level reaches -96 dB (and the voice ends) 0.5 s after the note-off
     out = render(lib, tmp_path, dc_sample(), {MODES: 1, RELEASE_VOL: tc(0.5)}, secs=1.5, release=0.5)
     e = env_of(out)
     top = e[int(0.4 * OUT)]
     end = np.nonzero(np.abs(e) > 0)[0][-1] / OUT
     assert abs(end - 1.0) < 0.01, end
-    assert abs(db(e[int(0.75 * OUT)] / top) - (-50)) < 1.0    # linear in dB on the way down
+    assert abs(db(e[int(0.75 * OUT)] / top) - (-48)) < 1.0    # linear in dB on the way down
 
 
 def test_attenuation_and_velocity(lib, tmp_path):
@@ -222,12 +223,40 @@ def test_filter(lib, tmp_path):
     assert abs(f3 - fc) < 0.1 * fc, f3
     # an octave above the cutoff, 2 poles: about -12 dB or lower
     assert db(np.mean(h[(f > 2 * fc - 10) & (f < 2 * fc + 10)]) / ref) < -9
-    # Q 100 cB: a peak about 10 dB over the passband at the cutoff
+    # Q 100 cB: FluidSynth's reading (measured against it in Task 7, 7.05 dB there): Q cB less 3.01 dB as a linear
+    # Q, so the peak is 10 dB over a non-resonant filter's -3 dB at the cutoff, about 7.2 dB over the passband
     f, h = response(lib, tmp_path, {FC: 6000, Q: 100})
     ref = np.mean(h[(f > 20) & (f < 60)])
     near = (f > 0.7 * fc) & (f < 1.3 * fc)
     peak = db(h[near].max() / ref)
-    assert abs(peak - 10) < 2, peak
+    assert abs(peak - 7.2) < 0.5, peak
+
+
+def test_short_loop_is_seamless(lib, tmp_path):
+    """A single-cycle loop (one 100-frame cycle of a cosine) after a silent start: once the loop has wrapped, the
+    interpolation's point before the loop start must be the loop's last frame, not the silent frame before it,
+    or every pass carries a click (a buzz at the loop's rate). Measured as harmonic distortion of the steady
+    tone against a clean reference: the same cosine rendered from a sample that is periodic all the way."""
+    def cos_sample(silent_start):
+        x = 16000 * np.cos(2 * np.pi * np.arange(2000) / 100)
+        if silent_start:
+            x[:500] = 0                       # the frame before the loop start (499) is 0; the loop's last is ~16000
+        return dict(name="c", data=x.astype(np.int16), rate=SR, pitch=69, loop=(500, 600))
+
+    def thd_db(out):
+        y = out[int(0.2 * OUT):int(1.2 * OUT), 0].astype(np.float64)    # 1 s: 1 Hz bins, 441 Hz exactly
+        spec = np.abs(np.fft.rfft(y * np.hanning(len(y)))) ** 2
+        def band(f0):
+            k = int(round(f0))
+            return spec[k - 3:k + 4].sum()
+        fund = band(441)
+        harm = sum(band(441 * h) for h in range(2, 40))
+        return 10 * np.log10(harm / fund)
+
+    ref = thd_db(render(lib, tmp_path, cos_sample(False), {MODES: 1}, secs=1.3))
+    got = thd_db(render(lib, tmp_path, cos_sample(True), {MODES: 1}, secs=1.3))
+    assert ref < -60, ref
+    assert got < ref + 3, (got, ref)
 
 
 def test_lfo_vibrato(lib, tmp_path):

@@ -255,7 +255,8 @@ static const GenInfo GENS[SMP_SF_NGEN] = {
   {0, ANY, AT_INST},                 /* 45 startloopAddrsCoarseOffset */
   {-1, -1, 127, AT_INST},            /* 46 keynum */
   {-1, -1, 127, AT_INST},            /* 47 velocity */
-  {0, 0, 1440, AT_BOTH},             /* 48 initialAttenuation */
+  {0, ANY, AT_BOTH},                 /* 48 initialAttenuation: not limited here; the voice limits 0.4 x it plus the
+                                        modulators to 0..1440, as FluidSynth does, so a negative value counts */
   {0, 0, 0, 0},                      /* 49 reserved */
   {0, ANY, AT_INST},                 /* 50 endloopAddrsCoarseOffset */
   {0, -120, 120, AT_BOTH},           /* 51 coarseTune */
@@ -270,12 +271,13 @@ static const GenInfo GENS[SMP_SF_NGEN] = {
 };
 #undef ANY
 
-/* SF2.04 section 8.4's default modulators. The velocity to filter cutoff one is 2.04's: -2400 cents and no amount
-   source. The pitch wheel one goes to 59, "initial pitch", which has no generator of its own (FluidSynth uses 59
+/* SF2.04 section 8.4's default modulators. The velocity to filter cutoff one is FluidSynth's (an amount source of
+   velocity through a switch), which FluidSynth, and so the voice (sfvoice.c), makes give 0; a font that brings
+   SF2.04's form of it (no amount source) adds that one, as in FluidSynth. The pitch wheel one goes to 59, "initial pitch", which has no generator of its own (FluidSynth uses 59
    the same way). */
 static const SmpSfMod DEFMODS[SF_NDEFMOD] = {
   {0x0502, 48, 960, 0, 0},        /* note-on velocity to initial attenuation */
-  {0x0102, 8, -2400, 0, 0},       /* note-on velocity to filter cutoff */
+  {0x0102, 8, -2400, 0x0C02, 0},  /* note-on velocity to filter cutoff, in FluidSynth's form (the voice skips it) */
   {0x000D, 6, 50, 0, 0},          /* channel pressure to vibrato LFO pitch depth */
   {0x0081, 6, 50, 0, 0},          /* CC1 (mod wheel) to vibrato LFO pitch depth */
   {0x0587, 48, 960, 0, 0},        /* CC7 (volume) to initial attenuation */

@@ -137,12 +137,12 @@ def test_bad_index_fails_plainly(lib, tmp_path):
 
 # a few of SF2.04's generator ranges (section 8.1.3), checked on every region walked
 CLAMPS = {8: (1500, 13500), 9: (0, 960), 17: (-500, 500), 29: (0, 1000), 34: (-12000, 8000), 37: (0, 1440),
-          46: (-1, 127), 48: (0, 1440), 51: (-120, 120), 52: (-99, 99), 56: (0, 1200), 58: (-1, 127)}
+          46: (-1, 127), 51: (-120, 120), 52: (-99, 99), 56: (0, 1200), 58: (-1, 127)}
 
 # SF2.04 section 8.4's default modulators, in the spec's order
 DEFAULT_MODS = [
     (0x0502, 48, 960, 0, 0),        # note-on velocity to initial attenuation
-    (0x0102, 8, -2400, 0, 0),       # note-on velocity to filter cutoff
+    (0x0102, 8, -2400, 0x0C02, 0),  # note-on velocity to filter cutoff, FluidSynth's form (the voice skips it)
     (0x000D, 6, 50, 0, 0),          # channel pressure to vibrato LFO pitch depth
     (0x0081, 6, 50, 0, 0),          # CC1 to vibrato LFO pitch depth
     (0x0587, 48, 960, 0, 0),        # CC7 to initial attenuation
@@ -232,12 +232,15 @@ def test_regions_clamped(lib, tmp_path):
     rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={48: 1400, 17: -450, 8: 2000})],
                                                         pgens={48: 400, 17: -200, 8: -1000})]))
     g = rs[0]["gen"]
-    assert g[48] == 1440
+    assert g[48] == 1800       # initialAttenuation isn't limited here: the voice limits 0.4 x it (FluidSynth's way)
     assert g[17] == -500
     assert g[8] == 1500
     # an instrument value out of range on its own is clamped too
     rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={56: 3000, 52: -500})])]))
     assert rs[0]["gen"][56] == 1200 and rs[0]["gen"][52] == -99
+    # a negative initialAttenuation is kept (just_t4_fixed.sf2 uses -78 and -26 to make quiet samples louder)
+    rs = one_preset_regions(lib, tmp_path, preset([inst([zone(0, gens={48: -78})])]))
+    assert rs[0]["gen"][48] == -78
 
 
 def test_modulators_merged(lib, tmp_path):
