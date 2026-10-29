@@ -11,22 +11,25 @@
 
    Never hangs. Media Foundation's calls are synchronous, and a wedged decoder or a dead USB or network drive would
    block them for good, so the work runs on a helper thread. The helper owns everything it makes (its COM, the
-   reader, its own growing buffer). The caller waits for it with a deadline (60 s, or 4 x the length when the file
-   says it, whichever is longer) and asks cancel now and then. On the deadline or a cancel, the caller marks the job
+   reader, its own growing buffer). The caller waits for it with a stall timer (60 s with no progress: no sample
+   decoded) and asks cancel now and then. On the stall timer or a cancel, the caller marks the job
    abandoned and returns at once with a plain reason; the helper sees the mark between samples, or whenever its
    stuck call finally returns, and frees the job itself. Who owns the job is settled by one interlocked exchange of
    its state (running to done by the helper, running to abandoned by the caller), so the helper never touches the
-   caller's memory: it hands over its result only by winning that exchange.
+   caller's memory: it hands over its result only by winning that exchange. Each helper holds a reference on this
+   DLL (taken before it starts, dropped by FreeLibraryAndExitThread as it ends), so a host that unloads the plugin
+   while an abandoned helper is still stuck inside Windows doesn't pull the code out from under it.
 
    Media Foundation's DLLs are delay-loaded and looked for first, so the plugin still loads where they're missing.
    Starting it (CoIncrementMTAUsage once, then MFStartup) happens once per process when it works, and is tried again
-   on the next load when it doesn't; it is never undone (process exit cleans up; never from DllMain).
+   on the next load when it doesn't; it is never undone (process exit cleans up; never from DllMain). One helper at
+   a time tries; another that comes meanwhile waits up to 5 s and then gives up ("busy or stuck"), so stuck starts
+   can't pile up helpers.
 
    Called from the main thread or worker threads (the sampler's loader), never from the audio thread: it allocates,
    reads the disk and waits. Files only, never bytes in memory (decode_memory doesn't come here). */
 #define COBJMACROS
 #include <windows.h>
-#include <process.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -44,37 +47,48 @@ void smp_mf_set_test_flags(long f) { InterlockedExchange(&test_flags, (LONG)f); 
 static volatile LONG helpers;                      /* helper threads still running, for the tests */
 SMP_API long smp_test_only_mf_helpers(void) { return InterlockedCompareExchange(&helpers, 0, 0); }
 
-/* Media Foundation, started once per process when it can be; a failure is tried again next time */
-static SRWLOCK mf_lock = SRWLOCK_INIT;
-static int mf_ok, mta_held;
-static int mf_ready(long flags) {
-  int ok;
-  if (flags & SMP_MF_TEST_NO_MF) return 0;
-  AcquireSRWLockExclusive(&mf_lock);
-  if (!mf_ok) {
-    /* the delay-loaded DLLs must be there before anything in them is called */
-    HMODULE plat = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    HMODULE rw = plat ? LoadLibraryExW(L"mfreadwrite.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) : NULL;
-    if (plat && rw) {
-      CO_MTA_USAGE_COOKIE cookie;                  /* keeps the process's MTA alive between our helpers */
-      if (!mta_held && SUCCEEDED(CoIncrementMTAUsage(&cookie))) mta_held = 1;
-      mf_ok = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET));
-    }
-    if (!mf_ok) {                                  /* nothing kept: the next load tries again */
-      if (rw) FreeLibrary(rw);
-      if (plat) FreeLibrary(plat);
-    }
+/* Media Foundation, started once per process when it can be; a failure is tried again next time. mf_state: 0 not
+   started (or failed), 1 a helper is starting it, 2 started. */
+enum { MF_IDLE, MF_STARTING, MF_STARTED };
+static volatile LONG mf_state;
+static int mta_held;                               /* only the helper that set MF_STARTING touches it */
+static int mf_start(void) {
+  HMODULE plat = LoadLibraryExW(L"mfplat.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  HMODULE rw = plat ? LoadLibraryExW(L"mfreadwrite.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) : NULL;
+  int ok = 0;
+  if (plat && rw) {                                /* the delay-loaded DLLs are there before anything in them is called */
+    CO_MTA_USAGE_COOKIE cookie;                    /* keeps the process's MTA alive between our helpers */
+    if (!mta_held && SUCCEEDED(CoIncrementMTAUsage(&cookie))) mta_held = 1;
+    ok = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET));
   }
-  ok = mf_ok;
-  ReleaseSRWLockExclusive(&mf_lock);
+  if (!ok) {                                       /* nothing kept: the next load tries again */
+    if (rw) FreeLibrary(rw);
+    if (plat) FreeLibrary(plat);
+  }
   return ok;
+}
+/* SMP_MF_OK when Media Foundation is ready, SMP_MF_NO_MF, or SMP_MF_BUSY (another helper's start is stuck) */
+static int mf_ready(long flags) {
+  ULONGLONG began = GetTickCount64(), wait = flags & SMP_MF_TEST_BUSY ? 200 : 5000;
+  if (flags & SMP_MF_TEST_NO_MF) return SMP_MF_NO_MF;
+  for (;;) {
+    LONG st = flags & SMP_MF_TEST_BUSY ? MF_STARTING : InterlockedCompareExchange(&mf_state, MF_STARTING, MF_IDLE);
+    if (st == MF_STARTED) return SMP_MF_OK;
+    if (st == MF_IDLE) {                           /* this helper starts it */
+      int ok = mf_start();
+      InterlockedExchange(&mf_state, ok ? MF_STARTED : MF_IDLE);
+      return ok ? SMP_MF_OK : SMP_MF_NO_MF;
+    }
+    if (GetTickCount64() - began > wait) return SMP_MF_BUSY;
+    Sleep(20);
+  }
 }
 
 /* One decode. The helper writes the results; the caller reads them only after the helper set state to DONE. */
 enum { JOB_RUNNING, JOB_DONE, JOB_ABANDONED };
 typedef struct {
   volatile LONG state;
-  volatile LONG64 length;                          /* the file's stated length in 100 ns units, 0 unknown */
+  volatile LONG progress;                          /* counts up as the helper gets on: the caller's stall timer */
   wchar_t *path;
   size_t max_floats;
   long flags;
@@ -156,17 +170,13 @@ static int take_sample(Job *j, IMFSample *s, unsigned long long *drop, long inde
 /* the decode itself, on the helper thread: sets j->res, and j->err when it fails */
 static void mf_read(Job *j) {
   IMFSourceReader *r = NULL; IMFMediaType *want = NULL, *native = NULL;
-  GUID native_sub = {0}; PROPVARIANT v;
+  GUID native_sub = {0};
   unsigned long long drop = 0;                     /* floats still to drop (the start delay) */
   int first = 1, empty = 0; long index = 0;
   HRESULT hr;
   j->res = SMP_MF_FAILED;
   if (FAILED(MFCreateSourceReaderFromURL(j->path, NULL, &r))) { j->res = SMP_MF_NOT_MINE; return; }   /* not media */
-  PropVariantInit(&v);
-  if (SUCCEEDED(IMFSourceReader_GetPresentationAttribute(r, (DWORD)MF_SOURCE_READER_MEDIASOURCE, &MF_PD_DURATION, &v)) &&
-      v.vt == VT_UI8 && v.uhVal.QuadPart < (ULONGLONG)LLONG_MAX)
-    InterlockedExchange64(&j->length, (LONG64)v.uhVal.QuadPart);
-  PropVariantClear(&v);
+  InterlockedIncrement(&j->progress);
   IMFSourceReader_SetStreamSelection(r, (DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
   if (FAILED(IMFSourceReader_SetStreamSelection(r, (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE))) {
     snprintf(j->err, sizeof j->err, "it has no sound in it");
@@ -192,6 +202,7 @@ static void mf_read(Job *j) {
     DWORD idx = 0, flags = 0; LONGLONG when = 0; IMFSample *s = NULL; int ok;
     if (abandoned(j)) goto done;                   /* the caller has gone: stop, and free everything */
     hr = IMFSourceReader_ReadSample(r, (DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &idx, &flags, &when, &s);
+    InterlockedIncrement(&j->progress);
     if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) {
       if (s) IMFSample_Release(s);
       break;                                       /* a read error: what came before it is kept, if any */
@@ -226,18 +237,23 @@ done:
   if (r) IMFSourceReader_Release(r);
 }
 
-static unsigned __stdcall helper(void *arg) {
-  Job *j = arg;
+typedef struct { Job *job; HMODULE self; } Start;
+static DWORD WINAPI helper(void *arg) {
+  Start st = *(Start *)arg;
+  Job *j = st.job;
   HRESULT co;
+  int ready;
+  free(arg);
   if (j->flags & SMP_MF_TEST_SLOW) Sleep(3000);    /* TESTS ONLY: a decoder that is stuck for 3 s */
   co = CoInitializeEx(NULL, COINIT_MULTITHREADED); /* its own thread: always its own COM */
-  if (!mf_ready(j->flags)) j->res = SMP_MF_NO_MF;
+  ready = abandoned(j) ? SMP_MF_FAILED : mf_ready(j->flags);
+  if (ready != SMP_MF_OK) j->res = ready;
   else if (!abandoned(j)) mf_read(j);
   if (SUCCEEDED(co)) CoUninitialize();
   /* hand over, or (the caller has gone) clean up: whoever changes state from RUNNING owns the job */
   if (InterlockedCompareExchange(&j->state, JOB_DONE, JOB_RUNNING) != JOB_RUNNING) job_free(j);
   InterlockedDecrement(&helpers);
-  return 0;
+  FreeLibraryAndExitThread(st.self, 0);            /* drops this helper's hold on the DLL; never returns */
 }
 
 /* MPEG-4 boxes, for the edit list: big-endian sizes, a box is size (4), type (4), then its payload; size 1 means a
@@ -301,7 +317,8 @@ SMP_API int smp_test_only_mp4_edit(const unsigned char *b, size_t len, double *s
 
 int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats, unsigned *ch, unsigned *sr,
                   int *trimmed, int (*cancel)(void *), void *arg, char *err, int cap) {
-  Job *j; HANDLE t; int n, res; ULONGLONG began = GetTickCount64();
+  Job *j; Start *st = NULL; HANDLE t = NULL; HMODULE self = NULL; int n, res; LONG seen = 0;
+  ULONGLONG moved = GetTickCount64();              /* when the helper last got on */
   *x = NULL; *floats = 0; *ch = 0; *sr = 0; *trimmed = 0;
   n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
   if (n <= 0) return SMP_MF_NOT_MINE;
@@ -315,9 +332,17 @@ int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats
   j->flags = InterlockedCompareExchange(&test_flags, 0, 0);
   j->state = JOB_RUNNING;
   InterlockedIncrement(&helpers);
-  t = (HANDLE)_beginthreadex(NULL, 0, helper, j, 0, NULL);
+  /* the helper's hold on this DLL (a real reference, not GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT), dropped as
+     it exits; the helper frees st */
+  if ((st = malloc(sizeof *st)) &&
+      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)(void *)helper, &self)) {
+    st->job = j; st->self = self;
+    t = CreateThread(NULL, 0, helper, st, 0, NULL);
+  }
   if (!t) {
     InterlockedDecrement(&helpers);
+    if (self) FreeLibrary(self);
+    free(st);
     job_free(j);
     snprintf(err, (size_t)cap, "Windows couldn't start decoding it");
     return SMP_MF_FAILED;
@@ -325,16 +350,15 @@ int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats
   for (;;) {
     const char *why = NULL;
     ULONGLONG limit, now;
+    LONG p;
     if (WaitForSingleObject(t, 50) == WAIT_OBJECT_0) break;
-    /* the deadline: 60 s, or 4 x the file's stated length when that is longer (tests: half a second) */
+    /* the stall timer: 60 s with no progress (tests: half a second) */
     limit = j->flags & SMP_MF_TEST_SLOW ? 500 : 60000;
-    {
-      LONG64 len = InterlockedCompareExchange64(&j->length, 0, 0);   /* 100 ns units */
-      if (len > 0 && (ULONGLONG)len / 2500 > limit) limit = (ULONGLONG)len / 2500;   /* 4 x, in ms */
-    }
     now = GetTickCount64();
+    p = InterlockedCompareExchange(&j->progress, 0, 0);
+    if (p != seen) { seen = p; moved = now; }
     if (cancel && cancel(arg)) why = "cancelled";
-    else if (now - began > limit) why = "Windows took too long to decode it";
+    else if (now - moved > limit) why = "Windows took too long to decode it";
     if (!why) continue;
     if (InterlockedCompareExchange(&j->state, JOB_ABANDONED, JOB_RUNNING) == JOB_RUNNING) {
       CloseHandle(t);                              /* the helper frees the job when it returns */

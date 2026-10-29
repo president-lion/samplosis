@@ -993,3 +993,63 @@ def test_mp4_edit_hostile(lib):
         for at in rnd.integers(0, len(c), int(rnd.integers(1, 8))):
             c[at] = int(rnd.integers(0, 256))
         mp4_edit(lib, bytes(c))
+
+
+UNLOAD_CHILD = r"""
+import ctypes, os, sys, time
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.FreeLibrary.argtypes = [wintypes.HMODULE]
+k32.GetModuleHandleW.restype = wintypes.HMODULE
+k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+path, m4a = sys.argv[1], sys.argv[2]
+dll = ctypes.CDLL(path)
+dll.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+dll.smp_test_only_decode_flags(4)                  # the helper sleeps 3 s; the stall timer is 0.5 s
+err = ctypes.create_string_buffer(512)
+dll.smp_sample_load.restype = ctypes.c_void_p
+s = dll.smp_sample_load(m4a.encode(), err, 512)
+print("load", bool(s), err.value.decode())
+name = os.path.basename(path)
+h = dll._handle
+del dll
+assert k32.FreeLibrary(h)                          # the host lets go of the plugin (its one reference)
+print("pinned", bool(k32.GetModuleHandleW(name)))  # the sleeping helper still holds it
+time.sleep(4.5)                                    # the helper wakes, sees it was abandoned and exits
+print("unloaded", not k32.GetModuleHandleW(name))
+"""
+
+
+@need_ffmpeg
+def test_windows_helper_outlives_unload(tmp_path):
+    # a host that unloads the plugin while an abandoned helper is still stuck in Windows: the helper holds the DLL
+    # until it ends, then lets go, and nothing crashes
+    f, _ = windows_file(tmp_path, "stuck.m4a", ["-c:a", "aac"])
+    plugin = tmp_path / "samplosis_copy.clap"                      # a copy, so its name is this process's alone
+    shutil.copyfile(os.path.join(ROOT, "samplosis.clap"), plugin)
+    env = dict(os.environ, SAMPLOSIS_SETTINGS=str(tmp_path / "settings.ini"))
+    r = subprocess.run([sys.executable, "-I", "-c", UNLOAD_CHILD, str(plugin), str(f)], capture_output=True, text=True,
+                       timeout=60, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = r.stdout.split("\n")
+    assert lines[0] == "load False Windows took too long to decode it", r.stdout
+    assert lines[1] == "pinned True" and lines[2] == "unloaded True", r.stdout
+
+
+@need_ffmpeg
+def test_windows_busy(lib, tmp_path):
+    # another helper stuck starting Media Foundation: this load gives up quickly with a plain reason
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
+    mf_flags(lib, 64)
+    try:
+        t = time.perf_counter()
+        s, err = load(lib, f)
+        secs = time.perf_counter() - t
+    finally:
+        mf_flags(lib, 0)
+    assert not s and err == "Windows decoding is busy or stuck", err
+    assert secs < 2, secs
+    s, err = load(lib, f)
+    assert s, err
+    lib.smp_sample_free(s)

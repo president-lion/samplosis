@@ -14,7 +14,7 @@
       in nearly anything). First bytes that name a container only Windows reads (MPEG-4 and 3GP "ftyp", ASF, AMR,
       ADTS AAC) skip this, so MP3 can't find false frames in them.
    5. a file (never bytes in memory) that nothing above read, and that isn't a raw name, goes to Windows Media
-      Foundation (mfdecode.c, on a helper thread with a deadline): AAC, WMA, and whatever else this machine's
+      Foundation (mfdecode.c, on a helper thread with a stall timer): AAC, WMA, and whatever else this machine's
       Windows decodes. by says Windows.
    Later stages add decoders after these. Whatever decodes a file, its result passes one place (finish): a sample
    that isn't finite, or is absurdly large (a damaged file), becomes silence. Never called on the audio thread. */
@@ -54,10 +54,11 @@ int smp_ape_read(void *h, float *out, int frames);
 void smp_ape_close(void *h);
 void smp_ape_set_debug_flags(long f);
 /* TESTS ONLY: 1 = Monkey's Audio throws inside its guard; 2 = the size limit is 65536 floats instead of 2 GiB;
-   4, 8, 16 and 32 are the Windows stage's (SMP_MF_TEST_* in mfdecode.h) */
+   4, 8, 16, 32 and 64 are the Windows stage's (SMP_MF_TEST_* in mfdecode.h) */
 SMP_API void smp_test_only_decode_flags(long f) {
   smp_ape_set_debug_flags(f & 1);
-  smp_mf_set_test_flags(f & (SMP_MF_TEST_SLOW | SMP_MF_TEST_NO_MF | SMP_MF_TEST_BUFFER_FAILS_FIRST | SMP_MF_TEST_BUFFER_FAILS_THIRD));
+  smp_mf_set_test_flags(f & (SMP_MF_TEST_SLOW | SMP_MF_TEST_NO_MF | SMP_MF_TEST_BUFFER_FAILS_FIRST |
+                             SMP_MF_TEST_BUFFER_FAILS_THIRD | SMP_MF_TEST_BUSY));
   dec_max_floats = f & 2 ? 65536 : (size_t)1 << 29;
 }
 SMP_API void smp_free(void *p) { free(p); }
@@ -571,6 +572,8 @@ static float *windows_stage(const char *path, int edit, double start, double dur
     snprintf(err, (size_t)cap, "%s", why);
   } else if (r == SMP_MF_NO_MF && !strcmp(err, NOT_SOUND) && windows_name(path)) {
     snprintf(err, (size_t)cap, "Windows Media Foundation isn't installed");
+  } else if (r == SMP_MF_BUSY && !strcmp(err, NOT_SOUND)) {
+    snprintf(err, (size_t)cap, "Windows decoding is busy or stuck");
   } else if (r == SMP_MF_FAILED && !strcmp(err, NOT_SOUND)) {
     snprintf(err, (size_t)cap, "%s", why);
   }
