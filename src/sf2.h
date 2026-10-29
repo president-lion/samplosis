@@ -75,6 +75,7 @@ struct SmpFont {
   int dls_ignored;                      /* DLS: connection blocks (or their output curves) that map to nothing here */
   int dls_boosts;                       /* DLS: regions with a gain above 0 (see sfdls.c) */
   int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
+  int is_ds;                            /* Decent Sampler (sfds.c, through sfsfz.c's builder): is_sfz is set too */
   int sfz_ignored;                      /* SFZ: different opcodes and headers used that this can't play */
   char sfz_first_ignored[64];           /* SFZ: the first of them */
   SfPhdr *phdr; int nphdr;
@@ -215,6 +216,25 @@ int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
 /* sfsfz.c: 1 when a file should be read as SFZ: its name ends .sfz, or its first bytes (head, n of them) are text with
    an SFZ header in them */
 int sf_is_sfz(const char *path, const uint8_t *head, size_t n);
+/* sfsfz.c's builder, shared by text formats read into the same model (sfds.c). sfz_build does what sf_parse_sfz
+   does (same return values) with feed in place of the .sfz text: feed is called twice (the first pass collects the
+   sample files, the second builds the regions) and gives the levels and opcodes by SFZ's names and values through
+   sfz_header ("global", "group", "region" ...) and sfz_opcode; sfz_ignored counts a name this can't play (once,
+   second pass only); sfz_loop_whole makes the current region loop the whole sample when neither its opcodes nor its
+   file give a loop. feed returns 0 with why to fail. full is the file's full path. */
+typedef struct SfzBuild SfzBuild;
+typedef int (*SfzFeed)(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int wcap);
+int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cancel)(void *), void *carg, char *why,
+              int wcap);
+void sfz_header(SfzBuild *b, const char *name);
+void sfz_opcode(SfzBuild *b, const char *name, const char *value);
+void sfz_ignored(SfzBuild *b, const char *name);
+int sfz_cancelled(SfzBuild *b);
+void sfz_loop_whole(SfzBuild *b);
+/* sfds.c: Decent Sampler. sf_is_ds: the name ends .dspreset, or the first bytes have a <DecentSampler element.
+   sf_parse_ds: as sf_parse_sfz, for a .dspreset */
+int sf_is_ds(const char *path, const uint8_t *head, size_t n);
+int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);
 /* cache.c: a positional read on a handle opened with FILE_FLAG_OVERLAPPED, waited for on an event of the calling

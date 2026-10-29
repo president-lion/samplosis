@@ -57,7 +57,11 @@
    Opcodes and their conversions to SF2 generators (SF2.04 section 8.1.3 units) are documented where finish_region
    builds a region; opcodes this can't play are counted (smp_sf_ignored: distinct names, the first kept) and do
    nothing. The SFZ semantics that need the player (round robin, keyswitches, release triggers, crossfades, groups,
-   polyphony, one-shots, amp_veltrack and its curve) go into SmpSfCond. */
+   polyphony, one-shots, amp_veltrack and its curve) go into SmpSfCond.
+
+   Shared. Everything after the text (the two passes, probing, the probe cache, regions, stereo pairs, start heads,
+   missing files and the ignored count) is sfz_build's, which other formats use too: a feed gives it headers and
+   opcodes by SFZ's names (sfz_header, sfz_opcode), once a pass. sfds.c feeds Decent Sampler presets that way. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,6 +130,8 @@ typedef struct {
   uint32_t group, off_by; int off_mode;
   double rt_decay; int polyphony, note_polyphony;
   double bend_up, bend_down; int bend_set;      /* cents */
+  int loop_whole;                              /* Decent Sampler's loopEnabled: with no loop given or in the file,
+                                                  the whole sample loops */
 } Opts;
 
 /* where a sample start head begins, and its sample per channel */
@@ -163,7 +169,7 @@ typedef struct { wchar_t *lw; uint64_t size, mtime; Info in; } Cached;
 /* a region being built: its modulators (an offset into the pool) and its velocity curve (index, or -1) */
 typedef struct { SmpSfRegion r; int mod_off, nmod, curve; } Reg;
 
-typedef struct P {
+typedef struct SfzBuild {
   SmpFont *f;
   const char *root_name;             /* the .sfz's file name, for messages */
   wchar_t root_dir[WPATH];           /* its folder, with a trailing backslash */
@@ -1253,6 +1259,7 @@ static void finish_region(P *p) {
   if (endx <= start) return;
   ls_abs = o->loop_start >= 0 ? (int64_t)clampd(floor(o->loop_start + 0.5), 0, fl->in.frames) : fl->in.ls;
   le_abs = o->loop_end >= 0 ? (int64_t)clampd(floor(o->loop_end + 0.5) + 1, 0, fl->in.frames) : fl->in.le;
+  if (o->loop_whole && o->loop_end < 0 && !(fl->in.le > fl->in.ls)) le_abs = fl->in.frames;
   lm = o->loop_mode >= 0 ? o->loop_mode : (fl->in.le > fl->in.ls ? LOOP_CONT : LOOP_NONE);
   uses_loop = (lm == LOOP_CONT || lm == LOOP_SUSTAIN) && le_abs > ls_abs;
   if (!uses_loop && lm != LOOP_ONESHOT) lm = LOOP_NONE;
@@ -1701,7 +1708,26 @@ static void free_parser(P *p) {
   free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves);
 }
 
+/* ---- the builder other text formats share (sfds.c): they feed headers and opcodes as SFZ names and values ---- */
+
+void sfz_header(SfzBuild *p, const char *name) { header(p, name, strlen(name)); }
+void sfz_opcode(SfzBuild *p, const char *name, const char *value) { opcode_at(p, name, strlen(name), value, strlen(value)); }
+void sfz_ignored(SfzBuild *p, const char *name) { ignored(p, name); }
+int sfz_cancelled(SfzBuild *p) { return cancelled(p); }
+void sfz_loop_whole(SfzBuild *p) { if (p->level == LV_REGION) p->region.loop_whole = 1; }
+
+/* an SFZ file's feed: its text, with its includes */
+static int feed_sfz(SfzBuild *p, void *ctx, const wchar_t *full, char *why, int wcap) {
+  (void)ctx;
+  return process_file(p, full, 0, why, wcap);
+}
+
 int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+  return sfz_build(f, path, feed_sfz, NULL, cancel, carg, why, wcap);
+}
+
+int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cancel)(void *), void *carg, char *why,
+              int wcap) {
   P *p = calloc(1, sizeof *p);
   wchar_t *full = NULL;
   int ok = 0, i;
@@ -1731,7 +1757,7 @@ int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
 
   /* the first pass collects the files, which are probed (the probe cache first) before the second builds */
   p->collect = 1;
-  if (!process_file(p, full, 0, why, wcap)) goto done;
+  if (!feed(p, ctx, full, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
   InterlockedExchange(&g_wrote, 0); g_pcache_path[0] = 0;
   pcache_read(p, full);
@@ -1744,7 +1770,7 @@ int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
   if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
   restart_text(p);
   p->collect = 0;
-  if (!process_file(p, full, 0, why, wcap)) goto done;
+  if (!feed(p, ctx, full, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
   if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
   if (p->oom) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }

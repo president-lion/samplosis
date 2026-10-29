@@ -1,0 +1,5 @@
+yxml, the git head of master as served on 2026-10-29 (it has no versioned releases)
+https://dev.yorhel.nl/yxml , files from https://g.blicky.net/yxml.git/plain/yxml.c and yxml.h
+SHA-256 yxml.c 7699a9c0e9d9b987b74ff86bf3fc28be6deed062d22d9a0f8376b868b15864e5
+SHA-256 yxml.h 6f79158a3811bf1fab575ef512b91ffc87a795f070b562f7fb6bcbf71fdd9078
+Kept: yxml.c and yxml.h only, unchanged. Licence: MIT (Expat), see COPYING (the notice at the top of yxml.h).

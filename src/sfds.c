@@ -1,0 +1,634 @@
+/* sfds.c: Decent Sampler presets (.dspreset; decentsampler-developers-guide.readthedocs.io) read into the SoundFont
+   model through sfsfz.c's builder. A preset is one preset (bank 0, program 0, named after the file); each <sample>
+   is a region (two for a stereo file), fed to the builder as SFZ opcodes, so sample files, probing, missing files,
+   stereo pairs, start heads and the region conditions all work as they do for SFZ.
+
+   The XML. yxml (src\codecs\yxml, MIT) parses it byte by byte; a small tree is kept of the elements down to
+   <sample> (DecentSampler, groups, group, sample: four levels), with their attributes. Deeper elements (the
+   bindings inside <ui> and so on) are read past. Damaged XML never crashes: yxml checks it is well formed (with a
+   fixed 64 KB stack, which bounds names and nesting), an attribute value keeps at most 64 KB, the tree at most
+   SF_MAX_REGIONS * 2 elements and 4M attributes, and the file at most 32 MB. XML that isn't well formed doesn't
+   open ("its XML is damaged near line N").
+
+   Levels. <groups> holds the defaults for every group, <group> for its samples; a <sample>'s own attribute wins,
+   then its group's, then <groups>' (the envelope, ranges, loop, trigger, round robin, tags and the rest). Three
+   kinds are combined instead, as Decent Sampler does:
+   - volume: <groups>' volume (globalVolume wins over it), <group>'s (groupVolume wins) and <sample>'s multiply;
+     each is linear (1 is unity) or decibels with a dB suffix;
+   - tuning (semitones): <groups>' globalTuning, <group>'s groupTuning and the sample's tuning add;
+   - pan (-100..100): globalPan, groupPan and the sample's pan add, and the sum is clamped.
+   A group with enabled="false" is left out.
+
+   The attributes and their SFZ opcodes (units in brackets):
+   - path: sample (relative to the .dspreset's folder; slashes either way);
+   - rootNote, loNote, hiNote, loVel, hiVel: pitch_keycenter, lokey, hikey, lovel, hivel (MIDI numbers);
+   - start, end, loopStart, loopEnd: offset, end, loop_start, loop_end (frames; end and loopEnd are the last frame
+     played, as Decent Sampler's defaults of the length minus 1 say);
+   - loopEnabled: true is loop_continuous, looping the whole sample when no loop points are given and the file has
+     none; false is no_loop; left out, the file's own loop counts (SFZ's rule);
+   - ampEnvEnabled false: one_shot (the sample plays to its end whatever the note-offs), unless it loops;
+   - attack, decay, sustain, release (seconds; sustain 0..1, as percent), and ampEnvAttack, ampEnvDecay,
+     ampEnvSustain, ampEnvRelease, which win over them on the same element; ampEnvDelay, ampEnvHold: ampeg_*.
+     Decent Sampler's guide gives no defaults, so SFZ's apply (instant attack and release, full sustain);
+   - pitchKeyTrack, ampVelTrack (0..1): pitch_keytrack, amp_veltrack (percent);
+   - trigger: attack, release, first, legato (continuous is counted and plays as attack);
+   - releaseTriggerDecay: rt_decay (dB a second with a dB suffix; a linear value v is the share lost a second, so
+     -20 log10(1 - v) dB);
+   - seqMode round_robin: seq_length and seq_position (seqPosition 1 by default; seqLength 0 or left out is the
+     highest seqPosition among the round-robin samples with the same key and velocity ranges, which is the set the
+     player cycles); random and true_random: the note's random draw split by position, lorand (position - 1) /
+     length to hirand position / length (both kinds may repeat a sample); always: every time;
+   - tags and silencedByTags: SFZ's group and off_by. Each tag named in some silencedByTags gets a number; a
+     sample's group is its first such tag (its own tags, then its group's), its off_by the first tag of its
+     silencedByTags. A sample with two such tags, or silenced by two, is counted ("tags beyond the first"): the
+     player has one group and one off_by per region;
+   - silencingMode fast or normal: off_mode;
+   - loCCn and hiCCn: loccN and hiccN (-1, the default, is no range).
+   Counted as ignored (smp_sf_ignored): every other attribute of <groups>, <group> and <sample> (glide, loop
+   crossfades, curves, outputs, slices and so on), and every element beside <groups> under <DecentSampler> (<ui>,
+   <effects>, <modulators>, <midi>, <tags>, <keyswitches> ...), as "<name>". The UI's knobs then stay at their
+   defaults: a library whose release or tone is only set by a knob's binding plays without it. name, enabled and
+   the root's own attributes are read past. Decent Sampler plays a centred voice 5.3 dB below its source (its
+   limiter's headroom); that isn't copied, so presets may sound louder here. */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+#include <yxml.h>
+#include "sf2.h"
+
+#define DS_MAX_TEXT (32u << 20)
+#define DS_STACK 65536                   /* yxml's stack: element and attribute names, and the nesting */
+#define DS_MAX_VALUE 65536               /* an attribute value's bytes kept */
+#define DS_MAX_ELEMS (SF_MAX_REGIONS * 2)
+#define DS_MAX_ATTRS (1 << 22)
+#define DS_LEVELS 4                      /* DecentSampler, groups, group, sample */
+
+typedef struct { int name, value; } Attr;               /* offsets into the string pool */
+typedef struct { int name, first_attr, nattr, first_child, last_child, next; } El;
+
+/* the attributes this reads, by number */
+enum {
+  A_PATH, A_ROOT, A_LONOTE, A_HINOTE, A_LOVEL, A_HIVEL, A_START, A_END, A_LOOPSTART, A_LOOPEND, A_LOOPENABLED,
+  A_ATTACK, A_DECAY, A_SUSTAIN, A_RELEASE, A_ENVATTACK, A_ENVDECAY, A_ENVSUSTAIN, A_ENVRELEASE, A_ENVDELAY,
+  A_ENVHOLD, A_VOLUME, A_GLOBALVOLUME, A_GROUPVOLUME, A_PAN, A_GROUPPAN, A_GLOBALPAN, A_TUNING, A_GROUPTUNING,
+  A_GLOBALTUNING, A_PITCHKEYTRACK, A_AMPVELTRACK, A_SEQMODE, A_SEQLENGTH, A_SEQPOSITION, A_TRIGGER, A_TAGS,
+  A_SILENCEDBY, A_SILENCINGMODE, A_RTDECAY, A_AMPENVENABLED, A_ENABLED, A_NAME, NA
+};
+static const char *const anames[NA] = {
+  "path", "rootNote", "loNote", "hiNote", "loVel", "hiVel", "start", "end", "loopStart", "loopEnd", "loopEnabled",
+  "attack", "decay", "sustain", "release", "ampEnvAttack", "ampEnvDecay", "ampEnvSustain", "ampEnvRelease",
+  "ampEnvDelay", "ampEnvHold", "volume", "globalVolume", "groupVolume", "pan", "groupPan", "globalPan", "tuning",
+  "groupTuning", "globalTuning", "pitchKeyTrack", "ampVelTrack", "seqMode", "seqLength", "seqPosition", "trigger",
+  "tags", "silencedByTags", "silencingMode", "releaseTriggerDecay", "ampEnvEnabled", "enabled", "name"
+};
+
+#define MAX_CC 4
+/* one element's attributes looked up: the value of each known one (NULL when absent), and its CC ranges */
+typedef struct {
+  const char *a[NA];
+  int ncc; int cc[MAX_CC]; const char *cclo[MAX_CC], *cchi[MAX_CC];
+} Look;
+
+/* a string to number map (open addressing) */
+typedef struct { char **key; int *val; int n, cap; } Map;
+
+/* the round-robin lengths found: key (kind, ranges) to the highest position */
+typedef struct { uint64_t *key; int *max; int n, cap; } SeqMap;
+
+typedef struct {
+  char *pool; size_t npool, cappool;
+  El *el; int nel, capel;
+  Attr *at; int nat, capat;
+  Map silencers;                         /* tags named in some silencedByTags, numbered from 1 */
+  SeqMap seq;
+  int pass;                              /* 0: the scan before the builder; 1: feeding it */
+  SfzBuild *b;
+  char num[64];
+} D;
+
+/* ---- small helpers ---- */
+
+static uint64_t fnv(const void *b, size_t n) {
+  const uint8_t *p = b; uint64_t h = 1469598103934665603ull; size_t i;
+  for (i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+  return h;
+}
+
+static int grow(void **a, int *cap, int need, size_t each) {
+  void *n; int c;
+  if (need <= *cap) return 1;
+  c = *cap ? *cap : 64;
+  while (c < need) { if (c > (1 << 28)) return 0; c *= 2; }
+  if (!(n = realloc(*a, (size_t)c * each))) return 0;
+  *a = n; *cap = c;
+  return 1;
+}
+
+static int sp(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+/* a number; 0 when the text isn't one */
+static int num(const char *v, double *out) {
+  char *e; double d;
+  if (!v) return 0;
+  while (sp(*v)) v++;
+  d = strtod(v, &e);
+  if (e == v || !isfinite(d)) return 0;
+  *out = d;
+  return 1;
+}
+
+/* a level: decibels with a dB suffix, else linear (1 is 0 dB); 0 when the text isn't a number */
+static int level_db(const char *v, double *db) {
+  char *e; double d;
+  if (!v) return 0;
+  while (sp(*v)) v++;
+  d = strtod(v, &e);
+  if (e == v || !isfinite(d)) return 0;
+  while (sp(*e)) e++;
+  if ((e[0] == 'd' || e[0] == 'D') && (e[1] == 'b' || e[1] == 'B')) *db = d;
+  else *db = d > 0 ? 20 * log10(d) : -144;
+  if (*db < -144) *db = -144;
+  if (*db > 24) *db = 24;
+  return 1;
+}
+
+static int is_true(const char *v) {
+  while (v && sp(*v)) v++;
+  return v && (!_strnicmp(v, "true", 4) || *v == '1');
+}
+
+static int is_false(const char *v) {
+  while (v && sp(*v)) v++;
+  return v && (!_strnicmp(v, "false", 5) || *v == '0');
+}
+
+static int word(const char *v, const char *w) {
+  size_t n = strlen(w);
+  while (v && sp(*v)) v++;
+  if (!v || _strnicmp(v, w, n)) return 0;
+  v += n;
+  while (sp(*v)) v++;
+  return !*v;
+}
+
+/* ---- the map of tags ---- */
+
+static int map_find(const Map *m, const char *k, size_t n) {
+  unsigned i;
+  if (!m->cap) return 0;
+  i = (unsigned)fnv(k, n) & (unsigned)(m->cap - 1);
+  while (m->key[i]) {
+    if (strlen(m->key[i]) == n && !memcmp(m->key[i], k, n)) return m->val[i];
+    i = (i + 1) & (unsigned)(m->cap - 1);
+  }
+  return 0;
+}
+
+/* adds k (n bytes) with the next number unless it is there; 0 when memory ran out */
+static int map_add(Map *m, const char *k, size_t n) {
+  unsigned i;
+  if (map_find(m, k, n)) return 1;
+  if ((m->n + 1) * 2 > m->cap) {
+    int nc = m->cap ? m->cap * 2 : 64, j;
+    char **nk = calloc((size_t)nc, sizeof *nk); int *nv = calloc((size_t)nc, sizeof *nv);
+    if (!nk || !nv || m->n >= (1 << 20)) { free(nk); free(nv); return 0; }
+    for (j = 0; j < m->cap; j++) if (m->key[j]) {
+      unsigned q = (unsigned)fnv(m->key[j], strlen(m->key[j])) & (unsigned)(nc - 1);
+      while (nk[q]) q = (q + 1) & (unsigned)(nc - 1);
+      nk[q] = m->key[j]; nv[q] = m->val[j];
+    }
+    free(m->key); free(m->val); m->key = nk; m->val = nv; m->cap = nc;
+  }
+  i = (unsigned)fnv(k, n) & (unsigned)(m->cap - 1);
+  while (m->key[i]) i = (i + 1) & (unsigned)(m->cap - 1);
+  if (!(m->key[i] = malloc(n + 1))) return 0;
+  memcpy(m->key[i], k, n); m->key[i][n] = 0;
+  m->val[i] = ++m->n;
+  return 1;
+}
+
+static void map_free(Map *m) {
+  int j;
+  for (j = 0; j < m->cap; j++) free(m->key[j]);
+  free(m->key); free(m->val);
+  memset(m, 0, sizeof *m);
+}
+
+/* the round-robin lengths: a slot for key, made when absent (NULL when memory ran out) */
+static int *seq_slot(SeqMap *s, uint64_t key) {
+  unsigned i;
+  if ((s->n + 1) * 2 > s->cap) {
+    int nc = s->cap ? s->cap * 2 : 64, j;
+    uint64_t *nk = malloc((size_t)nc * sizeof *nk); int *nm = malloc((size_t)nc * sizeof *nm);
+    if (!nk || !nm || nc > (1 << 26)) { free(nk); free(nm); return NULL; }
+    for (j = 0; j < nc; j++) nk[j] = 0;
+    for (j = 0; j < s->cap; j++) if (s->key[j]) {
+      unsigned q = (unsigned)fnv(&s->key[j], 8) & (unsigned)(nc - 1);
+      while (nk[q]) q = (q + 1) & (unsigned)(nc - 1);
+      nk[q] = s->key[j]; nm[q] = s->max[j];
+    }
+    free(s->key); free(s->max); s->key = nk; s->max = nm; s->cap = nc;
+  }
+  i = (unsigned)fnv(&key, 8) & (unsigned)(s->cap - 1);
+  while (s->key[i] && s->key[i] != key) i = (i + 1) & (unsigned)(s->cap - 1);
+  if (!s->key[i]) { s->key[i] = key; s->max[i] = 0; s->n++; }
+  return &s->max[i];
+}
+
+/* ---- the XML into the tree ---- */
+
+static int pool_add(D *d, const char *s, size_t n) {
+  size_t need = d->npool + n + 1;
+  if (need > d->cappool) {
+    size_t c = d->cappool ? d->cappool : 4096;
+    char *np;
+    while (c < need) c *= 2;
+    if (c > ((size_t)DS_MAX_TEXT * 3 + DS_MAX_VALUE) || !(np = realloc(d->pool, c))) return -1;
+    d->pool = np; d->cappool = c;
+  }
+  memcpy(d->pool + d->npool, s, n); d->pool[d->npool + n] = 0;
+  d->npool += n + 1;
+  return (int)(d->npool - n - 1);
+}
+
+/* the tree of t (n bytes): 1, or 0 with why */
+static int parse_xml(D *d, const char *t, size_t n, char *why, int wcap) {
+  yxml_t x;
+  void *stack = malloc(DS_STACK);
+  char *val = malloc(DS_MAX_VALUE + 1);
+  int cur[DS_LEVELS], depth = 0, attr_el = -1, ok = 0, k;
+  size_t vn = 0, i;
+  if (!stack || !val) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+  for (k = 0; k < DS_LEVELS; k++) cur[k] = -1;
+  yxml_init(&x, stack, DS_STACK);
+  for (i = 0; i < n; i++) {
+    yxml_ret_t r = yxml_parse(&x, (unsigned char)t[i]);
+    if (r < 0) { snprintf(why, (size_t)wcap, "its XML is damaged near line %u", (unsigned)x.line); goto done; }
+    switch (r) {
+      case YXML_ELEMSTART: {
+        int parent = depth > 0 && depth <= DS_LEVELS ? cur[depth - 1] : -1, e = -1;
+        if (depth < DS_LEVELS && (depth == 0 || parent >= 0) && d->nel < DS_MAX_ELEMS &&
+            grow((void **)&d->el, &d->capel, d->nel + 1, sizeof *d->el)) {
+          int nm = pool_add(d, x.elem, strlen(x.elem));
+          if (nm < 0) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+          e = d->nel++;
+          d->el[e].name = nm; d->el[e].first_attr = d->nat; d->el[e].nattr = 0;
+          d->el[e].first_child = d->el[e].last_child = d->el[e].next = -1;
+          if (parent >= 0) {
+            if (d->el[parent].last_child >= 0) d->el[d->el[parent].last_child].next = e;
+            else d->el[parent].first_child = e;
+            d->el[parent].last_child = e;
+          }
+        }
+        if (depth < DS_LEVELS) cur[depth] = e;
+        depth++;
+        attr_el = depth <= DS_LEVELS ? cur[depth - 1] : -1;
+        break;
+      }
+      case YXML_ELEMEND:
+        if (depth > 0) depth--;
+        if (depth < DS_LEVELS) cur[depth] = -1;
+        attr_el = -1;
+        break;
+      case YXML_ATTRSTART: vn = 0; break;
+      case YXML_ATTRVAL: {
+        size_t L = strlen(x.data);
+        if (vn + L <= DS_MAX_VALUE) { memcpy(val + vn, x.data, L); vn += L; }
+        break;
+      }
+      case YXML_ATTREND:
+        if (attr_el >= 0 && d->el[attr_el].first_attr + d->el[attr_el].nattr == d->nat && d->nat < DS_MAX_ATTRS &&
+            grow((void **)&d->at, &d->capat, d->nat + 1, sizeof *d->at)) {
+          int an = pool_add(d, x.attr, strlen(x.attr)), av = an >= 0 ? pool_add(d, val, vn) : -1;
+          if (av < 0) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+          d->at[d->nat].name = an; d->at[d->nat].value = av; d->nat++;
+          d->el[attr_el].nattr++;
+        }
+        break;
+      default: break;
+    }
+  }
+  if (yxml_eof(&x) < 0) { snprintf(why, (size_t)wcap, "its XML is damaged (it ends early)"); goto done; }
+  if (!d->nel || strcmp(d->pool + d->el[0].name, "DecentSampler")) {
+    snprintf(why, (size_t)wcap, "it has no <DecentSampler> element");
+    goto done;
+  }
+  ok = 1;
+done:
+  free(stack); free(val);
+  return ok;
+}
+
+/* ---- the levels ---- */
+
+static void ignored(D *d, const char *name) {
+  if (d->pass == 1) sfz_ignored(d->b, name);
+}
+
+/* an element's attributes by number; others counted (unless count is 0) */
+static void look(D *d, int e, Look *l, int count) {
+  int k, j;
+  memset(l, 0, sizeof *l);
+  if (e < 0) return;
+  for (k = 0; k < d->el[e].nattr; k++) {
+    const Attr *a = &d->at[d->el[e].first_attr + k];
+    const char *nm = d->pool + a->name, *v = d->pool + a->value;
+    for (j = 0; j < NA && strcmp(nm, anames[j]); j++) {}
+    if (j < NA) { l->a[j] = v; continue; }
+    if ((!strncmp(nm, "loCC", 4) || !strncmp(nm, "hiCC", 4)) && nm[4] >= '0' && nm[4] <= '9') {
+      char *end; long c = strtol(nm + 4, &end, 10);
+      if (!*end && c >= 0 && c <= 127) {
+        int i;
+        for (i = 0; i < l->ncc && l->cc[i] != c; i++) {}
+        if (i < MAX_CC) {
+          if (i == l->ncc) { l->cc[i] = (int)c; l->cclo[i] = l->cchi[i] = NULL; l->ncc++; }
+          if (nm[0] == 'l') l->cclo[i] = v; else l->cchi[i] = v;
+          continue;
+        }
+      }
+    }
+    if (count) ignored(d, nm);
+  }
+}
+
+/* the value of attribute a for a sample: its own, else its group's, else <groups>' */
+static const char *inh(const Look *s, const Look *g, const Look *gs, int a) {
+  return s->a[a] ? s->a[a] : g->a[a] ? g->a[a] : gs->a[a];
+}
+
+/* an envelope value: ampEnvX wins over x on the same element, the sample's over its group's over <groups>' */
+static const char *env(const Look *s, const Look *g, const Look *gs, int a_env, int a) {
+  const Look *lv[3] = {s, g, gs};
+  int k;
+  for (k = 0; k < 3; k++) {
+    if (lv[k]->a[a_env]) return lv[k]->a[a_env];
+    if (a >= 0 && lv[k]->a[a]) return lv[k]->a[a];
+  }
+  return NULL;
+}
+
+static int note_num(const char *v, int def) {
+  double x;
+  if (!num(v, &x)) return def;
+  x = floor(x + 0.5);
+  return x < -1 ? -1 : x > 128 ? 128 : (int)x;
+}
+
+enum { SEQ_ALWAYS, SEQ_RR, SEQ_RANDOM, SEQ_BAD };
+
+static int seq_mode(const char *v) {
+  if (!v || word(v, "always")) return SEQ_ALWAYS;
+  if (word(v, "round_robin")) return SEQ_RR;
+  if (word(v, "random") || word(v, "true_random")) return SEQ_RANDOM;
+  return SEQ_BAD;
+}
+
+static uint64_t seq_key(int kind, int lokey, int hikey, int lovel, int hivel) {
+  return (uint64_t)1 << 40 | (uint64_t)(kind == SEQ_RR) << 32 | (uint64_t)(uint8_t)lokey << 24 |
+         (uint64_t)(uint8_t)hikey << 16 | (uint64_t)(uint8_t)lovel << 8 | (uint8_t)hivel;
+}
+
+/* the next tag of a comma-separated list from *p: its start and length (0 at the end) */
+static size_t next_tag(const char **p, const char **start) {
+  const char *s = *p, *e;
+  size_t n;
+  while (*s && (sp(*s) || *s == ',')) s++;
+  for (e = s; *e && *e != ','; e++) {}
+  *p = e;
+  for (n = (size_t)(e - s); n && sp(s[n - 1]); n--) {}
+  *start = s;
+  return n;
+}
+
+static void op(D *d, const char *name, const char *value) { sfz_opcode(d->b, name, value); }
+
+static void opn(D *d, const char *name, double v) {
+  snprintf(d->num, sizeof d->num, "%.9g", v);
+  sfz_opcode(d->b, name, d->num);
+}
+
+/* one <sample> (with its group's and <groups>' looks): pass 0 notes its round-robin position; pass 1 feeds it */
+static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
+  const char *v, *path = s->a[A_PATH];
+  int lokey = note_num(inh(s, g, gs, A_LONOTE), 0), hikey = note_num(inh(s, g, gs, A_HINOTE), 127);
+  int lovel = note_num(inh(s, g, gs, A_LOVEL), 0), hivel = note_num(inh(s, g, gs, A_HIVEL), 127);
+  int mode = seq_mode(inh(s, g, gs, A_SEQMODE)), pos = 1, len = 0, k;
+  double x, total;
+  if ((v = inh(s, g, gs, A_SEQPOSITION)) != NULL && num(v, &x)) pos = x < 1 ? 1 : x > 65535 ? 65535 : (int)floor(x + 0.5);
+  if ((v = inh(s, g, gs, A_SEQLENGTH)) != NULL && num(v, &x)) len = x < 0 ? 0 : x > 65535 ? 65535 : (int)floor(x + 0.5);
+  if (d->pass == 0) {
+    if ((mode == SEQ_RR || mode == SEQ_RANDOM) && !len) {
+      int *m = seq_slot(&d->seq, seq_key(mode, lokey, hikey, lovel, hivel));
+      if (m && pos > *m) *m = pos;
+    }
+    if ((v = inh(s, g, gs, A_SILENCEDBY)) != NULL) {
+      const char *t; size_t n;
+      while ((n = next_tag(&v, &t)) != 0) map_add(&d->silencers, t, n);
+    }
+    return;
+  }
+  if (!path || !path[0]) return;                     /* no sample to play */
+  sfz_header(d->b, "region");
+  op(d, "sample", path);
+  opn(d, "pitch_keycenter", note_num(inh(s, g, gs, A_ROOT), 60));
+  opn(d, "lokey", lokey); opn(d, "hikey", hikey); opn(d, "lovel", lovel); opn(d, "hivel", hivel);
+  /* volume, tuning and pan: the levels combined */
+  total = 0;
+  if (level_db(gs->a[A_GLOBALVOLUME] ? gs->a[A_GLOBALVOLUME] : gs->a[A_VOLUME], &x)) total += x;
+  if (level_db(g->a[A_GROUPVOLUME] ? g->a[A_GROUPVOLUME] : g->a[A_VOLUME], &x)) total += x;
+  if (level_db(s->a[A_VOLUME], &x)) total += x;
+  opn(d, "volume", total < -144 ? -144 : total);
+  total = 0;
+  if (num(gs->a[A_GLOBALTUNING], &x)) total += x;
+  if (num(g->a[A_GROUPTUNING], &x)) total += x;
+  if (num(inh(s, g, gs, A_TUNING), &x)) total += x;
+  opn(d, "transpose", total < -120 ? -120 : total > 120 ? 120 : total);
+  total = 0;
+  if (num(gs->a[A_GLOBALPAN], &x)) total += x;
+  if (num(g->a[A_GROUPPAN], &x)) total += x;
+  if (num(inh(s, g, gs, A_PAN), &x)) total += x;
+  opn(d, "pan", total < -100 ? -100 : total > 100 ? 100 : total);
+  if (num(inh(s, g, gs, A_PITCHKEYTRACK), &x)) opn(d, "pitch_keytrack", x * 100);
+  if (num(inh(s, g, gs, A_AMPVELTRACK), &x)) opn(d, "amp_veltrack", x * 100);
+  /* playback and the loop */
+  if ((v = inh(s, g, gs, A_START)) != NULL) op(d, "offset", v);
+  if ((v = inh(s, g, gs, A_END)) != NULL) op(d, "end", v);
+  if ((v = inh(s, g, gs, A_LOOPSTART)) != NULL) op(d, "loop_start", v);
+  if ((v = inh(s, g, gs, A_LOOPEND)) != NULL) op(d, "loop_end", v);
+  v = inh(s, g, gs, A_LOOPENABLED);
+  if (is_true(v)) { op(d, "loop_mode", "loop_continuous"); sfz_loop_whole(d->b); }
+  else if (is_false(v)) op(d, "loop_mode", "no_loop");
+  if (is_false(inh(s, g, gs, A_AMPENVENABLED)) && !is_true(v)) op(d, "loop_mode", "one_shot");
+  /* the amplitude envelope */
+  if ((v = env(s, g, gs, A_ENVDELAY, -1)) != NULL) op(d, "ampeg_delay", v);
+  if ((v = env(s, g, gs, A_ENVATTACK, A_ATTACK)) != NULL) op(d, "ampeg_attack", v);
+  if ((v = env(s, g, gs, A_ENVHOLD, -1)) != NULL) op(d, "ampeg_hold", v);
+  if ((v = env(s, g, gs, A_ENVDECAY, A_DECAY)) != NULL) op(d, "ampeg_decay", v);
+  if ((v = env(s, g, gs, A_ENVSUSTAIN, A_SUSTAIN)) != NULL && num(v, &x)) opn(d, "ampeg_sustain", x * 100);
+  if ((v = env(s, g, gs, A_ENVRELEASE, A_RELEASE)) != NULL) op(d, "ampeg_release", v);
+  /* conditions */
+  if ((v = inh(s, g, gs, A_TRIGGER)) != NULL) {
+    if (word(v, "attack") || word(v, "release") || word(v, "first") || word(v, "legato")) {
+      const char *t; size_t n = next_tag(&v, &t);
+      char w[16];
+      if (n < sizeof w) { memcpy(w, t, n); w[n] = 0; op(d, "trigger", w); }
+    } else {
+      char w[64]; snprintf(w, sizeof w, "trigger=%.40s", v); ignored(d, w);
+    }
+  }
+  if ((v = inh(s, g, gs, A_RTDECAY)) != NULL) {
+    char *e; double r;
+    const char *q = v;
+    while (sp(*q)) q++;
+    r = strtod(q, &e);
+    if (e != q && isfinite(r)) {
+      while (sp(*e)) e++;
+      if (!((e[0] == 'd' || e[0] == 'D') && (e[1] == 'b' || e[1] == 'B')))
+        r = r <= 0 ? 0 : r >= 1 ? 200 : -20 * log10(1 - r);   /* linear: the share lost a second */
+      opn(d, "rt_decay", r < 0 ? 0 : r > 200 ? 200 : r);
+    }
+  }
+  if (mode == SEQ_RR || mode == SEQ_RANDOM) {
+    if (!len) {
+      int *m = seq_slot(&d->seq, seq_key(mode, lokey, hikey, lovel, hivel));
+      len = m && *m > 0 ? *m : pos;
+    }
+    if (len < 1) len = 1;
+    if (pos > len) pos = len;
+    if (mode == SEQ_RR) { opn(d, "seq_length", len); opn(d, "seq_position", pos); }
+    else { opn(d, "lorand", (double)(pos - 1) / len); opn(d, "hirand", (double)pos / len); }
+  } else if (mode == SEQ_BAD) {
+    char w[64]; snprintf(w, sizeof w, "seqMode=%.40s", inh(s, g, gs, A_SEQMODE)); ignored(d, w);
+  }
+  /* tags: the sample's group is its first silencing tag (its own, then its group's), off_by its first silencer */
+  {
+    int grp = 0, extra = 0, by = 0, pass;
+    for (pass = 0; pass < 2; pass++) {
+      const char *list = pass == 0 ? s->a[A_TAGS] : g->a[A_TAGS], *t; size_t n;
+      if (!list) continue;
+      while ((n = next_tag(&list, &t)) != 0) {
+        int id = map_find(&d->silencers, t, n);
+        if (!id || id == grp) continue;
+        if (!grp) grp = id; else extra = 1;
+      }
+    }
+    if ((v = inh(s, g, gs, A_SILENCEDBY)) != NULL) {
+      const char *t; size_t n;
+      while ((n = next_tag(&v, &t)) != 0) {
+        int id = map_find(&d->silencers, t, n);
+        if (!id || id == by) continue;
+        if (!by) by = id; else extra = 1;
+      }
+    }
+    if (grp) opn(d, "group", grp);
+    if (by) opn(d, "off_by", by);
+    if (extra) ignored(d, "tags beyond the first");
+    if ((v = inh(s, g, gs, A_SILENCINGMODE)) != NULL) {
+      if (word(v, "fast")) op(d, "off_mode", "fast");
+      else if (word(v, "normal")) op(d, "off_mode", "normal");
+      else { char w[64]; snprintf(w, sizeof w, "silencingMode=%.40s", v); ignored(d, w); }
+    }
+  }
+  /* CC ranges: the sample's own, else its group's, else <groups>' */
+  {
+    const Look *lv[3] = {s, g, gs};
+    char nm[16];
+    for (k = 0; k < 3; k++) {
+      int i;
+      if (!lv[k]->ncc) continue;
+      for (i = 0; i < lv[k]->ncc; i++) {
+        if (lv[k]->cclo[i] && num(lv[k]->cclo[i], &x) && x >= 0) { snprintf(nm, sizeof nm, "locc%d", lv[k]->cc[i]); opn(d, nm, x); }
+        if (lv[k]->cchi[i] && num(lv[k]->cchi[i], &x) && x >= 0) { snprintf(nm, sizeof nm, "hicc%d", lv[k]->cc[i]); opn(d, nm, x); }
+      }
+      break;
+    }
+  }
+}
+
+/* the whole tree, once a pass: 0 when cancelled */
+static int walk(D *d) {
+  int c, done = 0;
+  Look gs, g, s;
+  for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) {
+    int grp;
+    if (strcmp(d->pool + d->el[c].name, "groups")) {
+      char w[64]; snprintf(w, sizeof w, "<%.50s>", d->pool + d->el[c].name); ignored(d, w);
+      continue;
+    }
+    look(d, c, &gs, 1);
+    for (grp = d->el[c].first_child; grp >= 0; grp = d->el[grp].next) {
+      int smp;
+      if (strcmp(d->pool + d->el[grp].name, "group")) {
+        char w[64]; snprintf(w, sizeof w, "<%.50s>", d->pool + d->el[grp].name); ignored(d, w);
+        continue;
+      }
+      look(d, grp, &g, 1);
+      if (is_false(g.a[A_ENABLED])) continue;
+      for (smp = d->el[grp].first_child; smp >= 0; smp = d->el[smp].next) {
+        if (strcmp(d->pool + d->el[smp].name, "sample")) {
+          char w[64]; snprintf(w, sizeof w, "<%.50s>", d->pool + d->el[smp].name); ignored(d, w);
+          continue;
+        }
+        look(d, smp, &s, 1);
+        sample(d, &s, &g, &gs);
+        if ((++done & 0xFFF) == 0 && d->b && sfz_cancelled(d->b)) return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int feed_ds(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int wcap) {
+  D *d = ctx;
+  (void)full;
+  d->b = b; d->pass = 1;
+  sfz_header(b, "global");                           /* SFZ's defaults; every value is given per region */
+  if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); return 0; }
+  return 1;
+}
+
+int sf_is_ds(const char *path, const uint8_t *head, size_t n) {
+  const char *dot = path ? strrchr(path, '.') : NULL;
+  size_t i;
+  if (dot && !_stricmp(dot, ".dspreset")) return 1;
+  for (i = 0; i + 14 <= n; i++) if (!memcmp(head + i, "<DecentSampler", 14)) return 1;
+  return 0;
+}
+
+int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+  D *d = calloc(1, sizeof *d);
+  wchar_t *full = sf_full_path(path);
+  HANDLE h = INVALID_HANDLE_VALUE;
+  LARGE_INTEGER sz; DWORD got = 0;
+  char *t = NULL;
+  int ok = 0;
+  if (!d || !full) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+  h = CreateFileW(full, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) { snprintf(why, (size_t)wcap, "it can't be read"); goto done; }
+  if (!GetFileSizeEx(h, &sz) || sz.QuadPart > DS_MAX_TEXT) { snprintf(why, (size_t)wcap, "it's too big to be a preset"); goto done; }
+  if (!(t = malloc((size_t)sz.QuadPart + 1))) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+  if (sz.QuadPart && (!ReadFile(h, t, (DWORD)sz.QuadPart, &got, NULL) || got != (DWORD)sz.QuadPart)) {
+    snprintf(why, (size_t)wcap, "it can't be read");
+    goto done;
+  }
+  CloseHandle(h); h = INVALID_HANDLE_VALUE;
+  if (!parse_xml(d, t, (size_t)sz.QuadPart, why, wcap)) goto done;
+  free(t); t = NULL;
+  d->pass = 0;
+  walk(d);                                           /* the round-robin lengths and the silencing tags */
+  ok = sfz_build(f, path, feed_ds, d, cancel, carg, why, wcap);
+  if (ok == 0 && !strcmp(why, "it has no regions with samples")) snprintf(why, (size_t)wcap, "it has no samples to play");
+done:
+  if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+  free(t); free(full);
+  if (d) {
+    free(d->pool); free(d->el); free(d->at);
+    map_free(&d->silencers);
+    free(d->seq.key); free(d->seq.max);
+    free(d);
+  }
+  return ok;
+}

@@ -4,7 +4,8 @@ An accessible sampler for REAPER, written in C as a CLAP instrument for Windows.
 controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It includes Rubber Band (GPL),
 Signalsmith Stretch (MIT, see src\signalsmith), and these decoders, all 3-clause BSD, each with its licence in its
 folder under src\codecs: libopus, opusfile and libogg (Xiph.Org), WavPack (David Bryant) and the Monkey's Audio SDK
-(Matthew T. Ashland).
+(Matthew T. Ashland). It also includes yxml (Yoran Heling, MIT, see src\codecs\yxml), which reads Decent Sampler
+presets.
 
 ## What it does
 

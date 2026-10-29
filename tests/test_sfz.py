@@ -643,7 +643,8 @@ def test_sfz_made_samples_and_velcurve(lib, tmp_path):
 
 def test_sfz_filter_unity_keytrack_and_xml(lib, tmp_path):
     """SFZ's resonant lowpass keeps its passband at unity (SF2.04 would lower it by half the peak); a negative
-    pitch_keytrack plays lower going up; XML (a Decent Sampler preset with <group> tags) isn't taken as SFZ."""
+    pitch_keytrack plays lower going up; XML (a Decent Sampler preset with <group> tags) isn't taken as SFZ
+    (Task 10 plays it as a Decent Sampler preset), nor is other XML."""
     write_wav(tmp_path / "s100.wav", sine(RATE, 100.0))
     write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
     path = write_sfz(tmp_path / "fu.sfz", """
@@ -665,7 +666,14 @@ def test_sfz_filter_unity_keytrack_and_xml(lib, tmp_path):
     xml = tmp_path / "p.dspreset"
     xml.write_text('<?xml version="1.0"?>\n<DecentSampler><groups><group><sample path="a.wav"/></group></groups>'
                    '</DecentSampler>\n')
-    f, err = sf_open(lib, xml)
+    f = opened(lib, xml)                                                    # Task 10: Decent Sampler's own
+    try:
+        assert len(regions(lib, f, 0)) == 1
+    finally:
+        lib.smp_sf_close(f)
+    other = tmp_path / "other.sfz"                                         # other XML: not SFZ, whatever its name
+    other.write_text('<?xml version="1.0"?>\n<region><group/></region>\n')
+    f, err = sf_open(lib, other)
     assert not f and "SFZ" not in err
 
 

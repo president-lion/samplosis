@@ -923,17 +923,20 @@ SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *
   f->mtime = (uint64_t)mt.dwHighDateTime << 32 | mt.dwLowDateTime;
 
   {
-    /* SFZ: text, told by its name or by a header in its first bytes; sfsfz.c reads it (and its sample files) */
+    /* SFZ: text, told by its name or by a header in its first bytes; sfsfz.c reads it (and its sample files). A
+       Decent Sampler preset (XML with <DecentSampler>, or .dspreset) is read by sfds.c into the same builder. */
     uint8_t head[4096];
     uint32_t n = s.size < sizeof head ? (uint32_t)s.size : (uint32_t)sizeof head;
+    int ds = 0;
     if (!(n >= 4 && rd(&s, 0, head, 4) && !memcmp(head, "RIFF", 4)) && (n == 0 || rd(&s, 0, head, n)) &&
-        sf_is_sfz(path, head, n)) {
+        ((ds = sf_is_ds(path, head, n)) != 0 || sf_is_sfz(path, head, n))) {
       CloseHandle(s.h);
       f->is_sfz = 1;
+      f->is_ds = ds;
       f->path = _strdup(path);
       if (!f->path) snprintf(why, sizeof why, "out of memory");
       else {
-        int r = sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
+        int r = ds ? sf_parse_ds(f, path, cancel, carg, why, sizeof why) : sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
         if (r > 0) return f;
         if (r < 0) {                         /* why is the whole reason (every sample missing, say) */
           if (err && cap > 0) snprintf(err, cap, "%s", why);
@@ -941,7 +944,8 @@ SmpFont *sf_parse_ex(const char *path, int (*cancel)(void *), void *carg, char *
           return NULL;
         }
       }
-      if (err && cap > 0) snprintf(err, cap, "%s isn't an SFZ file this can play (%s)", base_name(path), why);
+      if (err && cap > 0) snprintf(err, cap, "%s isn't %s this can play (%s)", base_name(path),
+                                   ds ? "a Decent Sampler preset" : "an SFZ file", why);
       sf_free(f);
       return NULL;
     }
