@@ -896,7 +896,14 @@ namespace gig {
             inline file_offset_t WorstCaseMaxSamples(buffer_t* pDecompressionBuffer) {
                 return (file_offset_t) ((float)pDecompressionBuffer->Size / (float)WorstCaseFrameSize * (float)SamplesPerFrame);
             }
+        public:
+            // Samplosis: when LazyScan is set (before a file is opened), a compressed sample's frames are scanned
+            // only when it is first read (EnsureScanned), not when the file opens; until then SamplesTotal is an
+            // upper bound worked out from the data's size. Opening a big compressed .gig then reads only headers.
+            static bool LazyScan;
+            void EnsureScanned();
         private:
+            bool Scanned;
             void ScanCompressedSample();
             friend class File;
             friend class Region;

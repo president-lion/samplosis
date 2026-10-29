@@ -468,6 +468,7 @@ namespace {
 
         RIFF::Chunk* ewav = waveList->GetSubChunk(CHUNK_ID_EWAV);
         Compressed        = ewav;
+        Scanned           = !Compressed;
         Dithered          = false;
         TruncatedBits     = 0;
         if (Compressed) {
@@ -479,7 +480,15 @@ namespace {
                 ewav->SetPos(Channels == 2 ? 84 : 64);
                 TruncatedBits = ewav->ReadInt32();
             }
-            ScanCompressedSample();
+            if (!LazyScan) EnsureScanned();
+            else {
+                // Samplosis: scanned when first read; meanwhile an upper bound (GigaStudio's densest frame holds
+                // 2048 frames in 268 bytes)
+                if (!pCkData) throw gig::Exception("Compressed sample has no data chunk");
+                SamplesPerFrame = BitDepth == 24 ? 256 : 2048;
+                WorstCaseFrameSize = SamplesPerFrame * FrameSize + Channels;
+                SamplesTotal = (pCkData->GetSize() / 268 + 1) * 2048;
+            }
         }
 
         // we use a buffer for decompression only
@@ -632,6 +641,21 @@ namespace {
     }
 
     /// Scans compressed samples for mandatory informations (e.g. actual number of total sample points).
+    bool Sample::LazyScan = false;
+
+    // Samplosis: the frame scan, once, the first time a compressed sample is read (see LazyScan). A damaged
+    // sample's scan throws, and the sample then reads as empty.
+    void Sample::EnsureScanned() {
+        if (Scanned) return;
+        Scanned = true;
+        try { ScanCompressedSample(); }
+        catch (...) {
+            SamplesTotal = 0;
+            if (FrameTable) { delete[] FrameTable; FrameTable = NULL; }
+            throw;
+        }
+    }
+
     void Sample::ScanCompressedSample() {
         //TODO: we have to add some more scans here (e.g. determine compression rate)
         this->SamplesTotal = 0;
@@ -793,6 +817,7 @@ namespace {
      * @see                      ReleaseSampleData(), Read(), SetPos()
      */
     buffer_t Sample::LoadSampleDataWithNullSamplesExtension(file_offset_t SampleCount, uint NullSamplesCount) {
+        EnsureScanned();
         if (SampleCount > this->SamplesTotal) SampleCount = this->SamplesTotal;
         if (RAMCache.pStart) delete[] (int8_t*) RAMCache.pStart;
         file_offset_t allocationsize = (SampleCount + NullSamplesCount) * this->FrameSize;
@@ -895,6 +920,8 @@ namespace {
      */
     file_offset_t Sample::SetPos(file_offset_t SampleCount, RIFF::stream_whence_t Whence) {
         if (Compressed) {
+            EnsureScanned();
+            if (!FrameTable) return 0;
             switch (Whence) {
                 case RIFF::stream_curpos:
                     this->SamplePos += SampleCount;
@@ -1143,6 +1170,7 @@ namespace {
      */
     file_offset_t Sample::Read(void* pBuffer, file_offset_t SampleCount, buffer_t* pExternalDecompressionBuffer) {
         if (SampleCount == 0) return 0;
+        if (Compressed) { EnsureScanned(); if (!FrameTable) return 0; }
         if (!Compressed) {
             if (BitDepth == 24) {
                 return pCkData->Read(pBuffer, SampleCount * FrameSize, 1) / FrameSize;

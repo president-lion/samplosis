@@ -652,6 +652,11 @@ void name20(char *out, const std::string &s, const char *fallback, int n) {
 }
 
 /* g: the caller's owner of the libgig file (see Gig), set as soon as it exists */
+/* Compressed waves are scanned when first decoded, not when the file opens (libgig's LazyScan, our patch): a
+   project with a big compressed .gig opens reading headers only. Until a wave is decoded its length is an upper
+   bound from its data's size; the decode gives the real one. */
+static struct LazyScanOn { LazyScanOn() { gig::Sample::LazyScan = true; } } g_lazy_scan_on;
+
 int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap, Gig *&gp) {
   CancelHook hook = {cancel, carg};
   RIFF::progress_t prog;
@@ -955,6 +960,7 @@ float *decode(Decode &d) {
     decode_unlock(d);
   }
   gig::Sample *s = g->file->GetSample(d.c->index);
+  if (s) s->EnsureScanned();                     /* its frames scanned now (lazily: see g_lazy_scan_on) */
   if (!s || !s->SamplesTotal || !s->Channels || !s->Compressed) { say(d.err, d.cap, "the wave is missing"); return nullptr; }
   /* the same rules as the parse: no more frames than the data can hold (2048 in 268 bytes at best), cut at 2^26 */
   uint64_t n = s->SamplesTotal, most = (SampleData::of(s)->GetSize() / 268 + 1) * 2048;
