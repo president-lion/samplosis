@@ -23,7 +23,11 @@
    On the SoundFont page, the controls of the mode not chosen (One preset: Preset and Channel; All channels: the 16
    channels and their outputs) are hidden, and Tab skips hidden controls. The preset lists are built once per font.
    Each channel's first entry, "From the song (now <preset>)", follows what the song plays, but not while its list is
-   open. A dropped .sf2 or .sf3 loads as the SoundFont, and a dropped audio file into the sampler, and the tab follows.
+   open; a chosen preset the font lacks shows as "Bank b program p (not in this font)".
+   Files. Each main page has Browse and a File combo box: the files of its kind in the loaded file's folder, the
+   loaded one selected; choosing one (Up and Down too) loads it at once. Both load only their own page's kind (a file
+   of the other kind gives that player's error). A dropped file goes by its extension: a .sf2 or .sf3 loads as the
+   SoundFont, an audio file into the sampler, and the tab follows.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
 #include <commctrl.h>
@@ -49,9 +53,9 @@
 
 #define NCH 16                                /* MIDI channels */
 enum { ID_VAL = 100,                          /* + parameter id: its slider or combo box */
-       ID_SAMPLE = 200, ID_BROWSE, ID_PREV, ID_NEXT, ID_STATUS, ID_SETTINGS,
+       ID_SAMPLE = 200, ID_BROWSE, ID_FILE, ID_STATUS, ID_SETTINGS,
        ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
-       ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFPREV, ID_SFNEXT, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
+       ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
        ID_SFSETTINGS,
        ID_EDIT = 300,                         /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
@@ -74,7 +78,7 @@ typedef struct Gui {
   int page;                                   /* PG_SAMPLER, PG_SETTINGS or PG_FONT */
   HWND tabs;                                  /* the Player tab control: first on both main pages */
   bool setting_tab;                           /* the window moves the tab itself: not the user's choice */
-  HWND sample, browse, prev, next, status, settings;
+  HWND sample, browse, status, settings;
   HWND val[SMP_NALLPARAMS];                   /* each parameter's slider or combo box */
   Slider sl[SMP_NALLPARAMS + 1]; int nsl;
   Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
@@ -83,12 +87,17 @@ typedef struct Gui {
   Slider *limit;
   char dir_shown[1024], used_text[700];
   /* the SoundFont page */
-  HWND sffile, sfbrowse, sfprev, sfnext, sfmode, sfpreset, sfchannel, chan[NCH], out[NCH], sfstatus, sfsettings;
+  HWND sffile, sfbrowse, sfmode, sfpreset, sfchannel, chan[NCH], out[NCH], sfstatus, sfsettings;
   HWND mode_one[4], mode_all[4 * NCH];        /* each mode's own controls with their labels: shown in that mode only */
   int nmode_one, nmode_all;
   bool sf_one;                                /* the mode the page shows: One preset */
   const void *list_font; char list_key[1200]; /* the font the preset lists were built for (and its text) */
   char from_song[NCH][300];                   /* each channel's first entry as it reads now */
+  HWND file[2];                               /* each main page's File combo box: the sampler's, the SoundFont's */
+  char file_key[2][1110];                     /* the file it was listed for (unchanged: nothing to do) */
+  wchar_t file_dir[2][1100];                  /* its folder, when its entries are files that can load */
+  bool file_live[2];
+  char lacks_preset[200], lacks_chan[NCH][200];   /* the last entry saying a chosen preset isn't in the font, or "" */
   HWND all[NPAGES][PAGE_CTLS]; int nall[NPAGES];      /* every window on each page (labels too), to show and hide */
   HWND order[NPAGES][PAGE_STOPS]; int norder[NPAGES]; /* the Tab order of each page */
   HWND last; bool had_focus, closing;
@@ -446,12 +455,19 @@ static void sf_lists(Gui *g) {
   char key[1200], name[200], t[300]; int n = f ? smp_sf_preset_count(f) : 0, i, c, b, p;
   smp_plug_font_text(g->P, key, sizeof key);
   if (g->list_key[0] && (const void *)f == g->list_font && !strcmp(key, g->list_key)) return;
-  g->list_font = f; snprintf(g->list_key, sizeof g->list_key, "%s", key);
-  SendMessageW(g->sfpreset, CB_RESETCONTENT, 0, 0);
+  g->list_font = f; snprintf(g->list_key, sizeof g->list_key, "%s", key);  /* an open list closes first (its entries are about to go), and nothing redraws until all 17 are built */
+  for (c = 0; c <= NCH; c++) {
+    HWND h = c < NCH ? g->chan[c] : g->sfpreset;
+    if (SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0)) SendMessageW(h, CB_SHOWDROPDOWN, FALSE, 0);
+    SendMessageW(h, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(h, CB_RESETCONTENT, 0, 0);
+    SendMessageW(h, CB_INITSTORAGE, (WPARAM)(n + 2), (LPARAM)((n + 2) * 64 * sizeof(wchar_t)));
+  }
+  g->lacks_preset[0] = 0;
   for (c = 0; c < NCH; c++) {
-    SendMessageW(g->chan[c], CB_RESETCONTENT, 0, 0);
     cb_add(g->chan[c], "From the song");
     g->from_song[c][0] = 0;                    /* the timer writes it */
+    g->lacks_chan[c][0] = 0;
   }
   for (i = 0; i < n; i++) {
     if (!smp_sf_preset_info(f, i, &b, &p, name, sizeof name)) name[0] = 0, b = p = 0;
@@ -459,6 +475,20 @@ static void sf_lists(Gui *g) {
     cb_add(g->sfpreset, t);
     for (c = 0; c < NCH; c++) cb_add(g->chan[c], t);
   }
+  for (c = 0; c <= NCH; c++) {
+    HWND h = c < NCH ? g->chan[c] : g->sfpreset;
+    SendMessageW(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+  }}
+/* A chosen preset the font doesn't have: an entry after the presets (at base) saying so, selected, so a screen
+   reader says what's wrong instead of nothing. want NULL: no such entry. Returns its index, or -1. */
+static int lacks_entry(HWND c, char *have, int cap, int base, const char *want) {
+  if (strcmp(have, want ? want : "")) {
+    if (have[0]) SendMessageW(c, CB_DELETESTRING, (WPARAM)base, 0);
+    if (want) cb_add(c, want);
+    snprintf(have, (size_t)cap, "%s", want ? want : "");
+  }
+  return want ? base : -1;
 }
 static int sf_index(Gui *g, int bank, int program) {   /* the preset's place in the lists, or -1 */
   SmpFont *f = sf_font(g);
@@ -480,17 +510,22 @@ static void sf_layout(Gui *g) {
 }
 
 static void sf_show(Gui *g) {
-  char t[1500], name[200]; SfCfg c; SmpFont *f; int i, b, p;
+  char t[1500], name[200], lacks[200]; SfCfg c; SmpFont *f; int i, b, p, n, k;
   smp_plug_font_text(g->P, t, sizeof t); set_text(g->sffile, t);
   sf_lists(g);
   sf_cfg(g, &c);
   f = sf_font(g);
+  n = f ? smp_sf_preset_count(f) : 0;
   if ((bool)c.one != g->sf_one) { g->sf_one = c.one != 0; sf_layout(g); }
   cb_select(g->sfmode, c.one ? 1 : 0);
-  cb_select(g->sfpreset, sf_index(g, c.bank, c.program));
+  k = sf_index(g, c.bank, c.program);
+  snprintf(lacks, sizeof lacks, "Bank %d program %d (not in this font)", c.bank, c.program + 1);
+  if (k < 0) k = lacks_entry(g->sfpreset, g->lacks_preset, sizeof g->lacks_preset, n, f ? lacks : NULL);
+  else lacks_entry(g->sfpreset, g->lacks_preset, sizeof g->lacks_preset, n, NULL);
+  cb_select(g->sfpreset, k);
   cb_select(g->sfchannel, c.channel);
   for (i = 0; i < NCH; i++) {
-    int k = c.pin[i] >= 0 ? sf_index(g, c.pin[i] / 128, c.pin[i] % 128) : -1;
+    k = c.pin[i] >= 0 ? sf_index(g, c.pin[i] / 128, c.pin[i] % 128) : -1;
     /* the first entry says what the song plays there now; never while the list is open (it would jump) */
     if (f && smp_plug_sf_channel_now(g->P, i + 1, &b, &p)) {
       int at = smp_sf_find_preset(f, b, p);
@@ -505,6 +540,10 @@ static void sf_show(Gui *g) {
       SendMessageW(g->chan[i], CB_INSERTSTRING, 0, (LPARAM)w);
       if (was == 0) SendMessageW(g->chan[i], CB_SETCURSEL, 0, 0);     /* showing it: the new words show */
     }
+    if (c.pin[i] >= 0 && k < 0 && f) {           /* pinned to a preset the font lacks */
+      snprintf(lacks, sizeof lacks, "Bank %d program %d (not in this font)", c.pin[i] / 128, c.pin[i] % 128 + 1);
+      k = lacks_entry(g->chan[i], g->lacks_chan[i], sizeof g->lacks_chan[i], n + 1, lacks) - 1;
+    } else lacks_entry(g->chan[i], g->lacks_chan[i], sizeof g->lacks_chan[i], n + 1, NULL);
     cb_select(g->chan[i], c.pin[i] >= 0 ? (k >= 0 ? k + 1 : -1) : 0);
     cb_select(g->out[i], c.out[i]);
   }
@@ -512,8 +551,10 @@ static void sf_show(Gui *g) {
 
 /* a SoundFont combo box chose entry k: one state line to the player (one it won't take beeps) */
 static void sf_choose(Gui *g, int id, int k) {
-  char line[200] = ""; int b = 0, p = 0; SmpFont *f = sf_font(g);
+  char line[200] = ""; int b = 0, p = 0; SmpFont *f = sf_font(g); int n = f ? smp_sf_preset_count(f) : 0;
   if (k < 0) return;
+  /* the entry saying the chosen preset isn't in the font: choosing it changes nothing */
+  if ((id == ID_SFPRESET && k >= n) || (id >= ID_CHAN && id < ID_CHAN + NCH && k > n)) { sf_show(g); return; }
   if (id == ID_SFMODE) snprintf(line, sizeof line, "sf_mode %s", k ? "one" : "all");
   else if (id == ID_SFPRESET) { if (f && smp_sf_preset_info(f, k, &b, &p, NULL, 0)) snprintf(line, sizeof line, "sf_preset %d %d", b, p); }
   else if (id == ID_SFCHANNEL) { if (k) snprintf(line, sizeof line, "sf_channel %d", k); else snprintf(line, sizeof line, "sf_channel all"); }
@@ -526,6 +567,7 @@ static void sf_choose(Gui *g, int id, int k) {
 }
 
 static void show_page(Gui *g, int page, HWND to);
+static void file_list(Gui *g, int kind, bool rescan);
 static void refresh(Gui *g) {
   int id;
   if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
@@ -534,6 +576,7 @@ static void refresh(Gui *g) {
     return;
   }
   show_sample(g);
+  if (g->page != PG_SETTINGS) file_list(g, g->page == PG_FONT, false);
   for (id = 0; id < SMP_NALLPARAMS; id++) show_param(g, id, false);
   show_status(g);
   if (g->page == PG_FONT) sf_show(g);
@@ -544,10 +587,12 @@ static bool font_name(const wchar_t *n) {
   const wchar_t *dot = wcsrchr(n, L'.');
   return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3"));
 }
-/* a file to load: a .sf2 or .sf3 as the SoundFont (which then plays), anything else as the sample; dropped: the
-   sample then plays too */
-static void load_path_w(Gui *g, const wchar_t *w, bool dropped) {
-  char u[1100], err[700], msg[1900]; bool sf = font_name(w);
+/* a file to load: LOAD_SAMPLE or LOAD_FONT (as the page's Browse or File combo box asks: a file of the
+   other kind gives that player's error), or LOAD_DROPPED: by its extension, a .sf2 or .sf3 as the SoundFont
+   (which then plays), anything else as the sample (which then plays) */
+enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
+static void load_path_w(Gui *g, const wchar_t *w, int how) {
+  char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT, dropped = how == LOAD_DROPPED;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
   if (!(sf ? smp_plug_load_font(g->P, u, err, sizeof err) : smp_plug_load(g->P, u, err, sizeof err))) {
     const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
@@ -570,62 +615,96 @@ static bool audio_name(const wchar_t *n) {
 }
 static int by_name(const void *a, const void *b) { return _wcsicmp(*(const wchar_t *const *)a, *(const wchar_t *const *)b); }
 
-/* what Browse, Previous file and Next file work on: the sample (0) or the SoundFont (1) */
+/* what Browse and the File combo box work on: the sample (0) or the SoundFont (1) */
 typedef struct {
   int (*path)(Plug *, char *, int);
   bool (*ours)(const wchar_t *);
-  const char *none, *no_files, *only;
   const wchar_t *filter, *title;
 } FileKind;
 static const FileKind kinds[2] = {
-  {smp_plug_sample_path, audio_name, "No sample loaded", "No audio files in the sample's folder",
-   "It's the only audio file in its folder", L"Audio files\0*.wav;*.flac;*.mp3;*.ogg;*.aif;*.aiff\0All files\0*.*\0",
-   L"Load a sample"},
-  {smp_plug_font_path, font_name, "No SoundFont loaded", "No SoundFonts in the SoundFont's folder",
-   "It's the only SoundFont in its folder", L"SoundFonts\0*.sf2;*.sf3\0All files\0*.*\0", L"Load a SoundFont"},
+  {smp_plug_sample_path, audio_name, L"Audio files\0*.wav;*.flac;*.mp3;*.ogg;*.aif;*.aiff\0All files\0*.*\0", L"Load a sample"},
+  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3\0All files\0*.*\0", L"Load a SoundFont"},
 };
 
-/* Previous or next file: the files of its kind in the current one's folder, alphabetical (ignoring case), wrapping
-   round */
-static void step_file(Gui *g, int kind, int dir) {
+/* The File combo box: the files of its kind in the loaded file's folder, by name (alphabetical, ignoring case),
+   the loaded one selected (it is listed even if its kind's extensions don't match it). With nothing loaded, one
+   entry: "No file loaded", or "<name> (missing)". Its entries change only when the listing does, and never while its
+   list is open; rescan: list the folder again even if the loaded file is the same (the combo box just got the
+   focus: files added in Explorer show up). */
+static void file_list(Gui *g, int kind, bool rescan) {
   const FileKind *K = &kinds[kind];
-  char path[1100]; wchar_t w[1100], pat[1200], *slash, *name, **names = NULL, out[1200];
-  WIN32_FIND_DATAW fd; HANDLE f; int n = 0, cap = 0, i, at = -1, ins = 0;
-  if (!K->path(g->P, path, sizeof path) || !MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1100)) {
-    beep(); say_note(g, K->none); show_status(g); return;
+  HWND c = g->file[kind];
+  char path[1100], key[1110]; wchar_t w[1100], pat[1200], *slash, *name = NULL, **names = NULL, one[1200];
+  WIN32_FIND_DATAW fd; HANDLE f; int n = 0, cap = 0, i, at = -1, rc, same;
+  if (!c || SendMessageW(c, CB_GETDROPPEDSTATE, 0, 0)) return;
+  rc = K->path(g->P, path, sizeof path);
+  snprintf(key, sizeof key, "%d%s", rc, path);
+  if (!rescan && !strcmp(key, g->file_key[kind])) return;
+  snprintf(g->file_key[kind], sizeof g->file_key[kind], "%s", key);
+  g->file_dir[kind][0] = 0;
+  if (rc && MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1100)) {
+    for (slash = w; *slash; slash++) if (*slash == L'/') *slash = L'\\';
+    slash = wcsrchr(w, L'\\');
+    name = slash ? slash + 1 : w;
+    if (slash) *slash = 0; else w[0] = 0;
+  } else rc = 0;
+  if (rc == 1) {                              /* the folder's files of this kind, and the loaded one */
+    wcscpy(g->file_dir[kind], w);
+    swprintf(pat, 1200, L"%s\\*", w);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+      do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (!K->ours(fd.cFileName) && _wcsicmp(fd.cFileName, name))) continue;
+        if (n == cap) {
+          wchar_t **nn = realloc(names, sizeof *names * (size_t)(cap = cap ? cap * 2 : 64));
+          if (!nn) break;
+          names = nn;
+        }
+        names[n] = _wcsdup(fd.cFileName);
+        if (names[n]) n++;
+      } while (FindNextFileW(f, &fd));
+      FindClose(f);
+    }
+    qsort(names, (size_t)n, sizeof *names, by_name);
+    for (i = 0; i < n; i++) if (!_wcsicmp(names[i], name)) at = i;
   }
-  for (slash = w; *slash; slash++) if (*slash == L'/') *slash = L'\\';
-  slash = wcsrchr(w, L'\\');
-  if (!slash) { beep(); return; }
-  *slash = 0; name = slash + 1;
-  swprintf(pat, 1200, L"%s\\*", w);
-  f = FindFirstFileW(pat, &fd);
-  if (f != INVALID_HANDLE_VALUE) {
-    do {
-      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !K->ours(fd.cFileName)) continue;
-      if (n == cap) {
-        wchar_t **nn = realloc(names, sizeof *names * (size_t)(cap = cap ? cap * 2 : 64));
-        if (!nn) break;
-        names = nn;
-      }
-      names[n] = _wcsdup(fd.cFileName);
-      if (names[n]) n++;
-    } while (FindNextFileW(f, &fd));
-    FindClose(f);
+  if (rc != 1 || at < 0) {                    /* nothing loaded, missing, or the folder can't be read: one entry */
+    for (i = 0; i < n; i++) free(names[i]);
+    n = 0; at = 0;
+    if (rc) swprintf(one, 1200, rc == 2 ? L"%s (missing)" : L"%s", name); else wcscpy(one, L"No file loaded");
+    if (!names) names = malloc(sizeof *names);
+    if (names && (names[0] = _wcsdup(one)) != NULL) n = 1;
   }
-  if (!n) { free(names); beep(); say_note(g, K->no_files); show_status(g); return; }
-  qsort(names, (size_t)n, sizeof *names, by_name);
-  for (i = 0; i < n; i++) {
-    int c = _wcsicmp(names[i], name);
-    if (!c) at = i;
-    if (c < 0) ins = i + 1;
+  /* the same entries as now: only the selection moves (also safe inside the combo box's own notification) */
+  same = (int)SendMessageW(c, CB_GETCOUNT, 0, 0) == n;
+  for (i = 0; same && i < n; i++) {
+    wchar_t t[1200];
+    if (SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)i, 0) >= 1200) { same = 0; break; }
+    SendMessageW(c, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
+    same = !wcscmp(t, names[i]);
   }
-  i = at >= 0 ? at + dir : dir > 0 ? ins : ins - 1;        /* the file gone: its neighbours */
-  i = ((i % n) + n) % n;
-  if (at >= 0 && i == at) { beep(); say_note(g, K->only); show_status(g); }
-  else { swprintf(out, 1200, L"%s\\%s", w, names[i]); load_path_w(g, out, false); }
+  if (!same) {
+    SendMessageW(c, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    for (i = 0; i < n; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)names[i]);
+    SendMessageW(c, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(c, NULL, TRUE);
+  }
+  g->file_live[kind] = rc == 1 && n > 0 && at >= 0 && g->file_dir[kind][0];
+  cb_select(c, n ? at : -1);
   for (i = 0; i < n; i++) free(names[i]);
   free(names);
+}
+
+/* the File combo box chose entry k: that file loads at once through the page's own loader; if it won't, the
+   reason shows in Status (with a beep) and the combo box goes back to the loaded file */
+static void file_chosen(Gui *g, int kind, int k) {
+  HWND c = g->file[kind]; wchar_t t[600], out[1800];
+  if (k < 0 || !g->file_live[kind] || SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)k, 0) >= 600) { file_list(g, kind, true); return; }
+  SendMessageW(c, CB_GETLBTEXT, (WPARAM)k, (LPARAM)t);
+  swprintf(out, 1800, L"%s\\%s", g->file_dir[kind], t);
+  load_path_w(g, out, kind ? LOAD_FONT : LOAD_SAMPLE);
+  file_list(g, kind, true);                   /* the loaded file selected (again, when the load failed) */
 }
 
 static void browse_file(Gui *g, int kind) {
@@ -647,8 +726,8 @@ static void browse_file(Gui *g, int kind) {
   modal_begin(g);
   ok = test_dialog ? stub_dialog(g, file, 1100) : GetOpenFileNameW(&of);
   if (modal_end(g)) return;               /* the window (and maybe the plugin) went while the dialog was open */
-  if (ok) load_path_w(g, file, false);
-  focus(g->page == PG_FONT ? g->sfbrowse : g->browse);   /* the page showing now (a font chosen here switches) */
+  if (ok) load_path_w(g, file, kind ? LOAD_FONT : LOAD_SAMPLE);   /* this page's player, whatever the file */
+  focus(kind ? g->sfbrowse : g->browse);
 }
 
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
@@ -670,7 +749,7 @@ static HRESULT STDMETHODCALLTYPE d_over(IDropTarget *t, DWORD k, POINTL p, DWORD
 static HRESULT STDMETHODCALLTYPE d_leave(IDropTarget *t) { ((Drop *)t)->ok = 0; return S_OK; }
 static void drop_hdrop(Gui *g, HDROP h) {
   wchar_t w[1100];
-  if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w, true);
+  if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w, LOAD_DROPPED);
 }
 /* The drop only notes the file and posts WM_DROPPED: the load (maybe a decode) runs after the drag has returned, so
    Explorer or the Media Explorer isn't kept waiting, and nothing loads inside OLE's drag loop. */
@@ -761,11 +840,7 @@ static void click(Gui *g, int id) {
   int m;
   switch (id) {
     case ID_BROWSE: browse_file(g, 0); break;
-    case ID_PREV: step_file(g, 0, -1); break;
-    case ID_NEXT: step_file(g, 0, 1); break;
     case ID_SFBROWSE: browse_file(g, 1); break;
-    case ID_SFPREV: step_file(g, 1, -1); break;
-    case ID_SFNEXT: step_file(g, 1, 1); break;
     case ID_SETTINGS: case ID_SFSETTINGS: show_page(g, PG_SETTINGS, NULL); break;
     case ID_BACK:                             /* to the main page that plays, on its Settings button */
       m = smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER;
@@ -790,6 +865,7 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
   if (m == WM_GETDLGCODE) return DefSubclassProc(h, m, w, l) | DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTTAB | DLGC_WANTCHARS;
   if (g->closing) return DefSubclassProc(h, m, w, l);
   if (m == WM_SETFOCUS) { g->last = h; g->had_focus = true; }
+  if (m == WM_SETFOCUS && (id == ID_FILE || id == ID_SFFILE)) file_list(g, id == ID_SFFILE, true);   /* new files show */
   if (m == WM_KILLFOCUS && !(w && IsChild(g->win, (HWND)w))) g->had_focus = false;   /* gone out of the window */
   shift = GetKeyState(VK_SHIFT) < 0; ctrl = GetKeyState(VK_CONTROL) < 0;
   s = slider_of(g, h);
@@ -851,6 +927,8 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE)) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) choose(g, id, (int)k);
+      } else if (code == CBN_SELCHANGE && (id == ID_FILE || id == ID_SFFILE)) {
+        file_chosen(g, id == ID_SFFILE, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
       } else if (code == CBN_SELCHANGE && (id == ID_SFMODE || id == ID_SFPRESET || id == ID_SFCHANNEL ||
                                            (id >= ID_CHAN && id < ID_CHAN + NCH) || (id >= ID_OUT && id < ID_OUT + NCH))) {
         sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
@@ -867,11 +945,12 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       const NMHDR *n = (const NMHDR *)l;
       if (n && n->hwndFrom == g->tabs && n->code == TCN_SELCHANGE && !g->setting_tab)
         set_tab(g, (int)SendMessageW(g->tabs, TCM_GETCURSEL, 0, 0));
+      else break;                              /* not ours: the default */
       return 0;
     }
     case WM_SETFOCUS: keep_focus(g); return 0;
     case WM_DROPFILES: drop_hdrop(g, (HDROP)w); DragFinish((HDROP)w); return 0;
-    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f, true); } return 0;
+    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f, LOAD_DROPPED); } return 0;
   }
   return DefWindowProcW(h, m, w, l);
 }
@@ -984,8 +1063,7 @@ static bool build(Gui *g, HWND parent) {
   g->sample = labelled(g, 0, "Sample", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_SAMPLE);
   y += ROW;
   g->browse = ctl(g, 0, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_BROWSE);
-  g->prev = ctl(g, 0, L"BUTTON", L"Previous file", T | BS_PUSHBUTTON, 240, y, 120, 26, ID_PREV);
-  g->next = ctl(g, 0, L"BUTTON", L"Next file", T | BS_PUSHBUTTON, 368, y, 120, 26, ID_NEXT);
+  g->file[0] = labelled(g, PG_SAMPLER, "File", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 240, y, 40, 470, 320, ID_FILE);
   y += ROW;
   param_box(g, PG_SAMPLER, SMP_P_KEEP_LENGTH, 8, y, 120, 130);
   param_box(g, PG_SAMPLER, SMP_P_MODE, 384, y, 160, 130);
@@ -1005,8 +1083,7 @@ static bool build(Gui *g, HWND parent) {
   g->sffile = labelled(g, PG_FONT, "SoundFont", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_FONT);
   y += ROW;
   g->sfbrowse = ctl(g, PG_FONT, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_SFBROWSE);
-  g->sfprev = ctl(g, PG_FONT, L"BUTTON", L"Previous file", T | BS_PUSHBUTTON, 240, y, 120, 26, ID_SFPREV);
-  g->sfnext = ctl(g, PG_FONT, L"BUTTON", L"Next file", T | BS_PUSHBUTTON, 368, y, 120, 26, ID_SFNEXT);
+  g->file[1] = labelled(g, PG_FONT, "File", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 240, y, 40, 470, 320, ID_SFFILE);
   y += ROW;
   g->sfmode = labelled(g, PG_FONT, "Mode", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 120, 200, 200, ID_SFMODE);
   cb_add(g->sfmode, "All channels");

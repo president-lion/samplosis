@@ -465,7 +465,7 @@ def test_plugin_params(P):
 
 # ---- the window, driven by messages through host.exe's gui command ----
 MAIN_ORDER = [
-    ("Tab", "Player"), ("Edit", "Sample"), ("Button", "Browse"), ("Button", "Previous file"), ("Button", "Next file"),
+    ("Tab", "Player"), ("Edit", "Sample"), ("Button", "Browse"), ("ComboBox", "File"),
     ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
     ("Slider", "Root note"), ("Slider", "Transpose"), ("Slider", "Fine tune"), ("Slider", "Volume"), ("Slider", "Pan"),
     ("Slider", "Attack"), ("Slider", "Decay"), ("Slider", "Sustain"), ("Slider", "Release"),
@@ -565,21 +565,33 @@ def test_gui_slider_keys(P, tmp_path):
     assert "param 29: 0" in out
 
 
-def test_gui_next_file(P, tmp_path):
+def test_gui_file_combo(P, tmp_path):
+    # the File combo box: the folder's audio files by name, the loaded one selected; choosing one loads it at once
     d = tmp_path / "files"
     d.mkdir()
     for n in ("a.wav", "B.wav", "c.wav"):
         P.sample(n)
         os.replace(tmp_path / n, d / n)
     (d / "notes.txt").write_text("not audio")
+    (d / "bad.wav").write_bytes(b"not a wav at all")
     text = P.script(d / "B.wav")
-    out = gui(P, tmp_path, text, ["read Sample", "focus Next file", "key enter", "read Sample", "key enter",
-                                  "read Sample", "focus Previous file", "key space", "read Sample", "state", "counts"])
+    out = gui(P, tmp_path, text, ["read File", "list File", "focus File", "key down", "read Sample", "read Status",
+                                  "counts", "key end", "read Sample", "key down", "key home", "read Sample",
+                                  "key up", "state", "counts"])
     r = [x[1] for x in got(out, "read")]
-    assert r[0].startswith("B.wav, 0.80 s, root ")
-    assert r[1].startswith("c.wav, ") and r[2].startswith("a.wav, ") and r[3].startswith("c.wav, ")
-    assert ('sample "%s"' % (d / "c.wav")) in out
-    assert got(out, "counts")[0][2] != "mark_dirty 0"
+    f = got(out, "focus")
+    assert r[0] == "B.wav"
+    assert got(out, "list")[0] == ["File", "a.wav", "B.wav", "bad.wav", "c.wav"]    # notes.txt isn't listed
+    # bad.wav won't load: a beep, the reason in Status, and the combo box back on the loaded file
+    assert f[0] == ["ComboBox", "File", "B.wav"] and r[1].startswith("B.wav, 0.80 s, root ")
+    assert r[2].startswith("Can't load bad.wav: ") and got(out, "counts")[0][0] == "beeps 1"
+    assert f[1] == ["ComboBox", "File", "c.wav"] and r[3].startswith("c.wav, ")
+    assert f[2] == ["ComboBox", "File", "c.wav"]                     # Down at the last stays
+    assert f[3] == ["ComboBox", "File", "a.wav"] and r[4].startswith("a.wav, ")
+    assert f[4] == ["ComboBox", "File", "a.wav"]                     # Up at the first stays
+    assert ('sample "%s"' % (d / "a.wav")) in out
+    c = got(out, "counts")[1]
+    assert c[0] == "beeps 1" and c[2] != "mark_dirty 0"
 
 
 def test_gui_settings_page(P, tmp_path, settings_file):
@@ -657,8 +669,8 @@ def test_gui_closed_during_dialog(P, tmp_path, settings_file):
 
 
 # ---- the window's SoundFont tab ----
-SF_ORDER = ([("Tab", "Player"), ("Edit", "SoundFont"), ("Button", "Browse"), ("Button", "Previous file"),
-             ("Button", "Next file"), ("ComboBox", "Mode")] +
+SF_ORDER = ([("Tab", "Player"), ("Edit", "SoundFont"), ("Button", "Browse"), ("ComboBox", "File"),
+             ("ComboBox", "Mode")] +
             [x for n in range(1, 17) for x in (("ComboBox", "Channel %d" % n), ("ComboBox", "Channel %d output" % n))] +
             [("Slider", "SoundFont volume"), ("Slider", "SoundFont voices"), ("Slider", "SoundFont transpose"),
              ("ComboBox", "Reverb and chorus"), ("Edit", "Status"), ("Button", "Settings")])
@@ -720,42 +732,72 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     (d / "notes.txt").write_text("not a font")
     wav = P.sample("drop A3.wav")
     text = P.script(P.sample())
-    out = gui(P, tmp_path, text, ["key right", "read SoundFont", "dialog pick %s" % (d / "a.sf2"), "focus Browse",
-                                  "key enter", "read SoundFont", "focus Next file", "key enter", "read SoundFont",
-                                  "key enter", "read SoundFont", "key enter", "read SoundFont",
-                                  "focus Previous file", "key space", "read SoundFont", "state soundfont",
+    out = gui(P, tmp_path, text, ["key right", "read SoundFont", "read File", "dialog pick %s" % (d / "a.sf2"),
+                                  "focus Browse", "key enter", "read SoundFont", "list File", "focus File", "key down",
+                                  "read SoundFont", "key down", "read SoundFont", "key down", "key up",
+                                  "read SoundFont", "state soundfont",
                                   "drop %s" % wav, "say", "read Sample", "state plays",
-                                  "drop %s" % (d / "B.sf2"), "say", "read SoundFont", "state plays", "counts"])
+                                  "drop %s" % (d / "B.sf2"), "say", "read SoundFont", "state plays", "counts",
+                                  # each page's Browse loads its own kind, whatever the file
+                                  "dialog pick %s" % wav, "focus Browse", "key enter", "read SoundFont",
+                                  "read Status", "state sample", "counts",
+                                  "key tab ctrl", "dialog pick %s" % (d / "a.sf2"), "focus Browse", "key enter",
+                                  "read Sample", "read Status", "state plays", "counts"])
     r = [x[1] for x in got(out, "read")]
     f = got(out, "focus")
-    assert r[0] == "No SoundFont loaded"
-    assert f[1][:2] == ["Button", "Browse"] and r[1] == "a.sf2, 6 presets"
-    assert r[2:5] == ["B.sf2, 6 presets", "c.sf3, 6 presets", "a.sf2, 6 presets"]    # wraps round
-    assert r[5] == "c.sf3, 6 presets"
     st = [x[0] for x in got(out, "state")]
-    assert st[0] == 'soundfont "%s"' % (d / "c.sf3")
-    assert f[-2] == ["Tab", "Player", "Sampler"]                     # a dropped sample: the Sampler tab
+    c = [x[0] for x in got(out, "counts")]
+    assert r[0] == "No SoundFont loaded" and r[1] == "No file loaded"
+    assert f[1][:2] == ["Button", "Browse"] and r[2] == "a.sf2, 6 presets"
+    assert got(out, "list")[0] == ["File", "a.sf2", "B.sf2", "c.sf3"]          # notes.txt isn't listed
+    assert f[2] == ["ComboBox", "File", "B.sf2"] and r[3] == "B.sf2, 6 presets"
+    assert f[3] == ["ComboBox", "File", "c.sf3"] and r[4] == "c.sf3, 6 presets"
+    assert f[4] == ["ComboBox", "File", "c.sf3"]                     # Down at the last stays
+    assert f[5] == ["ComboBox", "File", "B.sf2"] and r[5] == "B.sf2, 6 presets"
+    assert st[0] == 'soundfont "%s"' % (d / "B.sf2")
+    assert f[6] == ["Tab", "Player", "Sampler"]                      # a dropped sample: the Sampler tab
     assert r[6].startswith("drop A3.wav, ") and st[1] == "plays sampler"
-    assert f[-1] == ["Tab", "Player", "SoundFont"]                   # a dropped font: the SoundFont tab
+    assert f[7] == ["Tab", "Player", "SoundFont"]                    # a dropped font: the SoundFont tab
     assert r[7] == "B.sf2, 6 presets" and st[2] == "plays soundfont"
-    assert got(out, "counts")[0][0] == "beeps 0"
+    assert c[0] == "beeps 0"
+    # a wav through the SoundFont page's Browse: the SoundFont player's error; the sample stays
+    assert r[8] == "B.sf2, 6 presets" and r[9].startswith("Can't load drop A3.wav: ") and c[1] == "beeps 1"
+    assert st[3].startswith('sample "%s"' % wav)
+    # a .sf2 through the Sampler page's Browse: the sampler's error; the sampler still plays its sample
+    assert r[10].startswith("drop A3.wav, ") and r[11].startswith("Can't load a.sf2: ")
+    assert st[4] == "plays sampler" and c[2] == "beeps 2"
 
 
 def test_gui_channel_from_song(P, tmp_path):
-    f = P.font()
-    text = 'plays soundfont\nsoundfont "%s"\n' % f
-    out = gui(P, tmp_path, text, ["say", "read Channel 2", "read Channel 10", "midi 193 33 0", "pump 400",
-                                  "read Channel 2", "focus Channel 2", "key down", "state sf_channel_preset",
-                                  "key up", "state sf_channel_preset", "focus Channel 2 output", "key down",
-                                  "state sf_output", "key end", "key down", "counts"])
+    font = P.font()
+    other = P.font("other.sf2")
+    text = 'plays soundfont\nsoundfont "%s"\nsf_channel_preset 3 0 99\n' % font
+    one = P.state_file('plays soundfont\nsoundfont "%s"\nsf_mode one\nsf_preset 0 99\n' % font, "one.txt")
+    out = gui(P, tmp_path, text, ["say", "read Channel 2", "read Channel 10", "read Channel 3", "midi 193 33 0",
+                                  "pump 400",
+                                  "read Channel 2", "focus Channel 2", "key down", "state sf_channel_preset 2",
+                                  "key up", "state sf_channel_preset 2", "focus Channel 2 output", "key down",
+                                  "state sf_output", "key end", "key down", "counts",
+                                  # One preset chosen by a state while the focus is on a channel's combo box
+                                  "focus Channel 2", "load %s" % one, "pump 400", "say", "read Preset",
+                                  "focus SoundFont volume", "key tab shift",
+                                  # the window closed while the SoundFont page's Browse dialog is open
+                                  "dialog closegui %s" % other, "focus Browse", "key enter", "pump 600",
+                                  "state soundfont", "alive"])
     r = [x[1] for x in got(out, "read")]
     f = got(out, "focus")
     st = [x[0] for x in got(out, "state")]
     assert f[0] == ["Tab", "Player", "SoundFont"]                    # opens on the tab that plays
     assert r[0] == "From the song (now Piano)" and r[1] == "From the song (now Kit)"
-    assert r[2] == "From the song (now Bass)"                        # program 33 on channel 2 played through
+    assert r[2] == "Bank 0 program 100 (not in this font)"           # pinned to a preset the font lacks
+    assert r[3] == "From the song (now Bass)"                        # program 33 on channel 2 played through
     assert f[1] == ["ComboBox", "Channel 2", "Piano, bank 0 program 1"] and st[0] == "sf_channel_preset 2 0 0"
     assert f[2] == ["ComboBox", "Channel 2", "From the song (now Bass)"] and st[1] == "(none)"
     assert f[3] == ["ComboBox", "Channel 2 output", "Output 2"] and st[2] == "sf_output 2 2"
     assert f[4] == f[5] == ["ComboBox", "Channel 2 output", "Output 16"]   # Down stops at the last
     assert got(out, "counts")[0][0] == "beeps 0"
+    assert f[6] == ["ComboBox", "Mode", "One preset"], out           # the channel combo hid: the focus on Mode
+    assert r[4] == "Bank 0 program 100 (not in this font)"
+    assert f[7] == ["ComboBox", "Channel", "All channels"]           # Shift+Tab skips the hidden channel combos
+    assert st[3] == 'soundfont "%s"' % font                          # not loaded: the window had gone
+    assert "alive: plugin\n" in out and "closed" in out

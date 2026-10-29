@@ -33,6 +33,8 @@
      midi <status> <d1> <d2> one block of 256 frames through the plugin with that MIDI event at frame 0 (the plugin
                              is activated at 48 kHz first, and deactivated at the end)
      drop <path>             drop the file on the plugin's window (WM_DROPFILES)
+     load <state.txt>        the host loads another state while the window is open ("load: ok")
+     list <name>             a combo box's entries: "list: <name> | <entry> | <entry> ..."
      counts                  "counts: beeps N | request_flush N | mark_dirty N"
      pump <ms>               let the window's timers run
      dialog <pick|closegui|destroy> <path>   the next file or folder dialog returns path at once; closegui first
@@ -562,6 +564,18 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       pr.frames_count = BLOCK; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
       p->process(p, &pr);
       main_thread(p);
+    } else if (!strcmp(a, "load")) {
+      if (load_state(p, arg) < 0) return 1;
+      main_thread(p); pump(30);
+    } else if (!strcmp(a, "list")) {
+      HWND c = find_named(arg); LRESULT i, n = c ? SendMessageW(c, CB_GETCOUNT, 0, 0) : 0;
+      printf("list: %s", arg);
+      for (i = 0; i < n; i++) {
+        wchar_t t[1100] = L""; char u[1100];
+        if (SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(c, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
+        utf8(t, u, sizeof u); printf(" | %s", u);
+      }
+      printf("\n");
     } else if (!strcmp(a, "drop")) {        /* a file dropped on the window, as Explorer's WM_DROPFILES gives it */
       wchar_t wp[1100]; size_t k; HGLOBAL hg; DROPFILES *df;
       MultiByteToWideChar(CP_UTF8, 0, arg, -1, wp, 1100);
