@@ -31,6 +31,52 @@ Rulings, plus findings that per-task and final reviews deferred. Each line comes
 - Ruling: the remaining deferred minors stay parked (reviewer triaged "can wait")
 - Final: minor (parked): copies 0.25-1 s now stream, so start past head resamples until start head built; failed initial ring commit unreported; fade look-ahead per block; flaky ready==before+1 assert
 
+## SoundFonts (stage 4): parked items (2026-10-28)
+
+Rulings made while building are in the README. These are the minor findings the reviews left parked.
+
+Parsing and loading:
+- The check on generator ids also covers records that no preset reaches, so a real font with junk there could be refused.
+- A font with no ifil chunk, or a mono sample with a bad link, is accepted. ROM samples are not handled.
+- Some cases have no tests: a sample end past the data, dropping sm24, duplicate bank and program pairs, and 65535 presets.
+- A hostile file with 10,000 zones of 1,024 modulators each is still slow to open, though bounded. The per-zone modulator cap counts invalid modulators before filtering.
+- Linked modulators are ignored, as in FluidSynth.
+- sf2.h pulls in windows.h. The real-font 2 second limit in the load test assumes the operating system's file cache.
+
+Voice and player:
+- Not tested: RPN tuning, bend through the default modulator, smp_sfv_update, the kill fade, effect sends, key-scaled hold and decay, and the modulation LFO to volume and filter.
+- At song start the pending notes loop costs up to 1,024 steps per pending note each block.
+- There is no data increment or decrement (CC96, CC97).
+- No test isolates the rule that protects a note's own voices when stealing. With SoundFont voices at 1, a note with two regions overshoots by one block.
+- Switching a font mid-song kills the voices at once, which may click.
+
+Effects:
+- Turning Reverb and chorus off cuts the tail, which may click.
+- The reverb is Freeverb, not FluidSynth's 2.x design, so the character differs.
+
+Comparison with FluidSynth:
+- The pad's spectral centroid is at plus 14.6 percent against the 15 percent allowance, because a fully open filter at Q 0 is bypassed while FluidSynth always low-passes near 19.9 kHz. A font with more top end could cross it. Keeping the filter running at the top, at unity gain, would fix it.
+- A font that brings the FluidSynth form of the velocity-to-cutoff modulator now applies it.
+- Levels sit about 1.5 dB under FluidSynth by the spec's filter mapping.
+- A comment in sf2.c near line 51 has loose wording.
+
+The plugin:
+- An instance that is not active holds its sf_used and its channels' presets until it is activated.
+- collect_now relies on the plugin's active flag following CLAP's rules.
+- The path for host buffers with a NULL channel pointer has no test, because host.exe cannot produce one.
+- The Sampler does not wait in an offline render, only the SoundFont player does.
+- A reset from the host lets the sf_used presets go in smp_synth_reset; the plugin uses smp_synth_flush instead, which keeps them.
+
+The window:
+- Listen in REAPER: rewriting the "From the song" entry on a focused channel combo may make NVDA read it again.
+- Listen in REAPER: whether NVDA speaks the new tab when Ctrl+Tab is pressed with the focus on the tab control is untested.
+- The channel combos are 120 pixels wide closed (320 open), so names are truncated for a sighted helper.
+- Arrowing through an open File list loads each file in turn, and big fonts load one after another.
+- The File combo does not wrap at the ends.
+
+Measured (Task 10):
+- A second instance on the same font costs 2.3 MB, over the 2 MB target. It is the second player's own memory; it was not broken down yet.
+
 ## After stage 1: stretcher choice and parallel copies (2026-10-28)
 
 Mike found keep length slow, and keys far from the root only kept length after he had played them once. He asked
