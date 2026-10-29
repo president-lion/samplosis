@@ -1,24 +1,32 @@
 # Samplosis
 
 An accessible sampler for REAPER, written in C as a CLAP instrument for Windows. The window is made of plain Windows
-controls that NVDA reads as they are. Licence: GPL version 2 (see COPYING). It includes Rubber Band (GPL),
-Signalsmith Stretch (MIT, see src\signalsmith), and these decoders, all 3-clause BSD, each with its licence in its
-folder under src\codecs: libopus, opusfile and libogg (Xiph.Org), WavPack (David Bryant) and the Monkey's Audio SDK
-(Matthew T. Ashland). It also includes yxml (Yoran Heling, MIT, see src\codecs\yxml), which reads Decent Sampler
-presets, and libgig (Christian Schoenebeck, GPL version 2 or later, see src\codecs\libgig), which reads GigaStudio
-files.
+controls that NVDA reads as they are.
+
+Licence: GPL version 2 (see COPYING). It includes these libraries, each under its own licence:
+
+- Rubber Band (Particular Programs, GPL), in src\rubberband, and Signalsmith Stretch (Geraint Luff, MIT), in
+  src\signalsmith: the time stretchers.
+- dr_wav, dr_flac and dr_mp3 (David Reid; public domain or MIT No Attribution) and stb_vorbis (Sean Barrett; public
+  domain or MIT), in src\decode: the built-in decoders, with their licences at the end of each file.
+- In src\codecs, each folder with its licence file and a VERSION.txt naming the version and where it came from:
+  libopus 1.6.1, opusfile 0.12 and libogg 1.3.6 (Xiph.Org, 3-clause BSD); WavPack 5.9.0 (David Bryant, 3-clause
+  BSD); the Monkey's Audio SDK 13.43 (Matthew T. Ashland, 3-clause BSD); yxml (Yoran Heling, MIT), which reads
+  Decent Sampler presets; and libgig 4.6.0 (Christian Schoenebeck, GPL version 2 or later, with four small read
+  fixes listed in its VERSION.txt), which reads GigaStudio files.
 
 ## What it does
 
 Samplosis has two players in one plugin, chosen by a tab: the Sampler, which plays one sample across the keyboard
-(stage 1), and the SoundFont player (stage 4, see "The SoundFont player"). A new instance starts on the Sampler, and
-a project saved before the SoundFont player existed loads as it was.
+(stage 1), and the SoundFont player (stage 4, see "The SoundFont player"), which also plays SFZ, Decent Sampler,
+DLS and GigaStudio instruments. A new instance starts on the Sampler, and a project saved before the SoundFont
+player existed loads as it was. Every file format, and what reads it, is in "File formats".
 
 The Sampler:
 
 - Load one audio file (wav, flac, ogg, mp3, opus, wv, ape and the other formats the bundled decoders read, and m4a,
   aac, wma and whatever else Windows itself decodes; with FFmpeg installed, also dsf, tta and anything else it
-  decodes) with the Browse button, by dragging it onto the window, or from a saved REAPER project. Files from the
+  decodes; see "File formats") with the Browse button, by dragging it onto the window, or from a saved REAPER project. Files from the
   window load in the background: the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" until it's ready.
   A damaged file of a built-in format (a .wav or .flac the built-in decoders refuse) may still load through FFmpeg;
   the status then says "(decoded by FFmpeg)". Known limit: a saved project loads its sample while REAPER waits, so
@@ -63,9 +71,12 @@ Settings page:
    thin and a note shifted down doesn't go boomy.
 3. Cache folder (edit box), then Browse folder.
 4. Cache size limit (in gigabytes), a slider.
-5. Cache in use (read only).
-6. Clear cache button.
-7. Back button.
+5. Raw sample rate, Raw channels, Raw sample format and Raw byte order: combo boxes for files ending .raw or .pcm
+   (see "Settings").
+6. FFmpeg: the ffmpeg.exe in use, or "Not found" (read only), then Browse for FFmpeg.
+7. Cache in use (read only).
+8. Clear cache button.
+9. Back button.
 
 Keys: Tab and Shift+Tab move through the controls and, past the first or last, out to REAPER's FX window.
 
@@ -94,8 +105,8 @@ The first control on both main pages is a tab control named Player, with two tab
   Switching during playback fades the old player's notes out over 5 ms (its reverb and chorus over 10 ms), so it
   doesn't click. While the Sampler plays, the SoundFont player lets go of its presets' samples (the font stays open,
   so switching back is quick; the presets load again then).
-- Drops load by file type: a .sf2 or .sf3 loads into the SoundFont player and switches to it; any other audio file
-  loads into the Sampler and switches to it.
+- Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz or .dspreset) loads
+  into the SoundFont player and switches to it; any other audio file loads into the Sampler and switches to it.
 - Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
   stays; on the Sampler page a .sf2 does the same.
 - Settings is one page for both. Back returns to the main page that plays.
@@ -104,36 +115,50 @@ The first control on both main pages is a tab control named Player, with two tab
 
 File replaces the old Previous file and Next file buttons, on both main pages. It comes right after Browse.
 
-- It lists the files in the loaded file's folder of that page's kind (audio files on the Sampler page, .sf2 and .sf3
-  on the SoundFont page): names only, alphabetical, ignoring case. The loaded one is selected.
+- It lists the files in the loaded file's folder of that page's kind (audio files on the Sampler page, every
+  instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz and .dspreset): names
+  only, alphabetical, ignoring case. The loaded one is selected. Browse on the SoundFont page offers the same kinds
+  ("SoundFonts and instruments"), and All files.
 - Choosing a file loads it at once. Up and Down on the closed box step through the folder and load each file as you
   go; they stop at the ends and do not wrap. Home and End go to the first and last.
 - With nothing loaded it holds one entry, "No file loaded", and choosing does nothing. A file that has gone shows as
   "<name> (missing)".
-- A file that fails to load gives a beep, the reason in Status, and the box goes back to the loaded file.
+- A file that fails to load gives a beep, the reason in Status, and the box goes back to the loaded file. When
+  something still plays, Status says so: "Can't load x.sfz: why. Still playing Piano.sf2." The message stays for
+  6 seconds, or until the next file loads; then Status says how things are again (such as the keep-length
+  progress).
 - The list is rescanned when the box gets the focus, and rebuilt when the loaded file changes. Arrowing through a list
   of big fonts loads each one in turn.
 
 ## The SoundFont player
 
 It plays a SoundFont 2 (.sf2) or SoundFont 3 (.sf3, Ogg compressed) file on 16 MIDI channels, as a General MIDI
-player does. Notes, program changes, controllers, pitch bend, pressure, sustain, RPN tuning and bend range, and the
-GM, GS and XG reset messages all work. Samples load in the background for the presets in use, and a font shared by
-several instances is kept in memory once.
+player does, and also SF4, SF2Pack, SoundFont 1, DLS, GigaStudio, SFZ and Decent Sampler instruments (see "File
+formats"); the tab and the page keep the name SoundFont. Each instrument file is a font of presets: a DLS or
+GigaStudio file has one preset per instrument, an SFZ or Decent Sampler file is one preset (bank 0, program 1).
+Notes, program changes, controllers, pitch bend, pressure, sustain, RPN tuning and bend range, and the GM, GS and XG
+reset messages all work. Samples load in the background for the presets in use, and a font shared by several
+instances is kept in memory once.
 
 Only the start of each sample is kept in memory: the first quarter second, or the whole sample when it is shorter
-than 1 second. A note starts from that at once, and the rest streams from the disk while it plays: from the font
-file for an .sf2, and from the cache folder (Settings) for an .sf3, whose Ogg samples are decoded once, the first
-time they are needed, and stored there as mono float files, so the next time the font opens nothing is decoded. A
+than 1 second. A note starts from that at once, and the rest streams from the disk while it plays. Uncompressed
+samples stream straight from where they are: the font file for an .sf2, .sf2pack's unpacked copy, a .dls or .gig
+file's own wave data, and an SFZ or Decent Sampler instrument's own WAV or AIFF sample files. Compressed
+samples (an .sf3's Ogg, an .sf4's FLAC, a compressed GigaStudio file, and SFZ or Decent Sampler samples in FLAC,
+Ogg, MP3 and the other compressed formats) are decoded once, the first time they are needed, into the cache folder
+(Settings) as mono float files, and stream from there; the next time the instrument opens nothing is decoded. A
 loop that lies wholly in the first quarter second plays from memory. Each player streams with a thread of its own,
-into a 64 KB ring for each voice that plays past a sample's start. If the disk falls behind, the voice fades out
-and back in rather than clicking (an underrun), and nothing stalls. An offline render waits for the disk, so it is
-exact. The piano of a General MIDI font that needed 24 MB in memory now needs under 1 MB.
+into a 64 KB ring for each voice that plays past a sample's start (a stereo sample plays as two voices). If the
+disk falls behind, the voice fades out and back in rather than clicking (an underrun), and nothing stalls. An
+offline render waits for the disk, so it is exact. The piano of a General MIDI font that needed 24 MB in memory now
+needs under 1 MB. See "Measured numbers" for a 1 GB piano streaming from a USB hard disk.
 
 The SoundFont page, in Tab order:
 
 1. Player (the tab control).
-2. SoundFont: the loaded font and its preset count, read only, like "gm.sf2, 142 presets".
+2. SoundFont: the loaded font, its format and its preset count, read only, like "gm.sf2, 142 presets" (no format
+   word for SoundFont 2 and 3), "Piano.sfz, SFZ, 1 preset", "gm.dls, DLS, 235 presets" or "Strings.gig, GigaStudio,
+   4 presets". The other format words are SF4, SF2Pack, SoundFont 1 and Decent Sampler.
 3. Browse button.
 4. File: the font files in that folder.
 5. Mode: All channels or One preset.
@@ -205,10 +230,26 @@ play, and the ones it can't read are silent (the player keeps trying to load the
 
 - "Ready: gm.sf2, 142 presets"
 - "Loading samples for 3 presets" ("1 preset" when it is one)
+- "Loading Piano.sfz": an instrument opening in the background from the window (an SFZ reads every sample file's
+  header first). The window stays usable, and what played before plays until it is ready.
 - "No SoundFont loaded"
 - "Missing: <path>": the file in the project is gone. The state keeps its path and settings, so the project still
   saves and comes back right if the file returns.
-- "Can't load the SoundFont: <reason>": a damaged or unsupported file. It never crashes anything.
+- "Can't load x: <reason>": a damaged or unsupported file, with " Still playing y." when something still plays. It
+  never crashes anything.
+- After "Ready: ..." or "Loading samples ...", what the instrument couldn't do, in the same line:
+  - its problem: "Missing 3 samples (first: Piano C4.wav)" (those regions are left out, the rest plays), "2 samples
+    can't be read (first: ...)", "Can't unpack x.sf2pack (it may be damaged)", or the GigaStudio restart message
+    (below);
+  - the settings it ignored: "Ignored 12 SFZ settings it doesn't support (first: lfo01_freq)" (also "Decent
+    Sampler settings" and "GigaStudio settings"). Each different setting name counts once.
+
+  For example: "Ready: kit.sfz, SFZ, 1 preset. Missing 1 sample (first: gone.wav). Ignored 1 SFZ setting it doesn't
+  support (first: eq1_freq)". The line changes only when the instrument does (a problem found while samples load
+  appears once), so it doesn't chatter.
+- "A GigaStudio file crashed the reader; save your project under a new name and restart REAPER": libgig crashed on
+  a damaged .gig file and Samplosis caught it. Every GigaStudio load is refused until REAPER restarts, since the
+  memory may be damaged. Other formats still load.
 
 ### The SoundFont state lines
 
@@ -272,6 +313,101 @@ notes on 64-sample boundaries, so each note is aligned by cross-correlation firs
   and the closed hat (plus 7.2 percent) are brighter in Samplosis, because a fully open filter is a wire here and
   FluidSynth low-passes at about 19.9 kHz. A font with more energy above 15 kHz could cross the allowance.
 - The reverb and chorus are not compared.
+
+## File formats
+
+### Sound files
+
+The Sampler loads these, and SFZ and Decent Sampler instruments use them as their samples. A file goes through four
+stages in turn, and the first one that reads it wins. The built-in and library stages go by the file's first bytes,
+not its name, so a misnamed file still loads.
+
+1. Built in (decoders compiled into the plugin):
+   - WAV in any of its containers: RIFF, RIFX, RF64 and Wave64 (.wav, .w64, .rf64), with 8 to 32-bit integer,
+     32 and 64-bit float, A-law, mu-law and ADPCM data;
+   - AIFF and AIFF-C (.aif, .aiff, .aifc);
+   - CAF (.caf), uncompressed only: 8 to 32-bit integer and 32 or 64-bit float, either byte order (an ALAC or other
+     compressed CAF says so plainly);
+   - FLAC (.flac), Ogg Vorbis (.ogg, .oga) and MP3 (.mp3);
+   - raw PCM: files ending .raw or .pcm, read as the raw settings say (see "Settings"), since they have no header.
+2. Library (the codecs vendored in src\codecs): Opus (.opus), WavPack (.wv, including DSD WavPack and files from
+   before version 4) and Monkey's Audio (.ape).
+3. Windows (Media Foundation, whatever this Windows decodes; files only): on Windows 11 here that is AAC and ALAC
+   in .m4a, .mp4 and .m4b, WMA, AC-3 and AMR (.amr, .3gp). Other machines may decode more or less (a Windows "N"
+   edition needs the Media Feature Pack). The status then says "Ready: x.m4a (decoded by Windows)".
+4. FFmpeg, if it is installed (files only): anything else it decodes, such as DSF and DFF (DSD), TTA, Musepack
+   (.mpc), Speex (.spx), E-AC-3, DTS, MLP and TrueHD, AU (.au, .snd), VOC, and the sound of Matroska, WebM and
+   QuickTime files (.mka, .mkv, .webm, .mov). While it works the status says "Decoding x.dsf with FFmpeg", then
+   "Ready: x.dsf (decoded by FFmpeg)". A damaged file of a built-in format that the built-in decoders refuse may
+   still be read by FFmpeg. FFmpeg runs hidden at below-normal priority; if it sends nothing for 60 seconds it is
+   stopped and the status says "FFmpeg took too long to decode it". Without FFmpeg, a file only it could read says
+   "FFmpeg isn't installed; this format needs it".
+
+Browse and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
+.rf64 .caf .raw .pcm .opus .wv .ape .m4a .aac .mp4 .wma .ac3 .amr .3gp .alac .dsf .dff .tta .mka .webm .au .snd
+.mpc .spx .oga .m4b .eac3 .dts .mlp .thd .voc .mov .mkv. A decoded file is at most 2 GiB of float samples (about
+1.5 hours of stereo at 48 kHz); a longer one is refused with a plain reason.
+
+### Instruments (the SoundFont page)
+
+The file's first bytes choose the reader, then its name.
+
+- SoundFont 2 (.sf2): read by Samplosis itself. Samples stream from the file.
+- SoundFont 3 (.sf3, Ogg Vorbis or Opus samples) and SF4 (.sf4, FLAC samples, as Cognitone's sf2convert writes
+  them): samples decoded once by the built-in and library decoders into the cache folder.
+- SF2Pack (.sf2pack, the whole sample block compressed in one stream): unpacked once into the cache folder, in the
+  background, the first time a preset is used.
+- SoundFont 1 (.sbk): read as SoundFont 2 with the version 1 rules.
+- DLS levels 1 and 2 (.dls), such as Windows' own C:\Windows\System32\drivers\gm.dls: 8 and 16-bit PCM waves stream
+  from the file; ADPCM waves are decoded once into the cache. Instruments are presets (drum instruments in bank 128),
+  articulations become envelopes, LFOs and modulators, and conditional chunks are evaluated.
+- GigaStudio and Gigasampler (.gig, versions 2 to 4, and the .gx01 extension files next to it): read through
+  libgig. Uncompressed waves stream from the file; compressed ones are decoded once into the cache. Velocity,
+  layer, keyswitch, round robin, random, release trigger, stereo and controller dimensions are mapped, with EG1,
+  EG2, the filter and the three LFOs.
+- SFZ (.sfz, text): read by Samplosis, with #include and #define, default_path, note_offset and octave_offset. Each
+  sample file is a sound file of any format above: WAV and AIFF stream from the file, others are decoded once into
+  the cache. Round robins, random layers, keyswitches, CC ranges, crossfades, release triggers (with rt_decay),
+  groups and off_by, polyphony, envelopes, filters, LFOs and bend ranges play.
+- Decent Sampler (.dspreset, XML): read by Samplosis (yxml checks the XML) into the same player as SFZ, with
+  inheritance from groups, round robins, tags and silencing, release triggers and CC ranges.
+
+Opening an SFZ or Decent Sampler instrument reads every sample file's header (never decoding a file to do so), so it
+opens in the background from the window. The headers are remembered in the cache folder, so the next open is quick.
+Samples that are missing or can't be read leave their regions out; the rest plays, and the status names the first
+(see "Status texts"). When none is left, the instrument doesn't load and that is the reason.
+
+### What SFZ, Decent Sampler and GigaStudio settings aren't supported
+
+These are counted: the status says how many different ones a file used, and the first ("Ignored 12 SFZ settings it
+doesn't support (first: lfo01_freq)"). The rest of the instrument plays without them.
+
+- SFZ: CC modulation (every opcode ending _onccN, _ccN or _curveccN), offset_random, amp_random, pitch_random,
+  delay, the eq opcodes, ampeg_vel2 and ampeg_start, LFO fades, lfo3 and higher, lfo2 to volume or cutoff, set_cc,
+  note_selfmask, position, count, sustain_cc, amp_keytrack; the one-pole, peaking, 4-pole and 6-pole filter types
+  (those regions play unfiltered); unknown loop_mode, trigger, off_mode and crossfade curve values; more than 4 CC
+  ranges in a region; made samples other than *sine, *silence and *noise; and unknown headers (counted as
+  <name>). Labels, hints, image, md5, output, off_time, and the contents of <curve>, <effect> and <midi> are read
+  past without counting. Approximations: LFOs are triangles (SFZ's default is a sine); when a region has both a
+  filter and a pitch envelope, the filter envelope's times serve both; release_key plays as a release trigger and
+  off_mode=time as normal.
+- Decent Sampler: glide, loop crossfades, loopDuringRelease, curves, playbackMode, slices, output routing,
+  legato, onLoCC and onHiCC, delay, silencingDecay and the other attributes not listed above; the <ui>, <effects>,
+  <modulators>, <midi>, <tags> and <keyswitches> elements (counted once each, with their contents read past);
+  trigger=continuous (plays as attack); a second silencing tag. Knob values set through <ui> are not applied (the
+  preset plays at the bound parameters' defaults), Decent Sampler's own limiter headroom isn't copied (a preset may
+  play louder than in Decent Sampler), and .dslibrary bundles (zips) aren't read: unzip them and open the .dspreset.
+- GigaStudio: EG1 and EG2 pre-attack and their controllers, the filter cutoff and resonance controllers, velocity
+  to cutoff, a filter LFO beside the amplitude LFO at another speed, EG3 (the pitch envelope), dimension bypass,
+  sustain defeat, mid/side decoding, ping-pong and backward loops (played forward), a second loop, velocity
+  attenuation without a crossfade, controller crossfades, release triggers that don't come on note-off, instrument
+  attenuation, MIDI rules, instrument scripts, channel aftertouch, smart MIDI and unknown dimensions (each plays the
+  zone value 0 selects), and a fifth controller dimension. Approximations: EG1's second decay, EG2's cutoff
+  scaling, the filter types (mapped to the player's filters with LinuxSampler's frequency map), LFO depths, and the
+  amplitude and filter LFOs sharing one LFO. Round robins count per region, where GigaStudio counts per key.
+
+Real files: the CC0 Karoryfer Emily Guitar SFZ library ignores 1 setting in emily_basic.sfz (amp_random), 1 in
+emily_chords.sfz (delay) and none in emily_five_voice.sfz (see "Measured numbers").
 
 ## The parameters
 
@@ -350,6 +486,14 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 - Stretcher: `stretcher signalsmith` (default) or `stretcher rubberband`. Keep the tone: `keep_tone off` (default) or
   `keep_tone on`. They apply to every Samplosis in every project. Changing either makes new keep-length copies; the
   old ones stay in the cache, so changing back is instant.
+- Raw sample rate (`raw_rate`, default 44100; 8000 to 192000 from a list), Raw channels (`raw_channels 1` or `2`,
+  default 2), Raw sample format (`raw_format s16`, `s24`, `s32`, `f32` or `u8`, default s16) and Raw byte order
+  (`raw_endian little` or `big`, default little): how a file ending .raw or .pcm is read, since it has no header to
+  say. Changing one applies the next time a raw file loads, and the status says so.
+- FFmpeg (`ffmpeg_path`, empty by default): the ffmpeg.exe to use (ffprobe.exe must be beside it). Empty means it is
+  looked for on PATH, then in the WinGet package folder
+  (`%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\*\bin\ffmpeg.exe`). The Settings page shows the one found,
+  or "Not found". Samplosis never installs it.
 - The environment variable SAMPLOSIS_SETTINGS names a different settings file (the tests use it).
 
 ## Build, install and test
@@ -360,7 +504,9 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 - `python -m pytest tests -q` runs the tests (needs numpy, soundfile and psutil). Some of them open test windows.
 - `python tests\measure.py` prints the CPU and memory numbers below, the SoundFont ones too when
   E:\samplepacks\soundfonts\just_t4_fixed.sf2 exists. Set MEASURE_DIR to a folder on a roomy drive; it needs a few GB for a
-  while and deletes its work folder at the end.
+  while and deletes its work folder at the end. MEASURE_PARTS picks parts (sampler, sf2, stream, dls, sfz; all by
+  default). The stream part writes a 1 GB instrument to MEASURE_STREAM_DIR (default
+  E:\samplepacks\_build\samplosis_stream_test) and deletes it; MEASURE_SFZ names a real .sfz to try.
 
 ## Measured numbers
 
@@ -394,7 +540,7 @@ warm-cache times; a first read from a cold disk is slower.
   before), and a second instance on the same font 1.95 MB idle and 2.10 MB with a piano note playing (1.81 before:
   each voice that streams has a 64 KB ring). The time spent in smp_synth_process at real-time pace is the same as
   before; the streamer thread adds about 1 to 1.5 percent of a core for 66 streaming voices. The numbers below are
-  the stage 2 ones.
+  the stage 2 ones; "Formats (stage 3)" below has the same measurements with every format in.
 - Opening the font (headers and preset lists only): 2 ms and 1 to 3 MB.
 - Loading a preset's samples, time and memory:
   - program 0, the acoustic piano: 11 to 12 ms, 24 MB (23.8 MB of sample data);
@@ -411,6 +557,67 @@ warm-cache times; a first read from a cold disk is slower.
 - A second instance on the same font, with the same preset playing: 2.3 MB more (2.2 to 2.3 across runs). The target was
   under 2 MB: **missed** by about 0.3 MB. The samples are shared; the 2.3 MB is the second player's own memory (this has not been broken down yet).
 
+### Formats (stage 3)
+
+Measured on 2026-10-29 on the same machine, with `python tests\measure.py` (MEASURE_DIR on D:), the SoundFont parts at
+below-normal priority. E: is a USB hard disk.
+
+just_t4_fixed.sf2 against the stage 2 numbers above (the rule: at most 10 percent worse), four runs:
+
+- Opening the font: 3 to 4 ms in a single open, 2.18 ms median over 40 opens (1.83 to 2.58), against stage 2's 2 ms;
+  1.6 to 3.2 MB, against 1 to 3 MB.
+- Loading the three presets: 2, 1 and 6 ms, with 0.82, 1.40 (in all) and 6.68 MB (in all) of samples in memory,
+  against 11, 8 and 7 ms and 52.4 MB in all. Much better: only the heads are loaded.
+- CPU for 66 organ voices: 2.63 to 3.05 percent with reverb and chorus off (stage 2: 2.7), 2.88 to 3.18 percent with
+  them on (stage 2: 2.9). The medians, 2.67 and 3.08, are within the 10 percent; single runs vary by about 0.4.
+- A second instance with a note playing: 2.1 to 2.7 MB, against 2.3 MB. The worst run is 17 percent more: the
+  64 KB ring of each streaming voice, accepted when streaming came in.
+- The Sampler, for reference: 0.79 and 0.85 percent CPU for 16 voices (keep length off and on), 8.9 MB idle, 23.2 MB
+  with a 60 second sample and its 97 copies.
+
+A GigaStudio-sized instrument streaming from E:. measure.py writes an SFZ piano to
+E:\samplepacks\_build\samplosis_stream_test: 88 keys, 4 velocity layers, 352 stereo 16-bit 44.1 kHz WAV files of
+17 seconds each, 1.06 GB in all, made from 8 repeated test tones, and deletes it afterwards.
+
+- What "cold" means here: Windows keeps files it has read in memory, and the cache can't be emptied without
+  administrator rights. So after writing, each file is opened once unbuffered while nothing else has it open, which
+  makes Windows drop its cached pages. Proof that it worked: a test file then read at 23 to 28 MB per second (the
+  USB disk), and at 2 to 3.4 GB per second the second time (from memory). Before each run everything is closed and
+  purged this way, and the frames that stream were never read before, so they come from the disk: the disk counters
+  showed 54 MB read during the 64-voice runs and 105 MB during the 128-voice ones, which is what the notes need.
+- Opening it cold (every sample file's header read): 4.9 to 5.1 seconds. Opening it again: 10 ms (the headers are
+  remembered in the cache folder). Memory for the open instrument: 0.2 to 1.3 MB.
+- Loading its heads cold (the first quarter second of all 704 mono halves): 8.3 to 8.6 seconds including the open,
+  15.6 MB of heads for 1.06 GB of samples; the process grew 17 to 19 MB (the player and the heads).
+- 64 voices (32 stereo notes struck within 43 ms, each a different file) for 10 seconds in real time from the cold
+  disk, four runs: 0, 690, 708 and 1109 underruns (counted per voice and per 256-frame block, out of about 120,000).
+  Compared with the same notes rendered offline (which waits for the disk), the dropouts were in the first second
+  (0.5 to 0.8 s: every voice needs its first read from the disk at once, and 32 cold seeks take longer than the
+  quarter second of head), plus one 100 ms window at 4.5 seconds in two runs. Elsewhere the output was exact. CPU:
+  0.67 s for the 10 s; memory grew 2 to 4 MB while playing (the rings).
+- 128 voices (64 stereo notes struck within 85 ms), five runs: 676 to 11118 underruns, all in the first 1.5
+  seconds; exact after that.
+- The same piano from the file cache (warm, read before): 0 underruns at 128 voices, in runs of 1, 3 and 10 seconds.
+- So streaming keeps up with 64 voices from a USB hard disk once notes are under way, but a big chord struck all at
+  once on samples never read since the computer started can drop out for about half a second. **The target of no
+  underruns from a cold disk is missed** for that case; see "Known limits".
+
+gm.dls (C:\Windows\System32\drivers\gm.dls, read only): opens in 12 ms with 235 presets and 495 samples (1.5 to
+1.9 MB). The piano loads in 4 ms (0.5 MB of samples). A C major chord and the C above, offline and in real time:
+peak minus 13.5 dBFS, all finite, no underruns, no ignored settings.
+
+A real SFZ library: the Karoryfer Emily Guitar (CC0, from github.com/sfzinstruments/karoryfer.emilyguitar, 121 MB,
+323 WAV samples; downloaded for the test and deleted afterwards). Five notes from C3 to G4 at velocities 60 to 127,
+offline and in real time:
+
+- emily_basic.sfz: opens in 7 ms, loads in 21 ms (13.6 MB of heads), peak minus 12 dBFS, 10 voices, no underruns;
+  ignores 1 setting (amp_random).
+- emily_five_voice.sfz: 216 samples, loads in 15 ms, peak minus 2.3 to minus 2.9 dBFS (five layered voices a
+  note), 25 voices, no underruns; ignores nothing.
+- emily_chords.sfz: loads in 18 ms, peak minus 10 to minus 12 dBFS, no underruns; ignores 1 setting (delay).
+- Every render was finite. The offline and real-time renders agree within 0.5 dB in level (RMS) and 1.6 dB in
+  peak.
+
 ## Known limits
 
 - Keep-length copies exist only within 48 semitones of the root. Keys further away are resampled (pitch by speed).
@@ -421,6 +628,21 @@ warm-cache times; a first read from a cold disk is slower.
   that first note is resampled. Narrowing the key range (Lowest note, Highest note) renders less and frees the
   copies it no longer reaches.
 - One sample per instance in the Sampler.
+- Streaming from a slow disk: a big chord struck all at once, on samples not read since the computer started, can
+  drop out for about half a second on a USB hard disk before the disk catches up (see "Formats (stage 3)" in the
+  measured numbers). Notes already playing, and samples read before, keep up. Each sample keeps only a quarter
+  second in memory.
+- A saved project loads its sample while REAPER waits. A sample not yet in the cache that needs FFmpeg can hold up
+  opening the project while it decodes (up to 60 seconds without output before FFmpeg is given up).
+- Windows decoding: when Windows marks an encoder delay itself, the padding at the end isn't trimmed; files that
+  give their delay only in an iTunes tag keep it (a few milliseconds of silence at the start); a bare AC-3 stream
+  keeps its 288-frame delay. If Windows' decoder ever hangs, every later file that needs Windows fails after 5
+  seconds until REAPER restarts.
+- A decoded file is at most 2 GiB of float samples (about 1.5 hours of stereo at 48 kHz). Decoding one near that
+  size briefly needs about twice as much memory.
+- Not yet tried with real files: Opus with more than 2 channels, some WavPack kinds (mono, 8-bit, multichannel,
+  .wvc correction files, DSD), 24 and 8-bit Monkey's Audio, a real SoundFont 1 bank (.sbk; only a hand-made one),
+  and GigaStudio extension files (.gx01).
 
 ### Not in the SoundFont player yet
 
@@ -430,9 +652,26 @@ warm-cache times; a first read from a cold disk is slower.
 - NRPN and SysEx beyond the GM, GS and XG resets are ignored. There are no data increment and decrement (CC96, CC97).
 - Reverb and chorus are not on the extra outputs (those channels are dry).
 - Linked modulators are ignored (as in FluidSynth).
+- One loader thread serves every instance: while an SF2Pack unpacks (up to about 10 seconds), other instances'
+  presets wait. If the cache folder doesn't exist the first time an SF2Pack is used, that pack stays unplayable until
+  it is opened again.
+- DLS: a bank with both bank select bytes set uses only the MSB; when a region has its own articulation it replaces
+  the instrument's whole articulation (the usual reading of the DLS text); the sustain level is read as 1000 minus
+  the level in centibels (Wine and SpessaSynth agree), which can differ by up to 4 dB from other readings.
+- SFZ and Decent Sampler: keyswitch keys (sw_lokey to sw_hikey, and sw_last keys) never sound themselves; a release
+  region uses the same random draw as its note-on (so it pairs with the attack's round robin); polyphony limits
+  count per channel and group; a follower region whose leader was stolen isn't counted by polyphony. Decent
+  Sampler's random round robins can repeat the same sample. Formats other than WAV, AIFF, FLAC and Ogg are opened
+  once to read their length at the first open (later opens use the cache folder).
+- GigaStudio: if libgig crashes on a damaged file, every GigaStudio load is refused until REAPER restarts (other
+  formats are fine). Round robins count per region, not per key. File names with characters outside Windows'
+  ANSI code page open through 8.3 short names, which the drive must have. Whether ReleaseTriggerDecay 0 means the
+  fastest decay or none in GigaStudio itself isn't confirmed (Samplosis follows LinuxSampler).
+- The status shows the instrument's first problem (and at most one more), and only the first ignored setting.
 
 ## What is still to come
 
-Done so far: stage 1 (one sample, keep length), the stretcher choice, and stage 4 (SoundFonts, with 16 stereo outputs
-for them). Still to come, from the design (docs\superpowers\specs): several samples and zones in the Sampler, filter and
+Done so far: stage 1 (one sample, keep length), the stretcher choice, stage 4 (SoundFonts, with 16 stereo outputs
+for them), and stage 3, many formats (the sound files and instruments in "File formats", streaming, and loading in
+the background). Still to come, from the design (docs\superpowers\specs): several samples and zones in the Sampler, filter and
 modulation, the command line tool, the tempo lock, and 16 outputs for the Sampler's zones.

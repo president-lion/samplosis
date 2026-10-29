@@ -99,3 +99,58 @@ Parked:
 - The thread pool is never closed, so one pool is leaked each time the DLL is unloaded.
 - A note-on's copy can wait behind other instances' running jobs (queued ones are not reordered across instances).
 - At speeds above 100 %, a Signalsmith copy of a tone that stops dead fades over its last few milliseconds.
+
+## Stage 3: many formats (2026-10-29)
+
+The plan is docs\superpowers\plans\2026-10-29-samplosis-formats.md, and its ledger (rulings and every deferred minor)
+is .superpowers\sdd\2026-10-29-samplosis-formats\progress.md. These are the items parked from it that still matter.
+
+Streaming:
+- A big chord struck all at once from a cold USB hard disk drops out for about half a second (measured in Task 12:
+  0 to 1109 underruns at 64 voices, all in the first second but one 100 ms window; 676 to 11118 at 128 voices).
+  The quarter-second head can't cover 32 or more cold seeks done one after another. Ideas, for Mike to choose: a
+  longer head as a setting, several reads in flight at once so the disk can order them, or reading a stereo file's
+  two halves in one read (each half reads the same frames now).
+- The look-ahead can miss a gap just before the post-loop head (a hard cut during an underrun), and a short loop is
+  read again on every lap.
+- The look-ahead's quarter-ring cap clicks at pitches above about 43 times real time.
+- Streaming looped samples keep a post-loop head, up to twice the head memory on odd fonts.
+- One event is leaked per foreign thread that reads, and the Sampler's stream plays failed reads as silence.
+- A second instance on the same font costs up to 2.7 MB with a note playing (2.3 MB in stage 2): the 64 KB ring of
+  each streaming voice, accepted.
+
+Decoding:
+- Float samples are sanitised everywhere; decoding near the 2 GiB ceiling briefly needs about 4 GB (a planar copy;
+  mono could skip it). A lying header on a file over 8 MB can reserve up to 2 GiB for a moment.
+- No tests yet for Opus with more than 2 channels, mono, 8-bit and multichannel WavPack, .wvc hybrid files, DSD,
+  and 24 and 8-bit Monkey's Audio. Monkey's AVX-512 path is untested on older processors, and Opus's alloca stack
+  depth on worker threads wasn't measured.
+- Windows: end padding isn't trimmed when Windows marks the delay itself; a format change mid-stream truncates
+  silently; files with only an iTunSMPB tag keep their delay. The "busy" message isn't limited to Windows
+  extensions. A stuck Windows decoder makes every later Windows load fail after 5 s for the life of the process.
+- FFmpeg: its 200 ms drain after it exits could cut a tail; a destroy that gives up after 2 s has no test; the host
+  callback is requested under the loader's lock (fine for REAPER).
+- A saved project waits for an uncached FFmpeg decode (up to 60 s per file without output) while it opens.
+
+Instruments:
+- One loader thread serves every instance: an SF2Pack unpack delays other instances' preset loads (up to about
+  10 s). With no cache folder at the first use, a pack stays broken until it is opened again.
+- SoundFont 1 is tested only with a hand-made bank: ask Mike for a real .sbk.
+- DLS: region modulator lists aren't deduplicated; MSB and LSB banks collapse to the MSB.
+- Region conditions: a lokey above 127 makes a preset fall back to scanning every region; retired round-robin
+  counter arrays are kept until the synth is freed (bounded).
+- SFZ: test hooks are compiled into the plugin (inert); probe-cache reads don't refresh an entry's time, so a busy
+  entry can be trimmed first; only one decode problem fits in the status; an unreachable share can cost up to four
+  timeouts; a follower whose leader was stolen alone isn't counted by polyphony; offset_random and CC modulation
+  aren't supported.
+- Decent Sampler: random round robins can repeat; <ui> knob values aren't applied; .dslibrary zips aren't read;
+  there's no limiter headroom; the seqLength inference counts samples that give their own seqLength; only negative
+  dB releaseTriggerDecay is tested; the tag and region cap messages have no tests.
+- GigaStudio: libgig is patched (four read fixes) and may have more bugs in paths the fixtures don't reach; an SEH
+  unwind may still run C++ destructors on an untrusted heap; Script's name resize is unbounded but unreachable.
+  Extension files (.gx01) have no test. Round robins count per region set, not per key.
+
+The window:
+- Listen in REAPER: the SoundFont status now adds the instrument's problem and ignored settings after "Ready: ...".
+  It changes only when the instrument does, but whether NVDA reads it at the right moments is untested.
+- The SoundFont tab and label keep the name SoundFont for every instrument format (Mike knows it by that name).

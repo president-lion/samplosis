@@ -44,6 +44,11 @@ typedef struct Plug {
                                         loading x to load y" is load_note */
   char load_note[1200];
   char load_err[1900];
+  /* the last failed or stopped window load is told (in the status, for a window open or opened soon) until
+     told_until (GetTickCount64), or until the next load succeeds or a state is applied; after that the status says
+     how things are again (keep-length progress, say) rather than hiding it behind an old failure */
+  char told[1900];
+  ULONGLONG told_until;
 } Plug;
 
 extern const char *const smp_param_label[SMP_NALLPARAMS];    /* "Root note", "Volume", ... "SoundFont volume" */
@@ -73,8 +78,11 @@ int smp_plug_load_font(Plug *P, const char *path, char *err, int cap);  /* 1 loa
 int smp_plug_load_font_start(Plug *P, const char *path, char *err, int cap);
 SmpSynth *smp_plug_synth(Plug *P);                 /* ask each time: activate at a new rate replaces the player,
                                                       so a pointer kept from before may have been freed */
-void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "No SoundFont loaded" or
-                                                          "Missing: <path>" */
+void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "Piano.sfz, SFZ, 1 preset",
+                                    "GM.dls, DLS, 235 presets", "No SoundFont loaded" or "Missing: <path>" (SF2 and SF3
+                                    have no format word, as before; every other format names itself) */
+void smp_plug_still_playing(Plug *P, char *out, int cap);   /* " Still playing y." (with its leading space) after a
+                                    load that failed, when something plays (the font or sample that plays); else "" */
 int smp_plug_sf_set(Plug *P, const char *line);    /* 1 taken; 0 the line didn't read (nothing changed: beep).
                                     One state line, like "sf_mode one", "sf_preset 0 25",
                                     "sf_channel_preset 3 0 25", "sf_channel_preset 3 song" (the song chooses again)

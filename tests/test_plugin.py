@@ -822,6 +822,17 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
         write_sf_font(d / n)
     (d / "notes.txt").write_text("not a font")
     wav = P.sample("drop A3.wav")
+    # a folder of every instrument kind: a real .sfz (one sample missing, one setting it can't play) and .dls; the
+    # other kinds only need their names for the File combo box
+    from test_dls import make_dls
+    k = tmp_path / "kinds"
+    k.mkdir()
+    P.sample("s.wav")
+    os.replace(tmp_path / "s.wav", k / "s.wav")
+    (k / "kit.sfz").write_text("<region> sample=s.wav key=60 eq1_freq=100\n<region> sample=gone.wav key=62\n")
+    make_dls(k / "bank.dls")
+    for n in ("g.gig", "h.dspreset", "i.sf4", "j.sf2pack", "l.sbk", "m.sf2", "n.sf3", "notes.txt", "o.wav"):
+        (k / n).write_bytes(b"x")
     text = P.script(P.sample())
     out = gui(P, tmp_path, text, ["key right", "read SoundFont", "read File", "dialog pick %s" % (d / "a.sf2"),
                                   "focus Browse", "key enter", "read SoundFont", "list File", "focus File", "key down",
@@ -833,7 +844,11 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
                                   "dialog pick %s" % wav, "focus Browse", "key enter", "read SoundFont",
                                   "read Status", "state sample", "counts",
                                   "key tab ctrl", "dialog pick %s" % (d / "a.sf2"), "focus Browse", "key enter",
-                                  "read Sample", "read Status", "state plays", "counts"])
+                                  "read Sample", "read Status", "state plays", "counts",
+                                  # a dropped .sfz and .dls go to the SoundFont tab; File lists every instrument kind
+                                  "drop %s" % (k / "kit.sfz"), "say", "read SoundFont", "list File",
+                                  "read Status", "drop %s" % wav, "say", "drop %s" % (k / "bank.dls"), "say",
+                                  "read SoundFont", "counts"])
     r = [x[1] for x in got(out, "read")]
     f = got(out, "focus")
     st = [x[0] for x in got(out, "state")]
@@ -856,7 +871,19 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     assert st[3].startswith('sample "%s"' % wav)
     # a .sf2 through the Sampler page's Browse: the sampler's error; the sampler still plays its sample
     assert r[10].startswith("drop A3.wav, ") and r[11].startswith("Can't load a.sf2: ")
+    assert r[11].endswith(". Still playing drop A3.wav."), r[11]       # the failure says what still plays
     assert st[4] == "plays sampler" and c[2] == "beeps 2"
+    assert f[-3] == ["Tab", "Player", "SoundFont"], out              # a dropped .sfz: the SoundFont tab
+    assert r[12] == "kit.sfz, SFZ, 1 preset", out
+    assert got(out, "list")[1] == ["File", "bank.dls", "g.gig", "h.dspreset", "i.sf4", "j.sf2pack", "kit.sfz",
+                                   "l.sbk", "m.sf2", "n.sf3"], out    # every kind; notes.txt and o.wav aren't
+    assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples for 1 preset. ")
+    assert r[13].endswith(". Missing 1 sample (first: gone.wav). "
+                          "Ignored 1 SFZ setting it doesn't support (first: eq1_freq)"), out
+    assert f[-2] == ["Tab", "Player", "Sampler"]
+    assert f[-1] == ["Tab", "Player", "SoundFont"], out              # a dropped .dls: the SoundFont tab
+    assert r[14] == "bank.dls, DLS, 5 presets", out
+    assert c[3] == "beeps 2", out
 
 
 def test_gui_sfz_loads_in_background(P, tmp_path):
@@ -881,7 +908,7 @@ def test_gui_sfz_loads_in_background(P, tmp_path):
     ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
     assert ms[1] < 500, out                                          # the drop returned at once
     assert r[0] == "Loading big.sfz", out
-    assert r[1] == "big.sfz, 1 preset", out
+    assert r[1] == "big.sfz, SFZ, 1 preset", out
     assert r[2].startswith("Ready: big.sfz") or r[2].startswith("Loading samples for "), out
     assert "state: plays soundfont" in out and ('state: soundfont "%s"' % sfz) in out
     assert got(out, "counts")[0][0] == "beeps 0"
@@ -957,7 +984,7 @@ def test_gui_load_does_not_block(P, tmp_path):
     out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % f, "focus Browse", "clock", "key enter", "clock",
                                   "pump 300", "read Status", "read Sample", "wait", "read Status", "read Sample",
                                   "state", "counts", "dialog pick %s" % junk, "focus Browse", "key enter", "wait",
-                                  "status", "counts"],
+                                  "status", "counts", "pump 6500", "status", "read Status"],
               env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
     r = [x[1] for x in got(out, "read")]
     ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
@@ -969,8 +996,11 @@ def test_gui_load_does_not_block(P, tmp_path):
     assert ('state: sample "%s"' % f) in out
     assert got(out, "counts")[0][0] == "beeps 0"
     # a load that fails: told in Status with a beep, and kept in the plugin's status for a window opened later
-    assert "status: Can't load junk.wav: it isn't a sound file Samplosis can read" in out, out
+    assert ("status: Can't load junk.wav: it isn't a sound file Samplosis can read. Still playing tone A3.tta."
+            in out), out
     assert got(out, "counts")[1][0] == "beeps 1"
+    # and only for a while: then the status says how things are again (it doesn't hide them for good)
+    assert "status: Ready: tone A3.tta (decoded by FFmpeg)" in out and r[4] == "Ready: tone A3.tta (decoded by FFmpeg)", out
 
 
 @pytest.mark.skipif(not FFMPEG, reason="ffmpeg isn't installed")
@@ -988,7 +1018,7 @@ def test_gui_load_of_other_kind_is_told(P, tmp_path):
               env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
     r = [x[1] for x in got(out, "read")]
     assert r[0] == "Stopped loading tone A3.tta to load kit.sfz", out
-    assert r[1] == "kit.sfz, 1 preset", out
+    assert r[1] == "kit.sfz, SFZ, 1 preset", out
     assert got(out, "counts")[0][0] == "beeps 0"
 
 

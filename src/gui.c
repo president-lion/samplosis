@@ -26,8 +26,9 @@
    open; a chosen preset the font lacks shows as "Bank b program p (not in this font)".
    Files. Each main page has Browse and a File combo box: the files of its kind in the loaded file's folder, the
    loaded one selected; choosing one (Up and Down too) loads it at once. Both load only their own page's kind (a file
-   of the other kind gives that player's error). A dropped file goes by its extension: a .sf2 or .sf3 loads as the
-   SoundFont, an audio file into the sampler, and the tab follows.
+   of the other kind gives that player's error). A dropped file goes by its extension: an instrument (.sf2 .sf3 .sf4
+   .sf2pack .sbk .dls .gig .sfz .dspreset) loads into the SoundFont player, an audio file into the sampler, and the
+   tab follows.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
 #include <commctrl.h>
@@ -651,35 +652,33 @@ static void refresh(Gui *g) {
   if (g->page == PG_SETTINGS) show_settings(g);
 }
 
+/* the SoundFont page's kinds: every instrument format the SoundFont player opens, for the File combo box and drops
+   (Browse's filter below lists the same) */
+static const wchar_t *const font_exts[] = {L".sf2", L".sf3", L".sf4", L".sf2pack", L".sbk", L".dls", L".gig", L".sfz",
+                                           L".dspreset"};
 static bool font_name(const wchar_t *n) {
-  const wchar_t *dot = wcsrchr(n, L'.');
-  return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3") || !_wcsicmp(dot, L".sfz") ||
-                 !_wcsicmp(dot, L".dspreset") || !_wcsicmp(dot, L".gig"));
+  const wchar_t *dot = wcsrchr(n, L'.'); size_t i;
+  if (!dot) return false;
+  for (i = 0; i < sizeof font_exts / sizeof font_exts[0]; i++) if (!_wcsicmp(dot, font_exts[i])) return true;
+  return false;
 }
 /* a file to load: LOAD_SAMPLE or LOAD_FONT (as the page's Browse or File combo box asks: a file of the
-   other kind gives that player's error), or LOAD_DROPPED: by its extension, a .sf2 or .sf3 as the SoundFont
+   other kind gives that player's error), or LOAD_DROPPED: by its extension, an instrument as the SoundFont
    (which then plays), anything else as the sample (which then plays) */
 enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
 /* A sample loads in the background (the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" meanwhile, and
    a failure is told when it comes, in refresh); so does a SoundFont ("Loading x.sfz": an SFZ reads every sample
    file's header), which then plays. */
 static void load_path_w(Gui *g, const wchar_t *w, int how) {
-  char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT, dropped = how == LOAD_DROPPED;
+  char u[1100], err[700], msg[1900], still[400]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT;
+  int ok;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
-  if (!sf) {
-    if (!smp_plug_load_start(g->P, u, dropped, err, sizeof err)) {
-      const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
-      if (b2 > base) base = b2;
-      snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
-      say_note(g, msg); beep();
-    } else g->note[0] = 0;
-    refresh(g);
-    return;
-  }
-  if (!smp_plug_load_font_start(g->P, u, err, sizeof err)) {
+  ok = sf ? smp_plug_load_font_start(g->P, u, err, sizeof err) : smp_plug_load_start(g->P, u, how == LOAD_DROPPED, err, sizeof err);
+  if (!ok) {                                  /* refused at once: "Can't load x: why. Still playing y." */
     const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
     if (b2 > base) base = b2;
-    snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
+    smp_plug_still_playing(g->P, still, sizeof still);
+    snprintf(msg, sizeof msg, "Can't load %s: %s%s%s", base ? base + 1 : u, err, still[0] ? "." : "", still);
     say_note(g, msg); beep();
   } else g->note[0] = 0;
   refresh(g);
@@ -717,7 +716,8 @@ typedef struct {
 } FileKind;
 static const FileKind kinds[2] = {
   {smp_plug_sample_path, audio_name, NULL, L"Load a sample"},             /* filter: audio_filter() */
-  {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3;*.sfz;*.dspreset;*.gig\0All files\0*.*\0", L"Load a SoundFont"},
+  {smp_plug_font_path, font_name, L"SoundFonts and instruments\0*.sf2;*.sf3;*.sf4;*.sf2pack;*.sbk;*.dls;*.gig;*.sfz;*.dspreset\0All files\0*.*\0",
+   L"Load a SoundFont"},
 };
 
 /* The File combo box: the files of its kind in the loaded file's folder, by name (alphabetical, ignoring case),

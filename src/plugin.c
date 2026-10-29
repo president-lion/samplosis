@@ -304,6 +304,7 @@ static int apply_text(Plug *P, const char *text) {
   char *rest; int plays, fk, r;
   SmpSynth *chk;
   if (!P->e || !P->s) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
+  P->told_until = 0;                       /* a whole new state: an old window load's failure no longer applies */
   plays = plays_of(text, err, sizeof err);
   if (plays < 0) { refuse(P, err); return 0; }
   /* The player's lines are checked first, on a player of its own without the font, so a bad line refuses the
@@ -791,11 +792,18 @@ static const void *p_ext(const clap_plugin_t *p, const char *id) {
 
 /* ---- the status, for the window (and the test host) ---- */
 static void sf_status(Plug *P, char *out, int cap);
+static int told_now(Plug *P) {            /* a failed or stopped window load is still being told */
+  if (!P->told_until) return 0;
+  if (GetTickCount64() < P->told_until) return 1;
+  P->told_until = 0;
+  return 0;
+}
 
 SMP_API int smp_plugin_status(const clap_plugin_t *p, char *out, int cap) {
   Plug *P = plug_of(p);
   if (!P || !out || cap <= 0) return 0;
-  if (P->plays && !P->bad && P->e && P->s) sf_status(P, out, cap);
+  if (told_now(P)) snprintf(out, (size_t)cap, "%s", P->told);
+  else if (P->plays && !P->bad && P->e && P->s) sf_status(P, out, cap);
   else snprintf(out, (size_t)cap, "%s", P->status);
   return 1;
 }
@@ -951,6 +959,37 @@ static const char *base_name(const char *path) {
 
 static int load_job(Plug *P, const char *path, int dropped, int font, char *err, int cap);
 
+/* a window load that failed or was stopped: told in the status for as long as the window's own note lasts (6 s) */
+#define TELL_MS 6000
+static void tell(Plug *P, const char *msg) {
+  snprintf(P->told, sizeof P->told, "%s", msg);
+  P->told_until = GetTickCount64() + TELL_MS;
+}
+
+void smp_plug_still_playing(Plug *P, char *out, int cap) {
+  const char *name = NULL;
+  if (cap <= 0) return;
+  out[0] = 0;
+  if (P->plays) {
+    SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
+    if (f && f->path) name = base_name(f->path);
+  } else {
+    const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
+    if (s) name = s->name;
+  }
+  if (name && name[0]) snprintf(out, (size_t)cap, " Still playing %s.", name);
+}
+
+/* "Can't load x: why." and, when something still plays, " Still playing y." */
+static void load_failed(Plug *P, const char *path, const char *why) {
+  char still[400]; size_t n = strlen(why);
+  smp_plug_still_playing(P, still, sizeof still);
+  snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s%s%s", base_name(path), why,
+           still[0] && n && why[n - 1] != '.' ? "." : "", still);
+  tell(P, P->load_err);
+  P->load_failed++;
+}
+
 int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap) {
   return load_job(P, path, dropped, 0, err, cap);
 }
@@ -969,7 +1008,7 @@ static int load_job(Plug *P, const char *path, int dropped, int font, char *err,
     /* the one worker serves both pages: a load of the other kind still running is stopped, and that is said (a
        newer load of the same kind replacing an older one is what was asked, so it isn't) */
     snprintf(P->load_note, sizeof P->load_note, "Stopped loading %s to load %s", P->loading_name, base_name(path));
-    snprintf(P->status, sizeof P->status, "%s", P->load_note);
+    tell(P, P->load_note);
     P->load_notes++;
   }
   j->L = L; j->dropped = dropped; j->font = font;
@@ -1001,24 +1040,19 @@ int smp_plug_poll_load(Plug *P) {
     char err[700] = "";
     SmpFont *f = j->f ? smp_sf_adopt(j->f, err, sizeof err) : NULL;
     j->f = NULL;                         /* adopted (or freed by adopt) */
-    if (f && take_font(P, f, j->path, err, sizeof err)) r = 1;
+    if (f && take_font(P, f, j->path, err, sizeof err)) { P->told_until = 0; r = 1; }
     else {
-      snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path), err[0] ? err : j->err);
-      snprintf(P->status, sizeof P->status, "%s", P->load_err);   /* kept for a window opened later */
-      P->load_failed++;
+      load_failed(P, j->path, err[0] ? err : j->err);   /* told by the window; the status says it for a while */
       r = -1;
     }
   } else if (j->s && P->e) {
     take_sample(P, j->s);
     j->s = NULL;
     if (j->dropped) smp_plug_set_plays(P, 0);   /* a dropped sample: the sampler plays */
+    P->told_until = 0;
     r = 1;
   } else {
-    /* told by the window when it's open; the status keeps it for a window opened later */
-    snprintf(P->load_err, sizeof P->load_err, "Can't load %s: %s", base_name(j->path),
-             j->s ? "the sound engine isn't working" : j->err);
-    snprintf(P->status, sizeof P->status, "%s", P->load_err);
-    P->load_failed++;
+    load_failed(P, j->path, j->s ? "the sound engine isn't working" : j->err);
     r = -1;
   }
   job_free(j);
@@ -1059,6 +1093,7 @@ void smp_plug_status_text(Plug *P, char *out, int cap) {
     snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
     return;
   }
+  if (told_now(P)) { snprintf(out, (size_t)cap, "%s", P->told); return; }
   if (P->plays && !P->bad && P->e && P->s) { sf_status(P, out, cap); return; }
   if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }
   if (smp_engine_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_engine_render_status(P->e, &ready, &total, why, sizeof why)) {
@@ -1082,6 +1117,18 @@ void smp_plug_set_plays(Plug *P, int which) {
 
 SmpSynth *smp_plug_synth(Plug *P) { return P->s; }
 
+/* the font's format in words, or NULL for SoundFont 2 and 3 (their text is as it was before other formats came) */
+static const char *font_kind(const SmpFont *f) {
+  if (f->is_gig) return "GigaStudio";
+  if (f->is_ds) return "Decent Sampler";
+  if (f->is_sfz) return "SFZ";
+  if (f->is_dls) return "DLS";
+  if (f->is_pack) return "SF2Pack";
+  if (f->version == 1) return "SoundFont 1";
+  if (f->version >= 4) return "SF4";
+  return NULL;
+}
+
 void smp_plug_font_text(Plug *P, char *out, int cap) {
   SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
   if (P->sf_missing) {
@@ -1092,19 +1139,34 @@ void smp_plug_font_text(Plug *P, char *out, int cap) {
   else {
     const char *name = f->path, *q;
     int n = smp_sf_preset_count(f);
+    const char *kind = font_kind(f);
     for (q = f->path; *q; q++) if (*q == '\\' || *q == '/') name = q + 1;
-    snprintf(out, (size_t)cap, "%s, %d %s", name, n, n == 1 ? "preset" : "presets");
+    snprintf(out, (size_t)cap, "%s%s%s, %d %s", name, kind ? ", " : "", kind ? kind : "", n, n == 1 ? "preset" : "presets");
   }
 }
 
+/* "Ready: x" or "Loading samples for N presets", then what the font couldn't do, each said once in plain words:
+   its problem ("Missing 3 samples (first: a.wav)", an SF2Pack that can't be unpacked, the GigaStudio restart
+   message) and the settings it ignored ("Ignored 12 SFZ settings it doesn't support (first: lfo01_freq)"). Both
+   change only when the font does (the problem may appear once, while samples load), so the status stays still. */
 static void sf_status(Plug *P, char *out, int cap) {
-  char t[1200]; int n;
+  char t[1200], first[200] = ""; int n, k; size_t L; SmpFont *f; const char *prob, *kind;
   if (P->sf_missing) { snprintf(out, (size_t)cap, "%s", P->sf_err); return; }
-  if (!smp_synth_font(P->s)) { snprintf(out, (size_t)cap, "No SoundFont loaded"); return; }
+  if (!(f = smp_synth_font(P->s))) { snprintf(out, (size_t)cap, "No SoundFont loaded"); return; }
   n = smp_synth_loading(P->s);
-  if (n > 0) { snprintf(out, (size_t)cap, "Loading samples for %d %s", n, n == 1 ? "preset" : "presets"); return; }
-  smp_plug_font_text(P, t, sizeof t);
-  snprintf(out, (size_t)cap, "Ready: %s", t);
+  if (n > 0) snprintf(out, (size_t)cap, "Loading samples for %d %s", n, n == 1 ? "preset" : "presets");
+  else { smp_plug_font_text(P, t, sizeof t); snprintf(out, (size_t)cap, "Ready: %s", t); }
+  prob = smp_sf_problem(f);
+  if (prob && prob[0] && (L = strlen(out)) + 4 < (size_t)cap) {
+    snprintf(out + L, (size_t)cap - L, ". %c%s", toupper((unsigned char)prob[0]), prob + 1);
+    L = strlen(out);
+    if (out[L - 1] == '.') out[L - 1] = 0;  /* statuses end without a full stop; ". " goes between parts */
+  }
+  k = smp_sf_ignored(f, first, sizeof first);
+  kind = f->is_gig ? "GigaStudio" : f->is_ds ? "Decent Sampler" : "SFZ";
+  if (k > 0 && (L = strlen(out)) + 4 < (size_t)cap)
+    snprintf(out + L, (size_t)cap - L, first[0] ? ". Ignored %d %s %s it doesn't support (first: %s)" :
+             ". Ignored %d %s %s it doesn't support%s", k, kind, k == 1 ? "setting" : "settings", first);
 }
 
 int smp_plug_load_font(Plug *P, const char *path, char *err, int cap) {
