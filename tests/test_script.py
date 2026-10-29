@@ -187,3 +187,20 @@ def test_same_sample_not_reloaded(lib, S):
     r, err = S.apply(e, 'sample "%s"' % g)
     assert r == 0, err
     assert lib.smp_engine_sample(e) != before
+
+
+def test_ignores_soundfont_lines(lib, S):
+    """a combined state text: the SoundFont player's lines and plays are left to others"""
+    f, s = S.sample()
+    a = S.engine()
+    lib.smp_engine_set_sample(a, s)
+    t1 = S.write(a)
+    mixed = ("plays soundfont\n" + t1 + 'soundfont "D:\\fonts\\GM.sf2"\nsf_mode all\nsf_used 0:0 128:0\n'
+             "sf_volume -6.0 dB\nsf_whatever anything at all\n")
+    b = S.engine()
+    r, err = S.apply(b, mixed)
+    assert r == 0, err
+    assert S.write(b) == t1
+    assert S.apply(b, "sfx 1\n") == (1, "line 1: unknown setting 'sfx'")
+
+

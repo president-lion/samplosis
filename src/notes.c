@@ -6,7 +6,7 @@
 #include <string.h>
 #include "samplosis.h"
 
-static const SmpParamInfo PARAMS[SMP_NPARAMS] = {
+static const SmpParamInfo PARAMS[SMP_NALLPARAMS] = {
   {"root", 0, 127, 60, SMP_K_NOTE},
   {"transpose", -48, 48, 0, SMP_K_SEMI},
   {"fine", -100, 100, 0, SMP_K_CENT},
@@ -38,10 +38,15 @@ static const SmpParamInfo PARAMS[SMP_NPARAMS] = {
   {"speed", 25, 400, 100, SMP_K_PERCENT},
   {"glide", 0, 10000, 0, SMP_K_MS},
   {"glide_mode", 0, 1, 0, SMP_K_CHOICE},
+  /* the SoundFont player's */
+  {"sf_volume", -60, 12, 0, SMP_K_DB},
+  {"sf_voices", 16, 1024, 256, SMP_K_COUNT},
+  {"sf_effects", 0, 1, 1, SMP_K_BOOL},
+  {"sf_transpose", -24, 24, 0, SMP_K_SEMI},
 };
 
 SMP_API const SmpParamInfo *smp_param_info(int id) {
-  return id >= 0 && id < SMP_NPARAMS ? &PARAMS[id] : NULL;
+  return id >= 0 && id < SMP_NALLPARAMS ? &PARAMS[id] : NULL;
 }
 
 /* ---- note names ---- */

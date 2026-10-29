@@ -6,7 +6,7 @@ import ctypes
 import pytest
 
 K_NOTE, K_SEMI, K_CENT, K_DB, K_PAN, K_MS, K_PERCENT, K_CHOICE, K_BOOL, K_COUNT, K_POSITION = range(11)
-NPARAMS = 31
+NPARAMS = 35   # the table: the sampler's 31, then the SoundFont player's 4
 
 
 @pytest.mark.parametrize("s,n", [("C-1", 0), ("C4", 60), ("a4", 69), ("Db4", 61), ("B#3", 60),
@@ -34,6 +34,12 @@ def test_note_from_filename(lib, p, n):
 def test_param_table(lib):
     names = [lib.smp_param_info(i).contents.name.decode() for i in range(NPARAMS)]
     assert names[0] == "root" and names[1] == "transpose" and names[25] == "keep_length" and names[28] == "speed"
+    assert names[31:] == ["sf_volume", "sf_voices", "sf_effects", "sf_transpose"]
+    sf = [(lib.smp_param_info(i).contents.lo, lib.smp_param_info(i).contents.hi, lib.smp_param_info(i).contents.def_,
+           lib.smp_param_info(i).contents.kind) for i in range(31, 35)]
+    assert sf == [(-60, 12, 0, K_DB), (16, 1024, 256, K_COUNT), (0, 1, 1, K_BOOL), (-24, 24, 0, K_SEMI)]
+    assert txt(lib, 31, 0) == "0.0 dB" and txt(lib, 32, 256) == "256" and txt(lib, 33, 1) == "on"
+    assert txt(lib, 34, 0) == "+0 st" and parse(lib, 34, "-12 st") == -12 and parse(lib, 32, "2000") == 1024
     assert len(set(names)) == NPARAMS
     assert not lib.smp_param_info(NPARAMS) and not lib.smp_param_info(-1)
     pi = lib.smp_param_info(11).contents

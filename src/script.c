@@ -77,6 +77,8 @@ SMP_API int smp_script_apply(SmpEngine *e, const char *text, char *err, int cap)
     rest = s;
     while (*rest && !isspace((unsigned char)*rest)) rest++;
     if (*rest) { *rest++ = 0; while (isspace((unsigned char)*rest)) rest++; }
+    /* the SoundFont player's lines and the plugin's plays line belong to others (sfsynth.c, plugin.c) */
+    if (!strcmp(name, "plays") || !strcmp(name, "soundfont") || !strncmp(name, "sf_", 3)) continue;
     if (!strcmp(name, "sample")) {
       char *q, *end;
       if (*rest != '"') { fail(err, cap, lineno, "sample needs the path in quotes, like %s", "sample \"E:\\samples\\a.wav\""); return 1; }

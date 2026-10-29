@@ -21,7 +21,10 @@ enum {
   SMP_P_BEND_RANGE = 22, SMP_P_PITCH_HI = 23, SMP_P_REVERSE = 24, SMP_P_KEEP_LENGTH = 25,
   SMP_P_VOICES = 26, SMP_P_PROBABILITY = 27, SMP_P_SPEED = 28, SMP_P_GLIDE = 29, SMP_P_GLIDE_MODE = 30
 };
-#define SMP_NPARAMS 31
+#define SMP_NPARAMS 31           /* the sampler's parameters */
+/* the SoundFont player's parameters follow in the same table */
+enum { SMP_P_SF_VOLUME = 31, SMP_P_SF_VOICES = 32, SMP_P_SF_EFFECTS = 33, SMP_P_SF_TRANSPOSE = 34 };
+#define SMP_NALLPARAMS 35        /* the whole table, and the CLAP parameter count */
 
 /* how a parameter reads in words */
 enum { SMP_K_NOTE, SMP_K_SEMI, SMP_K_CENT, SMP_K_DB, SMP_K_PAN, SMP_K_MS, SMP_K_PERCENT,
@@ -173,6 +176,41 @@ SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time b
    preset and waits for its samples first (main thread). Returns the number of voices started, -1 on error. */
 SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double rate, long frames, long release_at,
                              float *out_lr);
+
+/* The SoundFont player (sfsynth.c): 16 MIDI channels on one font, up to 1024 voices, 16 stereo outputs.
+   Threads: main (new, free, load, script, collect, font), audio (midi, process, reset), and set_param from any
+   thread. See the contract at the top of sfsynth.c: free and load never close a font a voice still plays. */
+typedef struct SmpSynth SmpSynth;
+SMP_API SmpSynth *smp_synth_new(double rate, int max_block);
+SMP_API void smp_synth_free(SmpSynth *s);   /* main thread, while nothing processes */
+SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap); /* 1 ok; the audio thread switches
+                                    at its next block, and the old font is closed once it has (smp_synth_collect) */
+SMP_API void smp_synth_midi(SmpSynth *s, const uint8_t *msg, int len, int at);  /* audio thread, queued like
+                                    note_on: note on and off, CC, program, pressure, poly pressure, bend, and the GM,
+                                    GS and XG reset SysEx; at is the frame offset in the next block */
+SMP_API void smp_synth_process(SmpSynth *s, float *const *outs /* 32: L,R per output */, int n);  /* audio thread */
+SMP_API void smp_synth_reset(SmpSynth *s);       /* audio thread: every voice off, controllers reset */
+SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v);   /* ids SMP_P_SF_*, any thread */
+SMP_API double smp_synth_get_param(const SmpSynth *s, int id);
+SMP_API int smp_synth_script_write(const SmpSynth *s, char *out, int cap);     /* like snprintf; main thread */
+SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int cap);  /* 0 ok; nothing changes
+                                    on error and err says "line N: ...". Lines not starting with sf_ or soundfont
+                                    (the sampler's, plays) are ignored, so one state text serves both */
+/* test helper: events one per line, "midi <byte> <byte> ... <frame>" (decimal; a SysEx is all its bytes) and
+   "reset <frame>"; starts from silence with every channel reset. With waiting on (the default) it waits for the
+   loader before each block and at notes whose samples aren't loaded, so the render is exact; with it off it
+   runs in real time. Writes output 1 (stereo), or all 32 channels when all_outputs is 1. 0 ok. */
+SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, int block, const char *wav_out,
+                                  int all_outputs);
+SMP_API void smp_synth_test_offline(SmpSynth *s, int wait);       /* tests: render_test's waiting on (1) or off */
+SMP_API int smp_synth_wait_loaded(SmpSynth *s, int timeout_ms);   /* tests: 0 once every preset in use is loaded */
+SMP_API int smp_synth_collect(SmpSynth *s);   /* main thread: closes replaced fonts the audio thread has let go
+                                    of; returns how many still wait */
+SMP_API SmpFont *smp_synth_font(const SmpSynth *s);   /* main thread: the font loaded last, or NULL */
+SMP_API int smp_synth_voices(const SmpSynth *s, int *peak);   /* sounding voices (not counting ones fading out
+                                    after a steal or kill); peak: the most since the last render_test */
+SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released);   /* tests: 1 when
+                                    voice slot i (0..1023) is sounding, with its channel (0..15), key and release */
 #ifdef __cplusplus
 }
 #endif

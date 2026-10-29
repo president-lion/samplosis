@@ -1,0 +1,430 @@
+"""The SoundFont player (sfsynth.c): channels, MIDI, presets, voices, modes, outputs and its state lines, played
+through smp_synth_render_test from a small font written by sf2make."""
+import ctypes
+import itertools
+import threading
+import time
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from sf2make import write_sf2
+
+SR = 44100      # the samples' rate
+OUT = 48000     # the output rate
+FP = ctypes.POINTER(ctypes.c_float)
+_count = itertools.count()
+
+# generator ids (SF2.04)
+RELEASE_VOL, EXCL, MODES, ROOTKEY = 38, 57, 54, 58
+P_VOLUME, P_VOICES, P_EFFECTS, P_TRANSPOSE = 31, 32, 33, 34
+
+
+def sine(freq, secs, amp=16000):
+    t = np.arange(int(secs * SR)) / SR
+    return (amp * np.sin(2 * np.pi * freq * t)).astype(np.int16)
+
+
+def zone(sample, keys=(0, 127), gens=None):
+    return dict(keys=keys, vels=(0, 127), sample=sample, gens=dict(gens or {}), mods=[])
+
+
+def preset(name, bank, program, zones):
+    return dict(name=name, bank=bank, program=program, gens={}, pmods=[],
+                instruments=[dict(name=name, gens={}, mods=[], zones=zones)])
+
+
+def write_font(path, base_pitch=69):
+    """The fixture font. At key 69: piano 440 Hz (bank 0 program 0, 1 s release), bass 220 Hz (0:33), the drum
+    kit 880 Hz (128:0; key 46 an open hi-hat at 440 Hz and key 42 a closed one at 880 Hz, both exclusive class 1),
+    and a looping organ at 330 Hz (0:16). base_pitch moves the piano's sample (font B in the switch test)."""
+    samples = [
+        dict(name="piano", data=sine(440, 2.0), rate=SR, pitch=base_pitch, loop=None),
+        dict(name="bass", data=sine(440, 2.0), rate=SR, pitch=81, loop=None),
+        dict(name="kit", data=sine(440, 2.0), rate=SR, pitch=57, loop=None),
+        dict(name="organ", data=sine(330, 1.0), rate=SR, pitch=69, loop=(4410, 4410 * 9)),
+    ]
+    kit = [zone(2, (0, 41)), zone(2, (43, 45)), zone(2, (47, 127)),
+           zone(0, (42, 42), {ROOTKEY: 30, EXCL: 1}),
+           zone(0, (46, 46), {ROOTKEY: 46, EXCL: 1})]
+    presets = [preset("Piano", 0, 0, [zone(0, gens={RELEASE_VOL: 0})]),
+               preset("Bass", 0, 33, [zone(1)]),
+               preset("Kit", 128, 0, kit),
+               preset("Organ", 0, 16, [zone(3, gens={MODES: 1})])]
+    write_sf2(path, presets, samples)
+
+
+@pytest.fixture
+def font(tmp_path):
+    p = tmp_path / "gm.sf2"
+    write_font(p)
+    return p
+
+
+@pytest.fixture
+def S(lib, font, tmp_path):
+    class H:
+        synths = []
+
+        def new(self, load=True):
+            s = lib.smp_synth_new(float(OUT), 256)
+            assert s
+            self.synths.append(s)
+            if load:
+                err = ctypes.create_string_buffer(512)
+                assert lib.smp_synth_load(s, str(font).encode(), err, 512) == 1, err.value
+            return s
+
+        def render(self, s, events, secs, all_outputs=0, block=256):
+            out = tmp_path / ("r%d.wav" % next(_count))
+            frames = int(secs * OUT)
+            rc = lib.smp_synth_render_test(s, events.encode(), frames, block, str(out).encode(), all_outputs)
+            assert rc == 0
+            x, rate = sf.read(str(out), dtype="float32", always_2d=True)
+            assert rate == OUT and x.shape == (frames, 32 if all_outputs else 2)
+            assert np.all(np.isfinite(x))
+            return x
+
+        def write(self, s):
+            n = lib.smp_synth_script_write(s, None, 0)
+            buf = ctypes.create_string_buffer(n + 1)
+            assert lib.smp_synth_script_write(s, buf, n + 1) == n
+            return buf.value.decode()
+
+        def apply(self, s, text):
+            err = ctypes.create_string_buffer(1024)
+            r = lib.smp_synth_script_apply(s, text.encode(), err, 1024)
+            return r, err.value.decode()
+
+    h = H()
+    yield h
+    for s in h.synths:
+        lib.smp_synth_free(s)
+
+
+def peak_freq(x, rate=OUT):
+    """the strongest frequency: Hann window, 8x zero padding, parabolic interpolation on log magnitude"""
+    x = x - np.mean(x)
+    n = len(x)
+    spec = np.abs(np.fft.rfft(x * np.hanning(n), 8 * n)) + 1e-12
+    k = int(np.argmax(spec))
+    a, b, c = np.log(spec[k - 1:k + 2])
+    d = 0.5 * (a - c) / (a - 2 * b + c)
+    return (k + d) * rate / (8 * n)
+
+
+def tone(x, f, rate=OUT):
+    """the amplitude of frequency f in x (Hann-weighted)"""
+    w = np.hanning(len(x))
+    t = np.arange(len(x)) / rate
+    return 2 * abs(np.sum(x * w * np.exp(-2j * np.pi * f * t))) / np.sum(w)
+
+
+def seg(x, a, b, ch=0):
+    return x[int(a * OUT):int(b * OUT), ch]
+
+
+def rms(x):
+    return float(np.sqrt(np.mean(np.square(x, dtype=np.float64))))
+
+
+def onset(x, th=1e-3):
+    idx = np.nonzero(np.abs(x[:, 0]) > th)[0]
+    return int(idx[0]) if len(idx) else None
+
+
+def freq_of(S, s, events, secs=0.5):
+    x = S.render(s, events, secs)
+    return peak_freq(seg(x, 0.1, secs - 0.05))
+
+
+def test_program_change_and_bank(lib, S):
+    s = S.new()
+    assert abs(freq_of(S, s, "midi 193 33 0\nmidi 145 69 100 0") - 220) < 1      # program 33 on channel 2: bass
+    # a drum bank select then program 0 on channel 1: the kit. MIDI's CC0 tops out at 127, the XG drum bank,
+    # which the player treats as drums (the font has no bank 127, so it falls back to 128:0)
+    assert abs(freq_of(S, s, "midi 176 0 127 0\nmidi 192 0 0\nmidi 144 69 100 0") - 880) < 2
+    assert abs(freq_of(S, s, "midi 153 69 100 0") - 880) < 2                     # channel 10: drums by default
+    assert abs(freq_of(S, s, "midi 144 69 100 0") - 440) < 1                     # channel 1: the piano
+
+
+def test_program_fallback(lib, S):
+    s = S.new()
+    assert abs(freq_of(S, s, "midi 176 0 8 0\nmidi 192 33 0\nmidi 144 69 100 0") - 220) < 1    # bank 0's bass
+    assert abs(freq_of(S, s, "midi 201 99 0\nmidi 153 69 100 0") - 880) < 2                    # kit 99: 128:0
+    assert abs(freq_of(S, s, "midi 176 0 50 0\nmidi 192 120 0\nmidi 144 69 100 0") - 440) < 1  # the first preset
+    # XG style: CC0 0 and CC32 naming a bank the font has (bank 0 here, so a no-op), or one it lacks (ignored)
+    assert abs(freq_of(S, s, "midi 176 0 0 0\nmidi 176 32 5 0\nmidi 192 33 0\nmidi 144 69 100 0") - 220) < 1
+
+
+def test_pending_note_starts_when_loaded(lib, S):
+    s = S.new()
+    lib.smp_synth_test_offline(s, 0)                    # real time: the render doesn't wait for the loader
+    x = S.render(s, "midi 192 33 0\nmidi 144 69 100 0", 0.6)
+    t = onset(x)
+    assert t is not None and t < 0.3 * OUT, t           # late at most by the load time, never lost
+    assert abs(peak_freq(x[t + 2400:t + 2400 + 12000, 0]) - 220) < 1.5
+    s2 = S.new()                                        # waiting on (the default): exactly on its frame
+    x = S.render(s2, "midi 192 33 1000\nmidi 144 69 100 1000", 0.4)
+    t = onset(x)
+    assert t is not None and 1000 <= t < 1000 + 200, t
+
+
+def test_one_preset_mode(lib, S):
+    s = S.new()
+    r, err = S.apply(s, "sf_mode one\nsf_preset 0 33\nsf_channel 3\n")
+    assert r == 0, err
+    assert abs(freq_of(S, s, "midi 146 69 100 0") - 220) < 1                     # channel 3 plays the bass
+    x = S.render(s, "midi 144 69 100 0", 0.3)
+    assert np.max(np.abs(x)) < 1e-6                                              # channel 1 isn't listened to
+    assert abs(freq_of(S, s, "midi 194 0 0\nmidi 146 69 100 0") - 220) < 1       # program changes are ignored
+    assert abs(freq_of(S, s, "midi 194 0 0\nmidi 146 69 100 0") - 220) < 1
+    r, err = S.apply(s, "sf_mode one\nsf_preset 0 33\nsf_channel 10\n")         # channel 10: no drum rule
+    assert r == 0, err
+    assert abs(freq_of(S, s, "midi 153 69 100 0") - 220) < 1
+
+
+def test_exclusive_class(lib, S):
+    s = S.new()
+    x = S.render(s, "midi 153 46 100 0\nmidi 153 42 100 24000", 0.8)
+    before = seg(x, 0.25, 0.35)
+    after = x[24000 + 480:24000 + 480 + 4800, 0]       # from 10 ms after the closed hi-hat
+    assert tone(before, 440) > 0.05
+    assert tone(after, 440) < 0.01 * tone(before, 440)
+    assert tone(after, 880) > 0.05
+
+
+def test_sustain_and_sostenuto(lib, S):
+    s = S.new()
+    x = S.render(s, "midi 192 16 0\nmidi 176 64 127 0\nmidi 144 69 100 0\nmidi 128 69 0 9600\n"
+                    "midi 176 64 0 28800", 1.0)
+    assert tone(seg(x, 0.4, 0.55), 330) > 0.02          # released under the pedal: still sounding
+    assert np.max(np.abs(seg(x, 0.65, 1.0))) < 1e-4     # pedal up: gone
+    b = 330 * 2 ** (7 / 12)
+    x = S.render(s, "midi 192 16 0\nmidi 144 69 100 0\nmidi 176 66 127 4800\nmidi 144 76 100 7200\n"
+                    "midi 128 69 0 14400\nmidi 128 76 0 14400\nmidi 176 66 0 28800", 1.0)
+    assert tone(seg(x, 0.18, 0.28), b) > 0.02           # B sounded while held
+    w = seg(x, 0.4, 0.55)
+    assert tone(w, 330) > 0.02                          # A was down when sostenuto went on: held
+    assert tone(w, b) < 0.002                           # B wasn't: let go at its note-off
+    assert np.max(np.abs(seg(x, 0.65, 1.0))) < 1e-4
+
+
+HELD = "midi 192 16 0\nmidi 176 64 127 0\nmidi 144 69 100 0\nmidi 128 69 0 4800\n"
+
+
+@pytest.mark.parametrize("event,also_held", [
+    ("midi 176 120 0 24000", True),
+    ("midi 176 121 0 24000", False),
+    ("reset 24000", True),
+    ("midi 240 126 127 9 1 247 24000", True),                       # GM reset
+    ("midi 240 65 16 66 18 64 0 127 0 65 247 24000", True),         # GS reset
+    ("midi 240 67 16 76 0 0 126 0 247 24000", True),                # XG reset
+])
+def test_no_stuck_notes(lib, S, event, also_held):
+    s = S.new()
+    ev = HELD + ("midi 144 76 100 0\n" if also_held else "") + event
+    x = S.render(s, ev, 1.0)
+    assert tone(seg(x, 0.3, 0.45), 330) > 0.02
+    assert np.max(np.abs(seg(x, 0.6, 1.0))) < 1e-4, event
+
+
+def test_no_stuck_notes_all_notes_off(lib, S):
+    s = S.new()
+    x = S.render(s, HELD + "midi 176 123 0 24000\nmidi 176 64 0 38400", 1.2)
+    assert tone(seg(x, 0.55, 0.78), 330) > 0.02         # All Notes Off respects the pedal
+    assert np.max(np.abs(seg(x, 0.9, 1.2))) < 1e-4      # gone within 0.1 s of the pedal-up
+
+
+def zero_cross_cents(x, ref):
+    """the pitch of each cycle in cents from ref, from upward zero crossings (linearly interpolated)"""
+    i = np.nonzero((x[:-1] < 0) & (x[1:] >= 0))[0]
+    t = i + (-x[i]) / (x[i + 1] - x[i])
+    f = OUT / np.diff(t)
+    return 1200 * np.log2(f / ref)
+
+
+def test_controllers(lib, S):
+    s = S.new()
+    # CC7 64 against 127, changed mid-note (smp_sfv_update): the concave default modulator, (64/127)^2
+    x = S.render(s, "midi 176 7 127 0\nmidi 144 69 100 0\nmidi 176 7 64 24000", 1.0)
+    db = 20 * np.log10(rms(seg(x, 0.7, 0.95)) / rms(seg(x, 0.2, 0.45)))
+    assert abs(db - 20 * np.log10((64 / 127) ** 2)) < 0.3, db
+    x = S.render(s, "midi 176 10 0 0\nmidi 144 69 100 0", 0.5)                  # hard left
+    assert rms(seg(x, 0.1, 0.4, 1)) < 1e-3 * rms(seg(x, 0.1, 0.4, 0))
+    x = S.render(s, "midi 144 69 100 0", 1.0)
+    assert np.max(np.abs(zero_cross_cents(seg(x, 0.1, 0.9), 440))) < 3
+    x = S.render(s, "midi 176 1 127 0\nmidi 144 69 100 0", 1.0)                 # vibrato
+    assert np.max(np.abs(zero_cross_cents(seg(x, 0.1, 0.9), 440))) >= 20
+    # pitch bend through the default pitch wheel modulator: 2 semitones by default, 12 after RPN 0
+    assert abs(freq_of(S, s, "midi 224 127 127 0\nmidi 144 69 100 0") - 440 * 2 ** (2 * 8191 / 8192 / 12)) < 1
+    rpn0 = "midi 176 101 0 0\nmidi 176 100 0 0\nmidi 176 6 12 0\nmidi 176 38 0 0\n"
+    assert abs(freq_of(S, s, rpn0 + "midi 224 127 127 0\nmidi 144 69 100 0") - 440 * 2 ** (12 * 8191 / 8192 / 12)) < 2
+    # RPN 1 fine tuning (+50 cents) and RPN 2 coarse tuning (+2 semitones); NRPNs are ignored
+    rpn1 = "midi 176 101 0 0\nmidi 176 100 1 0\nmidi 176 6 96 0\nmidi 176 38 0 0\n"
+    assert abs(freq_of(S, s, rpn1 + "midi 144 69 100 0") - 440 * 2 ** (50 / 1200)) < 1
+    rpn2 = "midi 176 101 0 0\nmidi 176 100 2 0\nmidi 176 6 66 0\n"
+    assert abs(freq_of(S, s, rpn2 + "midi 144 69 100 0") - 440 * 2 ** (2 / 12)) < 1
+    nrpn = "midi 176 99 0 0\nmidi 176 98 0 0\nmidi 176 6 100 0\n"
+    assert abs(freq_of(S, s, nrpn + "midi 144 69 100 0") - 440) < 1
+    # a bend arriving mid-note moves the sounding note
+    x = S.render(s, "midi 144 69 100 0\nmidi 224 127 127 24000", 1.0)
+    assert abs(peak_freq(seg(x, 0.6, 0.95)) - 440 * 2 ** (2 * 8191 / 8192 / 12)) < 1
+
+
+def voices(lib, s):
+    peak = ctypes.c_int()
+    n = lib.smp_synth_voices(s, ctypes.byref(peak))
+    keys = []
+    for i in range(1024):
+        c, k, rel = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        if lib.smp_synth_test_voice(s, i, ctypes.byref(c), ctypes.byref(k), ctypes.byref(rel)):
+            keys.append(k.value)
+    assert len(keys) == n
+    return n, peak.value, sorted(keys)
+
+
+def test_voice_limit_and_stealing(lib, S):
+    s = S.new()
+    lib.smp_synth_set_param(s, P_VOICES, 16)
+    ev = "\n".join("midi 144 %d 100 %d" % (30 + i, i * 480) for i in range(40))   # each past its attack
+    S.render(s, ev, 0.5)
+    n, peak, keys = voices(lib, s)
+    assert n == 16 and peak == 16 and keys == list(range(54, 70))   # the oldest went first
+    # a voice in its release goes before a held one, even a quieter held one
+    ev = "\n".join("midi 144 %d %d 0" % (k, 127 if k == 45 else 30) for k in range(40, 56))
+    S.render(s, ev + "\nmidi 128 45 0 4800\nmidi 144 70 30 7200", 0.3)
+    n, peak, keys = voices(lib, s)
+    assert n == 16 and keys == sorted([k for k in range(40, 56) if k != 45] + [70])
+
+
+def test_outputs(lib, S):
+    s = S.new()
+    r, err = S.apply(s, "sf_output 2 3\n")
+    assert r == 0, err
+    x = S.render(s, "midi 145 69 100 0", 0.4, all_outputs=1)
+    for c in range(32):
+        if c in (4, 5):
+            assert rms(x[:, c]) > 0.01, c
+        else:
+            assert np.max(np.abs(x[:, c])) < 1e-6, c
+    x = S.render(s, "midi 144 69 100 0", 0.4, all_outputs=1)        # channel 1: output 1
+    assert rms(x[:, 0]) > 0.01 and np.max(np.abs(x[:, 2:])) < 1e-6
+    r, err = S.apply(s, "sf_mode one\nsf_output 2 3\n")              # one preset: everything on output 1
+    assert r == 0, err
+    x = S.render(s, "midi 145 69 100 0", 0.4, all_outputs=1)
+    assert rms(x[:, 0]) > 0.01 and np.max(np.abs(x[:, 2:])) < 1e-6
+
+
+def test_volume_and_transpose(lib, S):
+    s = S.new()
+    a = S.render(s, "midi 144 69 100 0", 0.5)
+    lib.smp_synth_set_param(s, P_VOLUME, -6)
+    lib.smp_synth_set_param(s, P_TRANSPOSE, 12)
+    b = S.render(s, "midi 144 69 100 0", 0.5)
+    assert abs(20 * np.log10(rms(seg(b, 0.2, 0.45)) / rms(seg(a, 0.2, 0.45))) + 6) < 0.1
+    assert abs(peak_freq(seg(b, 0.1, 0.45)) - 880) < 2
+    assert lib.smp_synth_get_param(s, P_VOLUME) == -6 and lib.smp_synth_get_param(s, P_TRANSPOSE) == 12
+
+
+STATE = ("sf_mode one\nsf_preset 0 33\nsf_channel 3\nsf_channel_preset 3 0 25\nsf_channel_preset 10 128 0\n"
+         "sf_output 2 3\nsf_output 16 16\nsf_used 0:0 0:33 128:0\n"
+         "sf_volume -6.0 dB\nsf_voices 64\nsf_effects off\nsf_transpose +2 st\n")
+
+
+def test_state_lines_roundtrip(lib, S, font):
+    s1 = S.new()
+    r, err = S.apply(s1, "# Samplosis 0.1.0\nplays soundfont\nroot C4\nvolume -3.0 dB\n" + STATE)
+    assert r == 0, err                                  # the sampler's lines and plays are ignored
+    w1 = S.write(s1)
+    assert w1 == 'soundfont "%s"\n' % font + STATE
+    assert lib.smp_synth_get_param(s1, P_VOICES) == 64 and lib.smp_synth_get_param(s1, P_EFFECTS) == 0
+    # sf_used: those presets are used as soon as the state loads (piano, bass and the kit: samples 0, 1 and 2)
+    assert lib.smp_synth_wait_loaded(s1, 5000) == 0
+    assert lib.smp_sf_loaded_samples(lib.smp_synth_font(s1)) == 3
+    s2 = S.new(load=False)
+    r, err = S.apply(s2, w1)
+    assert r == 0, err
+    assert S.write(s2) == w1
+    # a bad line: "line N: ..." and nothing changes
+    bad = w1.splitlines()
+    bad[2] = "sf_mode banana"
+    r, err = S.apply(s2, "\n".join(bad))
+    assert r != 0 and err.startswith("line 3: "), err
+    assert S.write(s2) == w1
+    for line in ("sf_bogus 1", "sf_channel 17", "sf_output 2", "sf_used 0-0", "sf_volume loud",
+                 'soundfont "unclosed', "sf_channel_preset 0 0 0"):
+        r, err = S.apply(s2, "sf_mode all\n" + line + "\n")
+        assert r != 0 and err.startswith("line 2: "), (line, err)
+        assert S.write(s2) == w1
+    # a missing font: the error names the path, and nothing changes
+    missing = str(font.parent / "nope" / "missing.sf2")
+    r, err = S.apply(s2, 'soundfont "%s"\nsf_mode all\n' % missing)
+    assert r != 0 and missing in err, err
+    assert S.write(s2) == w1
+    # defaults: absent lines go back to them; no font yet writes no soundfont line
+    s3 = S.new(load=False)
+    assert S.write(s3) == ("sf_mode all\nsf_preset 0 0\nsf_channel all\n"
+                           "sf_volume 0.0 dB\nsf_voices 256\nsf_effects on\nsf_transpose +0 st\n")
+
+
+def test_font_switch_while_playing(lib, S, font, tmp_path):
+    """load font B while a thread renders from font A: the audio thread switches at a block, the old font is
+    closed only after it let go, and nothing it held stays in use"""
+    b_path = tmp_path / "b.sf2"
+    write_font(b_path, base_pitch=57)                   # B's piano plays 880 Hz at key 69
+    lib.smp_sf_test_grace(20)
+    err = ctypes.create_string_buffer(512)
+    fa = lib.smp_sf_open(str(font).encode(), err, 512)  # our own reference to A, to watch its samples
+    assert fa
+    try:
+        s = S.new()
+        stop = threading.Event()
+        out = []
+        bufs = [np.zeros(256, np.float32) for _ in range(32)]
+        arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+
+        def player():
+            k = 0
+            while not stop.is_set():
+                if k % 20 == 0:
+                    lib.smp_synth_midi(s, bytes([0x90, 69, 100]), 3, 0)
+                if k % 20 == 15:
+                    lib.smp_synth_midi(s, bytes([0x80, 69, 0]), 3, 0)
+                lib.smp_synth_process(s, arr, 256)
+                out.append(bufs[0].copy())
+                k += 1
+                time.sleep(0.002)
+
+        th = threading.Thread(target=player)
+        th.start()
+        try:
+            time.sleep(0.4)
+            assert lib.smp_sf_loaded_samples(fa) >= 1  # A's piano is in use
+            assert lib.smp_synth_load(s, str(b_path).encode(), err, 512) == 1, err.value
+            t0 = time.time()
+            while lib.smp_synth_collect(s) and time.time() - t0 < 3:
+                time.sleep(0.01)
+            assert lib.smp_synth_collect(s) == 0       # the old font was closed once the audio thread let go
+            t0 = time.time()
+            while lib.smp_sf_loaded_samples(fa) and time.time() - t0 < 3:
+                time.sleep(0.01)
+            assert lib.smp_sf_loaded_samples(fa) == 0  # and nothing of A is in use any more
+            time.sleep(0.4)
+        finally:
+            stop.set()
+            th.join()
+        x = np.concatenate(out)
+        assert np.all(np.isfinite(x))
+        freqs = [peak_freq(x[i:i + 2560]) for i in range(0, len(x) - 2560, 2560) if rms(x[i:i + 2560]) > 0.01]
+        assert any(abs(f - 440) < 5 for f in freqs) and any(abs(f - 880) < 5 for f in freqs)
+        assert abs(freqs[-1] - 880) < 5
+        # freeing the synth with notes sounding lets go of everything it held
+        lib.smp_synth_midi(s, bytes([0x90, 69, 100]), 3, 0)
+        lib.smp_synth_process(s, arr, 256)
+        S.synths.remove(s)
+        lib.smp_synth_free(s)
+    finally:
+        lib.smp_sf_close(fa)
+        lib.smp_sf_test_grace(0)
