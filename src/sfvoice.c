@@ -302,10 +302,14 @@ static void lfo_step(SmpSfLfo *o, double n) {
 static double menv_out(const SmpSfEnv *e) { return e->stage == E_ATTACK ? curve(127 * e->val, 1) : e->val; }
 
 /* The cutoff is kept within the spec's 1500 to 13500 cents and under 0.45 times the output rate. Fully open
-   (13500 cents or more) with Q 0 the filter is a straight wire, so it is transparent and skipped. */
+   (13500 cents or more) with Q 0 the lowpass is a straight wire, so it is transparent and skipped. The other kinds
+   (SFZ's fil_type: highpass, bandpass and notch, from RBJ's cookbook like the lowpass) are never a wire; a loader
+   sets them only with a cutoff. The highpass is lowered by q_gain as the lowpass is; the bandpass peaks at 0 dB
+   (RBJ's constant 0 dB peak form) and the notch passes 0 dB away from its cutoff, both with the same Q. */
 static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
   double hz, w, cs, alpha, a0;
-  if (fc_cents >= 13500 && v->g[G_Q] <= 0) {
+  int kind = v->reg->cond.fil_type;
+  if (kind == SMP_FIL_LP && fc_cents >= 13500 && v->g[G_Q] <= 0) {
     c[0] = 1; c[1] = c[2] = c[3] = c[4] = 0;
     return;
   }
@@ -314,9 +318,24 @@ static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
   cs = cos(w);
   alpha = sin(w) / (2 * v->q_lin);
   a0 = 1 + alpha;
-  c[0] = (1 - cs) / 2 / a0 * v->q_gain;       /* RBJ's lowpass, the DC gain lowered by q_gain */
-  c[1] = (1 - cs) / a0 * v->q_gain;
-  c[2] = c[0];
+  switch (kind) {
+    case SMP_FIL_HP:
+      c[0] = (1 + cs) / 2 / a0 * v->q_gain;
+      c[1] = -(1 + cs) / a0 * v->q_gain;
+      c[2] = c[0];
+      break;
+    case SMP_FIL_BP:
+      c[0] = alpha / a0; c[1] = 0; c[2] = -alpha / a0;
+      break;
+    case SMP_FIL_BR:
+      c[0] = 1 / a0; c[1] = -2 * cs / a0; c[2] = c[0];
+      break;
+    default:
+      c[0] = (1 - cs) / 2 / a0 * v->q_gain;   /* RBJ's lowpass, the DC gain lowered by q_gain */
+      c[1] = (1 - cs) / a0 * v->q_gain;
+      c[2] = c[0];
+      break;
+  }
   c[3] = -2 * cs / a0;
   c[4] = (1 - alpha) / a0;
 }
@@ -379,7 +398,9 @@ static double xf_out(int x, int lo, int hi) { return x <= lo ? 1 : x >= hi ? 0 :
      reading): 100 % is c itself (40 log10(vel / 127) dB), 0 % is flat. For t < 0 the curve turns over, loudest
      at the softest velocity: gain = 1 + t c, so -100 % is 1 - c (silent at 127) and the gain is continuous through
      0 % (sfzformat.com only says negative values invert the tracking; this is the form that meets 0 % smoothly);
-   - a release trigger's rt_decay: -rt_decay dB per second the note was held. */
+   - a release trigger's rt_decay: -rt_decay dB per second the note was held;
+   - amp_velcurve (SFZ's amp_velcurve_N), when set, is the curve c instead of (vel / 127)^2;
+   - gain: a plain factor (SFZ's volume above 0 dB, which initialAttenuation can't say). */
 static double xf_pos(const SmpSfRegion *r, int key, int vel) {
   const SmpSfCond *c = &r->cond;
   double x = 1;
@@ -399,9 +420,11 @@ static double cond_gain(const SmpSfRegion *r, int key, int vel, double held) {
   g = c->xf_curve == 1 ? x : sqrt(x);
   if (!isnan(c->amp_veltrack)) {
     double t = clampd(c->amp_veltrack / 100.0, -1, 1), cv = (vel / 127.0) * (vel / 127.0);
+    if (c->amp_velcurve) cv = clampd(c->amp_velcurve[vel & 127], 0, 1);
     g *= t >= 0 ? 1 - t * (1 - cv) : 1 + t * cv;
   }
   if (held >= 0 && c->rt_decay > 0) g *= pow(10.0, -c->rt_decay * held / 20.0);
+  if (c->gain > 0 && c->gain != 1) g *= c->gain;
   return g;
 }
 
@@ -497,6 +520,11 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
 }
 
 void smp_sfv_release(SmpSfVoice *v) {
+  if (!v->live || v->released || v->reg->cond.one_shot) return;   /* a one-shot plays on to its sample's end */
+  smp_sfv_off(v);
+}
+
+void smp_sfv_off(SmpSfVoice *v) {
   double a;
   if (!v->live || v->released) return;
   v->released = 1;

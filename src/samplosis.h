@@ -179,7 +179,17 @@ typedef struct {
   uint8_t off_mode;             /* 0 fast, 1 normal (release) */
   float rt_decay;               /* dB per second held, for release triggers */
   float amp_veltrack;           /* percent; NaN = use SF2 modulators */
+  /* added for SFZ (Task 9); the SF2 family leaves them at their defaults */
+  float gain;                   /* an amplitude factor beyond what initialAttenuation can say (SFZ volume above
+                                   0 dB); 1 */
+  const float *amp_velcurve;    /* 128 points, 0..1: the velocity curve amp_veltrack tracks instead of the
+                                   default (vel / 127)^2; NULL for the default. Lives in the font. */
+  uint16_t polyphony;           /* at most this many voices of the region's group sound at once on a channel; 0 none */
+  uint16_t note_polyphony;      /* and at most this many of one key of that group; 0 none */
+  uint8_t one_shot;             /* note-offs and the pedals don't release it: it plays its sample to the end */
+  uint8_t fil_type;             /* SMP_FIL_*: the kind of filter initialFilterFc and Q set */
 } SmpSfCond;
+enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3 };   /* 2-pole lowpass, highpass, bandpass, notch */
 typedef struct {
   uint8_t lokey, hikey, lovel, hivel; int sample;            /* index into the font's samples */
   int16_t gen[SMP_SF_NGEN];
@@ -235,6 +245,9 @@ SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
    x.sf2pack (it may be damaged)", "the cache folder can't hold x.sf2pack's unpacked samples"), or "" when there is
    none. Any thread; the text doesn't change once set. */
 SMP_API const char *smp_sf_problem(const SmpFont *f);
+/* SFZ: how many different opcodes (and headers, as "<name>") the file used that this can't play, and the first of
+   them in first (may be NULL); 0 for every other format. Any thread. */
+SMP_API int smp_sf_ignored(const SmpFont *f, char *first, int cap);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */

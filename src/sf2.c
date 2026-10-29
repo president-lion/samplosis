@@ -755,6 +755,7 @@ void sf_cond_defaults(SmpSfCond *c) {
   c->xfin_lokey = c->xfin_hikey = c->xfout_lokey = c->xfout_hikey = -1;
   c->xfin_lovel = 0; c->xfin_hivel = 0; c->xfout_lovel = 127; c->xfout_hivel = 127;
   c->amp_veltrack = (float)NAN;
+  c->gain = 1;
 }
 
 /* the parts of a region that decide its round-robin set: its ranges and its conditions but seq_pos. Copied field
@@ -919,6 +920,30 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
   f->size = s.size;
   f->mtime = (uint64_t)mt.dwHighDateTime << 32 | mt.dwLowDateTime;
 
+  {
+    /* SFZ: text, told by its name or by a header in its first bytes; sfsfz.c reads it (and its sample files) */
+    uint8_t head[4096];
+    uint32_t n = s.size < sizeof head ? (uint32_t)s.size : (uint32_t)sizeof head;
+    if (!(n >= 4 && rd(&s, 0, head, 4) && !memcmp(head, "RIFF", 4)) && (n == 0 || rd(&s, 0, head, n)) &&
+        sf_is_sfz(path, head, n)) {
+      CloseHandle(s.h);
+      f->is_sfz = 1;
+      f->path = _strdup(path);
+      if (!f->path) snprintf(why, sizeof why, "out of memory");
+      else {
+        int r = sf_parse_sfz(f, path, why, sizeof why);
+        if (r > 0) return f;
+        if (r < 0) {                         /* why is the whole reason (every sample missing, say) */
+          if (err && cap > 0) snprintf(err, cap, "%s", why);
+          sf_free(f);
+          return NULL;
+        }
+      }
+      if (err && cap > 0) snprintf(err, cap, "%s isn't an SFZ file this can play (%s)", base_name(path), why);
+      sf_free(f);
+      return NULL;
+    }
+  }
   if (!rd(&s, 0, h, 12) || memcmp(h, "RIFF", 4) ||
       (memcmp(h + 8, "sfbk", 4) && memcmp(h + 8, "sfpk", 4) && memcmp(h + 8, "DLS ", 4))) {
     if (err && cap > 0) snprintf(err, cap, "%s isn't a SoundFont", base_name(path));
@@ -1049,6 +1074,11 @@ void sf_free(SmpFont *f) {
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */
   free(f->swmask); free(f->pflags); free(f->kix_off); free(f->kix);
   free(f);
+}
+
+int smp_sf_ignored(const SmpFont *f, char *first, int cap) {
+  if (first && cap > 0) snprintf(first, (size_t)cap, "%s", f && f->is_sfz ? f->sfz_first_ignored : "");
+  return f && f->is_sfz ? f->sfz_ignored : 0;
 }
 
 int smp_sf_preset_count(const SmpFont *f) { return f ? f->nphdr : 0; }

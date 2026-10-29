@@ -49,7 +49,16 @@ typedef struct {
   uint64_t key;              /* DECODED: cache key of a decoded mono float copy in the disk cache (sffont.c) */
   uint8_t wrap;              /* DECODED: the bytes are a DLS wave's LIST chunk, which reads as a RIFF WAVE file once
                                 its two ids are changed (LIST to RIFF, wave to WAVE); sffont.c does that */
+  uint32_t skip;             /* DECODED: the sample starts this many frames into the decoded file (an SFZ start
+                                head, see sfsfz.c); the cache file holds the whole channel, so the key leaves it out */
+  uint8_t gen;               /* SF_GEN_*: a sample made in memory instead of read (SFZ's *sine, *silence, *noise) */
 } SmpSrc;
+enum { SF_GEN_NONE = 0, SF_GEN_SINE, SF_GEN_SILENCE, SF_GEN_NOISE };
+/* the made samples' lengths and rates: a 1024-frame sine cycle at the rate that makes it C4 (261.63 Hz), so it plays
+   at the region's pitch_keycenter; 1024 frames of silence and 32768 of white noise at 44100 Hz. All loop whole. */
+#define SF_GEN_FRAMES 1024
+#define SF_GEN_SINE_RATE 267905u
+#define SF_GEN_NOISE_FRAMES 32768
 
 struct SmpFont {
   char *path;
@@ -62,6 +71,9 @@ struct SmpFont {
   int is_dls;                           /* DLS (sfdls.c): only phdr, shdr, src, paths, order and regions are filled */
   int dls_ignored;                      /* DLS: connection blocks (or their output curves) that map to nothing here */
   int dls_boosts;                       /* DLS: regions with a gain above 0 (see sfdls.c) */
+  int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
+  int sfz_ignored;                      /* SFZ: different opcodes and headers used that this can't play */
+  char sfz_first_ignored[64];           /* SFZ: the first of them */
   SfPhdr *phdr; int nphdr;
   SfBag *pbag; int npbag;
   SmpSfMod *pmod; int npmod;
@@ -141,6 +153,7 @@ typedef struct SfPcm {
   uint64_t offset;                      /* PCM_FILE: byte offset of frame 0 */
   uint8_t enc, channels, channel;       /* PCM_FILE */
   SmpEntry *entry;                      /* DECODED: the mono float cache file, open while the sample is loaded */
+  uint32_t skip;                        /* DECODED: frame 0 is this frame of the cache file */
   void *tail;                           /* the post-loop head: tail_frames frames from frame tail_start (its own
                                            allocation, with pads), or NULL */
   uint32_t tail_start, tail_frames;
@@ -184,6 +197,12 @@ wchar_t *sf_full_path(const char *path);
 /* sfdls.c: fills f from a DLS file (RIFF form "DLS ", already checked) open on h: 1 when it did, 0 with why when it
    can't, -1 for a GigaStudio file (which this can't read yet) */
 int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
+/* sfsfz.c: fills f from an SFZ file (f->size, mtime and path set): 1 when it did; 0 with why (a reason to put in
+   brackets) or -1 with why (the whole reason) when it can't. Main thread (it reads every sample file's header). */
+int sf_parse_sfz(SmpFont *f, const char *path, char *why, int wcap);
+/* sfsfz.c: 1 when a file should be read as SFZ: its name ends .sfz, or its first bytes (head, n of them) are text with
+   an SFZ header in them */
+int sf_is_sfz(const char *path, const uint8_t *head, size_t n);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);
 /* cache.c: a positional read on a handle opened with FILE_FLAG_OVERLAPPED, waited for on an event of the calling

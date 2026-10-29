@@ -58,7 +58,10 @@ class SmpSfCond(ctypes.Structure):
                 ("xfin_lokey", i8), ("xfin_hikey", i8), ("xfout_lokey", i8), ("xfout_hikey", i8),
                 ("xfin_lovel", u8), ("xfin_hivel", u8), ("xfout_lovel", u8), ("xfout_hivel", u8),
                 ("xf_curve", u8), ("group", ctypes.c_uint32), ("off_by", ctypes.c_uint32), ("off_mode", u8),
-                ("rt_decay", ctypes.c_float), ("amp_veltrack", ctypes.c_float)]
+                ("rt_decay", ctypes.c_float), ("amp_veltrack", ctypes.c_float),
+                ("gain", ctypes.c_float), ("amp_velcurve", ctypes.POINTER(ctypes.c_float)),
+                ("polyphony", ctypes.c_uint16), ("note_polyphony", ctypes.c_uint16),
+                ("one_shot", u8), ("fil_type", u8)]
 
 
 class SmpSfRegion(ctypes.Structure):
@@ -246,6 +249,7 @@ def lib(settings_file):
                             ("smp_sf_test_whole", None, [c_int]),
                             ("smp_sf_test_decodes", c_long, []),
                             ("smp_sf_problem", c_char_p, [vp]),
+                            ("smp_sf_ignored", c_int, [vp, c_char_p, c_int]),
                             ("smp_synth_underruns", c_long, [vp]),
                             ("smp_synth_test_stream_pause", None, [vp, c_int]),
                             ("smp_synth_set_offline", None, [vp, c_int]),

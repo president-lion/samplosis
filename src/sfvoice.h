@@ -89,7 +89,9 @@ int smp_sfv_needs_ring_now(const SmpSfVoice *v);       /* the voice's first fram
                                                           render waits for the streamer then) */
 int smp_sfv_ring_low(SmpSfVoice *v);                   /* the voice streams and its ring holds less than half a ring
                                                           ahead of it (an offline render tops the rings up then) */
-void smp_sfv_release(SmpSfVoice *v);                   /* note-off: the envelopes' release stages */
+void smp_sfv_release(SmpSfVoice *v);                   /* note-off: the envelopes' release stages (not for a
+                                                          one-shot region, which plays its sample to the end) */
+void smp_sfv_off(SmpSfVoice *v);                       /* the release stages even for a one-shot (an off_by stop) */
 void smp_sfv_kill(SmpSfVoice *v, double fade_ms);      /* fades out over fade_ms; 0 or less ends it at once */
 void smp_sfv_update(SmpSfVoice *v, const SmpSfChan *c);   /* a controller changed: the modulators again */
 /* adds n frames into l and r (and the effect sends into rev and cho, either may be NULL). Returns 0 once the

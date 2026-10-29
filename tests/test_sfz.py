@@ -1,0 +1,562 @@
+"""SFZ (Task 9): an .sfz is one preset whose regions come from its opcodes. Every test writes a small .sfz and its
+samples (16-bit or 24-bit WAV, some with a smpl loop, and FLAC) into tmp_path, opens it through smp_sf_open, and
+checks the regions' generators and conditions, and how notes sound (smp_sf_test_note, or the player for the region
+conditions)."""
+import ctypes
+import math
+import os
+import random
+import struct
+
+import numpy as np
+import soundfile as sf
+
+from test_sf2 import CLAMPS, load_all, mods, peak_hz, presets, regions, sf_open
+from test_sffont import pcm
+
+RATE = 44100
+OUT = 48000
+
+
+# ---- fixtures written here ----
+
+def sine(n, freq, rate=RATE, amp=0.5):
+    return amp * np.sin(2 * np.pi * freq * np.arange(n) / rate)
+
+
+def write_wav(path, x, rate=RATE, bits=16, loop=None, unity=None):
+    """A PCM WAV (mono, or frames x 2), optionally with a smpl chunk: loop = (first, last) frames (last inclusive)."""
+    x = np.asarray(x, dtype=np.float64)
+    ch = 1 if x.ndim == 1 else x.shape[1]
+    if bits == 16:
+        data = np.clip(np.round(x * 32767), -32768, 32767).astype("<i2").tobytes()
+    else:
+        v = np.clip(np.round(x * 8388607), -8388608, 8388607).astype("<i4").reshape(-1)
+        data = b"".join(int(s).to_bytes(4, "little", signed=True)[:3] for s in v)
+    block = ch * bits // 8
+    fmt = struct.pack("<HHIIHH", 1, ch, rate, rate * block, block, bits)
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+    if loop or unity is not None:
+        smpl = struct.pack("<9I", 0, 0, 0, 60 if unity is None else unity, 0, 0, 0, 1 if loop else 0, 0)
+        if loop:
+            smpl += struct.pack("<6I", 0, 0, loop[0], loop[1], 0, 0)
+        chunks += b"smpl" + struct.pack("<I", len(smpl)) + smpl
+    chunks += b"data" + struct.pack("<I", len(data)) + data + (b"\0" if len(data) & 1 else b"")
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks)
+    return path
+
+
+def write_sfz(path, text):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return str(path)
+
+
+def opened(lib, path):
+    f, err = sf_open(lib, path)
+    assert f, err
+    return f
+
+
+def note(lib, f, key, vel=100, n=24000, release_at=-1):
+    """the preset's note as stereo frames x 2 at OUT Hz"""
+    out = (ctypes.c_float * (2 * n))()
+    nv = lib.smp_sf_test_note(f, 0, key, vel, float(OUT), n, release_at, out)
+    assert nv >= 0
+    return np.frombuffer(out, dtype=np.float32).reshape(n, 2).copy(), nv
+
+
+def rms(x):
+    return float(np.sqrt(np.mean(np.square(x)) + 1e-30))
+
+
+def db(a, b):
+    return 20 * math.log10(a / b)
+
+
+def ignored(lib, f):
+    first = ctypes.create_string_buffer(128)
+    n = lib.smp_sf_ignored(f, first, 128)
+    return n, first.value.decode("utf-8", "replace")
+
+
+def walk(lib, f):
+    """everything the API offers about the font, every index in range (test_sf2.walk_font without its SF2-only
+    modulator count)"""
+    ns = lib.smp_sf_sample_count(f)
+    for i in range(lib.smp_sf_preset_count(f)):
+        assert lib.smp_sf_preset_info(f, i, None, None, None, 0)
+        for r in regions(lib, f, i):
+            assert r.lokey <= r.hikey <= 127 and r.lovel <= r.hivel <= 127
+            assert 0 <= r.sample < ns
+            assert len(mods(r.imod, r.nimod)) == r.nimod
+            for g, (lo, hi) in CLAMPS.items():
+                assert lo <= r.gen[g] <= hi, (g, r.gen[g])
+
+
+def cents(r):
+    return 100 * r.gen[51] + r.gen[52]
+
+
+# ---- the tests ----
+
+def test_sfz_basic_mapping(lib, tmp_path):
+    """Keys (numbers and note names, c4 = 60), velocity, pitch_keycenter, tune and transpose, volume, amplitude
+    and pan become SF2's ranges and generators; notes sound at the right pitch and level."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    write_wav(tmp_path / "b24.wav", sine(RATE // 2, 440.0), bits=24)
+    sf.write(str(tmp_path / "c.aif"), sine(RATE // 2, 440.0), RATE, format="AIFF", subtype="PCM_16")
+    path = write_sfz(tmp_path / "Basic Piano.sfz", """
+<region> sample=a.wav lokey=c4 hikey=e4 pitch_keycenter=d4 tune=-30 transpose=1 volume=-6 pan=-50 lovel=10 hivel=100
+<region> sample=a.wav key=72 volume=3
+<region> sample=b24.wav key=74 volume=-3
+<region> sample=a.wav lokey=C#3 hikey=eb3 pitch_keycenter=76 amplitude=50
+<region> sample=c.aif key=40
+<region> sample=a.wav key=41
+""")
+    f = opened(lib, path)
+    try:
+        assert presets(lib, f) == [(0, 0, "Basic Piano")]
+        r = regions(lib, f, 0)
+        assert len(r) == 6
+        assert (r[0].lokey, r[0].hikey, r[0].lovel, r[0].hivel) == (60, 64, 10, 100)
+        assert r[0].gen[58] == 62 and cents(r[0]) == 70
+        assert r[0].gen[48] == 150 and r[0].gen[17] == -250          # -6 dB x -25; pan x 5
+        assert abs(r[0].cond.amp_veltrack - 100) < 1e-6 and abs(r[0].cond.gain - 1) < 1e-6
+        assert (r[1].lokey, r[1].hikey, r[1].gen[58]) == (72, 72, 72)
+        assert r[1].gen[48] == 0 and abs(r[1].cond.gain - 10 ** (3 / 20)) < 1e-4
+        assert (r[3].lokey, r[3].hikey) == (49, 51) and r[3].gen[48] == 151   # 50 % is -6.02 dB
+        walk(lib, f)
+        x, nv = note(lib, f, 62)
+        assert nv == 1
+        assert abs(peak_hz(x[2000:20000, 0], OUT) - 440 * 2 ** (70 / 1200)) < 2
+        assert rms(x[2000:20000, 0]) > 2 * rms(x[2000:20000, 1])     # panned left
+        hi, _ = note(lib, f, 72)
+        lo, _ = note(lib, f, 74)
+        assert abs(peak_hz(hi[2000:20000, 0], OUT) - 440) < 2 and abs(peak_hz(lo[2000:20000, 0], OUT) - 440) < 2
+        assert abs(db(rms(hi[2000:20000]), rms(lo[2000:20000])) - 6) < 0.3   # +3 dB against -3 dB (16 and 24 bit)
+        aif, _ = note(lib, f, 40)
+        wav, _ = note(lib, f, 41)
+        assert abs(peak_hz(aif[2000:20000, 0], OUT) - 440) < 2
+        assert abs(db(rms(aif[2000:20000]), rms(wav[2000:20000]))) < 0.05      # big-endian AIFF streams the same
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_inheritance_and_define_include(lib, tmp_path):
+    """global, master, group and region inherit in order; #define replaces text; #include reads a file relative to
+    the one including it (a cycle back to the root is ignored); comments; control's default_path and
+    octave_offset."""
+    os.makedirs(tmp_path / "samples")
+    os.makedirs(tmp_path / "inc")
+    write_wav(tmp_path / "samples" / "a.wav", sine(RATE // 2, 440.0))
+    write_sfz(tmp_path / "inc" / "more.sfz", '<region> sample=a.wav lokey=65 hikey=66 volume=0\n#include "../main.sfz"\n')
+    path = write_sfz(tmp_path / "main.sfz", """// an instrument
+#define $VOL -12
+#define $KEY 64
+#define $K2 $KEY
+<control> default_path=samples/
+<global> volume=$VOL ampeg_release=0.5
+<master> lovel=1 hivel=64
+<group> pitch_keycenter=60 tune=10
+<region> sample=a.wav key=$K2
+#include "inc/more.sfz"
+<group> tune=20   // a comment <region> sample=bogus.wav
+/* a block
+   comment <region> sample=bogus.wav */
+<region> sample=a.wav lokey=70 hikey=71
+<master> hivel=127
+<region> sample=a.wav key=80
+<control> octave_offset=1
+<region> sample=a.wav key=60
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.lokey, x.hikey) for x in r] == [(64, 64), (65, 66), (70, 71), (80, 80), (72, 72)]
+        assert [(x.lovel, x.hivel) for x in r] == [(1, 64), (1, 64), (1, 64), (0, 127), (0, 127)]
+        assert [x.gen[48] for x in r] == [300, 0, 300, 300, 300]
+        assert [cents(x) for x in r] == [10, 10, 20, 0, 0]
+        assert [x.gen[58] for x in r] == [64, 60, 60, 80, 72]     # key= sets pitch_keycenter too
+        assert all(x.gen[38] == -1200 for x in r)                      # 0.5 s release in timecents
+        assert lib.smp_sf_problem(f) == b""
+        assert ignored(lib, f)[0] == 0
+    finally:
+        lib.smp_sf_close(f)
+
+
+def envelope(x, win=480):
+    a = np.abs(x)
+    return np.array([a[i:i + win].max() for i in range(0, len(a) - win, win)])
+
+
+def test_sfz_envelope_and_filter(lib, tmp_path):
+    """ampeg_* is the volume envelope, fileg_* the modulation envelope to the cutoff; fil_type, cutoff, resonance
+    and fil_veltrack; highpass and bandpass (the voice's RBJ extension); a filter kind the voice lacks is counted
+    and plays unfiltered."""
+    write_wav(tmp_path / "s100.wav", sine(RATE * 2, 100.0))
+    write_wav(tmp_path / "s5k.wav", sine(RATE * 2, 5000.0))
+    path = write_sfz(tmp_path / "e.sfz", """
+<region> sample=s100.wav key=60 ampeg_delay=0.01 ampeg_attack=0.1 ampeg_hold=0.05 ampeg_decay=0.2 ampeg_sustain=50 ampeg_release=0.3
+<region> sample=s5k.wav key=62 pitch_keycenter=62 fil_type=lpf_2p cutoff=1000 resonance=6 fil_veltrack=1200 fileg_attack=0.2 fileg_sustain=50 fileg_depth=1200
+<region> sample=s100.wav key=64 pitch_keycenter=64 fil_type=hpf_2p cutoff=2000
+<region> sample=s100.wav key=65 pitch_keycenter=65
+<region> sample=s5k.wav key=66 pitch_keycenter=66 fil_type=bpf_2p cutoff=500
+<region> sample=s5k.wav key=67 pitch_keycenter=67 fil_type=pkf_2p cutoff=500
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        e = r[0].gen
+        assert (e[33], e[34], e[35], e[36], e[37], e[38]) == (-7973, -3986, -5186, -2786, 60, -2084)
+        g = r[1].gen
+        assert g[8] == round(1200 * math.log2(1000 / 8.176)) and g[9] == 60 and r[1].cond.fil_type == 0
+        assert g[26] == round(1200 * math.log2(0.2)) and g[29] == 500 and g[11] == 1200
+        assert (0x0002, 8, 1200, 0, 0) in mods(r[1].imod, r[1].nimod)
+        assert all(m[1] != 8 or m[0] == 0x0002 for m in mods(r[0].imod, r[0].nimod))   # no velocity-to-cutoff default
+        assert r[2].cond.fil_type == 1 and r[4].cond.fil_type == 2
+        assert r[5].gen[8] == 13500 and r[5].cond.fil_type == 0                # unsupported: no filter
+        n, first = ignored(lib, f)
+        assert n == 1 and first == "fil_type=pkf_2p"
+        # the envelope: silent in its delay, rising, then at the 50 % sustain (-6 dB) after the decay
+        x, _ = note(lib, f, 60, n=int(0.8 * OUT))
+        env = envelope(x[:, 0])
+        peak = env[int(0.12 * 100):int(0.15 * 100)].mean()          # in the hold
+        sus = env[int(0.6 * 100):int(0.7 * 100)].mean()
+        assert env[0] < 0.01 * peak
+        assert abs(db(sus, peak) + 6.0) < 1.0
+        # the highpass removes the 100 Hz sine; the same region without the filter keeps it
+        hp, _ = note(lib, f, 64)
+        plain, _ = note(lib, f, 65)
+        assert db(rms(hp[4000:]), rms(plain[4000:])) < -40
+        # the lowpass (1 kHz, opened by velocity and its envelope) and the bandpass (500 Hz) cut the 5 kHz sine
+        bp, _ = note(lib, f, 66)
+        un, _ = note(lib, f, 67)
+        assert db(rms(bp[4000:]), rms(un[4000:])) < -15
+        lp, _ = note(lib, f, 62, vel=1)
+        assert db(rms(lp[12000:]), rms(un[12000:])) < -20
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_loop_modes(lib, tmp_path):
+    """loop_mode: the default follows the file's smpl loop (loop_continuous) or its absence (no_loop); one_shot
+    ignores note-off; loop_sustain plays on past the loop after release; loop_start, loop_end, offset and end
+    become SF2's address offsets."""
+    write_wav(tmp_path / "loop.wav", sine(RATE // 2, 441.0), loop=(1000, 1999))
+    write_wav(tmp_path / "plain.wav", sine(RATE // 2, 441.0))
+    path = write_sfz(tmp_path / "l.sfz", """
+<group> pitch_keycenter=60
+<region> sample=loop.wav key=60
+<region> sample=loop.wav key=61 pitch_keycenter=61 loop_mode=no_loop
+<region> sample=plain.wav key=62 pitch_keycenter=62 loop_mode=one_shot
+<region> sample=loop.wav key=63 pitch_keycenter=63 loop_mode=loop_sustain loop_start=500 loop_end=1499
+<region> sample=plain.wav key=64 pitch_keycenter=64 offset=100 end=20099
+<region> sample=plain.wav key=65 pitch_keycenter=65 loop_mode=loop_continuous loop_start=200 loop_end=1199
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.gen[54] for x in r] == [1, 0, 0, 3, 0, 1]
+        assert r[2].cond.one_shot == 1 and r[0].cond.one_shot == 0
+        assert (r[3].gen[2], r[3].gen[3]) == (-500, -500)                 # against the file's loop 1000..2000
+        assert (r[4].gen[0], r[4].gen[1]) == (100, 20100 - RATE // 2)      # end is the last frame played
+        assert (r[5].gen[2], r[5].gen[3]) == (200, 1200)                   # no file loop: from frame 0
+        n = int(1.2 * OUT)
+        held = lambda k, rel=-1: note(lib, f, k, n=n, release_at=rel)[0][:, 0]
+        late = slice(int(0.8 * OUT), int(0.9 * OUT))
+        assert rms(held(60)[late]) > 0.05                                   # loops past the 0.5 s sample
+        assert rms(held(61)[late]) < 1e-4                                   # ends with the sample
+        one = held(62, rel=int(0.05 * OUT))
+        assert rms(one[int(0.3 * OUT):int(0.4 * OUT)]) > 0.05               # plays on after its note-off
+        assert rms(one[late]) < 1e-4
+        sus = held(63, rel=int(0.8 * OUT))
+        assert rms(sus[int(0.7 * OUT):int(0.79 * OUT)]) > 0.05              # held: loops
+        assert rms(sus[int(1.0 * OUT):]) < 1e-3                             # released: plays out, then silence
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_offset_start_head(lib, tmp_path):
+    """A region whose offset lies past the head the loader keeps gets a start head: a sample of its own from that
+    frame, so the note starts from memory at once; an offset inside the head doesn't."""
+    x = sine(3 * RATE, 300.0)
+    x[2 * RATE:] = sine(RATE, 600.0)
+    write_wav(tmp_path / "long.wav", x)
+    path = write_sfz(tmp_path / "o.sfz", """
+<region> sample=long.wav key=60 offset=88200
+<region> sample=long.wav key=61 pitch_keycenter=61 offset=1000
+<region> sample=long.wav key=62 pitch_keycenter=62 offset=88200
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert lib.smp_sf_sample_count(f) == 2                              # the file, and one start head
+        assert r[0].sample == r[2].sample != r[1].sample
+        assert r[0].gen[0] == 0 and r[0].gen[4] == 0 and r[1].gen[0] == 1000
+        load_all(lib, f)
+        lib.smp_sf_use(f, 0, 1)
+        lib.smp_sf_wait_idle(f, 10000)
+        head, _ = pcm(lib, f, r[0].sample)
+        lib.smp_sf_use(f, 0, -1)
+        want = np.round(sine(len(head), 600.0) * 32767)
+        assert np.max(np.abs(head[:2000] - want[:2000])) <= 1                # the file's frames from 2 s on
+        y, _ = note(lib, f, 60, n=12000)
+        assert abs(peak_hz(y[1000:12000, 0], OUT) - 600) < 3
+    finally:
+        lib.smp_sf_close(f)
+
+
+class Player:
+    def __init__(self, lib, tmp_path, path):
+        self.lib, self.tmp = lib, tmp_path
+        err = ctypes.create_string_buffer(512)
+        self.s = lib.smp_synth_new(float(OUT), 256)
+        lib.smp_synth_set_param(self.s, 33, 0)                               # no effects
+        assert lib.smp_synth_load(self.s, path.encode(), err, 512) == 1, err.value
+
+    def render(self, events, secs):
+        out = self.tmp / "r.wav"
+        assert self.lib.smp_synth_render_test(self.s, "\n".join(events).encode(), int(secs * OUT), 256,
+                                              str(out).encode(), 0) == 0
+        x, _ = sf.read(str(out), dtype="float32", always_2d=True)
+        return x[:, 0]
+
+    def free(self):
+        self.lib.smp_synth_free(self.s)
+
+
+def on(k, v, t):
+    return "midi %d %d %d %d" % (0x90, k, v, int(round(t * OUT)))
+
+
+def off(k, t):
+    return "midi %d %d 0 %d" % (0x80, k, int(round(t * OUT)))
+
+
+def tone(x, f):
+    w = np.hanning(len(x))
+    t = np.arange(len(x)) / OUT
+    return 2 * abs(np.sum(x * w * np.exp(-2j * np.pi * f * t))) / np.sum(w)
+
+
+def test_sfz_round_robin_and_release(lib, tmp_path):
+    """seq_length and seq_position (position 1 by default) cycle through Task 8's player; a release region plays
+    at note-off and falls rt_decay dB a second held; half-given keyswitch ranges take SFZ's defaults and
+    sw_default is set on every region; polyphony per group."""
+    freqs = [300.0, 500.0, 700.0, 900.0]
+    for fq in freqs:
+        write_wav(tmp_path / ("s%d.wav" % fq), sine(RATE, fq))
+    path = write_sfz(tmp_path / "rr.sfz", """
+<group> seq_length=3 pitch_keycenter=60 key=60
+<region> sample=s300.wav
+<region> sample=s500.wav seq_position=2
+<region> sample=s700.wav seq_position=3
+<group> trigger=release rt_decay=6 pitch_keycenter=60 key=60
+<region> sample=s900.wav
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.cond.seq_len, x.cond.seq_pos) for x in r[:3]] == [(3, 1), (3, 2), (3, 3)]
+        assert r[3].cond.trigger == 1 and abs(r[3].cond.rt_decay - 6) < 1e-6 and r[3].cond.seq_len == 0
+    finally:
+        lib.smp_sf_close(f)
+    sw = write_sfz(tmp_path / "sw.sfz", """
+<group> sw_lokey=36 sw_last=36 key=100
+<region> sample=s300.wav
+<group> sw_hikey=40 sw_last=38 sw_default=38 key=101 xfin_lokey=90
+<region> sample=s300.wav
+""")
+    f = opened(lib, sw)
+    try:
+        r = regions(lib, f, 0)
+        assert (r[0].cond.sw_lokey, r[0].cond.sw_hikey, r[0].cond.sw_last) == (36, 127, 36)
+        assert (r[1].cond.sw_lokey, r[1].cond.sw_hikey, r[1].cond.sw_last) == (0, 40, 38)
+        assert (r[1].cond.xfin_lokey, r[1].cond.xfin_hikey) == (90, 0)
+        assert all(x.cond.sw_default == 38 for x in r)
+    finally:
+        lib.smp_sf_close(f)
+    p = Player(lib, tmp_path, path)
+    try:
+        ev = []
+        for i in range(4):
+            ev += [on(60, 100, 0.5 * i), off(60, 0.5 * i + 0.2)]
+        x = p.render(ev, 2.2)
+        got = []
+        for i in range(4):
+            w = x[int((0.5 * i + 0.05) * OUT):int((0.5 * i + 0.18) * OUT)]
+            got.append([fq for fq in freqs[:3] if tone(w, fq) > 0.02])
+        assert got == [[300.0], [500.0], [700.0], [300.0]]
+        rel = x[int(0.25 * OUT):int(0.45 * OUT)]
+        assert tone(rel, 900.0) > 0.02                                    # the release region after note-off
+        # rt_decay: held 1.1 s against 0.1 s is 6 dB a second quieter
+        a = p.render([on(60, 100, 0), off(60, 0.1)], 0.6)
+        b = p.render([on(60, 100, 0), off(60, 1.1)], 1.6)
+        la = tone(a[int(0.2 * OUT):int(0.4 * OUT)], 900.0)
+        lb = tone(b[int(1.2 * OUT):int(1.4 * OUT)], 900.0)
+        assert abs(db(la, lb) - 6.0) < 1.0
+    finally:
+        p.free()
+
+
+def test_sfz_polyphony_and_one_shot_choke(lib, tmp_path):
+    """polyphony=1 on a group stops its earlier voice when another key of the group starts (other groups play on);
+    off_by chokes a one-shot (a hi-hat), which a note-off doesn't stop."""
+    write_wav(tmp_path / "s300.wav", sine(RATE, 300.0))
+    write_wav(tmp_path / "s500.wav", sine(RATE, 500.0))
+    write_wav(tmp_path / "s700.wav", sine(RATE, 700.0))
+    path = write_sfz(tmp_path / "p.sfz", """
+<group> group=5 polyphony=1
+<region> sample=s300.wav key=60 pitch_keycenter=60
+<region> sample=s500.wav key=61 pitch_keycenter=61
+<group> group=6
+<region> sample=s700.wav key=65 pitch_keycenter=65
+<group>
+<region> sample=s300.wav key=62 pitch_keycenter=62 loop_mode=one_shot group=1 off_by=2
+<region> sample=s500.wav key=64 pitch_keycenter=64 loop_mode=one_shot group=2
+""")
+    p = Player(lib, tmp_path, path)
+    try:
+        x = p.render([on(65, 100, 0), on(60, 100, 0), on(61, 100, 0.2), off(60, 0.5), off(61, 0.5), off(65, 0.5)], 0.6)
+        early, late = x[int(0.05 * OUT):int(0.18 * OUT)], x[int(0.3 * OUT):int(0.45 * OUT)]
+        assert tone(early, 300.0) > 0.05 and tone(early, 700.0) > 0.05
+        assert tone(late, 300.0) < 0.01                                     # stopped by key 61 in its group
+        assert tone(late, 500.0) > 0.05 and tone(late, 700.0) > 0.05         # group 6 isn't limited
+        z = p.render([on(62, 100, 0), off(62, 0.05), on(64, 100, 0.3)], 0.6)
+        assert tone(z[int(0.1 * OUT):int(0.25 * OUT)], 300.0) > 0.05          # one-shot plays past note-off
+        assert tone(z[int(0.4 * OUT):int(0.55 * OUT)], 300.0) < 0.01          # choked by group 2
+        assert tone(z[int(0.4 * OUT):int(0.55 * OUT)], 500.0) > 0.05
+    finally:
+        p.free()
+
+
+def test_sfz_missing_sample(lib, tmp_path):
+    """Missing samples skip their regions; the font opens with the rest and its problem names the first missing
+    file and the count. With every sample missing it doesn't open, and the reason says so."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 4, 440.0))
+    (tmp_path / "junk.wav").write_bytes(b"RIFF\x10\0\0\0WAVEjunkjunkjunk")
+    path = write_sfz(tmp_path / "m.sfz", """
+<region> sample=a.wav key=60
+<region> sample=b.wav key=61
+<region> sample=c.wav key=62
+<region> sample=b.wav key=63
+<region> sample=junk.wav key=64
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.lokey for x in r] == [60]
+        prob = lib.smp_sf_problem(f).decode()
+        assert "Missing 2 samples (first: b.wav)" in prob
+        assert "1 sample can't be read (first: junk.wav)" in prob
+        x, nv = note(lib, f, 60)
+        assert nv == 1 and rms(x) > 0.01
+    finally:
+        lib.smp_sf_close(f)
+    gone = write_sfz(tmp_path / "gone.sfz", "<region> sample=nothere.wav key=60\n")
+    f, err = sf_open(lib, gone)
+    assert not f and "Missing 1 sample (first: nothere.wav)" in err and "gone.sfz" in err
+
+
+def test_sfz_unknown_opcodes_counted(lib, tmp_path):
+    """Opcodes this can't play are counted once per name (the first kept); labels and hints aren't; unknown
+    headers count as <name>."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 4, 440.0))
+    path = write_sfz(tmp_path / "u.sfz", """
+<control> hint_ram_based=1 label_cc7=Volume
+<global> eq1_freq=100 eq1_gain=3 region_label=Hi
+<group> foo_bar=1 amp_random=2 eq1_freq=200 group_label=x
+<region> sample=a.wav key=60 sw_label=y
+<region> sample=a.wav key=61 amp_random=3
+<weird> x=1
+""")
+    f = opened(lib, path)
+    try:
+        assert len(regions(lib, f, 0)) == 2
+        assert ignored(lib, f) == (5, "eq1_freq")      # eq1_freq, eq1_gain, foo_bar, amp_random, <weird>
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_corrupt(lib, tmp_path):
+    """Every 97th truncation, seeded random corruption, random bytes, a huge line, deep and cyclic includes:
+    each opens as a font or gives NULL with a reason, never a crash; some that open load their samples."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 4, 440.0), loop=(100, 999))
+    sf.write(str(tmp_path / "b.flac"), np.stack([sine(RATE // 4, 440.0), sine(RATE // 4, 660.0)], 1), RATE)
+    write_sfz(tmp_path / "self.sfz", '#include "self.sfz"\n<region> sample=a.wav key=70\n')
+    good = """#define $K 60
+<control> default_path=./
+<global> ampeg_release=0.2 // comment
+<group> seq_length=2 lovel=1 hivel=127 cutoff=2000 fil_type=hpf_2p
+<region> sample=a.wav key=$K seq_position=1 offset=10 end=9000 loop_mode=loop_sustain
+<region> sample=b.flac lokey=c4 hikey=g4 seq_position=2 pan=20 width=50 sw_lokey=24 sw_hikey=30 sw_last=24
+<region> sample=*sine key=72 trigger=release rt_decay=3 locc64=64 hicc64=127 amp_velcurve_64=0.5
+#include "self.sfz"
+"""
+    data = good.encode()
+    variants = [data[:cut] for cut in range(0, len(data), 97)]
+    rng = random.Random(97)
+    for _ in range(300):
+        b = bytearray(data)
+        for _ in range(8):
+            b[rng.randrange(len(b))] = rng.randrange(256)
+        variants.append(bytes(b))
+    variants.append(bytes(rng.randrange(256) for _ in range(5000)))
+    variants.append(b"a" * (1 << 20) + b"\n<region> sample=a.wav key=60\n")
+    variants.append(b"<region> sample=" + b"x" * 5000 + b".wav key=60\n" + b"$" * 100000)
+    variants.append(b"#define $A $A$A$A$A\n" * 50 + b"<region> sample=a.wav key=$A\n")
+    path = tmp_path / "bad.sfz"
+    opened_n = 0
+    for k, v in enumerate(variants):
+        path.write_bytes(v)
+        f, err = sf_open(lib, path)
+        if f:
+            opened_n += 1
+            walk(lib, f)
+            ignored(lib, f)
+            lib.smp_sf_problem(f)
+            if k % 7 == 0:
+                load_all(lib, f)
+            lib.smp_sf_close(f)
+        else:
+            assert err
+    assert opened_n > 0
+
+
+def test_sfz_paths_with_spaces_and_backslashes(lib, tmp_path):
+    """Sample paths with spaces run to the next opcode; backslashes and slashes both work, with default_path and
+    absolute paths. A stereo FLAC is decoded (once) and plays as two regions panned left and right."""
+    d = tmp_path / "my samples"
+    os.makedirs(d)
+    write_wav(d / "Grand Piano C4.wav", sine(RATE // 2, 440.0))
+    sf.write(str(d / "Grand Piano D4.flac"), np.stack([sine(RATE // 2, 440.0), sine(RATE // 2, 660.0)], 1), RATE)
+    sf.write(str(d / "Grand Piano E4.ogg"), sine(RATE // 2, 440.0), RATE, format="OGG", subtype="VORBIS")
+    absolute = str(d / "Grand Piano C4.wav").replace("/", "\\")
+    path = write_sfz(tmp_path / "s.sfz", """
+<region> sample=my samples\\Grand Piano C4.wav lokey=60 hikey=60 pitch_keycenter=60
+<control> default_path=my samples/
+<region> sample=Grand Piano D4.flac   lokey=62 hikey=62 pitch_keycenter=62
+<region> sample=%s key=64
+<region> sample=Grand Piano E4.ogg key=66
+""" % absolute)
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [x.lokey for x in r] == [60, 62, 62, 64, 66]
+        assert r[0].sample == r[3].sample                                    # the same file, once
+        assert (r[1].gen[17], r[2].gen[17]) == (-500, 500)                  # the stereo pair
+        assert lib.smp_sf_problem(f) == b""
+        before = lib.smp_sf_test_decodes()
+        x, nv = note(lib, f, 60)
+        assert nv == 1 and abs(peak_hz(x[2000:20000, 0], OUT) - 440) < 2
+        y, nv = note(lib, f, 62)
+        assert nv == 2
+        assert abs(peak_hz(y[2000:20000, 0], OUT) - 440) < 2                # left channel on the left
+        assert abs(peak_hz(y[2000:20000, 1], OUT) - 660) < 2                # right on the right
+        assert lib.smp_sf_test_decodes() - before <= 2                       # the FLAC's channels from one decode
+        o, nv = note(lib, f, 66)
+        assert nv == 1 and abs(peak_hz(o[2000:20000, 0], OUT) - 440) < 2   # Ogg Vorbis, length from its last page
+    finally:
+        lib.smp_sf_close(f)

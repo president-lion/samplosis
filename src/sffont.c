@@ -206,7 +206,7 @@ static HANDLE font_handle(SmpFont *f, int path_id) {
 static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *broken) {
   SmpEntry *e = smp_cache_open_mono(c->key);
   SfPcm *p;
-  uint32_t n, hf;
+  uint32_t n, hf, skip = c->skip;
   if (!e) {
     float *x; int ch = 0, r = 0; long frames = 0; char err[256];
     const float *mono;
@@ -233,23 +233,59 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
     mono = x + (size_t)(c->channel < ch ? c->channel : 0) * (size_t)n;   /* channel after channel */
     /* every decoded sample goes to the cache, short ones too, so the next open decodes nothing */
     if (smp_cache_write_mono(c->key, mono, n, r > 0 ? r : (int)rate) == 0) e = smp_cache_open_mono(c->key);
-    hf = e ? head_of(n, rate) : n;                                  /* no cache: held whole */
-    p = new_pcm(n, hf, 1);
+    /* A whole sample file (SFZ, Decent Sampler) in stereo: the loader made its other channel the sample next to
+       this one, so that one's cache file is written now too, from the same decode, rather than decoding the file
+       a second time when it loads. */
+    if (!c->length && ch > 1) {
+      int s = (int)(c - f->src), k;
+      for (k = s - 1; k <= s + 1; k += 2) {
+        const SmpSrc *o;
+        SmpEntry *oe;
+        if (k < 0 || k >= f->nshdr) continue;
+        o = &f->src[k];
+        if (o->kind != SMP_SRC_DECODED || o->length || o->path_id != c->path_id || o->channel == c->channel ||
+            o->channel >= ch || o->gen) continue;
+        if ((oe = smp_cache_open_mono(o->key)) != NULL) { smp_cache_close(oe); continue; }
+        smp_cache_write_mono(o->key, x + (size_t)o->channel * (size_t)n, n, r > 0 ? r : (int)rate);
+      }
+    }
+    if (skip >= n) { free(x); if (e) smp_cache_close(e); *broken = 1; return NULL; }
+    hf = e ? head_of(n - skip, rate) : n - skip;                    /* no cache: held whole */
+    p = new_pcm(n - skip, hf, 1);
     if (!p) { free(x); if (e) smp_cache_close(e); return NULL; }
-    memcpy(p->data, mono, (size_t)hf * sizeof(float));
+    memcpy(p->data, mono + skip, (size_t)hf * sizeof(float));
     free(x);
-    if (hf < n) p->entry = e;
+    if (hf < n - skip) { p->entry = e; p->skip = skip; }
     else if (e) smp_cache_close(e);
     return p;
   }
-  if (smp_entry_frames(e) == 0 || smp_entry_frames(e) > MAX_DECODED_FRAMES) { smp_cache_close(e); *broken = 1; return NULL; }
-  n = (uint32_t)smp_entry_frames(e);
+  if (smp_entry_frames(e) == 0 || smp_entry_frames(e) > MAX_DECODED_FRAMES || smp_entry_frames(e) <= skip) {
+    smp_cache_close(e); *broken = 1; return NULL;
+  }
+  n = (uint32_t)smp_entry_frames(e) - skip;
   hf = head_of(n, rate);
   p = new_pcm(n, hf, 1);
   if (!p) { smp_cache_close(e); return NULL; }
-  if (smp_entry_read_mono(e, 0, (float *)p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
-  if (hf < n) p->entry = e;
+  if (smp_entry_read_mono(e, skip, (float *)p->data, (long)hf) != (long)hf) { smp_cache_close(e); free(p); *broken = 1; return NULL; }
+  if (hf < n) { p->entry = e; p->skip = skip; }
   else smp_cache_close(e);
+  return p;
+}
+
+/* a sample made in memory (SFZ's *sine, *silence and *noise), held whole: n frames of it */
+static SfPcm *made_pcm(int gen, uint32_t n) {
+  SfPcm *p = new_pcm(n, n, 1);
+  float *d;
+  uint32_t i, x = 0x12345678u;
+  if (!p) return NULL;
+  d = (float *)p->data;
+  for (i = 0; i < n; i++) {
+    if (gen == SF_GEN_SINE) d[i] = (float)sin(2 * 3.14159265358979323846 * i / n);   /* one cycle */
+    else if (gen == SF_GEN_NOISE) {                                 /* xorshift32 white noise, -1..1 */
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      d[i] = (float)((x >> 8) * (2.0 / 16777216.0) - 1.0);
+    }
+  }
   return p;
 }
 
@@ -268,7 +304,7 @@ static int load_tail(SmpFont *f, const SmpSrc *c, SfPcm *p, uint32_t rate) {
   n = t1 - t0;
   if (!(b = calloc((size_t)n + 2 * SF_PCM_PAD, w))) return 0;
   if (p->entry) {
-    ok = smp_entry_read_mono(p->entry, t0, (float *)(b + SF_PCM_PAD * w), (long)n) == (long)n;
+    ok = smp_entry_read_mono(p->entry, (uint64_t)t0 + p->skip, (float *)(b + SF_PCM_PAD * w), (long)n) == (long)n;
   } else if (p->h != INVALID_HANDLE_VALUE) {
     HANDLE h = font_handle(f, c->path_id);
     int bps = pcm_bytes(c->enc);
@@ -304,7 +340,10 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   *broken = 0;
   if (f->is_pack && end > f->pack_frames) end = (uint32_t)f->pack_frames;   /* a pack: inside the decoded data */
   if (end <= sh->start) { *broken = 1; return NULL; }       /* start and end were clamped into smpl at open */
-  if (c->kind == SMP_SRC_DECODED) {
+  if (c->gen) {
+    p = made_pcm(c->gen, end - sh->start);
+    if (!p) return NULL;
+  } else if (c->kind == SMP_SRC_DECODED) {
     p = load_decoded(f, c, rate, broken);
     if (!p) return NULL;
   } else {
@@ -794,7 +833,7 @@ long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n) 
   if (p && frame < p->frames) {
     long want = (uint64_t)n < p->frames - frame ? n : (long)(p->frames - frame);
     if (p->entry) {
-      got = smp_entry_read_mono(p->entry, frame, out, want);
+      got = smp_entry_read_mono(p->entry, frame + p->skip, out, want);
       if (got < 0) got = 0;
     } else if (p->h != INVALID_HANDLE_VALUE) {
       /* through a small buffer on the stack, a piece at a time: no allocation, and a failed read stops here */

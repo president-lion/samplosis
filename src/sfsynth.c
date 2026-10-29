@@ -60,7 +60,12 @@
    - group and off_by: a region starting in group G stops this channel's voices whose region has off_by G (off_by
      0 is none), with that voice's off_mode: fast is the 5 ms kill, normal its release. SF2's exclusive classes
      work as before beside them.
-   - Crossfades and amp_veltrack: a fixed gain worked out when the voice starts (sfvoice.c). */
+   - Crossfades and amp_veltrack: a fixed gain worked out when the voice starts (sfvoice.c).
+   - polyphony and note_polyphony (SFZ): before a region starts, while its group already has that many voices
+     sounding on the channel (not released or fading), or that many on its key, the oldest stops by its own
+     off_mode (poly_limit).
+   - one_shot (SFZ loop_mode=one_shot): note-offs and the pedals don't release the voice (release_voice); an
+     off_by stop with off_mode normal and the polyphony limits do (stop_voice), and kills always do. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -345,9 +350,17 @@ static void kill_voice(SmpSynth *s, int i, double ms) {
   if (!s->v[i].live) slot_free(s, i);
 }
 
+/* a note-off or a pedal's let-go: a one-shot region (SFZ loop_mode=one_shot) ignores it, even while pending */
 static void release_voice(SmpSynth *s, int i) {
+  if (s->sl[i].reg && s->sl[i].reg->cond.one_shot) return;
   if (s->sl[i].st == V_PENDING) { slot_free(s, i); return; }
   if (s->sl[i].st == V_LIVE) smp_sfv_release(&s->v[i]);
+}
+
+/* a stop by another region (off_by with off_mode normal, or a polyphony limit): the release, one-shots too */
+static void stop_voice(SmpSynth *s, int i) {
+  if (s->sl[i].st == V_PENDING) { slot_free(s, i); return; }
+  if (s->sl[i].st == V_LIVE) smp_sfv_off(&s->v[i]);
 }
 
 /* how loud a voice counts for stealing. One still in its delay or attack is judged by the level it is rising
@@ -415,9 +428,39 @@ static int try_start(SmpSynth *s, int i) {
   return 1;
 }
 
+/* SFZ's polyphony and note_polyphony, before region r starts on channel c: while the channel already has that
+   many voices of r's group sounding (not released or fading), or that many of r's group on this key, the oldest
+   of them stops, by its own off_mode (fast: the 5 ms kill; normal: its release). */
+static void poly_limit(SmpSynth *s, int c, int key, const SmpSfRegion *r) {
+  int pass;
+  for (pass = 0; pass < 2; pass++) {
+    int lim = pass ? r->cond.note_polyphony : r->cond.polyphony;
+    if (!lim) continue;
+    for (;;) {
+      int i, n = 0, old = -1;
+      for (i = 0; i < MAXV; i++) {
+        Slot *t = &s->sl[i];
+        if (t->st == V_FREE || t->chan != c || !t->reg || t->reg->cond.group != r->cond.group) continue;
+        if (pass && t->key != key) continue;
+        if (t->st == V_LIVE && (s->v[i].released || s->v[i].killing)) continue;
+        n++;
+        if (old < 0 || t->age < s->sl[old].age) old = i;
+      }
+      if (n < lim || old < 0) break;
+      if (s->sl[old].reg->cond.off_mode == 1 && s->sl[old].st == V_LIVE) {
+        smp_sfv_off(&s->v[old]);
+        if (!s->v[old].released) kill_voice(s, old, KILL_MS);   /* never loop forever on one that can't release */
+      } else kill_voice(s, old, KILL_MS);
+      if (s->sl[old].st == V_PENDING) slot_free(s, old);
+    }
+  }
+}
+
 /* held: a release trigger's seconds held (it starts with its key up), else negative */
 static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion *r, double held) {
-  int i = free_slot(s); Slot *t;
+  int i; Slot *t;
+  if (r->cond.polyphony || r->cond.note_polyphony) poly_limit(s, c, key, r);
+  i = free_slot(s);
   if (i < 0) return;
   t = &s->sl[i];
   memset(t, 0, sizeof *t);
@@ -488,7 +531,7 @@ static void make_room(SmpSynth *s, int c, const SmpSfRegion *r) {
     if (t->st == V_FREE || t->chan != c) continue;
     if (ex && t->excl == ex) kill_voice(s, i, KILL_MS);
     else if (g && t->reg && t->reg->cond.off_by == g) {
-      if (t->reg->cond.off_mode == 1) release_voice(s, i); else kill_voice(s, i, KILL_MS);
+      if (t->reg->cond.off_mode == 1) stop_voice(s, i); else kill_voice(s, i, KILL_MS);
     }
   }
 }
