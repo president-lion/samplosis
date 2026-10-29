@@ -82,6 +82,9 @@ The first control on both main pages is a tab control named Player, with two tab
   on the Settings page.
 - The tab you choose is what plays. It is saved with the project (`plays sampler` or `plays soundfont`). The window
   opens on the tab that plays, and follows it when it changes some other way, such as a project loading.
+  Switching during playback fades the old player's notes out over 5 ms (its reverb and chorus over 10 ms), so it
+  doesn't click. While the Sampler plays, the SoundFont player lets go of its presets' samples (the font stays open,
+  so switching back is quick; the presets load again then).
 - Drops load by file type: a .sf2 or .sf3 loads into the SoundFont player and switches to it; any other audio file
   loads into the Sampler and switches to it.
 - Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
@@ -159,7 +162,8 @@ outputs, those channels play on Output 1. In REAPER, turn on the extra outputs i
 
 A built-in reverb and chorus, driven by the song's CC91 and CC93 sends as General MIDI defines. The Reverb and chorus
 switch turns both off. The power-on reverb send is 40 (General MIDI level 2). The reverb is a Freeverb design (not
-FluidSynth's, so its character differs) and the chorus depth is 8 ms. SoundFont volume applies to the effects too.
+FluidSynth's, so its character differs) and the chorus depth is 8 ms. SoundFont volume applies to the effects too. REAPER's
+stop, seek and loop fade the tails out over 10 ms and clear them.
 
 ### Loading ahead
 
@@ -381,7 +385,7 @@ warm-cache times; a first read from a cold disk is slower.
     for the whole run, so it is not a held test. The first try with 122 voices (61 organ notes) measured 5.0 to 5.3 percent,
     which is the same cost per voice (about 4.2 percent per 100 voices); 64 notes in a layered preset can pass 5 percent.
 - A second instance on the same font, with the same preset playing: 2.3 MB more (2.2 to 2.3 across runs). The target was
-  under 2 MB: **missed** by about 0.3 MB. The samples are shared; the 2.3 MB is the second player's own memory (I did not break it down).
+  under 2 MB: **missed** by about 0.3 MB. The samples are shared; the 2.3 MB is the second player's own memory (this has not been broken down yet).
 
 ## Known limits
 

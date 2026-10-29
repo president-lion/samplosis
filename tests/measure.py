@@ -118,8 +118,10 @@ for bank, prog in ((0, 0), (0, 25), (128, 0)):
     assert lib.smp_sf_wait_idle(font, 120000) == 0
     dt = time.perf_counter() - t0
     print(f"Load preset {bank}:{prog}: {dt * 1000:.0f} ms, samples {lib.smp_sf_loaded_bytes(font) / 1e6:.1f} MB in all, private bytes grew {(priv() - m0) / 1e6:.1f} MB")
+    # The release and the use again come back to back, well inside the loader's 2 s grace, so the preset is never
+    # freed: each preset stays loaded while the next one loads. That is why "samples ... MB in all" is cumulative
+    # (piano, then piano and guitar, then all three), while "private bytes grew" is each preset's own growth.
     lib.smp_sf_use(font, idx, -1)
-    # the loader frees them 2 s after nothing needs them; keep this preset resident by using it again below
     lib.smp_sf_use(font, idx, 1)
 
 def new_synth():
