@@ -59,6 +59,45 @@ def test_settings_defaults_and_roundtrip(lib, settings_file, tmp_path):
     point_cache(lib, tmp_path)
 
 
+def test_settings_raw_and_ffmpeg_roundtrip(lib, settings_file, tmp_path):
+    if os.path.exists(settings_file):
+        os.remove(settings_file)
+    s = get(lib)                                         # the defaults: search for FFmpeg; 44100 Hz stereo s16 little
+    assert s.ffmpeg_path == b""
+    assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (44100, 2, 0, 0)
+    s.cache_dir = str(tmp_path).encode()
+    s.ffmpeg_path = r"C:\tools\ffmpeg ü\ffmpeg.exe".encode()
+    s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian = 96000, 1, 3, 1
+    assert lib.smp_settings_set(ctypes.byref(s)) == 0
+    s = get(lib)
+    assert s.ffmpeg_path == r"C:\tools\ffmpeg ü\ffmpeg.exe".encode()
+    assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (96000, 1, 3, 1)
+    text = open(settings_file, encoding="utf-8").read().splitlines()
+    names = [ln.split(" ")[0] for ln in text]             # in this order, after keep_tone
+    assert names == ["cache_dir", "cache_limit_gb", "stretcher", "keep_tone", "ffmpeg_path",
+                     "raw_rate", "raw_channels", "raw_format", "raw_endian"]
+    assert "raw_rate 96000" in text and "raw_channels 1" in text
+    assert "raw_format f32" in text and "raw_endian big" in text
+    for fmt, k in (("s16", 0), ("S24", 1), ("s32 ", 2), ("F32", 3), ("u8\t", 4)):   # by hand: any case, spaces after
+        with open(settings_file, "w") as f:
+            f.write("cache_dir %s\nraw_format %s\nraw_endian BIG \nraw_rate 22050\nraw_channels 2\n" % (tmp_path, fmt))
+        s = get(lib)
+        assert (s.raw_format, s.raw_endian, s.raw_rate, s.raw_channels) == (k, 1, 22050, 2)
+    with open(settings_file, "w") as f:                  # unknown values keep the defaults
+        f.write("cache_dir %s\nraw_format s12\nraw_endian middle\nraw_rate 12345\nraw_channels 3\nffmpeg_path \n"
+                % tmp_path)
+    s = get(lib)
+    assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (44100, 2, 0, 0) and s.ffmpeg_path == b""
+    s = SmpSettings()                                    # an empty struct saves as the defaults, not as zeros
+    s.cache_dir = str(tmp_path).encode()
+    s.cache_limit_gb = 10
+    assert lib.smp_settings_set(ctypes.byref(s)) == 0
+    s = get(lib)
+    assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (44100, 2, 0, 0)
+    assert "raw_rate 44100" in open(settings_file).read()
+    point_cache(lib, tmp_path)
+
+
 def test_cache_write_open_read(lib, tmp_path):
     point_cache(lib, tmp_path)
     key = lib.smp_key(b"src|a.wav|1|2")

@@ -20,12 +20,16 @@ class SmpSample(ctypes.Structure):
                 ("src_key", ctypes.c_uint64), ("rev_key", ctypes.c_uint64),
                 ("rate", ctypes.c_int), ("frames", ctypes.c_uint64),
                 ("root", ctypes.c_int), ("root_from", ctypes.c_int),
-                ("fwd", ctypes.c_void_p), ("rev", ctypes.c_void_p)]
+                ("fwd", ctypes.c_void_p), ("rev", ctypes.c_void_p),
+                ("by", ctypes.c_int)]                         # what decoded it: 0 built in, 1 library, 2 Windows, 3 FFmpeg
 
 
 class SmpSettings(ctypes.Structure):
     _fields_ = [("cache_dir", ctypes.c_char * 1024), ("cache_limit_gb", ctypes.c_double),
-                ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int)]
+                ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int),
+                ("ffmpeg_path", ctypes.c_char * 1024),
+                ("raw_rate", ctypes.c_int), ("raw_channels", ctypes.c_int),
+                ("raw_format", ctypes.c_int), ("raw_endian", ctypes.c_int)]   # raw_format 0 s16, 1 s24, 2 s32, 3 f32, 4 u8; raw_endian 0 little, 1 big
 
 
 class SmpSfMod(ctypes.Structure):

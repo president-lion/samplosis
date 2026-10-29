@@ -44,9 +44,18 @@ SMP_API int smp_value_parse(int param, const char *s, double *v);    /* 1 ok (cl
 /* stretcher: SMP_STRETCH_SIGNALSMITH (the default) or SMP_STRETCH_RUBBERBAND; keep_tone: 1 keeps the instrument's
    formants where they were when keep length shifts it (off by default) */
 enum { SMP_STRETCH_SIGNALSMITH = 0, SMP_STRETCH_RUBBERBAND = 1 };
-typedef struct { char cache_dir[1024]; double cache_limit_gb; int stretcher, keep_tone; } SmpSettings;
+/* ffmpeg_path: FFmpeg's ffmpeg.exe, UTF-8, empty to search for it. raw_*: how files ending .raw or .pcm read:
+   raw_rate (8000 to 192000, default 44100), raw_channels (1 or 2, default 2), raw_format, raw_endian. */
+enum { SMP_RAW_S16 = 0, SMP_RAW_S24 = 1, SMP_RAW_S32 = 2, SMP_RAW_F32 = 3, SMP_RAW_U8 = 4 };
+enum { SMP_RAW_LITTLE = 0, SMP_RAW_BIG = 1 };
+typedef struct {
+  char cache_dir[1024]; double cache_limit_gb; int stretcher, keep_tone;
+  char ffmpeg_path[1024];
+  int raw_rate, raw_channels, raw_format, raw_endian;
+} SmpSettings;
 SMP_API void smp_settings_get(SmpSettings *s);        /* defaults when the file is missing; reloads when it changes */
 SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */
+int smp_raw_rates(const int **list);                  /* the rates raw_rate may be, lowest first; returns how many */
 
 /* disk cache of decoded audio: <16 hex>.smpc, 32 byte header then float32 stereo interleaved */
 typedef struct SmpEntry SmpEntry;
@@ -73,6 +82,8 @@ typedef struct SmpSample {
   int root;                             /* from the file name, else detected, else 60 */
   int root_from;                        /* 0 name, 1 detected, 2 default */
   SmpEntry *fwd, *rev;                  /* rev NULL until needed */
+  int by;                               /* what decoded it (SmpDecBy in decode.h): 0 built in, 1 a library,
+                                           2 Windows, 3 FFmpeg */
 } SmpSample;
 SMP_API SmpSample *smp_sample_load(const char *path, char *err, int cap);   /* NULL and a plain message on failure */
 SMP_API SmpSample *smp_sample_load_known(const char *path, uint64_t src_key, int root, char *err, int cap); /* source may be gone */

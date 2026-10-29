@@ -31,6 +31,7 @@
 #include "engine_int.h"
 #include "plugin_int.h"
 #include "sf2.h"
+#include "decode.h"
 
 #define DEFAULT_RATE 48000.0
 #define COLLECT_ROUNDS 8
@@ -173,6 +174,12 @@ static void keep_text(Plug *P, const char *text) {
   free(P->text); P->text = t;
 }
 
+/* "Ready: x.wav", and what decoded it when that wasn't built in: "Ready: x.m4a (decoded by Windows)" */
+static void ready_status(Plug *P, const SmpSample *s) {
+  const char *by = s->by == SMP_DEC_WINDOWS ? " (decoded by Windows)" : s->by == SMP_DEC_FFMPEG ? " (decoded by FFmpeg)" : "";
+  snprintf(P->status, sizeof P->status, "Ready: %s%s", s->name, by);
+}
+
 static void ask_collect(Plug *P) {
   InterlockedExchange(&P->collect_left, COLLECT_ROUNDS);
   if (P->host && P->host->request_callback) P->host->request_callback(P->host);
@@ -196,7 +203,7 @@ static int apply_sampler(Plug *P, const char *text) {
     s = smp_engine_sample(P->e);
     P->missing = 0;
     keep_text(P, text);
-    if (s) snprintf(P->status, sizeof P->status, "Ready: %s", s->name);
+    if (s) ready_status(P, s);
     else snprintf(P->status, sizeof P->status, "No sample loaded");
     ask_collect(P);
     return 1;
@@ -816,7 +823,7 @@ int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
   P->missing = 0;
   t = engine_text(P->e);
   if (t) { free(P->text); P->text = t; }
-  snprintf(P->status, sizeof P->status, "Ready: %s", s->name);
+  ready_status(P, s);
   P->bad = 0;
   tell_host(P, SMP_P_ROOT);
   mark_dirty(P);

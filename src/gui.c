@@ -43,6 +43,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include "plugin_int.h"
+#include "decode.h"
 
 #define W_WIDTH 760
 #define ROW 30
@@ -56,8 +57,8 @@ enum { ID_VAL = 100,                          /* + parameter id: its slider or c
        ID_SAMPLE = 200, ID_BROWSE, ID_FILE, ID_STATUS, ID_SETTINGS,
        ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
        ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
-       ID_SFSETTINGS,
-       ID_EDIT = 300,                         /* + slider number: the edit box that stands in for it */
+       ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
+       ID_EDIT = 300,                        /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
        ID_OUT = 420 };                        /* + channel - 1: its output combo box */
 enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, NPAGES = 3 };
@@ -86,6 +87,8 @@ typedef struct Gui {
   HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
   Slider *limit;
   char dir_shown[1024], used_text[700];
+  HWND rawrate, rawch, rawfmt, rawend, ffmpeg, ffbrowse;  /* how raw files read; where FFmpeg is */
+  char ff_text[1100];                         /* FFmpeg's path as found, or "Not found" */
   /* the SoundFont page */
   HWND sffile, sfbrowse, sfmode, sfpreset, sfchannel, chan[NCH], out[NCH], sfstatus, sfsettings;
   HWND mode_one[4], mode_all[4 * NCH];        /* each mode's own controls with their labels: shown in that mode only */
@@ -293,14 +296,28 @@ static void rescan_used(Gui *g) {             /* scans the folder: on opening th
   if (b < (1ull << 30)) snprintf(g->used_text, sizeof g->used_text, "%.0f MB of %s", b / 1048576.0, lim);
   else snprintf(g->used_text, sizeof g->used_text, "%.1f GB of %s", b / 1073741824.0, lim);
 }
+static void find_ffmpeg(Gui *g) {            /* searches: on opening the page and after Browse for FFmpeg */
+  if (!smp_ffmpeg_find(g->ff_text, sizeof g->ff_text)) snprintf(g->ff_text, sizeof g->ff_text, "Not found");
+}
+static int rate_index(int rate) {             /* the Raw sample rate entry for a rate */
+  const int *r; int n = smp_raw_rates(&r), i;
+  for (i = 0; i < n; i++) if (r[i] == rate) return i;
+  return 0;
+}
+static void sel(HWND c, int k) { if (SendMessageW(c, CB_GETCURSEL, 0, 0) != k) SendMessageW(c, CB_SETCURSEL, (WPARAM)k, 0); }
 static void show_settings(Gui *g) {
   SmpSettings s; HWND foc = GetFocus();
   smp_settings_get(&s);
   if (foc != g->dir) { set_text(g->dir, s.cache_dir); snprintf(g->dir_shown, sizeof g->dir_shown, "%s", s.cache_dir); }
   if (!g->limit->editing) sl_show(g, g->limit, false);
   set_text(g->used, g->used_text);
-  if (SendMessageW(g->stretcher, CB_GETCURSEL, 0, 0) != s.stretcher) SendMessageW(g->stretcher, CB_SETCURSEL, (WPARAM)s.stretcher, 0);
-  if (SendMessageW(g->keeptone, CB_GETCURSEL, 0, 0) != s.keep_tone) SendMessageW(g->keeptone, CB_SETCURSEL, (WPARAM)s.keep_tone, 0);
+  sel(g->stretcher, s.stretcher);
+  sel(g->keeptone, s.keep_tone);
+  sel(g->rawrate, rate_index(s.raw_rate));
+  sel(g->rawch, s.raw_channels == 1 ? 0 : 1);
+  sel(g->rawfmt, s.raw_format);
+  sel(g->rawend, s.raw_endian);
+  set_text(g->ffmpeg, g->ff_text);
 }
 static void save_settings(Gui *g, const SmpSettings *s) {
   if (smp_settings_set(s)) beep();
@@ -326,11 +343,17 @@ static void set_limit(Gui *g, double gb) {     /* the slider has clamped it */
   set_text(g->used, g->used_text);
 }
 /* the Stretcher and Keep the tone combo boxes: every engine makes its copies again with the new choice (old ones
-   stay in the cache, so changing back is instant) */
+   stay in the cache, so changing back is instant). The raw combo boxes: how the next .raw or .pcm file loaded reads
+   (a raw file's cache key holds them, so loading it again reads it the new way). */
 static void choose(Gui *g, int id, int k) {
-  SmpSettings s;
+  SmpSettings s; const int *r; int n = smp_raw_rates(&r);
   smp_settings_get(&s);
-  if (id == ID_STRETCHER) s.stretcher = k; else s.keep_tone = k;
+  if (id == ID_STRETCHER) s.stretcher = k;
+  else if (id == ID_KEEPTONE) s.keep_tone = k;
+  else if (id == ID_RAWRATE) s.raw_rate = r[k < n ? k : n - 1];
+  else if (id == ID_RAWCH) s.raw_channels = k ? 2 : 1;
+  else if (id == ID_RAWFMT) s.raw_format = k;
+  else if (id == ID_RAWEND) s.raw_endian = k;
   if (smp_settings_set(&s)) beep();             /* not save_settings: the cache folder needs no rescan */
   show_settings(g);
 }
@@ -400,6 +423,34 @@ static void browse_folder(Gui *g) {
     } else beep();
   } else if (ok < 0) beep();
   focus(g->dirbrowse);
+}
+
+/* Browse for FFmpeg: an .exe chosen goes in Settings, and the FFmpeg box shows what is found now */
+static void browse_ffmpeg(Gui *g) {
+  wchar_t file[1100] = L"", dirw[1100] = L"", *slash; OPENFILENAMEW of; int ok;
+  if (smp_ffmpeg_find_w(dirw, 1100) && (slash = wcsrchr(dirw, L'\\')) != NULL) *slash = 0; else dirw[0] = 0;
+  memset(&of, 0, sizeof of);
+  of.lStructSize = sizeof of;
+  of.hwndOwner = GetAncestor(g->win, GA_ROOT);
+  of.lpstrFilter = L"Programs\0*.exe\0All files\0*.*\0";
+  of.lpstrFile = file; of.nMaxFile = 1100;
+  of.lpstrInitialDir = dirw[0] ? dirw : NULL;
+  of.lpstrTitle = L"Find ffmpeg.exe";
+  of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+  modal_begin(g);
+  ok = test_dialog ? stub_dialog(g, file, 1100) : GetOpenFileNameW(&of);
+  if (modal_end(g)) return;               /* the window (and maybe the plugin) went while the dialog was open */
+  if (ok) {
+    SmpSettings s; char u[1024];
+    smp_settings_get(&s);
+    if (WideCharToMultiByte(CP_UTF8, 0, file, -1, u, sizeof u, NULL, NULL) > 0) {
+      strcpy(s.ffmpeg_path, u);
+      if (smp_settings_set(&s)) beep();
+      find_ffmpeg(g);
+      show_settings(g);
+    } else beep();
+  }
+  focus(g->ffbrowse);
 }
 
 /* ---- the sample and the SoundFont ---- */
@@ -606,12 +657,27 @@ static void load_path_w(Gui *g, const wchar_t *w, int how) {
   refresh(g);
 }
 
-static bool audio_name(const wchar_t *n) {
-  static const wchar_t *const ext[] = {L".wav", L".flac", L".mp3", L".ogg", L".aif", L".aiff"};
-  const wchar_t *dot = wcsrchr(n, L'.'); int i;
+static bool audio_name(const wchar_t *n) {     /* the decode layer's list of the sampler's extensions */
+  const wchar_t **ext; int k = smp_audio_extensions(&ext), i;
+  const wchar_t *dot = wcsrchr(n, L'.');
   if (!dot) return false;
-  for (i = 0; i < 6; i++) if (!_wcsicmp(dot, ext[i])) return true;
+  for (i = 0; i < k; i++) if (!_wcsicmp(dot, ext[i])) return true;
   return false;
+}
+/* Browse's filter for samples, from the same list: "Audio files" then "All files" (made once) */
+static const wchar_t *audio_filter(void) {
+  static wchar_t f[1024]; static int made;
+  if (!made) {
+    const wchar_t **ext; int k = smp_audio_extensions(&ext), i; size_t at;
+    wcscpy(f, L"Audio files");
+    at = wcslen(f) + 1;
+    for (i = 0; i < k && at + wcslen(ext[i]) + 40 < 1024; i++)
+      at += (size_t)swprintf(f + at, 1024 - at, L"%s*%s", i ? L";" : L"", ext[i]);
+    at++;                                     /* past the patterns' terminating zero */
+    memcpy(f + at, L"All files\0*.*\0", sizeof L"All files\0*.*\0");
+    made = 1;
+  }
+  return f;
 }
 static int by_name(const void *a, const void *b) { return _wcsicmp(*(const wchar_t *const *)a, *(const wchar_t *const *)b); }
 
@@ -622,7 +688,7 @@ typedef struct {
   const wchar_t *filter, *title;
 } FileKind;
 static const FileKind kinds[2] = {
-  {smp_plug_sample_path, audio_name, L"Audio files\0*.wav;*.flac;*.mp3;*.ogg;*.aif;*.aiff\0All files\0*.*\0", L"Load a sample"},
+  {smp_plug_sample_path, audio_name, NULL, L"Load a sample"},             /* filter: audio_filter() */
   {smp_plug_font_path, font_name, L"SoundFonts\0*.sf2;*.sf3\0All files\0*.*\0", L"Load a SoundFont"},
 };
 
@@ -720,7 +786,7 @@ static void browse_file(Gui *g, int kind) {
   memset(&of, 0, sizeof of);
   of.lStructSize = sizeof of;
   of.hwndOwner = GetAncestor(g->win, GA_ROOT);
-  of.lpstrFilter = K->filter;
+  of.lpstrFilter = K->filter ? K->filter : audio_filter();
   of.lpstrFile = file; of.nMaxFile = 1100;
   of.lpstrInitialDir = dirw[0] ? dirw : NULL;
   of.lpstrTitle = K->title;
@@ -814,7 +880,7 @@ static bool shows_on(Gui *g, int page, HWND h) {
    one hides, so the focus never falls to nothing. */
 static void show_page(Gui *g, int page, HWND to) {
   HWND f = GetFocus(); int i, q;
-  if (page == PG_SETTINGS) { rescan_used(g); show_settings(g); }
+  if (page == PG_SETTINGS) { rescan_used(g); find_ffmpeg(g); show_settings(g); }
   if (page == PG_FONT) { SfCfg c; sf_cfg(g, &c); g->sf_one = c.one != 0; }
   g->page = page;
   if (page != PG_SETTINGS) {                  /* the tab control shows the page's tab */
@@ -849,6 +915,7 @@ static void click(Gui *g, int id) {
       show_page(g, m, m == PG_FONT ? g->sfsettings : g->settings);
       break;
     case ID_DIRBROWSE: browse_folder(g); break;
+    case ID_FFBROWSE: browse_ffmpeg(g); break;
     case ID_CLEAR: clear_cache(g); break;
   }
 }
@@ -926,7 +993,8 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NALLPARAMS) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) smp_plug_set_param(g->P, id - ID_VAL, (double)k);
-      } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE)) {
+      } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE || id == ID_RAWRATE ||
+                                           id == ID_RAWCH || id == ID_RAWFMT || id == ID_RAWEND)) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) choose(g, id, (int)k);
       } else if (code == CBN_SELCHANGE && (id == ID_FILE || id == ID_SFFILE)) {
@@ -1136,6 +1204,30 @@ static bool build(Gui *g, HWND parent) {
   g->dirbrowse = ctl(g, 1, L"BUTTON", L"Browse folder", T | BS_PUSHBUTTON, 630, y, 120, 26, ID_DIRBROWSE);
   y += ROW;
   g->limit = slider(g, 1, "Cache size limit", SL_LIMIT, 8, y, 140, 160, ID_LIMIT);
+  y += ROW;
+  g->rawrate = labelled(g, 1, "Raw sample rate", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 320, ID_RAWRATE);
+  {
+    const int *r; int n = smp_raw_rates(&r), i;
+    for (i = 0; i < n; i++) { char t[32]; snprintf(t, sizeof t, "%d Hz", r[i]); cb_add(g->rawrate, t); }
+  }
+  y += ROW;
+  g->rawch = labelled(g, 1, "Raw channels", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_RAWCH);
+  cb_add(g->rawch, "Mono");
+  cb_add(g->rawch, "Stereo");
+  y += ROW;
+  g->rawfmt = labelled(g, 1, "Raw sample format", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_RAWFMT);
+  cb_add(g->rawfmt, "16-bit integer");                 /* in SMP_RAW_* order */
+  cb_add(g->rawfmt, "24-bit integer");
+  cb_add(g->rawfmt, "32-bit integer");
+  cb_add(g->rawfmt, "32-bit float");
+  cb_add(g->rawfmt, "8-bit unsigned");
+  y += ROW;
+  g->rawend = labelled(g, 1, "Raw byte order", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_RAWEND);
+  cb_add(g->rawend, "Little endian");
+  cb_add(g->rawend, "Big endian");
+  y += ROW;
+  g->ffmpeg = labelled(g, 1, "FFmpeg", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 140, 470, 24, ID_FFMPEG);
+  g->ffbrowse = ctl(g, 1, L"BUTTON", L"Browse for FFmpeg", T | BS_PUSHBUTTON, 630, y, 120, 26, ID_FFBROWSE);
   y += ROW;
   g->used = labelled(g, 1, "Cache in use", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 140, 470, 24, ID_USED);
   y += ROW;

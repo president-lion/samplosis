@@ -663,9 +663,18 @@ def test_gui_settings_page(P, tmp_path, settings_file):
     with open(settings_file) as fh:
         before = fh.read()
     try:
+        fake = tmp_path / "tools" / "ffmpeg.exe"
+        fake.parent.mkdir()
+        fake.write_bytes(b"MZ")
         out = gui(P, tmp_path, text, ["focus Settings", "key enter", "key down", "key down", "key tab", "key down",
                                       "key tab", "key tab", "key tab", "key enter", "type 5", "key enter",
-                                      "key up", "key down", "key tab", "key tab", "key tab", "key tab",
+                                      "key up", "key down",
+                                      # the raw settings and FFmpeg, after Cache size limit
+                                      "key tab", "key down", "key home", "key end", "key down", "key tab", "key up",
+                                      "key tab", "key tab", "key down", "key tab", "key tab",
+                                      "key tab", "key tab", "key tab",
+                                      "key tab shift", "key tab shift", "key tab shift", "focus Back", "key tab",
+                                      "focus Browse for FFmpeg", "dialog pick %s" % fake, "key enter", "read FFmpeg",
                                       "focus Back", "key enter", "focus Back", "say"])
         f = got(out, "focus")
         assert f[0] == ["ComboBox", "Stretcher", "Signalsmith Stretch, fast"]
@@ -676,12 +685,27 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert f[7] == ["Slider", "Cache size limit", "10 GB"]
         assert f[8] == ["Edit", "Cache size limit", "10 GB"]
         assert f[9][2] == "5 GB" and f[10][2] == "6 GB" and f[11][2] == "5 GB"
-        assert f[12][:2] == ["Edit", "Cache in use"] and f[12][2].endswith(" of 5 GB")
-        assert [x[:2] for x in f[13:16]] == [["Button", "Clear cache"], ["Button", "Back"], ["Button", "after"]]
-        assert f[16][:2] == ["Button", "Settings"]           # Back: on the Settings button again
-        assert f[17][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+        assert f[12] == ["ComboBox", "Raw sample rate", "44100 Hz"] and f[13][2] == "48000 Hz"
+        assert f[14][2] == "8000 Hz" and f[15][2] == f[16][2] == "192000 Hz"   # Home, End; Down stops at the last
+        assert f[17] == ["ComboBox", "Raw channels", "Stereo"] and f[18][2] == "Mono"
+        assert f[19] == ["ComboBox", "Raw sample format", "16-bit integer"]
+        assert f[20] == ["ComboBox", "Raw byte order", "Little endian"] and f[21][2] == "Big endian"
+        assert f[22][:2] == ["Edit", "FFmpeg"]                               # the path found, or Not found
+        assert f[22][2] == "Not found" or f[22][2].lower().endswith("ffmpeg.exe"), f[22]
+        assert f[23][:2] == ["Button", "Browse for FFmpeg"]
+        assert f[24][:2] == ["Edit", "Cache in use"] and f[24][2].endswith(" of 5 GB")
+        assert [x[:2] for x in f[25:27]] == [["Button", "Clear cache"], ["Button", "Back"]]
+        assert [x[:2] for x in f[27:30]] == [["Button", "Clear cache"], ["Edit", "Cache in use"],
+                                             ["Button", "Browse for FFmpeg"]]          # Shift+Tab back up
+        assert f[30][:2] == ["Button", "after"]                              # past the end: out of the plugin
+        assert f[31][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
+        assert got(out, "read")[0] == ["FFmpeg", str(fake)]
+        assert f[32][:2] == ["Button", "Settings"]           # Back: on the Settings button again
+        assert f[33][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
         with open(settings_file) as fh:
             saved = fh.read()
+        assert "raw_rate 192000\n" in saved and "raw_channels 1\n" in saved and "raw_endian big\n" in saved
+        assert ("ffmpeg_path %s\n" % fake) in saved
         assert "cache_limit_gb 5\n" in saved and "stretcher rubberband\n" in saved and "keep_tone on\n" in saved
     finally:
         with open(settings_file, "w") as fh:

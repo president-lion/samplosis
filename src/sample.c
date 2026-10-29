@@ -24,9 +24,15 @@ static int stat_src(const char *path, uint64_t *size, uint64_t *mtime) {
   return 1;
 }
 
+/* a raw file's key holds how it is read, so changing the raw settings decodes it again */
 static uint64_t src_key_of(const char *path, uint64_t size, uint64_t mtime) {
-  char d[1200];
-  snprintf(d, sizeof d, "src|%s|%llu|%llu", path, (unsigned long long)size, (unsigned long long)mtime);
+  char d[1300];
+  int k = snprintf(d, sizeof d, "src|%s|%llu|%llu", path, (unsigned long long)size, (unsigned long long)mtime);
+  if (smp_is_raw_name(path) && k > 0 && k < (int)sizeof d) {
+    SmpSettings s;
+    smp_settings_get(&s);
+    snprintf(d + k, sizeof d - (size_t)k, "|raw %d %d %d %d", s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian);
+  }
   return smp_key(d);
 }
 
@@ -37,21 +43,24 @@ static void sidecar_path(uint64_t key, wchar_t *out, int cap) {
   swprintf(out, cap, L"%s\\%016llx.txt", dir, (unsigned long long)key);
 }
 
-static int sidecar_read(uint64_t key, int *root, int *from) {
+/* the sidecar: "root r from f by b" (by, what decoded the file, came later: 0 when it isn't there) */
+static int sidecar_read(uint64_t key, int *root, int *from, int *by) {
   wchar_t p[1200]; FILE *f; int ok;
   sidecar_path(key, p, 1200);
   f = _wfopen(p, L"rb");
   if (!f) return 0;
-  ok = fscanf(f, "root %d from %d", root, from) == 2;
+  *by = 0;
+  ok = fscanf(f, "root %d from %d by %d", root, from, by) >= 2;
   fclose(f);
+  if (*by < SMP_DEC_BUILTIN || *by > SMP_DEC_FFMPEG) *by = 0;
   return ok;
 }
 
-static void sidecar_write(uint64_t key, int root, int from) {
+static void sidecar_write(uint64_t key, int root, int from, int by) {
   wchar_t p[1200]; FILE *f;
   sidecar_path(key, p, 1200);
   f = _wfopen(p, L"wb");
-  if (f) { fprintf(f, "root %d from %d\n", root, from); fclose(f); }
+  if (f) { fprintf(f, "root %d from %d by %d\n", root, from, by); fclose(f); }
 }
 
 static int root_of(double m) {
@@ -94,16 +103,17 @@ static double detect_entry(SmpEntry *e, int rate) {
 
 /* detected: fractional MIDI note from the decode, or -2 when not measured (then the sidecar, then the cache, is used) */
 static void find_root(SmpSample *s, const char *path, int use_sidecar, double detected) {
-  int n = smp_note_from_filename(path), r, f;
+  int n = smp_note_from_filename(path), r, f, by, side = use_sidecar && sidecar_read(s->src_key, &r, &f, &by);
+  if (side) s->by = by;                         /* what decoded it, noted at the first load */
   if (n >= 0) { s->root = n; s->root_from = 0; return; }
-  if (use_sidecar && sidecar_read(s->src_key, &r, &f)) { s->root = r; s->root_from = f; return; }
+  if (side) { s->root = r; s->root_from = f; return; }
   if (detected < -1.5) detected = detect_entry(s->fwd, s->rate);
   s->root = root_of(detected); s->root_from = detected < 0 ? 2 : 1;
 }
 
 SmpSample *smp_sample_load(const char *path, char *err, int cap) {
   uint64_t size, mtime, key; SmpEntry *e; SmpSample *s;
-  double detected = -2;
+  double detected = -2; SmpDecBy by = SMP_DEC_BUILTIN;
   if (!path || !stat_src(path, &size, &mtime)) {
     snprintf(err, (size_t)cap, "can't open %s: the file isn't there", path ? path : "(no file)");
     return NULL;
@@ -119,7 +129,7 @@ SmpSample *smp_sample_load(const char *path, char *err, int cap) {
   {
     int ch = 0, rate = 0; long n = 0, i; float *x, *lr;
     g_decodes++;
-    x = decode_audio(path, &ch, &n, &rate, err, cap);
+    x = decode_audio_ex(path, &ch, &n, &rate, &by, NULL, NULL, err, cap);
     if (!x) return NULL;
     lr = malloc(sizeof(float) * 2 * (size_t)n);
     if (!lr) { free(x); snprintf(err, (size_t)cap, "out of memory reading %s", path); return NULL; }
@@ -142,18 +152,20 @@ SmpSample *smp_sample_load(const char *path, char *err, int cap) {
   if (!e) { snprintf(err, (size_t)cap, "can't read %s back from the cache folder", path); return NULL; }
   s = make(path, key, e);
   if (!s) { snprintf(err, (size_t)cap, "out of memory"); return NULL; }
+  s->by = (int)by;
   find_root(s, path, 0, detected);
-  sidecar_write(key, s->root, s->root_from);
+  sidecar_write(key, s->root, s->root_from, s->by);
   return s;
 }
 
 SmpSample *smp_sample_load_known(const char *path, uint64_t src_key, int root, char *err, int cap) {
-  SmpEntry *e = smp_cache_open(src_key); SmpSample *s; int r, f;
+  SmpEntry *e = smp_cache_open(src_key); SmpSample *s; int r, f, by = 0;
   if (!e) { snprintf(err, (size_t)cap, "%s is gone and its copy isn't in the cache", path ? path : "(no file)"); return NULL; }
   s = make(path ? path : "", src_key, e);
   if (!s) { snprintf(err, (size_t)cap, "out of memory"); return NULL; }
   s->root = root < 0 ? 0 : root > 127 ? 127 : root;
-  s->root_from = sidecar_read(src_key, &r, &f) && r == s->root ? f : 2;
+  s->root_from = sidecar_read(src_key, &r, &f, &by) && r == s->root ? f : 2;
+  s->by = by;
   return s;
 }
 
