@@ -1,6 +1,12 @@
-"""Writes small SoundFont files (SF2, or SF3 with Ogg Vorbis samples) for the tests.
+"""Writes small SoundFont files for the tests: SF2, SF3 (Ogg Vorbis samples), SF4 (FLAC samples), SF2Pack (the
+whole smpl chunk as one compressed stream) and SoundFont 1 (.sbk).
 
-write_sf2(path, presets, samples, sf3=False)
+write_sf2(path, presets, samples, sf3=False, sf4=False, pack=None)
+  sf4: True writes each sample as its own FLAC stream flagged 0x20 with ifil 4 (Cognitone's sf2convert);
+       0x10 writes FLAC flagged 0x10 with ifil 3 (FLAC inside SF3, as the KKQ fork of sf2convert writes it).
+  pack: "flac", "vorbis", "opus" or "wavpack": the RIFF form becomes sfpk and smpl holds the whole SF2 sample
+        data (16-bit mono) as one stream in that codec, as BASSMIDI's packer writes it. wavpack needs ffmpeg.
+write_sbk(path, presets, samples, rom=()): see its own comment.
 
 samples: a list of dicts
   name, data (int16 numpy array), rate, pitch (root key), correction (cents),
@@ -86,7 +92,40 @@ def _ogg(data, rate):
     return buf.getvalue()
 
 
-def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=()):
+def _flac(data, rate):
+    buf = io.BytesIO()
+    import soundfile as sf
+    sf.write(buf, np.asarray(data, dtype=np.int16), rate, format="FLAC", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def pack_stream(data, codec):
+    """The whole sample data (int16 mono) as one stream in codec, the way BASSMIDI packs it (44100 Hz, or 48000 Hz
+    for Opus)."""
+    import soundfile as sf
+    data = np.asarray(data, dtype=np.int16)
+    buf = io.BytesIO()
+    if codec == "flac":
+        sf.write(buf, data, 44100, format="FLAC", subtype="PCM_16")
+    elif codec == "vorbis":
+        sf.write(buf, data, 44100, format="OGG", subtype="VORBIS")
+    elif codec == "opus":
+        sf.write(buf, data, 48000, format="OGG", subtype="OPUS")
+    elif codec == "wavpack":
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            raw, wv = d + "/in.raw", d + "/out.wv"
+            data.tofile(raw)
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "s16le", "-ar", "44100", "-ac", "1",
+                            "-i", raw, "-c:a", "wavpack", wv], check=True)
+            return open(wv, "rb").read()
+    else:
+        raise ValueError(codec)
+    return buf.getvalue()
+
+
+def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=(), sf4=False, pack=None):
     # sample data and headers
     smpl = bytearray()
     shdr = []
@@ -94,12 +133,12 @@ def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=()):
         data = np.asarray(s["data"], dtype=np.int16)
         loop = s.get("loop")
         stype = s.get("type", 1)
-        if sf3:
+        if sf3 or sf4:
             start = len(smpl)
-            smpl += _ogg(data, s["rate"])
+            smpl += _flac(data, s["rate"]) if sf4 else _ogg(data, s["rate"])
             end = len(smpl)
             ls, le = (loop if loop else (0, 0))     # SF3: loop points count frames from the sample's start
-            stype |= 0x10
+            stype |= 0x20 if sf4 is True else 0x10
         else:
             start = len(smpl) // 2
             smpl += data.tobytes() + b"\0" * (2 * PAD_FRAMES)
@@ -151,13 +190,76 @@ def write_sf2(path, presets, samples, sf3=False, junk_pgen=(), junk_igen=()):
     imod.append(b"\0" * 10)
     igen.append(b"\0" * 4)
 
-    info = _list(b"INFO", [_chunk(b"ifil", struct.pack("<HH", 3 if sf3 else 2, 1)),
+    if pack:
+        smpl = pack_stream(np.frombuffer(bytes(smpl), dtype=np.int16), pack)
+    info = _list(b"INFO", [_chunk(b"ifil", struct.pack("<HH", 4 if sf4 is True else 3 if (sf3 or sf4) else 2, 1)),
                            _chunk(b"isng", b"EMU8000\0"),
                            _chunk(b"INAM", b"Samplosis test font\0")])
     sdta = _list(b"sdta", [_chunk(b"smpl", bytes(smpl))])
     pdta = _list(b"pdta", [_chunk(cid, b"".join(recs)) for cid, recs in (
         (b"phdr", phdr), (b"pbag", pbag), (b"pmod", pmod), (b"pgen", pgen), (b"inst", inst),
         (b"ibag", ibag), (b"imod", imod), (b"igen", igen), (b"shdr", shdr))])
+    body = (b"sfpk" if pack else b"sfbk") + info + sdta + pdta
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+
+
+def write_sbk(path, presets, samples, rom=()):
+    """A SoundFont 1 (.sbk) file, laid out as awesfx reads one: ifil 1, sample names in an snam chunk inside sdta,
+    16-byte shdr records (start, end, loop start, loop end in frames from smpl's start; no rate, root or type), no
+    modulators and no terminal sample record. The generators (presets as for write_sf2, without pmods and mods)
+    are written as given, so they are in SBK units: times in milliseconds, pan 0-127, sustain 0-127 and so on; the
+    root key and tuning are generator 55 (samplePitch, root x 100 minus the cents).
+    rom: ROM samples, (name, start, end) in the sound card's memory; they come first, before the samples in the file
+    (the first sample in the file starts at 0, which is how a reader tells where ROM ends). Instrument zones refer to
+    samples by index in the shdr list, so the samples in the file are numbered after the ROM ones."""
+    smpl = bytearray()
+    snam, shdr = [], []
+    for name, start, end in rom:
+        snam.append(_name(name))
+        shdr.append(struct.pack("<IIII", start, end, start, end))
+    for s in samples:
+        data = np.asarray(s["data"], dtype=np.int16)
+        loop = s.get("loop")
+        start = len(smpl) // 2
+        smpl += data.tobytes() + b"\0" * (2 * PAD_FRAMES)
+        end = start + len(data)
+        ls, le = ((start + loop[0], start + loop[1]) if loop else (start, start))
+        snam.append(_name(s["name"]))
+        shdr.append(struct.pack("<IIII", start, end, ls, le))
+    inst, ibag, igen = [], [], []
+    phdr, pbag, pgen = [], [], []
+    for p in presets:
+        phdr.append(_name(p["name"]) + struct.pack("<HHHIII", p["program"], p["bank"], len(pbag), 0, 0, 0))
+        if p.get("gens"):
+            pbag.append(struct.pack("<HH", len(pgen), 0))
+            pgen += _gens(p.get("gens"))
+        for ins in p.get("instruments", []):
+            pbag.append(struct.pack("<HH", len(pgen), 0))
+            pgen += _gens(ins.get("pgens"), last=(GEN_INSTRUMENT, len(inst)))
+            inst.append(_name(ins["name"]) + struct.pack("<H", len(ibag)))
+            if ins.get("gens"):
+                ibag.append(struct.pack("<HH", len(igen), 0))
+                igen += _gens(ins.get("gens"))
+            for z in ins.get("zones", []):
+                ibag.append(struct.pack("<HH", len(igen), 0))
+                igen += _gens(z.get("gens"), keys=tuple(z.get("keys", (0, 127))), vels=tuple(z.get("vels", (0, 127))),
+                              last=(GEN_SAMPLEID, z["sample"]))
+    phdr.append(_name("EOP") + struct.pack("<HHHIII", 0, 0, len(pbag), 0, 0, 0))
+    pbag.append(struct.pack("<HH", len(pgen), 0))
+    pgen.append(b"\0" * 4)
+    inst.append(_name("EOI") + struct.pack("<H", len(ibag)))
+    ibag.append(struct.pack("<HH", len(igen), 0))
+    igen.append(b"\0" * 4)
+    info = _list(b"INFO", [_chunk(b"ifil", struct.pack("<HH", 1, 0)), _chunk(b"isng", b"EMU8000\0"),
+                           _chunk(b"irom", b"1MGM\0"), _chunk(b"INAM", b"Samplosis test bank\0")])
+    sd = [_chunk(b"snam", b"".join(snam))]
+    if smpl:
+        sd.append(_chunk(b"smpl", bytes(smpl)))
+    sdta = _list(b"sdta", sd)
+    pdta = _list(b"pdta", [_chunk(cid, b"".join(recs)) for cid, recs in (
+        (b"phdr", phdr), (b"pbag", pbag), (b"pgen", pgen), (b"inst", inst), (b"ibag", ibag), (b"igen", igen),
+        (b"shdr", shdr))])
     body = b"sfbk" + info + sdta + pdta
     with open(path, "wb") as f:
         f.write(b"RIFF" + struct.pack("<I", len(body)) + body)

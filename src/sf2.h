@@ -12,8 +12,20 @@ enum { SF_GEN_INSTRUMENT = 41, SF_GEN_KEYRANGE = 43, SF_GEN_VELRANGE = 44, SF_GE
 /* the number of default modulators (SF2.04 section 8.4) that start every region's instrument list */
 #define SF_NDEFMOD 10
 
-/* sample types (shdr sfSampleType); SF3 adds 0x10 for Ogg Vorbis data */
-enum { SF_MONO = 1, SF_RIGHT = 2, SF_LEFT = 4, SF_LINKED = 8, SF_VORBIS = 0x10, SF_ROM = 0x8000 };
+/* sample types (shdr sfSampleType). SF3 adds 0x10 for compressed data (Ogg Vorbis, or FLAC in files from the KKQ
+   fork of sf2convert); SF4 (Cognitone's sf2convert, ifil 4) adds 0x20 for FLAC. Either way the codec is told by the
+   stream's own first bytes, so both bits mean "compressed" (0x20 only from version 3 on, where nothing else uses
+   it). */
+enum { SF_MONO = 1, SF_RIGHT = 2, SF_LEFT = 4, SF_LINKED = 8, SF_VORBIS = 0x10, SF_FLAC = 0x20, SF_ROM = 0x8000 };
+#define SF_COMPRESSED (SF_VORBIS | SF_FLAC)
+
+/* SF2Pack: the decoded pack is a 16-bit cache file; this is the size of its header, before the first frame */
+#define SF_PACK_HDR 32
+/* a decoded pack's limit in frames: decode_memory's ceiling (2 GiB of float), so 1 GiB of 16-bit sample data */
+#define SF_PACK_MAX_FRAMES (1u << 29)
+
+/* the generator SoundFont 1 uses for a sample's root key and tuning (SF2 reserves the number) */
+#define SF1_GEN_SAMPLEPITCH 55
 
 /* the hydra's records as read from the file. Each array keeps its terminal record (EOP, EOI, the last bag)
    so a zone's range is always [x[i], x[i+1]); the counts below leave the terminal record out. */
@@ -42,7 +54,9 @@ struct SmpFont {
   uint64_t size, mtime;                 /* the file's, to tell when it changed */
   uint64_t smpl_off, smpl_size;         /* the 16-bit sample data: file offset and size in bytes */
   uint64_t sm24_off, sm24_size;         /* the low bytes for 24-bit samples; size 0 when absent or unusable */
-  int is_sf3;                           /* any sample is Ogg Vorbis */
+  int is_sf3;                           /* any sample is compressed (SF3 or SF4) */
+  int version;                          /* ifil's major number (1 for SoundFont 1; 0 when the file has no ifil) */
+  int is_pack;                          /* SF2Pack: smpl is one compressed stream of the whole 16-bit sample data */
   SfPhdr *phdr; int nphdr;
   SfBag *pbag; int npbag;
   SmpSfMod *pmod; int npmod;
@@ -82,7 +96,14 @@ struct SmpFont {
   uint8_t *need;                        /* per sample: scratch for one pass */
   HANDLE *ph;                           /* per path: the handle one pass opened by name (closed at its end) */
   ULONGLONG *idle_since;                /* per sample: when a published sample stopped being needed (0: needed) */
+  /* SF2Pack (the loader's own, but for pack_key, set at open): the pack decoded into a pinned 16-bit cache file */
+  uint64_t pack_key;
+  int pack_state;                       /* SF_PACK_* */
+  SmpEntry *pack_entry;                 /* open while the font is, so the cache file is never trimmed */
+  uint64_t pack_frames;                 /* frames in the decoded pack (sample ends are clamped to it at load) */
 };
+
+enum { SF_PACK_NONE, SF_PACK_READY, SF_PACK_BROKEN };
 
 /* A loaded sample: its head in memory, and how to read the rest. The head is the first quarter second, or the whole
    sample when it is under 1 s (then head_frames == frames and nothing streams). SF_PCM_PAD zero frames sit before

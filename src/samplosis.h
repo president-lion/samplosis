@@ -76,6 +76,12 @@ SMP_API int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, 
 SMP_API SmpEntry *smp_cache_open_mono(uint64_t key);  /* NULL if missing or not a mono file */
 SMP_API long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames);  /* any one thread at a time
                                     per call; positional, so threads may share an entry */
+/* 16-bit cache files, for a decoded SF2Pack: the same 32-byte .smpc header (version 2, 1 channel), then int16 mono, so
+   the pack's sample headers point into it as they would into an SF2's smpl chunk. Opening one pins it (trim never
+   deletes it) until it is closed; the font reads it by its path (smp_cache_path) like any sample file. */
+SMP_API int smp_cache_write_i16(uint64_t key, const int16_t *x, uint64_t frames, int rate);  /* 0 ok */
+SMP_API SmpEntry *smp_cache_open_i16(uint64_t key);   /* NULL if missing, short, or not a 16-bit file */
+int smp_cache_path(uint64_t key, char *utf8, int cap); /* the .smpc file's full path for key; 0 when there is none */
 SMP_API uint64_t smp_cache_trim(uint64_t limit_bytes); /* deletes oldest closed files and .part files over an hour old;
                                                          returns bytes left */
 SMP_API int smp_cache_ok(char *why, int cap);         /* 1 if the cache folder works, else 0 and a reason */

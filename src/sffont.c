@@ -19,9 +19,15 @@
    sample when it is under 1 s. A voice starts from the head at once; the rest is read by the synth's streamer
    thread through smp_sf_stream_read, from the font file (PCM_FILE: one shared handle per file, opened by the loader
    with full sharing, read with positional reads so any number of streamers can share it) or from a mono float
-   cache file (DECODED: SF3's Ogg Vorbis, decoded once by the loader into the cache folder; the second open of the
-   font decodes nothing). A stream handle is the loaded sample itself, so it is valid exactly as long as the
-   sample is held.
+   cache file (DECODED: SF3's and SF4's compressed samples, decoded once by the loader into the cache folder; the
+   second open of the font decodes nothing). A stream handle is the loaded sample itself, so it is valid exactly
+   as long as the sample is held.
+
+   SF2Pack. The whole sample data is one compressed stream. The first time a preset of the font is used, the loader
+   decodes it, in its own pass (so off the main thread; other fonts wait for that pass), into a 16-bit cache file,
+   and from then on every sample is plain PCM in that file at its SF2 offset. The font opens at once from its
+   headers; until the pack is decoded its samples aren't loaded, and smp_sf_wait_idle waits for that pass like any
+   other. The cache file stays open (pinned) while the font is, and the next open finds it and decodes nothing.
 
    Freeing (the protocol the audio thread relies on). A reader does:
        InterlockedIncrement(&voices[s]);  p = pcm[s];  if (!p) InterlockedDecrement(&voices[s]);
@@ -44,6 +50,7 @@
    The caller's guarantee: every voice and streamer has released its samples before smp_sf_close drops the last
    reference (the synth stops its voices, then waits for its streamer). Close frees the counters themselves, so a
    release after it would write freed memory. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -287,15 +294,17 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   const SmpSfSample *sh = &f->shdr[s];
   const SmpSrc *c = &f->src[s];
   uint32_t rate = sh->rate ? sh->rate : 44100;
+  uint32_t end = sh->end;
   SfPcm *p = NULL;
   uint64_t ls, le;
   *broken = 0;
-  if (sh->end <= sh->start) { *broken = 1; return NULL; }   /* start and end were clamped into smpl at open */
+  if (f->is_pack && end > f->pack_frames) end = (uint32_t)f->pack_frames;   /* a pack: inside the decoded data */
+  if (end <= sh->start) { *broken = 1; return NULL; }       /* start and end were clamped into smpl at open */
   if (c->kind == SMP_SRC_DECODED) {
     p = load_decoded(f, c, rate, broken);
     if (!p) return NULL;
   } else {
-    uint32_t frames = sh->end - sh->start, hf = head_of(frames, rate);
+    uint32_t frames = end - sh->start, hf = head_of(frames, rate);
     int bps = pcm_bytes(c->enc), wide = bps > 2;
     HANDLE h = font_handle(f, c->path_id);
     if (!h) return NULL;
@@ -313,8 +322,9 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
     }
     if (hf < frames) { p->h = f->fh[c->path_id]; p->offset = c->offset; p->enc = c->enc; p->channels = c->channels; p->channel = c->channel; }
   }
-  if (sh->type & SF_VORBIS) {
-    /* SF3: loop points count decoded frames from the stream's start (as MuseScore and Polyphone write them) */
+  if (sh->type & SF_COMPRESSED) {
+    /* SF3 and SF4: loop points count decoded frames from the stream's start (as MuseScore, Polyphone and
+       sf2convert write them) */
     ls = sh->loop_start; le = sh->loop_end;
   } else {
     ls = sh->loop_start > sh->start ? sh->loop_start - sh->start : 0;
@@ -327,6 +337,50 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   p->loop_start = (uint32_t)ls; p->loop_end = (uint32_t)le;
   if (!load_tail(f, c, p, rate)) { free_pcm(p); return NULL; }   /* out of memory: tried again later */
   return p;
+}
+
+/* SF2Pack: the decoded pack, from the cache when it is there, else decoded now (once) and written there as 16-bit
+   mono. Sets pack_state to READY, or BROKEN when it can never be had (the stream doesn't decode, it is over the
+   decode limit, or the cache folder can't hold it); leaves it NONE when the file can't be read or memory ran out
+   for now, to be tried again. The decode runs on the loader thread. A pack too big for decode_memory's 2 GiB of
+   float (1 GiB of 16-bit data, SF_PACK_MAX_FRAMES) is refused by it, and the samples then never load. */
+static void pack_prepare(SmpFont *f) {
+  SmpEntry *e = smp_cache_open_i16(f->pack_key);
+  if (!e) {
+    HANDLE h = font_handle(f, 0);
+    uint8_t *bytes;
+    float *x;
+    int16_t *o;
+    int ch = 0, r = 0;
+    long frames = 0, i;
+    char err[256];
+    if (!h) return;                                             /* tried again in RETRY_MS */
+    if (f->smpl_size == 0 || f->smpl_size > 0x7fffffffu) { f->pack_state = SF_PACK_BROKEN; return; }
+    if (!(bytes = malloc((size_t)f->smpl_size))) return;
+    if (!read_at(h, f->smpl_off, bytes, f->smpl_size)) { free(bytes); f->pack_state = SF_PACK_BROKEN; return; }
+    x = decode_memory(bytes, (size_t)f->smpl_size, &ch, &frames, &r, err, sizeof err);
+    free(bytes);
+    if (!x) { f->pack_state = SF_PACK_BROKEN; return; }
+    InterlockedIncrement(&g_decodes);
+    if (frames <= 0 || (unsigned long)frames > SF_PACK_MAX_FRAMES || ch <= 0) { free(x); f->pack_state = SF_PACK_BROKEN; return; }
+    /* the first channel (channel after channel, so its frames come first) to int16, in place: frame i's int16 goes
+       where float i/2 was, which has been read already. FLAC and WavPack give back exactly the packed values. */
+    o = (int16_t *)x;
+    for (i = 0; i < frames; i++) {
+      float v = x[i] * 32768.0f;
+      o[i] = (int16_t)(v >= 32767.0f ? 32767 : v <= -32768.0f ? -32768 : (int)floorf(v + 0.5f));
+    }
+    if (smp_cache_write_i16(f->pack_key, o, (uint64_t)frames, r > 0 ? r : 44100) != 0) {
+      free(x);
+      f->pack_state = SF_PACK_BROKEN;                           /* no cache folder to stream it from */
+      return;
+    }
+    free(x);
+    if (!(e = smp_cache_open_i16(f->pack_key))) { f->pack_state = SF_PACK_BROKEN; return; }
+  }
+  f->pack_entry = e;
+  f->pack_frames = smp_entry_frames(e);
+  f->pack_state = SF_PACK_READY;
 }
 
 static void publish(SmpFont *f, int s, SfPcm *p) {
@@ -351,6 +405,10 @@ static DWORD pass(SmpFont *f) {
     n = smp_sf_regions(f, p, &r);
     for (k = 0; k < n; k++) if (r[k].sample >= 0 && r[k].sample < f->nshdr) f->need[r[k].sample] = 1;
   }
+  if (f->is_pack && f->pack_state == SF_PACK_NONE && !f->closing && !g_stop) {   /* the pack first, once needed */
+    for (s = 0; s < f->nshdr && !f->need[s]; s++) {}
+    if (s < f->nshdr) pack_prepare(f);
+  }
 
   for (s = 0; s < f->nshdr; s++) {
     if (f->closing || g_stop) { aborted = 1; break; }
@@ -359,6 +417,9 @@ static DWORD pass(SmpFont *f) {
       if (f->state[s] == SF_ST_RETIRED) {          /* needed again before it was freed: publish it again */
         publish(f, s, f->held[s]);
         f->state[s] = SF_ST_PUBLISHED;
+      } else if (f->state[s] == SF_ST_NONE && f->is_pack && f->pack_state != SF_PACK_READY) {
+        if (f->pack_state == SF_PACK_BROKEN) f->state[s] = SF_ST_BROKEN;   /* the pack never decodes */
+        else retry = 1;                                                     /* tried again in RETRY_MS */
       } else if (f->state[s] == SF_ST_NONE && cant_open) {
         retry = 1;
       } else if (f->state[s] == SF_ST_NONE) {
@@ -456,6 +517,7 @@ static void free_font(SmpFont *f) {
 #endif
   if (f->held) for (s = 0; s < f->nshdr; s++) free_pcm(f->held[s]);
   if (f->fh) for (s = 0; s < f->npaths; s++) if (f->fh[s]) CloseHandle(f->fh[s]);
+  if (f->pack_entry) smp_cache_close(f->pack_entry);
   free((void *)f->users); free((void *)f->voices); free((void *)f->pcm); free(f->fh); free(f->ph);
   free(f->held); free(f->state); free(f->need); free(f->idle_since); free(f->wpath);
   f->wpath = NULL;
@@ -464,10 +526,18 @@ static void free_font(SmpFont *f) {
 
 /* the cache keys of the font's DECODED samples: the file's full path, size and modified time, the byte range and
    the channel, so a changed file never finds a stale copy */
-static void source_keys(SmpFont *f) {
+static int source_keys(SmpFont *f) {
   char path[2048 * 3], d[2048 * 3 + 160];
   int s;
   if (!WideCharToMultiByte(CP_UTF8, 0, f->wpath, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path);
+  if (f->is_pack) {
+    /* the decoded pack: keyed by the file (sfpack1: the version of this layout), named by the cache folder now */
+    char file[2048 * 3];
+    snprintf(d, sizeof d, "sfpack1|%s|%llu|%llu", path, (unsigned long long)f->size, (unsigned long long)f->mtime);
+    f->pack_key = smp_key(d);
+    if (smp_cache_path(f->pack_key, file, (int)sizeof file) && !(f->paths[1] = _strdup(file))) return 0;
+    /* no cache folder: paths[1] stays NULL, the pack can't be written, and its samples never load */
+  }
   for (s = 0; s < f->nshdr; s++) {
     SmpSrc *c = &f->src[s];
     uint64_t size = f->size, mtime = f->mtime;
@@ -487,6 +557,7 @@ static void source_keys(SmpFont *f) {
              (unsigned long long)mtime, (unsigned long long)c->offset, (unsigned long long)c->length, (unsigned)c->channel);
     c->key = smp_key(d);
   }
+  return 1;
 }
 
 static int setup(SmpFont *f) {
@@ -502,8 +573,7 @@ static int setup(SmpFont *f) {
   f->ph = calloc(f->npaths > 0 ? (size_t)f->npaths : 1, sizeof(HANDLE));
   f->stuck_gen = -1;
   if (!(f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since && f->fh && f->ph)) return 0;
-  source_keys(f);
-  return 1;
+  return source_keys(f);
 }
 
 /* the file's full path as a new wide string, or NULL */

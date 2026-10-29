@@ -1,13 +1,16 @@
 import ctypes
 import os
 import random
+import shutil
+import struct
 import time
 
 import numpy as np
 import pytest
 
 from conftest import SmpSfRegion, SmpSfSample, write_wav
-from sf2make import write_sf2
+from sf2make import write_sbk, write_sf2
+from test_sffont import pcm
 
 REAL_FONT = r"E:\samplepacks\soundfonts\just_t4_fixed.sf2"
 
@@ -443,8 +446,36 @@ def walk_font(lib, f):
         assert len(h.name) <= 20
 
 
-def test_truncated_and_corrupt_files(lib, tmp_path):
-    good = make_font(tmp_path / "good.sf2")
+def load_all(lib, f, timeout=10000):
+    """Uses every preset, waits for the loader, reads every sample that loaded, then lets the presets go."""
+    n = lib.smp_sf_preset_count(f)
+    for i in range(n):
+        lib.smp_sf_use(f, i, 1)
+    lib.smp_sf_wait_idle(f, timeout)
+    for i in range(lib.smp_sf_sample_count(f)):
+        pcm(lib, f, i)
+    for i in range(n):
+        lib.smp_sf_use(f, i, -1)
+
+
+def damaged_kind(kind, tmp_path):
+    """A good file of one kind, for the damaged-file test."""
+    if kind == "sf2":
+        return make_font(tmp_path / "good.sf2")
+    if kind == "sbk":
+        path = str(tmp_path / "good.sbk")
+        write_sbk(path, SBK_PRESETS, SBK_SAMPLES, rom=[("ROM Piano", 5000, 9000)])
+        return path
+    path = str(tmp_path / ("good." + kind))
+    write_sf2(path, PRESETS, SAMPLES, sf4=(kind == "sf4"), pack=("flac" if kind == "sf2pack" else None))
+    return path
+
+
+@pytest.mark.parametrize("kind", ["sf2", "sf4", "sf2pack", "sbk"])
+def test_truncated_and_corrupt_files(lib, tmp_path, kind):
+    """Every 97th truncation and seeded random corruption: each open gives a font or NULL with a reason, never a
+    crash. For the new kinds, some damaged fonts that open also load their samples (a bad FLAC stream, a bad pack)."""
+    good = damaged_kind(kind, tmp_path)
     data = open(good, "rb").read()
     variants = [data[:cut] for cut in range(0, len(data), 97)]
     rng = random.Random(1234)
@@ -453,14 +484,16 @@ def test_truncated_and_corrupt_files(lib, tmp_path):
         for _ in range(8):
             b[rng.randrange(len(b))] = rng.randrange(256)
         variants.append(bytes(b))
-    path = tmp_path / "bad.sf2"
+    path = tmp_path / ("bad." + kind)
     opened = 0
-    for v in variants:
+    for k, v in enumerate(variants):
         path.write_bytes(v)
         f, err = sf_open(lib, path)
         if f:
             opened += 1
             walk_font(lib, f)
+            if kind != "sf2" and k % 7 == 0:
+                load_all(lib, f)
             lib.smp_sf_close(f)
         else:
             assert err
@@ -484,3 +517,228 @@ def test_open_real_font_fast(lib):
         walk_font(lib, f)
     finally:
         lib.smp_sf_close(f)
+
+
+# ---- SF4, SF2Pack and SoundFont 1 ----
+
+def short_samples():
+    """Three samples under 1 s (so a loaded sample is held whole) for comparing formats sample by sample."""
+    return [dict(name="T%d" % i, data=tone(n, fr), rate=22050, pitch=60, correction=0, loop=lp)
+            for i, (n, fr, lp) in enumerate([(6000, 440.0, (1200, 5800)), (4000, 220.0, None),
+                                              (5000, 330.0, (17, 4999))])]
+
+
+def all_preset(n):
+    return [preset([inst([zone(i, keys=(10 * i, 10 * i + 9)) for i in range(n)])], name="All")]
+
+
+def loaded(lib, path, expect):
+    """Opens a font, loads every sample and returns [(int16 data, loop)] and how many decodes it took."""
+    d0 = lib.smp_sf_test_decodes()
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 20000) == 0
+        assert lib.smp_sf_loaded_samples(f) == expect
+        out = [pcm(lib, f, i) for i in range(expect)]
+        lib.smp_sf_use(f, 0, -1)
+        return out, lib.smp_sf_test_decodes() - d0
+    finally:
+        lib.smp_sf_close(f)
+
+
+@pytest.mark.parametrize("flag", [True, 0x10])
+def test_sf4_matches_sf2(lib, tmp_path, flag):
+    """SF4 (each sample its own FLAC stream, flagged 0x20 with ifil 4) and FLAC inside SF3 (flagged 0x10) play
+    exactly the SF2's samples, with SF3's loop points."""
+    samples = short_samples()
+    a, b = str(tmp_path / "t.sf2"), str(tmp_path / "t.sf4")
+    write_sf2(a, all_preset(3), samples)
+    write_sf2(b, all_preset(3), samples, sf4=flag)
+    want, _ = loaded(lib, a, 3)
+    got, decodes = loaded(lib, b, 3)
+    assert decodes == 3
+    for i, ((da, la), (db, lb)) in enumerate(zip(want, got)):
+        assert len(da) == len(db) == len(samples[i]["data"])
+        assert np.array_equal(da.astype(np.int32), db.astype(np.int32)), i
+        assert la == lb == (samples[i]["loop"] or (0, 0))
+
+
+PACK_EXACT = ["flac", "wavpack"]
+
+
+@pytest.mark.parametrize("codec", PACK_EXACT)
+def test_sf2pack_flac_matches_sf2(lib, tmp_path, codec):
+    """An SF2Pack (RIFF form sfpk, the whole smpl chunk as one lossless stream) plays exactly the SF2's samples.
+    The pack is decoded once, into the cache: the second open decodes nothing."""
+    if codec == "wavpack" and not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg isn't installed, so no WavPack pack can be made")
+    samples = short_samples()
+    a, b = str(tmp_path / "t.sf2"), str(tmp_path / "t.sf2pack")
+    write_sf2(a, all_preset(3), samples)
+    write_sf2(b, all_preset(3), samples, pack=codec)
+    with open(b, "rb") as fh:
+        assert fh.read(12)[8:] == b"sfpk"
+    want, _ = loaded(lib, a, 3)
+    got, decodes = loaded(lib, b, 3)
+    assert decodes == 1                                   # one stream for the whole pack
+    for i, ((da, la), (db, lb)) in enumerate(zip(want, got)):
+        assert np.array_equal(da, db), i
+        assert la == lb
+    again, decodes = loaded(lib, b, 3)
+    assert decodes == 0
+    assert all(np.array_equal(x[0], y[0]) for x, y in zip(got, again))
+
+
+@pytest.mark.parametrize("codec", ["vorbis", "opus"])
+def test_sf2pack_vorbis(lib, tmp_path, codec):
+    """A lossy pack (Ogg Vorbis, or Opus at 48 kHz) comes within -30 dB of the SF2's samples (-25 dB for Opus: at
+    libsndfile's default bitrate the 220 Hz sample comes back at -29.6 dB, from libsndfile's own decoder too)."""
+    samples = short_samples()
+    a, b = str(tmp_path / "t.sf2"), str(tmp_path / "t.sf2pack")
+    write_sf2(a, all_preset(3), samples)
+    write_sf2(b, all_preset(3), samples, pack=codec)
+    want, _ = loaded(lib, a, 3)
+    got, _ = loaded(lib, b, 3)
+    for i, ((da, la), (db, lb)) in enumerate(zip(want, got)):
+        assert len(da) == len(db)                         # shdr gives the lengths, as in SF2
+        x, y = da.astype(np.float64), db.astype(np.float64)
+        err_db = 20 * np.log10(np.sqrt(np.mean((x - y) ** 2)) / np.sqrt(np.mean(x ** 2)))
+        assert err_db < (-30 if codec == "vorbis" else -25), (i, err_db)
+        assert la == lb
+
+
+def test_sf2pack_damaged_stream(lib, tmp_path):
+    """A pack whose stream can't be decoded opens (the headers are fine) but loads nothing, and says so by not
+    loading; nothing crashes."""
+    samples = short_samples()
+    b = tmp_path / "bad.sf2pack"
+    write_sf2(str(b), all_preset(3), samples, pack="flac")
+    data = bytearray(b.read_bytes())
+    at = data.find(b"fLaC")
+    data[at:at + 4] = b"junk"
+    b.write_bytes(bytes(data))
+    f, err = sf_open(lib, b)
+    assert f, err
+    try:
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 10000) == 0
+        assert lib.smp_sf_loaded_samples(f) == 0
+        lib.smp_sf_use(f, 0, -1)
+    finally:
+        lib.smp_sf_close(f)
+
+
+SBK_RATE = 44100
+# 441 Hz at 44100 Hz: a period of exactly 100 frames
+SBK_SAMPLES = [dict(name="Sine 441", data=tone(22050, 441.0, SBK_RATE), loop=(1000, 21000))]
+# instrument zone generators in SBK units: root A4 (samplePitch 6900), loop on, pan hard right (127), attack 10 ms,
+# release 100 ms, volume sustain at full (127), modulation sustain 48 of 96, chorus 128 of 256
+SBK_GENS = {55: 6900, 54: 1, 17: 127, 34: 10, 38: 100, 37: 127, 29: 48, 15: 128}
+SBK_PRESETS = [
+    dict(name="Sine", bank=0, program=0, gens={},
+         instruments=[dict(name="Sine", gens={}, zones=[dict(keys=(0, 127), sample=1, gens=SBK_GENS)])]),
+    dict(name="Rom Piano", bank=0, program=1, gens={},
+         instruments=[dict(name="Rom", gens={}, zones=[dict(keys=(0, 127), sample=0, gens={55: 6000})])]),
+]
+
+
+def peak_hz(x, rate):
+    w = np.hanning(len(x))
+    spec = np.abs(np.fft.rfft(x * w, 8 * len(x)))
+    return np.argmax(spec) * rate / (8 * len(x))
+
+
+def test_sbk_minimal(lib, tmp_path):
+    """A hand-built SoundFont 1 bank: its generators are converted to SF2 units, the ROM sample's preset has
+    nothing to play, and the file's sample plays at the right pitch (root from samplePitch, 44100 Hz)."""
+    path = str(tmp_path / "t.sbk")
+    write_sbk(path, SBK_PRESETS, SBK_SAMPLES, rom=[("ROM Piano", 5000, 9000)])
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        assert presets(lib, f) == [(0, 0, "Sine"), (0, 1, "Rom Piano")]
+        assert lib.smp_sf_sample_count(f) == 2
+        h = lib.smp_sf_sample(f, 1).contents
+        assert h.name.decode() == "Sine 441"
+        assert (h.start, h.end, h.rate) == (0, 22050, SBK_RATE)
+        assert lib.smp_sf_sample(f, 0).contents.type & 0x8000          # the ROM sample
+        assert regions(lib, f, 1) == []                                # nothing in the file to play
+        (r,) = regions(lib, f, 0)
+        assert r.sample == 1
+        assert r.gen[58] == 69                                         # root key from samplePitch
+        assert r.gen[17] == 500                                        # pan 127: hard right
+        assert r.gen[34] == round(1200 * np.log2(0.010))               # 10 ms in timecents
+        assert r.gen[38] == round(1200 * np.log2(0.100))
+        assert r.gen[37] == 0                                          # sustain 127: no attenuation
+        assert r.gen[29] == 500                                        # mod sustain 48 of 96: half way
+        assert r.gen[15] == 500                                        # chorus 128 of 256
+        assert r.gen[54] == 1
+        walk_font(lib, f)
+        lib.smp_sf_use(f, 0, 1)
+        assert lib.smp_sf_wait_idle(f, 5000) == 0
+        data, loop = pcm(lib, f, 1)
+        assert np.array_equal(data, SBK_SAMPLES[0]["data"])
+        assert loop == (1001, 21002)                                   # awesfx's SBK loop correction
+        lib.smp_sf_use(f, 0, -1)
+        for key, hz in ((69, 441.0), (81, 882.0), (57, 220.5)):
+            n = 24000
+            out = np.zeros(2 * n, np.float32)
+            assert lib.smp_sf_test_note(f, 0, key, 100, 48000.0, n, -1,
+                                        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))) == 1
+            right = out[1::2].astype(np.float64)
+            assert np.sqrt(np.mean(right[4800:] ** 2)) > 0.01
+            assert abs(np.sqrt(np.mean(out[0::2][4800:] ** 2))) < 1e-3   # hard right
+            got = peak_hz(right[4800:], 48000)
+            assert abs(got - hz) < hz * 0.005, (key, got)
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sbk_rom_only_refused(lib, tmp_path):
+    """A bank that only names Sound Blaster ROM samples has nothing to play and is refused plainly."""
+    path = str(tmp_path / "rom.sbk")
+    write_sbk(path, SBK_PRESETS[1:], [], rom=[("ROM Piano", 5000, 9000), ("ROM Strings", 9000, 12000)])
+    f, err = sf_open(lib, path)
+    assert not f
+    assert err == "this SoundFont uses Sound Blaster ROM samples, which aren't in the file", err
+
+
+def test_sf2pack_long_sample_streams(lib, tmp_path):
+    """A long sample in a pack streams from the decoded pack's cache file: a 3 s note renders exactly as the SF2's."""
+    rate = 44100
+    samples = [dict(name="Long", data=tone(3 * rate, 330.0, rate), rate=rate, pitch=60, correction=0,
+                    loop=(rate, 2 * rate)),
+               dict(name="Short", data=tone(rate // 4, 440.0, rate), rate=rate, pitch=72, correction=0, loop=None)]
+    a, b = str(tmp_path / "l.sf2"), str(tmp_path / "l.sf2pack")
+    write_sf2(a, all_preset(2), samples)
+    write_sf2(b, all_preset(2), samples, pack="flac")
+    outs = []
+    for path in (a, b):
+        f, err = sf_open(lib, path)
+        assert f, err
+        try:
+            n = int(3.5 * 48000)
+            out = np.zeros(2 * n, np.float32)
+            assert lib.smp_sf_test_note(f, 0, 5, 100, 48000.0, n, int(3.2 * 48000),
+                                        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))) == 1
+            outs.append(out)
+        finally:
+            lib.smp_sf_close(f)
+    assert np.sqrt(np.mean(outs[0][-48000:] ** 2)) > 0.001
+    assert np.array_equal(outs[0], outs[1])
+
+
+def test_sf2pack_too_big_refused(lib, tmp_path):
+    """A pack whose samples reach past what can be unpacked (1 GiB of 16-bit data: decode_memory's 2 GiB of float)
+    is refused at open with a plain reason, not after a long decode."""
+    path = tmp_path / "big.sf2pack"
+    write_sf2(str(path), all_preset(1), short_samples()[:1], pack="flac")
+    data = bytearray(path.read_bytes())
+    at = data.find(b"shdr") + 8
+    data[at + 24:at + 28] = struct.pack("<I", (1 << 29) + 1)   # the first sample's end
+    path.write_bytes(bytes(data))
+    f, err = sf_open(lib, path)
+    assert not f
+    assert "big.sf2pack isn't a SoundFont this can read (its packed samples are too big to unpack" in err, err

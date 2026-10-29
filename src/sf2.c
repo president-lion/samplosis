@@ -1,7 +1,9 @@
-/* sf2.c: read a SoundFont's (SF2 or SF3) RIFF chunks and its hydra (the preset, instrument and sample headers).
-   Only the headers are read; the sample data stays on disk and is found again by smpl_off. Every count is
-   checked against its chunk's size and every index against the array it points into, so a damaged file
-   gives a plain reason instead of a crash. */
+/* sf2.c: read a SoundFont's RIFF chunks and its hydra (the preset, instrument and sample headers): SF2, SF3 and SF4
+   (compressed samples), SF2Pack (RIFF form sfpk: the whole sample data as one compressed stream, decoded by the
+   loader) and SoundFont 1 (.sbk, converted to SF2's model at open). Only the headers are read; the sample data
+   stays on disk and is found again by smpl_off. Every count is checked against its chunk's size and every index
+   against the array it points into, so a damaged file gives a plain reason instead of a crash. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +35,14 @@ static const char *base_name(const char *path) {
   const char *b = path, *p;
   for (p = path; *p; p++) if (*p == '\\' || *p == '/' || *p == ':') b = p + 1;
   return b;
+}
+
+/* a chunk id for a message: its four bytes, with anything that isn't plain printable ASCII as '?' (a damaged id
+   would otherwise put stray bytes in the reason) */
+static void chunk_id(char out[5], const uint8_t *id) {
+  int i;
+  for (i = 0; i < 4; i++) out[i] = id[i] >= 32 && id[i] < 127 ? (char)id[i] : '?';
+  out[4] = 0;
 }
 
 /* the reason a file can't be read: "<name> isn't a SoundFont this can read (<why>)" */
@@ -84,18 +94,95 @@ static int gens_ok(const SfBag *b, int nbag, int ngen, int nmod) {
   return b[nbag].gen <= ngen && b[nbag].mod <= nmod;
 }
 
-static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, int wcap) {
-  Sub sub[9]; uint32_t pos = 0; int i, k;
+/* ---- SoundFont 1 ----
+   SoundFont 1 (.sbk) was never published. This follows awesfx (Takashi Iwai's AWE32 tools for Linux, GPL), the one
+   open reader: its sffile.c for the layout and its sbkconv.c and parsesf.c for the units. What differs from SF2:
+   - the sample names are in an snam chunk in sdta (20 bytes each), and shdr records are 16 bytes: start, end, loop
+     start and loop end, in frames from smpl's start as in SF2. There is no rate (44100 Hz), root key (60),
+     correction or type. awesfx reads shdr with no terminal record, so every record is a sample here too (a
+     terminal one would be an empty sample that nothing plays).
+   - the samples before the first one that starts at 0 are in the Sound Blaster's ROM, not in the file.
+   - awesfx moves every loop start on by 1 frame and every loop end by 2; that is done here too.
+   - modulators: awesfx ignores pmod and imod (their SBK layout isn't known), so they are ignored here; the regions
+     get SF2's default modulators, as every SF2 region does.
+   - generator numbers are SF2's, but most values are in other units (converted below, one record at a time), and
+     number 55 is samplePitch: root key x 100 minus the tuning in cents.
+   - a value is not added to the instrument's: the instrument zone's own value counts, else its global zone's, else
+     the preset zone's, else the preset's global zone's, else the default (awesfx's merge_table). */
+
+/* one generator record's value from SBK units to SF2's (awesfx's sbkconv.c, except where noted) */
+static int sf1_convert(unsigned op, int v) {
+  switch (op) {
+    case 5: case 6: case 7: return (1200 * v / 64 + 1) / 2;              /* LFO and envelope to pitch */
+    case 8: return v >= 127 ? 14400 : 59 * v + 4366;                      /* filter cutoff 0..127 to absolute cents */
+    case 9: return v * 3 / 2;                                             /* resonance to centibels */
+    case 10: return 1200 * 3 * v / 64;                                    /* LFO to cutoff */
+    case 11: return 1200 * 6 * v / 64;                                    /* envelope to cutoff */
+    case 13: return 120 * v / 64;                                         /* LFO to volume (tremolo) */
+    case 15: case 16: return v * 1000 / 256;                              /* chorus and reverb 0..255 */
+    case 17: return v * 1000 / 127 - 500;                                 /* pan 0..127 */
+    case 21: case 23: case 25: case 26: case 27: case 28: case 30:
+    case 33: case 34: case 35: case 36: case 38: {                        /* times in milliseconds to timecents */
+      double s = (v > 0 ? v : 1) / 1000.0;
+      return (int)floor(1200.0 * log2(s) + 0.5);
+    }
+    case 22: case 24:                                                     /* LFO frequency to absolute cents */
+      if (v <= 0) return op == 22 ? -725 : -15600;
+      return (int)(1200.0 * log2((double)v) - 7925.0);
+    case 29: return v < 96 ? 1000 * (96 - v) / 96 : 0;                    /* mod envelope sustain 0..96 */
+    case 31: case 32: case 39: case 40: return (int)(v * 5.55);           /* time change per key */
+    case 37: return v < 96 ? (2000 - 21 * v) / 2 : 0;                     /* volume sustain 0..96 to centibels */
+    case 48:
+      /* initial attenuation 0..127, 127 = full level. awesfx gives -2000 x log10(v / 127), ten times the amplitude
+         ratio in centibels, which would make 64 nearly 60 dB down; this takes the plain ratio, 200 x log10(127 / v)
+         centibels (64 is 6 dB down), and 0 is silent. A guess, as SBK isn't documented. */
+      if (v <= 0) return 1440;
+      if (v >= 127) return 0;
+      return (int)floor(200.0 * log10(127.0 / v) + 0.5);
+    case 56: return v ? 50 : 100;                                         /* scale tuning: a switch, half steps */
+    default: return v;                                                    /* offsets, ranges, keys, tuning, ids */
+  }
+}
+
+static int16_t clamp16(int v) { return (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v); }
+
+/* the sample records of a SoundFont 1 file (see above). snam may be NULL. */
+static void sf1_samples(SmpFont *f, const uint8_t *shdr, uint32_t n, const uint8_t *snam, uint32_t nsnam) {
+  uint32_t i; int in_rom = 1;
+  for (i = 0; i < n; i++) {
+    const uint8_t *r = shdr + (size_t)i * 16;
+    SmpSfSample *s = &f->shdr[i];
+    if (snam && i < nsnam) name20(s->name, snam + (size_t)i * 20); else s->name[0] = 0;
+    s->start = u32(r); s->end = u32(r + 4); s->loop_start = u32(r + 8); s->loop_end = u32(r + 12);
+    s->rate = 44100; s->pitch = 60; s->correction = 0; s->link = 0;
+    if (s->start == 0) in_rom = 0;                  /* the first sample in the file starts at 0 */
+    s->type = in_rom ? (SF_ROM | SF_MONO) : SF_MONO;
+    if (!in_rom) {                                  /* awesfx's loop correction for SBK */
+      if (s->loop_start < 0xffffffffu) s->loop_start++;
+      if (s->loop_end < 0xfffffffeu) s->loop_end += 2;
+    }
+  }
+}
+
+/* snam, nsnam: SoundFont 1's sample names (NULL when absent or not SF1) */
+static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, const uint8_t *snam, uint32_t nsnam, char *why, int wcap) {
+  Sub sub[9]; uint32_t pos = 0; int i, k, v1 = f->version == 1;
   memcpy(sub, SUBS, sizeof sub);
+  if (v1) sub[8].rec = 16;
   while (pos + 8 <= size) {
     uint32_t n = u32(p + pos + 4);
     if (n > size - pos - 8) { snprintf(why, wcap, "a preset list runs past its chunk"); return 0; }
     for (k = 0; k < 9; k++)
       if (!memcmp(p + pos, sub[k].id, 4) && !sub[k].p) {
+        if (v1 && (k == 2 || k == 6)) continue;     /* SF1 modulators: ignored (see above) */
         if (n % sub[k].rec) { snprintf(why, wcap, "the %s list's size isn't a whole number of records", sub[k].id); return 0; }
         sub[k].p = p + pos + 8; sub[k].n = n / sub[k].rec;
       }
     pos += 8 + n + (n & 1);
+  }
+  if (v1) {   /* no modulators: just the terminal record (zeroed below), and every bag's modulator index is 0 */
+    static const uint8_t none[10] = {0};
+    sub[2].p = sub[6].p = none; sub[2].n = sub[6].n = 1;
   }
   for (k = 0; k < 9; k++)
     if (!sub[k].p || sub[k].n < 1) { snprintf(why, wcap, "it has no %s list", sub[k].id); return 0; }
@@ -106,7 +193,7 @@ static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, in
   /* the counts leave out the terminal record (EOP, EOI, EOS, the last bag and the last generator and modulator) */
   f->nphdr = sub[0].n - 1; f->npbag = sub[1].n - 1; f->npmod = sub[2].n - 1; f->npgen = sub[3].n - 1;
   f->ninst = sub[4].n - 1; f->nibag = sub[5].n - 1; f->nimod = sub[6].n - 1; f->nigen = sub[7].n - 1;
-  f->nshdr = sub[8].n - 1;
+  f->nshdr = v1 ? (int)sub[8].n : (int)sub[8].n - 1;   /* SF1's shdr has no terminal record */
   if (f->nphdr < 1) { snprintf(why, wcap, "it has no presets"); return 0; }
 
   f->phdr = calloc(sub[0].n, sizeof *f->phdr); f->pbag = calloc(sub[1].n, sizeof *f->pbag);
@@ -129,7 +216,13 @@ static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, in
   }
   read_bags(f->pbag, sub[1].p, sub[1].n); read_mods(f->pmod, sub[2].p, sub[2].n); read_gens(f->pgen, sub[3].p, sub[3].n);
   read_bags(f->ibag, sub[5].p, sub[5].n); read_mods(f->imod, sub[6].p, sub[6].n); read_gens(f->igen, sub[7].p, sub[7].n);
-  for (i = 0; i < (int)sub[8].n; i++) {
+  if (v1) {
+    for (i = 0; i < (int)sub[1].n; i++) f->pbag[i].mod = 0;
+    for (i = 0; i < (int)sub[5].n; i++) f->ibag[i].mod = 0;
+    for (i = 0; i < (int)sub[3].n; i++) f->pgen[i].amount = clamp16(sf1_convert(f->pgen[i].oper, f->pgen[i].amount));
+    for (i = 0; i < (int)sub[7].n; i++) f->igen[i].amount = clamp16(sf1_convert(f->igen[i].oper, f->igen[i].amount));
+    sf1_samples(f, sub[8].p, sub[8].n, snam, nsnam);
+  } else for (i = 0; i < (int)sub[8].n; i++) {
     const uint8_t *r = sub[8].p + (size_t)i * 46;
     SmpSfSample *s = &f->shdr[i];
     name20(s->name, r);
@@ -170,7 +263,9 @@ static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, in
       s->link = 0;
       s->type = (uint16_t)((s->type & ~(SF_RIGHT | SF_LEFT | SF_LINKED)) | SF_MONO);
     }
-    if (s->type & SF_VORBIS) f->is_sf3 = 1;
+    if (f->version < 3) s->type &= (uint16_t)~SF_FLAC;   /* 0x20 means FLAC only from version 3 on */
+    if (f->is_pack) s->type &= (uint16_t)~SF_COMPRESSED; /* a pack's samples are plain 16-bit once it is decoded */
+    if (s->type & SF_COMPRESSED) f->is_sf3 = 1;
   }
   return 1;
 }
@@ -190,31 +285,42 @@ static int build_order(SmpFont *f) {
   return 1;
 }
 
-/* sample positions are kept inside the sample data; loop points are left as written (the voice clamps them) */
+/* sample positions are kept inside the sample data; loop points are left as written (the voice clamps them). A
+   pack's decoded length isn't known until it is decoded: its samples are held to the decode limit here, and to the
+   decoded length when they load. */
 static void clamp_samples(SmpFont *f) {
   int i;
   for (i = 0; i < f->nshdr; i++) {
     SmpSfSample *s = &f->shdr[i];
-    uint64_t l = (s->type & SF_VORBIS) ? f->smpl_size : f->smpl_size / 2;   /* SF3: bytes; SF2: frames */
+    uint64_t l = f->is_pack ? SF_PACK_MAX_FRAMES
+               : (s->type & SF_COMPRESSED) ? f->smpl_size : f->smpl_size / 2;   /* SF3 and SF4: bytes; SF2: frames */
     if (s->end > l) s->end = (uint32_t)l;
     if (s->start > s->end) s->start = s->end;
   }
 }
 
 /* every sample's source: SF2 data is 16-bit mono PCM in smpl (sm24 is ignored: its lowest 8 bits are inaudible
-   here); SF3 data is an Ogg Vorbis stream in smpl, decoded once into the cache. has_long says whether any sample
-   may be 1 s or longer (an SF3 stream's length isn't known until it is decoded, so any SF3 counts). */
+   here); SF3 and SF4 data is a compressed stream per sample in smpl (Ogg Vorbis, Opus or FLAC), decoded once into
+   the cache. An SF2Pack's samples are 16-bit mono PCM in the decoded pack, a cache file the loader writes (path 1,
+   named by sffont.c), at their SF2 offsets after its header. has_long says whether any sample may be 1 s or longer
+   (a compressed stream's length isn't known until it is decoded, so any SF3 or SF4 counts). */
 static int build_sources(SmpFont *f, const char *path) {
   int i;
   f->src = calloc(f->nshdr > 0 ? (size_t)f->nshdr : 1, sizeof *f->src);
-  f->paths = calloc(1, sizeof *f->paths);
+  f->paths = calloc(2, sizeof *f->paths);
   if (!f->src || !f->paths || !(f->paths[0] = _strdup(path))) return 0;
-  f->npaths = 1;
+  f->npaths = f->is_pack ? 2 : 1;
   for (i = 0; i < f->nshdr; i++) {
     const SmpSfSample *sh = &f->shdr[i];
     SmpSrc *c = &f->src[i];
     c->path_id = 0; c->channels = 1; c->channel = 0;
-    if (sh->type & SF_VORBIS) {
+    if (f->is_pack) {
+      c->kind = SMP_SRC_PCM_FILE;
+      c->enc = SMP_PCM_S16LE;
+      c->path_id = 1;
+      c->offset = SF_PACK_HDR + (uint64_t)sh->start * 2;
+      if (sh->end - sh->start >= (sh->rate ? sh->rate : 44100)) f->has_long = 1;
+    } else if (sh->type & SF_COMPRESSED) {
       c->kind = SMP_SRC_DECODED;
       c->offset = f->smpl_off + sh->start;
       c->length = sh->end - sh->start;
@@ -236,7 +342,7 @@ static int build_sources(SmpFont *f, const char *path) {
    which means "not set". The sample offsets and sampleModes have no range here: the voice keeps the offsets
    inside the sample. where says at which levels a generator counts; the ones with neither (unused, reserved, and
    the instrument, range and sample generators, which are handled apart) are never stored. */
-enum { AT_INST = 1, AT_PRESET = 2, AT_BOTH = 3 };
+enum { AT_INST = 1, AT_PRESET = 2, AT_BOTH = 3, AT_SF1 = 4 };   /* AT_SF1: read_zone also keeps samplePitch */
 typedef struct { int16_t def, lo, hi; uint8_t where; } GenInfo;
 #define ANY -32768, 32767
 static const GenInfo GENS[SMP_SF_NGEN] = {
@@ -354,7 +460,7 @@ static void read_zone(const SfGen *gen, int g0, int g1, unsigned link_oper, int 
       z->set |= 1ull << op;
       continue;
     }
-    if (op >= SMP_SF_NGEN || !(GENS[op].where & where)) continue;
+    if (op >= SMP_SF_NGEN || !((GENS[op].where & where) || (op == SF1_GEN_SAMPLEPITCH && (where & AT_SF1)))) continue;
     z->v[op] = (int16_t)a; z->set |= 1ull << op;   /* a generator given twice: the later one counts */
   }
 }
@@ -364,6 +470,37 @@ static int zone_val(const Zone *local, const Zone *global, int i, int dflt) {
   if (local->set >> i & 1) return local->v[i];
   if (global && (global->set >> i & 1)) return global->v[i];
   return dflt;
+}
+
+static int zone_has(const Zone *local, const Zone *global, int i) {
+  return (local->set >> i & 1) || (global && (global->set >> i & 1));
+}
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* SoundFont 1: a region's generators, already in SF2 units (see sf1_convert): the instrument's value, else the
+   preset's, else the default. Unset sustains are full level (SF2's 0): awesfx's SBK default of 1000 is never
+   converted, which would make a zone that doesn't set them fall silent after its decay, so that is taken as a slip.
+   The LFO frequencies default to awesfx's SBK values. samplePitch becomes the root key (overridingRootKey; when the
+   zone also sets that, it shifts the root as in awesfx) and a fine tuning added to fineTune; scale tuning's halving
+   of that tuning in awesfx is left out. */
+static void sf1_region(SmpSfRegion *r, const Zone *iz, const Zone *ig, const Zone *pz, const Zone *pg) {
+  int i;
+  for (i = 0; i < SMP_SF_NGEN; i++) {
+    int v = i == 22 ? -725 : i == 24 ? -15600 : GENS[i].def;
+    if (zone_has(iz, ig, i)) v = zone_val(iz, ig, i, v);
+    else if ((GENS[i].where & AT_PRESET) && zone_has(pz, pg, i)) v = zone_val(pz, pg, i, v);
+    r->gen[i] = (int16_t)clampi(v, GENS[i].lo, GENS[i].hi);
+  }
+  r->gen[SF1_GEN_SAMPLEPITCH] = 0;
+  if (zone_has(iz, ig, SF1_GEN_SAMPLEPITCH) || zone_has(pz, pg, SF1_GEN_SAMPLEPITCH)) {
+    int sp = zone_has(iz, ig, SF1_GEN_SAMPLEPITCH) ? zone_val(iz, ig, SF1_GEN_SAMPLEPITCH, 0)
+                                                   : zone_val(pz, pg, SF1_GEN_SAMPLEPITCH, 0);
+    int root = sp / 100, tune = -(sp % 100), rk = r->gen[58];
+    if (tune <= -50) { root++; tune += 100; }
+    r->gen[58] = (int16_t)clampi(rk >= 0 ? root + rk - 60 : root, 0, 127);
+    r->gen[52] = (int16_t)clampi(r->gen[52] + tune, -99, 99);
+  }
 }
 
 /* identical modulators have the same source, destination, amount source and transform; only the amount differs */
@@ -459,6 +596,7 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
   SmpSfMod *scratch = NULL, *pbase = NULL;        /* pbase: the current preset's global list */
   Pool pool = {0};
   int *rstart = NULL; int ok = 0, p, i, nslots = 1, got;
+  int v1 = f->version == 1 ? AT_SF1 : 0;          /* SoundFont 1: values aren't added (sf1_region) */
   size_t sreg, sstart, total; char *block;
 
   /* a list per instrument zone, preset zone and instrument, and the defaults: twice that many slots */
@@ -486,7 +624,7 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
       int ins, ib0, ib1, ib, have_ig = 0, padd[SMP_SF_NGEN];
       uint8_t pklo, pkhi, pvlo, pvhi;
       Zone ig, iz;
-      read_zone(f->pgen, f->pbag[b].gen, f->pbag[b + 1].gen, SF_GEN_INSTRUMENT, AT_PRESET, &pz);
+      read_zone(f->pgen, f->pbag[b].gen, f->pbag[b + 1].gen, SF_GEN_INSTRUMENT, AT_PRESET | v1, &pz);
       if (pz.link < 0) {   /* a first zone with no instrument is the global one; any later one is ignored */
         if (b == b0) { pg = pz; have_pg = 1; }
         continue;
@@ -509,7 +647,7 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
       ins = pz.link; ib0 = f->inst[ins].bag; ib1 = f->inst[ins + 1].bag;
       for (ib = ib0; ib < ib1; ib++) {
         SmpSfRegion *r; uint8_t klo, khi, vlo, vhi; int s;
-        read_zone(f->igen, f->ibag[ib].gen, f->ibag[ib + 1].gen, SF_GEN_SAMPLEID, AT_INST, &iz);
+        read_zone(f->igen, f->ibag[ib].gen, f->ibag[ib + 1].gen, SF_GEN_SAMPLEID, AT_INST | v1, &iz);
         if (iz.link < 0) {
           if (ib == ib0) { ig = iz; have_ig = 1; }
           continue;
@@ -549,10 +687,12 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
         r = &reg[nreg];
         memset(r, 0, sizeof *r);
         r->lokey = klo; r->hikey = khi; r->lovel = vlo; r->hivel = vhi; r->sample = s;
-        for (i = 0; i < SMP_SF_NGEN; i++) {
+        if (v1) {
+          sf1_region(r, &iz, have_ig ? &ig : NULL, &pz, have_pg ? &pg : NULL);
+        } else for (i = 0; i < SMP_SF_NGEN; i++) {
           int v = zone_val(&iz, have_ig ? &ig : NULL, i, GENS[i].def);
           if (GENS[i].where & AT_PRESET) v += padd[i];
-          r->gen[i] = (int16_t)(v < GENS[i].lo ? GENS[i].lo : v > GENS[i].hi ? GENS[i].hi : v);
+          r->gen[i] = (int16_t)clampi(v, GENS[i].lo, GENS[i].hi);
         }
         r->gen[SF_GEN_KEYRANGE] = (int16_t)(klo | khi << 8);
         r->gen[SF_GEN_VELRANGE] = (int16_t)(vlo | vhi << 8);
@@ -597,10 +737,11 @@ fail:
 /* parses a font's headers into a new SmpFont (sffont.c's smp_sf_open shares it through the registry) */
 SmpFont *sf_parse(const char *path, char *err, int cap) {
   wchar_t w[2048]; Src s; LARGE_INTEGER sz; FILETIME mt; uint8_t h[12];
-  uint64_t pos, end, pdta_off = 0; uint32_t pdta_size = 0; int have_pdta = 0, have_smpl = 0, ok = 0;
+  uint64_t pos, end, pdta_off = 0, snam_off = 0; uint32_t pdta_size = 0, snam_size = 0;
+  int have_pdta = 0, have_smpl = 0, ok = 0;
   char why[200] = "";
   SmpFont *f;
-  uint8_t *pd = NULL;
+  uint8_t *pd = NULL, *sn = NULL;
   if (err && cap > 0) err[0] = 0;
   if (!path || !MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048)) {
     if (err && cap > 0) snprintf(err, cap, "can't open %s", path ? base_name(path) : "(no file)");
@@ -623,10 +764,11 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
   f->size = s.size;
   f->mtime = (uint64_t)mt.dwHighDateTime << 32 | mt.dwLowDateTime;
 
-  if (!rd(&s, 0, h, 12) || memcmp(h, "RIFF", 4) || memcmp(h + 8, "sfbk", 4)) {
+  if (!rd(&s, 0, h, 12) || memcmp(h, "RIFF", 4) || (memcmp(h + 8, "sfbk", 4) && memcmp(h + 8, "sfpk", 4))) {
     if (err && cap > 0) snprintf(err, cap, "%s isn't a SoundFont", base_name(path));
     goto done;
   }
+  f->is_pack = !memcmp(h + 8, "sfpk", 4);
   /* some writers get the RIFF size slightly wrong; the file's own end is the hard limit */
   end = 8 + (uint64_t)u32(h + 4);
   if (end > s.size) end = s.size;
@@ -645,13 +787,24 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
           uint8_t d[8]; uint32_t m;
           if (!rd(&s, sp, d, 8)) { snprintf(why, sizeof why, "it can't be read"); goto bad; }
           m = u32(d + 4);
-          if (m > send - sp - 8) { snprintf(why, sizeof why, "the %.4s chunk runs past its list", d); goto bad; }
+          if (m > send - sp - 8) {
+            char id[5];
+            chunk_id(id, d);
+            snprintf(why, sizeof why, "the %s chunk runs past its list", id);
+            goto bad;
+          }
           if (!memcmp(d, "smpl", 4) && !have_smpl) { f->smpl_off = sp + 8; f->smpl_size = m; have_smpl = 1; }
           else if (!memcmp(d, "sm24", 4) && !f->sm24_size) { f->sm24_off = sp + 8; f->sm24_size = m; }
-          else if (!memcmp(d, "ifil", 4) && m >= 4) {
+          else if (!memcmp(d, "snam", 4) && !snam_off) { snam_off = sp + 8; snam_size = m; }
+          else if (!memcmp(d, "ifil", 4) && m >= 4 && !f->version) {
             uint8_t v[4];
             if (!rd(&s, sp + 8, v, 4)) { snprintf(why, sizeof why, "it can't be read"); goto bad; }
-            if (u16(v) < 2 || u16(v) > 3) { snprintf(why, sizeof why, "it is version %u, and only 2 and 3 can be read", u16(v)); goto bad; }
+            /* 1 is SoundFont 1 (.sbk), 3 SF3, 4 Cognitone's SF4; a pack is an SF2 underneath */
+            if (u16(v) < 1 || u16(v) > 4 || (f->is_pack && u16(v) == 1)) {
+              snprintf(why, sizeof why, "it is version %u, and only 1 to 4 can be read", u16(v));
+              goto bad;
+            }
+            f->version = u16(v);
           }
           sp += 8 + (uint64_t)m + (m & 1);
         }
@@ -660,15 +813,46 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
     pos += 8 + (uint64_t)n + (n & 1);
   }
   if (!have_pdta) { snprintf(why, sizeof why, "it has no preset list"); goto bad; }
-  if (!have_smpl) { snprintf(why, sizeof why, "it has no sample data"); goto bad; }
+  /* a SoundFont 1 bank may have no sample data at all (every sample in the sound card's ROM): told apart below */
+  if (!have_smpl && f->version != 1) { snprintf(why, sizeof why, "it has no sample data"); goto bad; }
   pd = malloc(pdta_size ? pdta_size : 1);
   if (!pd) { snprintf(why, sizeof why, "out of memory"); goto bad; }
   if (!rd(&s, pdta_off, pd, pdta_size)) { snprintf(why, sizeof why, "it can't be read"); goto bad; }
-  if (!parse_pdta(f, pd, pdta_size, why, sizeof why)) goto bad;
+  if (f->version == 1 && snam_size >= 20) {
+    if (!(sn = malloc(snam_size))) { snprintf(why, sizeof why, "out of memory"); goto bad; }
+    if (!rd(&s, snam_off, sn, snam_size)) { snprintf(why, sizeof why, "it can't be read"); goto bad; }
+  }
+  if (!parse_pdta(f, pd, pdta_size, sn, snam_size / 20, why, sizeof why)) goto bad;
+  if (f->version == 1) {
+    /* a bank whose samples are all in the ROM has nothing here to play: refused, with this exact reason */
+    int i, rom = 0, data = 0;
+    for (i = 0; i < f->nshdr; i++) {
+      const SmpSfSample *x = &f->shdr[i];
+      if (x->type & SF_ROM) rom++;
+      else if (have_smpl && x->end > x->start && x->start < f->smpl_size / 2) data++;
+    }
+    if (!data && rom) {
+      if (err && cap > 0) snprintf(err, cap, "this SoundFont uses Sound Blaster ROM samples, which aren't in the file");
+      goto done;
+    }
+    if (!have_smpl) { snprintf(why, sizeof why, "it has no sample data"); goto bad; }
+  }
   if (!build_order(f)) { snprintf(why, sizeof why, "out of memory"); goto bad; }
   if (!build_regions(f, why, sizeof why)) goto bad;
+  if (f->is_pack) {
+    /* a pack is decoded whole, as float, and decode_memory stops at 2 GiB of float: a pack whose samples reach past
+       SF_PACK_MAX_FRAMES (1 GiB of 16-bit data) could never be decoded, so it is refused now, not after a long
+       decode. Only samples a region plays count, as with the other checks on samples. */
+    int i;
+    for (i = 0; i < f->nregions; i++)
+      if (f->shdr[f->regions[i].sample].end > SF_PACK_MAX_FRAMES) {
+        snprintf(why, sizeof why, "its packed samples are too big to unpack (over 1 GB of sample data)");
+        goto bad;
+      }
+  }
   /* 24-bit low bytes only count when there is one for every 16-bit sample */
-  if (f->sm24_size && (f->is_sf3 || f->sm24_size < f->smpl_size / 2)) f->sm24_off = f->sm24_size = 0;
+  if (f->sm24_size && (f->is_sf3 || f->is_pack || f->version == 1 || f->sm24_size < f->smpl_size / 2))
+    f->sm24_off = f->sm24_size = 0;
   clamp_samples(f);
   f->path = _strdup(path);
   if (!f->path || !build_sources(f, path)) { snprintf(why, sizeof why, "out of memory"); goto bad; }
@@ -677,7 +861,7 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
 bad:
   why_bad(err, cap, path, why);
 done:
-  free(pd);
+  free(pd); free(sn);
   CloseHandle(s.h);
   if (!ok) { sf_free(f); return NULL; }
   return f;
