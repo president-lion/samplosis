@@ -376,7 +376,7 @@ static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stre
   if (!(g & 0x7FFFFF)) g = ++ss->gen;          /* 0 means "none" in the tags */
   memset(&m, 0, sizeof m);
   m.f = v->font; m.stream = stream; m.slot = slot; m.sample = v->sample; m.gen = g;
-  m.hf = (uint32_t)v->hf; m.end = (uint32_t)v->end; m.ls = (uint32_t)v->ls; m.le = (uint32_t)v->le;
+  m.hf = (uint32_t)v->hf; m.t0 = (uint32_t)v->t0; m.t1 = (uint32_t)v->t1; m.end = (uint32_t)v->end; m.ls = (uint32_t)v->ls; m.le = (uint32_t)v->le;
   m.p0 = v->start > 0 ? v->start - 1 : 0;
   m.loopy = v->loopy;
   InterlockedExchange(&ss->rel, -1);
@@ -408,6 +408,7 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
 
   v->font = f; v->reg = r; v->sample = r->sample;
   v->data = vw.head; v->is_float = vw.is_float; v->hf = vw.head_frames;
+  if (vw.tail) { v->tail = vw.tail; v->t0 = vw.tail_start; v->t1 = (int64_t)vw.tail_start + vw.tail_frames; }
   v->key = key & 127; v->vel = vel & 127;
   if (gen[G_VELOCITY] >= 0) v->vel = gen[G_VELOCITY] & 127;
   v->pkey = gen[G_KEYNUM] >= 0 ? (gen[G_KEYNUM] & 127) : v->key;
@@ -522,12 +523,14 @@ static __inline float frame_f32(const SmpSfVoice *v, int64_t i) {
   return i < -SF_PCM_PAD ? 0 : ((const float *)v->data)[i];
 }
 
-/* A streaming voice's frame i (of the current lap): from the head when the sample frame is inside it, else from
-   the ring at its path frame, if the streamer has got that far; else *dry is set and it is 0. */
+/* A streaming voice's frame i (of the current lap): from the head or the post-loop head when the sample frame is in
+   one of them, else from the ring at its path frame, if the streamer has got that far; else *dry is set and it is 0. */
 static __inline float frame_stream(const SmpSfVoice *v, int64_t i, int *dry) {
   int64_t p = i + v->laps * v->L, s = sf_path_frame(p, v->ls, v->le, v->loopy, v->rel_w);
   if (s >= v->end) return 0;
   if (s < v->hf) return v->is_float ? ((const float *)v->data)[s] : ((const int16_t *)v->data)[s] * (1.0f / 32768.0f);
+  if (s >= v->t0 && s < v->t1)
+    return v->is_float ? ((const float *)v->tail)[s - v->t0] : ((const int16_t *)v->tail)[s - v->t0] * (1.0f / 32768.0f);
   if (p < v->avail) return v->ring[p & SF_RMASK];
   *dry = 1;
   return 0;
@@ -536,14 +539,16 @@ static __inline float frame_stream(const SmpSfVoice *v, int64_t i, int *dry) {
 /* frame i will come from the ring, and the ring doesn't have it yet */
 static __inline int ring_short(const SmpSfVoice *v, int64_t i) {
   int64_t p = i + v->laps * v->L, s = sf_path_frame(p, v->ls, v->le, v->loopy, v->rel_w);
-  return s >= v->hf && s < v->end && p >= v->avail;
+  return s >= v->hf && s < v->end && !(s >= v->t0 && s < v->t1) && p >= v->avail;
 }
 
-/* the ring won't have every frame the next m samples and SF_UFADE more need: fade out now. The ring fills in path
+/* the ring won't have every frame the next m samples and SF_UFADE more need (at most a quarter ring): fade out now. The ring fills in path
    order, so it is enough to look at the furthest frame, and at the loop's last frame when the loop end comes
    first (past it the path may be back in the head). */
 static int ahead_short(const SmpSfVoice *v, int m) {
-  int64_t a = (int64_t)v->pos, b = (int64_t)(v->pos + (SF_UFADE + m) * fabs(v->ratio)) + 3;
+  /* at a high pitch that many samples would be more frames than a ring holds: then a quarter ring (a quicker fade) */
+  double span = (SF_UFADE + m) * fabs(v->ratio);
+  int64_t a = (int64_t)v->pos, b = (int64_t)(v->pos + (span < SF_RING / 4 ? span : SF_RING / 4)) + 3;
   if (ring_short(v, b)) return 1;
   return v->looping && a < v->le && b >= v->le && ring_short(v, v->le - 1);
 }
@@ -623,7 +628,7 @@ static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho,
     int64_t lo = (int64_t)v->pos - 1, hi = (int64_t)(v->pos + rmax * m) + 3;
     int lin = !v->loopy || ((v->laps == 0 || lo >= v->ls) && (!v->looping || hi < v->le));
     if (lin && hi < hend) return v->is_float ? run_f32(v, l, r, rev, cho, m) : run_i16(v, l, r, rev, cho, m);
-    if (lin && lo >= v->hf && hi < v->end && hi + v->laps * v->L < v->avail) {
+    if (lin && lo >= v->hf && hi < v->end && hi + v->laps * v->L < v->avail && (hi < v->t0 || lo >= v->t1)) {
       v->roff = v->laps * v->L;
       return run_ring(v, l, r, rev, cho, m);
     }
@@ -642,7 +647,8 @@ static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho,
         const int16_t *d = (const int16_t *)v->data + i0;
         x0 = d[-1] * (1.0f / 32768.0f); x1 = d[0] * (1.0f / 32768.0f); x2 = d[1] * (1.0f / 32768.0f); x3 = d[2] * (1.0f / 32768.0f);
       }
-    } else if (lin && i0 - 1 >= v->hf && i0 + 2 < v->end && i0 + 2 + v->laps * v->L < v->avail) {
+    } else if (lin && i0 - 1 >= v->hf && i0 + 2 < v->end && i0 + 2 + v->laps * v->L < v->avail &&
+               (i0 + 2 < v->t0 || i0 - 1 >= v->t1)) {   /* the streamer skips the post-loop head's frames */
       int64_t q = i0 - 1 + v->laps * v->L;
       x0 = v->ring[q & SF_RMASK]; x1 = v->ring[(q + 1) & SF_RMASK]; x2 = v->ring[(q + 2) & SF_RMASK]; x3 = v->ring[(q + 3) & SF_RMASK];
     } else {

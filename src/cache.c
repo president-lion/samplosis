@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "samplosis.h"
+#include "sf2.h"
 
 #define HDR 32
 #define MAX_OPEN 4096
@@ -96,6 +97,28 @@ static int write_ch(uint64_t key, const float *lr, uint64_t frames, int rate, ui
 int smp_cache_write(uint64_t key, const float *lr, uint64_t frames, int rate) { return write_ch(key, lr, frames, rate, 2); }
 int smp_cache_write_mono(uint64_t key, const float *x, uint64_t frames, int rate) { return write_ch(key, x, frames, rate, 1); }
 
+static __declspec(thread) HANDLE t_ev;   /* each thread's event for smp_pread */
+
+int smp_pread(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
+  OVERLAPPED o;
+  *got = 0;
+  if (!t_ev && !(t_ev = CreateEventW(NULL, TRUE, FALSE, NULL))) return 0;
+  memset(&o, 0, sizeof o);
+  o.Offset = (DWORD)off; o.OffsetHigh = (DWORD)(off >> 32);
+  o.hEvent = t_ev;
+  if (!ReadFile(h, buf, n, NULL, &o)) {
+    DWORD e = GetLastError();
+    if (e == ERROR_HANDLE_EOF) return 1;
+    if (e != ERROR_IO_PENDING) return 0;
+  }
+  if (!GetOverlappedResult(h, &o, got, TRUE)) return GetLastError() == ERROR_HANDLE_EOF;
+  return 1;
+}
+
+void smp_pread_thread_done(void) {
+  if (t_ev) { CloseHandle(t_ev); t_ev = NULL; }
+}
+
 static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
   OVERLAPPED o = {0};
   o.Offset = (DWORD)off; o.OffsetHigh = (DWORD)(off >> 32);
@@ -108,11 +131,14 @@ static int read_at(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got) {
 static SmpEntry *open_entry(uint64_t key, int whole_div, uint32_t want_ch) {
   wchar_t fn[1200];
   if (!file_w(key, L".smpc", fn, 1200)) return NULL;
-  HANDLE h = CreateFileW(fn, GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  /* mono files are read by every streamer of a font at once: overlapped, so their reads don't queue up */
+  HANDLE h = CreateFileW(fn, GENERIC_READ | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL | (want_ch == 1 ? FILE_FLAG_OVERLAPPED : 0), NULL);
   if (h == INVALID_HANDLE_VALUE) return NULL;
   unsigned char hdr[HDR]; DWORD got;
   uint32_t ver, ch, rate; uint64_t frames;
-  if (!read_at(h, 0, hdr, HDR, &got) || got != HDR || memcmp(hdr, "SMPC", 4)) { CloseHandle(h); return NULL; }
+  int ok = want_ch == 1 ? smp_pread(h, 0, hdr, HDR, &got) : read_at(h, 0, hdr, HDR, &got);
+  if (!ok || got != HDR || memcmp(hdr, "SMPC", 4)) { CloseHandle(h); return NULL; }
   memcpy(&ver, hdr + 4, 4); memcpy(&ch, hdr + 8, 4); memcpy(&rate, hdr + 12, 4); memcpy(&frames, hdr + 16, 8);
   LARGE_INTEGER sz;
   if (ver != 1 || ch != want_ch || !GetFileSizeEx(h, &sz) || (uint64_t)sz.QuadPart < HDR + frames * 4 * ch) { CloseHandle(h); return NULL; }
@@ -170,7 +196,7 @@ long smp_entry_read_mono(SmpEntry *e, uint64_t frame, float *x, long frames) {
   uint64_t n = e->frames - frame;
   if (n > (uint64_t)frames) n = (uint64_t)frames;
   DWORD got;
-  if (!read_at(e->h, HDR + frame * 4, x, (DWORD)(n * 4), &got)) return 0;
+  if (!smp_pread(e->h, HDR + frame * 4, x, (DWORD)(n * 4), &got)) return 0;
   return (long)(got / 4);
 }
 

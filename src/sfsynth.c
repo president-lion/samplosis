@@ -47,8 +47,9 @@
 #define HOLD_SECONDS 10.0         /* sf_used presets are let go this long after the first note-on after the state
                                      loaded (a project loads long before Play is pressed) */
 #define G_EXCL 57                 /* exclusiveClass */
-#define OFFLINE_STEP 256          /* an offline render with streaming voices plays this many frames between waits for
-                                     the streamer, so no ring can run dry even at a high pitch */
+#define OFFLINE_STEP 256          /* an offline render with streaming voices plays at most this many frames between
+                                     looks at the rings (fewer at high pitches: see render) */
+#define COLLECT_WAIT_MS 200       /* collect waits this long for the streamer, else tries again on its next call */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
 
 enum { V_FREE, V_PENDING, V_LIVE };
@@ -561,7 +562,10 @@ SMP_API int smp_synth_collect(SmpSynth *s) {
     SmpFont *f = s->ret[i].f;
     if (s->epoch >= s->ret[i].a0 + 2 && (s->cur != f || f == s->font)) {
       /* the audio thread has let go of f and ended its voices; the streamer lets go on its next whole pass */
-      if (s->st && !synced) { sfs_sync(s->st); synced = 1; }
+      if (s->st && !synced) {
+        if (!sfs_sync_for(s->st, COLLECT_WAIT_MS)) break;   /* a slow disk: closed on a later call */
+        synced = 1;
+      }
       if (s->used_font == f && f != s->font) used_drop_main(s);
       smp_sf_close(f);
       s->ret[i] = s->ret[--s->nret];
@@ -698,13 +702,27 @@ static int any_ring_low(SmpSynth *s) {
   return 0;
 }
 
-/* Offline, voices that stream are played OFFLINE_STEP frames at a time, and before a step in which any ring holds
-   less than half a ring ahead of its voice the streamer tops every ring up, so the render is exact. (A step at
-   up to 32 times the speed fits in half a ring.) The steps change nothing else: every voice carries its state. */
+/* frames a step may play: the fastest streaming voice (with room for its pitch to rise in the step) must not go
+   through more than a quarter ring, so that and the voice's look-ahead (another quarter at most) fit in the half
+   ring a ring holds ahead of it after a top-up */
+static int offline_step(const SmpSynth *s) {
+  int i; double rmax = 1, n;
+  for (i = 0; i < MAXV; i++) {
+    if (s->sl[i].st != V_LIVE || !s->v[i].ss) continue;
+    if (!s->v[i].primed) return SMP_SFV_CTL;    /* a new voice: its pitch is known after its first stretch */
+    if (s->v[i].ratio > rmax) rmax = s->v[i].ratio;
+  }
+  n = (SF_RING / 4 - 64) / (rmax * 1.5);
+  return n >= OFFLINE_STEP ? OFFLINE_STEP : n < 1 ? 1 : (int)n;
+}
+
+/* Offline, voices that stream are played a step at a time (offline_step), and before a step in which any ring holds
+   less than half a ring ahead of its voice the streamer tops every ring up, so the render is exact at any pitch.
+   The steps change nothing else: every voice carries its state. */
 static void render(SmpSynth *s, float *const *outs, int a, int b, int base) {
   if ((s->offline || s->render_offline) && s->st && any_streaming(s)) {
     while (a < b) {
-      int e = b - a > OFFLINE_STEP ? a + OFFLINE_STEP : b;
+      int step = offline_step(s), e = b - a > step ? a + step : b;
       if (any_ring_low(s)) sfs_sync(s->st);
       render_voices(s, outs, a, e, base);
       a = e;

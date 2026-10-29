@@ -33,6 +33,7 @@ typedef struct SmpSfVoice {
   SmpFont *font; const SmpSfRegion *reg; int sample;
   const void *data; int is_float;        /* the held head (int16 or float): the whole sample when it is under 1 s */
   int64_t hf;                            /* frames in data */
+  const void *tail; int64_t t0, t1;      /* the post-loop head (the same type as data): sample frames [t0, t1) */
   int key, vel;                          /* as played (for the modulators' key and velocity sources) */
   int pkey;                              /* the key for pitch and the keynum scalings: keynum when set */
   double rate, transpose, srate;         /* output rate, transpose in semitones, the sample's rate */

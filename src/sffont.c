@@ -104,9 +104,17 @@ static SfPcm *new_pcm(uint32_t frames, uint32_t head, int is_float) {
 
 /* overwrites a freed buffer's start first, so a read after free shows up in tests instead of finding old data */
 static void free_pcm(SfPcm *p) {
+  size_t w;
+  uint64_t own;
   if (!p) return;
+  w = p->is_float ? sizeof(float) : sizeof(int16_t);
+  own = p->bytes;                          /* bytes counts the post-loop head too, which is its own allocation */
   if (p->entry) smp_cache_close(p->entry);
-  memset(p, 0xDD, p->bytes < 65536 ? (size_t)p->bytes : 65536);
+  if (p->tail) {
+    own -= ((uint64_t)p->tail_frames + 2 * SF_PCM_PAD) * w;
+    free((uint8_t *)p->tail - SF_PCM_PAD * w);
+  }
+  memset(p, 0xDD, own < 65536 ? (size_t)own : 65536);
   free(p);
 }
 
@@ -158,8 +166,9 @@ static void pcm_convert(const uint8_t *b, int enc, int ch, int c, uint32_t n, fl
 
 /* The handle for path_id in this pass (loader thread only). Each pass opens the file by name, as stage 2 did, so a
    file that has gone away stops new samples loading (the ones loaded keep playing). The first time, a duplicate of
-   that handle becomes the font's streaming handle, kept until the font closes, so streams read the very file the
-   headers came from even if it is renamed meanwhile. NULL when the file can't be opened now. */
+   then, a second handle opened by name becomes the font's streaming handle, kept until the font closes, so streams
+   read the very file the headers came from even if it is renamed meanwhile. It is overlapped, so the streamers of
+   every player on the font read it in parallel (smp_pread). NULL when the file can't be opened now. */
 static HANDLE font_handle(SmpFont *f, int path_id) {
   HANDLE h;
   wchar_t w[2048];
@@ -175,11 +184,9 @@ static HANDLE font_handle(SmpFont *f, int path_id) {
                   FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return NULL;
   if (!f->fh[path_id]) {
-    HANDLE d;
-    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &d, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-      CloseHandle(h);
-      return NULL;
-    }
+    HANDLE d = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    if (d == INVALID_HANDLE_VALUE) { CloseHandle(h); return NULL; }
     f->fh[path_id] = d;
   }
   f->ph[path_id] = h;
@@ -235,6 +242,44 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
   return p;
 }
 
+/* The post-loop head of a sample that streams and has frames after its loop: from the loop end (or the head's end,
+   if later) to a quarter second past the loop end, or the sample's end. A loop-until-release then goes on past its
+   loop end from memory while the streamer, woken after the block, catches up. 0 when memory ran out. */
+static int load_tail(SmpFont *f, const SmpSrc *c, SfPcm *p, uint32_t rate) {
+  uint32_t t0, t1, n, pl = rate / 4 > MIN_HEAD ? rate / 4 : MIN_HEAD;
+  size_t w = p->is_float ? sizeof(float) : sizeof(int16_t);
+  uint8_t *b;
+  int ok = 0;
+  if (p->head_frames >= p->frames || p->loop_end <= p->loop_start || p->loop_end >= p->frames) return 1;
+  t0 = p->loop_end > p->head_frames ? p->loop_end : p->head_frames;
+  t1 = p->frames - p->loop_end > pl ? p->loop_end + pl : p->frames;
+  if (t1 <= t0) return 1;
+  n = t1 - t0;
+  if (!(b = calloc((size_t)n + 2 * SF_PCM_PAD, w))) return 0;
+  if (p->entry) {
+    ok = smp_entry_read_mono(p->entry, t0, (float *)(b + SF_PCM_PAD * w), (long)n) == (long)n;
+  } else if (p->h != INVALID_HANDLE_VALUE) {
+    HANDLE h = font_handle(f, c->path_id);
+    int bps = pcm_bytes(c->enc);
+    uint64_t nb = (uint64_t)n * (uint64_t)bps * c->channels;
+    if (h && c->enc == SMP_PCM_S16LE && c->channels == 1) {
+      ok = read_at(h, c->offset + (uint64_t)t0 * 2, b + SF_PCM_PAD * w, nb);
+    } else if (h) {
+      uint8_t *raw = nb < 0x7fffffffu ? malloc((size_t)nb) : NULL;
+      if (!raw) { free(b); return 0; }
+      ok = read_at(h, c->offset + (uint64_t)t0 * (uint64_t)bps * c->channels, raw, nb);
+      if (ok) pcm_convert(raw, c->enc, c->channels, c->channel, n, p->is_float ? (float *)(b + SF_PCM_PAD * w) : NULL,
+                          p->is_float ? NULL : (int16_t *)(b + SF_PCM_PAD * w));
+      free(raw);
+    }
+  }
+  if (!ok) { free(b); return 1; }                                 /* unreadable: the voice streams those frames instead */
+  p->tail = b + SF_PCM_PAD * w;
+  p->tail_start = t0; p->tail_frames = n;
+  p->bytes += ((size_t)n + 2 * SF_PCM_PAD) * w;
+  return 1;
+}
+
 /* loads sample s's head (all of it under 1 s); NULL with *broken set when the sample can never load (empty,
    unreadable or bad Ogg), NULL without it when memory ran out or the file can't be opened (tried again on a later
    pass) */
@@ -280,6 +325,7 @@ static SfPcm *load_sample(SmpFont *f, int s, int *broken) {
   if (le > p->frames) le = p->frames;
   if (ls > le) ls = le;
   p->loop_start = (uint32_t)ls; p->loop_end = (uint32_t)le;
+  if (!load_tail(f, c, p, rate)) { free_pcm(p); return NULL; }   /* out of memory: tried again later */
   return p;
 }
 
@@ -395,6 +441,7 @@ static DWORD WINAPI loader(void *arg) {
     }
     wait = next;
   }
+  smp_pread_thread_done();
   return 0;
 }
 
@@ -423,10 +470,21 @@ static void source_keys(SmpFont *f) {
   if (!WideCharToMultiByte(CP_UTF8, 0, f->wpath, -1, path, (int)sizeof path, NULL, NULL)) snprintf(path, sizeof path, "%s", f->path);
   for (s = 0; s < f->nshdr; s++) {
     SmpSrc *c = &f->src[s];
+    uint64_t size = f->size, mtime = f->mtime;
+    const char *file = path;
     if (c->kind != SMP_SRC_DECODED) continue;
-    snprintf(d, sizeof d, "sfdec|%s|%s|%llu|%llu|%llu|%llu|%u", path, c->path_id ? f->paths[c->path_id] : "",
-             (unsigned long long)f->size, (unsigned long long)f->mtime, (unsigned long long)c->offset,
-             (unsigned long long)c->length, (unsigned)c->channel);
+    if (c->path_id > 0 && c->path_id < f->npaths) {    /* a sample file of its own: its own size and time */
+      wchar_t w[2048]; WIN32_FILE_ATTRIBUTE_DATA a;
+      file = f->paths[c->path_id];
+      size = mtime = 0;
+      if (MultiByteToWideChar(CP_UTF8, 0, file, -1, w, 2048) && GetFileAttributesExW(w, GetFileExInfoStandard, &a)) {
+        size = (uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+        mtime = (uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+      }
+    }
+    /* sfdec1: the decoder's version, so a changed decoder never finds an old copy */
+    snprintf(d, sizeof d, "sfdec1|%s|%llu|%llu|%llu|%llu|%u", file, (unsigned long long)size,
+             (unsigned long long)mtime, (unsigned long long)c->offset, (unsigned long long)c->length, (unsigned)c->channel);
     c->key = smp_key(d);
   }
 }
@@ -565,6 +623,7 @@ int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view) {
     view->head_frames = p->head_frames; view->frames = p->frames;
     view->loop_start = p->loop_start; view->loop_end = p->loop_end;
     view->stream = p->head_frames < p->frames ? p : NULL;
+    view->tail = p->tail; view->tail_start = p->tail_start; view->tail_frames = p->tail_frames;
   }
   return 1;
 }
@@ -591,10 +650,13 @@ long smp_sf_stream_read(const void *stream, uint64_t frame, float *out, long n) 
       int fb = pcm_bytes(p->enc) * p->channels;
       long per = (long)(sizeof buf / (size_t)fb);
       while (got < want) {
-        long k = want - got < per ? want - got : per;
-        if (!read_at(p->h, p->offset + (frame + (uint64_t)got) * (uint64_t)fb, buf, (uint64_t)k * (uint64_t)fb)) break;
-        pcm_convert(buf, p->enc, p->channels, p->channel, (uint32_t)k, out + got, NULL);
-        got += k;
+        long k = want - got < per ? want - got : per, r;
+        DWORD rb = 0;
+        if (!smp_pread(p->h, p->offset + (frame + (uint64_t)got) * (uint64_t)fb, buf, (DWORD)(k * fb), &rb)) break;
+        r = (long)(rb / (DWORD)fb);
+        if (r > 0) pcm_convert(buf, p->enc, p->channels, p->channel, (uint32_t)r, out + got, NULL);
+        got += r;
+        if (r < k) break;                                            /* short: the file ended early */
       }
     }
   }

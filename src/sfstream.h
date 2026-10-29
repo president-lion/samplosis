@@ -32,6 +32,7 @@ typedef struct SfMsg {
   SmpFont *f; const void *stream;
   int slot, sample; LONG gen;
   uint32_t hf;                           /* frames in the head: those are never read into the ring */
+  uint32_t t0, t1;                       /* the post-loop head's frames [t0, t1) (none when equal): not read either */
   uint32_t end, ls, le;                  /* the voice's end and loop */
   int64_t p0;                            /* the first path frame the voice reads */
   int loopy;                             /* the voice loops (sample mode 1 or 3, with a loop) */
@@ -56,6 +57,7 @@ int sfs_push(SfStream *st, const SfMsg *m);   /* audio thread: 1 queued, 0 full 
 void sfs_wake(SfStream *st);             /* audio thread: a block was played */
 void sfs_sync(SfStream *st);             /* offline and main thread: returns after a whole pass that tops every ring
                                             up (not just the half-empty ones) */
+int sfs_sync_for(SfStream *st, int timeout_ms);   /* the same, giving up after timeout_ms: 1 done, 0 timed out */
 void sfs_pause(SfStream *st, int on);    /* tests: the streamer reads nothing (forces underruns) */
 
 #endif

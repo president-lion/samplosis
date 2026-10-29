@@ -100,6 +100,9 @@ typedef struct SfPcm {
   uint64_t offset;                      /* PCM_FILE: byte offset of frame 0 */
   uint8_t enc, channels, channel;       /* PCM_FILE */
   SmpEntry *entry;                      /* DECODED: the mono float cache file, open while the sample is loaded */
+  void *tail;                           /* the post-loop head: tail_frames frames from frame tail_start (its own
+                                           allocation, with pads), or NULL */
+  uint32_t tail_start, tail_frames;
 } SfPcm;
 
 enum { SF_ST_NONE, SF_ST_PUBLISHED, SF_ST_RETIRED, SF_ST_BROKEN };
@@ -109,5 +112,10 @@ SmpFont *sf_parse(const char *path, char *err, int cap);
 void sf_free(SmpFont *f);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);
+/* cache.c: a positional read on a handle opened with FILE_FLAG_OVERLAPPED, waited for on an event of the calling
+   thread's own, so threads sharing the handle read in parallel. 1 when the read worked (*got may be short at the
+   end of the file). A thread that has used it calls smp_pread_thread_done before it ends. */
+int smp_pread(HANDLE h, uint64_t off, void *buf, DWORD n, DWORD *got);
+void smp_pread_thread_done(void);
 
 #endif

@@ -112,7 +112,8 @@ static void service(SfStream *st, int i) {
   float *ring = sfs_ring(st, i);
   LONG g = r->m.gen, rl;
   LONG64 nd;
-  int64_t need, total, limit, L = (int64_t)r->m.le - r->m.ls, hf = r->m.hf;
+  int64_t need, total, limit, L = (int64_t)r->m.le - r->m.ls, hf = r->m.hf, t0 = r->m.t0, t1 = r->m.t1;
+  long got;
   if (!r->on) return;
   if (sl->live != g) { drop(st, r); return; }
   rl = InterlockedCompareExchange(&sl->rel, 0, 0);
@@ -142,14 +143,21 @@ static void service(SfStream *st, int i) {
     if (n <= 0) { r->fill = limit; break; }
     if (r->m.loopy && r->rel < 0 && r->m.le <= hf && r->fill >= r->m.le) { r->fill = limit; break; }   /* round a loop in the head */
     if (n > limit - r->fill) n = limit - r->fill;
-    if (s + n <= hf) { r->fill += n; continue; }   /* all in the head */
-    if (s < hf) { r->fill += hf - s; continue; }   /* the part in the head */
+    /* frames the voice has in memory (the head, the post-loop head) are skipped */
+    if (s < hf) { r->fill += s + n <= hf ? n : hf - s; continue; }
+    if (s >= t0 && s < t1) { r->fill += s + n <= t1 ? n : t1 - s; continue; }
+    if (s < t0 && s + n > t0) n = t0 - s;
     if (n > CHUNK) n = CHUNK;
     wrap = SF_RING - (r->fill & SF_RMASK);
     if (n > wrap) n = wrap;
-    smp_sf_stream_read(r->m.stream, (uint64_t)s, ring + (r->fill & SF_RMASK), (long)n);   /* a failed read is silence */
-    r->fill += n;
+    got = smp_sf_stream_read(r->m.stream, (uint64_t)s, ring + (r->fill & SF_RMASK), (long)n);
+    r->fill += got > 0 ? got : 0;
     if (sl->live != g) return;                      /* gone meanwhile: dropped on the next pass */
+    if (got < n) {                                  /* a read failed: what came is good, the rest is tried again on a
+                                                       later pass, and meanwhile the voice fades and counts it */
+      sl->filled = SF_TAG(g, r->rel >= 0) | r->fill;
+      return;
+    }
     sl->filled = SF_TAG(g, r->rel >= 0) | r->fill;  /* volatile store: the ring data is visible first */
   }
   sl->filled = SF_TAG(g, r->rel >= 0) | r->fill;
@@ -165,7 +173,12 @@ static DWORD WINAPI streamer(LPVOID arg) {
     WaitForSingleObject(st->wake, wait);
     if (st->quit) break;
     drain(st);
-    if (!st->paused) {
+    if (st->paused) {                              /* tests: no reads, but ended voices still let go */
+      for (k = st->nact - 1; k >= 0; k--) {
+        Rec *r = &st->rec[st->act[k]];
+        if (st->slot[r->m.slot].live != r->m.gen) drop(st, r);
+      }
+    } else {
       /* the voices nearest to running dry first, then the rest (a service may drop a record: walk down) */
       for (k = st->nact - 1; k >= 0; k--) {
         i = st->act[k];
@@ -190,6 +203,7 @@ static DWORD WINAPI streamer(LPVOID arg) {
     InterlockedIncrement64(&st->pass);
     SetEvent(st->idle);
   }
+  smp_pread_thread_done();
   return 0;
 }
 
@@ -232,14 +246,20 @@ void sfs_free(SfStream *st) {
   free(st);
 }
 
-void sfs_sync(SfStream *st) {
+int sfs_sync_for(SfStream *st, int timeout_ms) {
   LONG64 target;
-  if (!st) return;
+  ULONGLONG t0 = GetTickCount64();
+  int done = 1;
+  if (!st) return 1;
   InterlockedIncrement(&st->topup);
   target = st->pass + 2;                           /* a whole pass that began after this call */
   while (st->pass < target) {
+    if (timeout_ms >= 0 && GetTickCount64() - t0 >= (ULONGLONG)timeout_ms) { done = 0; break; }
     SetEvent(st->wake);
     WaitForSingleObject(st->idle, 50);
   }
   InterlockedDecrement(&st->topup);
+  return done;
 }
+
+void sfs_sync(SfStream *st) { sfs_sync_for(st, -1); }

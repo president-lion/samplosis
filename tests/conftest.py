@@ -55,7 +55,8 @@ class SmpSfView(ctypes.Structure):
     _fields_ = [("head", ctypes.c_void_p), ("is_float", ctypes.c_int),
                 ("head_frames", ctypes.c_uint32), ("frames", ctypes.c_uint32),
                 ("loop_start", ctypes.c_uint32), ("loop_end", ctypes.c_uint32),
-                ("stream", ctypes.c_void_p)]
+                ("stream", ctypes.c_void_p),
+                ("tail", ctypes.c_void_p), ("tail_start", ctypes.c_uint32), ("tail_frames", ctypes.c_uint32)]
 
 
 def write_wav(path, data, rate):
@@ -228,7 +229,8 @@ def lib(settings_file):
                             ("smp_sf_test_decodes", c_long, []),
                             ("smp_synth_underruns", c_long, [vp]),
                             ("smp_synth_test_stream_pause", None, [vp, c_int]),
-                            ("smp_synth_set_offline", None, [vp, c_int])):
+                            ("smp_synth_set_offline", None, [vp, c_int]),
+                            ("smp_synth_unload", c_int, [vp])):
         if hasattr(dll, name):
             getattr(dll, name).restype = res
             getattr(dll, name).argtypes = args

@@ -181,11 +181,15 @@ SMP_API void smp_sf_use(SmpFont *f, int preset, int delta);   /* any thread, aud
 /* What smp_sf_pcm_acquire holds: the sample's head in memory (int16 or float mono, by is_float), the frame
    counts, the loop (frames from the sample's start, clamped to it), and a stream handle for the frames past the
    head (NULL when the head is the whole sample: under 1 s). A few zero frames are readable before head[0] and after
-   the head's last frame. Everything stays valid until release, even if the sample is retired meanwhile. */
+   the head's last frame. A sample that streams and has a loop with frames after it also keeps a post-loop head:
+   tail_frames frames from frame tail_start (in tail, the same type as head), so a loop-until-release can go on past
+   its loop end at once while the streamer catches up. Everything stays valid until release, even if the sample is
+   retired meanwhile. */
 typedef struct {
   const void *head; int is_float;
   uint32_t head_frames, frames, loop_start, loop_end;
   const void *stream;
+  const void *tail; uint32_t tail_start, tail_frames;
 } SmpSfView;
 SMP_API int smp_sf_pcm_acquire(SmpFont *f, int sample, SmpSfView *view);   /* any thread, audio too: 1 and the view
                                     when the sample is loaded (held until release); 0 (nothing to release, view

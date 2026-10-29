@@ -844,17 +844,29 @@ def busy(secs, seed, freq=330.0):
     return np.clip(x, -32000, 32000).astype(np.int16)
 
 
-def render_file(lib, path, events, secs, tmp_path, whole=False, block=256, pause=False):
-    """Renders events offline on a new synth with path loaded: (stereo out, underruns). whole: the samples are held
-    whole, as in stage 2 (the reference)."""
+def render_file(lib, path, events, secs, tmp_path, whole=False, block=256, pause=False, realtime=False, params=(),
+                before=None):
+    """Renders events on a new synth with path loaded: (stereo out, underruns). Offline unless realtime (then the
+    presets are used and loaded first, and the render runs at real-time pace, never waiting). whole: the samples
+    are held whole, as in stage 2 (the reference). params: (id, value) pairs. before(s): called just before."""
     lib.smp_sf_test_whole(1 if whole else 0)
     s = lib.smp_synth_new(float(OUT), 256)
     try:
         lib.smp_synth_set_param(s, P_EFFECTS, 0)
+        for pid, val in params:
+            lib.smp_synth_set_param(s, pid, val)
         err = ctypes.create_string_buffer(512)
         assert lib.smp_synth_load(s, str(path).encode(), err, 512) == 1, err.value
         if pause:
             lib.smp_synth_test_stream_pause(s, 1)
+        if realtime:
+            warm = tmp_path / ("w%d.wav" % next(_count))
+            prog = chr(10).join(l for l in events.split(chr(10)) if l.split()[1:2] and 192 <= int(l.split()[1]) < 208)
+            assert lib.smp_synth_render_test(s, prog.encode(), 256, 256, str(warm).encode(), 0) == 0
+            assert lib.smp_synth_wait_loaded(s, 20000) == 0
+            lib.smp_synth_test_offline(s, 0)
+        if before:
+            before(s)
         out = tmp_path / ("s%d.wav" % next(_count))
         assert lib.smp_synth_render_test(s, events.encode(), int(secs * OUT), block, str(out).encode(), 0) == 0
         x, _ = sf.read(str(out), dtype="float32", always_2d=True)
@@ -970,3 +982,144 @@ def test_streaming_many_voices_no_underrun(lib, tmp_path):
             os.rmdir(STREAM_DIR)
         except OSError:
             pass
+
+
+COARSE = 51
+
+
+def test_mode3_release_realtime(lib, tmp_path):
+    """Loop-until-release in real time: at the release the voice goes on past its loop end from the post-loop head
+    while the streamer catches up, so nothing underruns, whatever the phase of the release. Channel 1: a short loop
+    past the head; channel 2: a loop inside the head with a long tail. Each matches the samples held whole."""
+    a, b = busy(2.5, 3, 260.0), busy(2.5, 4, 190.0)
+    path = tmp_path / "m3.sf2"
+    write_sf2(str(path), [preset("Short", 0, 0, [zone(0, gens={MODES: 3, RELEASE_VOL: 1200})]),
+                          preset("InHead", 0, 1, [zone(1, gens={MODES: 3, RELEASE_VOL: 1200})])],
+              [dict(name="short", data=a, rate=SR, pitch=60, loop=(SR // 2, SR // 2 + 300)),
+               dict(name="inhead", data=b, rate=SR, pitch=60, loop=(SR // 20, SR // 10))])
+    ev = ["midi 193 1 0"]
+    for k, key in enumerate((60, 62, 65, 67, 72)):             # released at different phases of the loop
+        on = int(k * 0.8 * OUT)
+        off = on + int((0.7 + 0.0021 * k) * OUT) + 37 * k
+        ev += ["midi 144 %d 100 %d" % (key, on), "midi 128 %d 0 %d" % (key, off),
+               "midi 145 %d 100 %d" % (key, on + 11), "midi 129 %d 0 %d" % (key, off + 101)]
+    ev = "\n".join(ev)
+    secs = 5 * 0.8 + 1.8
+    ref, _ = render_file(lib, path, ev, secs, tmp_path, whole=True)
+    x, under = render_file(lib, path, ev, secs, tmp_path, realtime=True)
+    assert under == 0
+    assert np.sqrt(np.mean(ref[int(0.8 * OUT):int(1.4 * OUT)] ** 2)) > 0.05   # the tails after the releases sound
+    assert err_db(ref, x) < -90, err_db(ref, x)
+
+
+def test_stream_steal_reuse(lib, tmp_path):
+    """Stealing mid-stream with 16 voices: new notes take over slots whose voices were streaming, and the same keys
+    come back into reused slots. Offline it matches the samples held whole exactly; in real time nothing underruns."""
+    samples = [dict(name="v%d" % i, data=busy(6.0, 200 + i, 150.0 + 11 * i), rate=SR, pitch=40 + i, loop=None)
+               for i in range(24)]
+    path = tmp_path / "steal.sf2"
+    write_sf2(str(path), [preset("Steal", 0, 0, [zone(i, keys=(40 + i, 40 + i)) for i in range(24)])], samples)
+    ev = []
+    for k, start in enumerate((0, 8, 16, 0, 8)):
+        at = int(k * 0.4 * OUT)
+        ev += ["midi 144 %d 100 %d" % (40 + start + j, at + 3 * j) for j in range(8)]
+    ev = "\n".join(ev)
+    params = [(P_VOICES, 16)]
+    ref, _ = render_file(lib, path, ev, 3.0, tmp_path, whole=True, params=params)
+    x, under = render_file(lib, path, ev, 3.0, tmp_path, params=params)
+    assert under == 0
+    assert err_db(ref, x) < -90, err_db(ref, x)
+    x, under = render_file(lib, path, ev, 3.0, tmp_path, params=params, realtime=True)
+    assert under == 0
+    assert err_db(ref, x) < -90, err_db(ref, x)
+
+
+def test_stream_extreme_pitch_offline(lib, tmp_path):
+    """An offline render stays exact at a pitch far past 32 times the speed: its steps shrink with the pitch."""
+    path = tmp_path / "hi.sf2"
+    write_sf2(str(path), [preset("Hi", 0, 0, [zone(0, gens={COARSE: 60})])],
+              [dict(name="hi", data=busy(30.0, 5, 50.0), rate=SR, pitch=60, loop=None)])
+    ev = "midi 144 84 100 0"                                   # 84 semitones up: 128 times the speed
+    ref, _ = render_file(lib, path, ev, 0.4, tmp_path, whole=True)
+    x, under = render_file(lib, path, ev, 0.4, tmp_path)
+    assert under == 0
+    assert np.sqrt(np.mean(ref[int(0.1 * OUT):int(0.2 * OUT)] ** 2)) > 0.01   # past the head
+    assert err_db(ref, x) < -90, err_db(ref, x)
+
+
+def test_stream_read_failure(lib, tmp_path):
+    """The font file is cut short while it plays: the reads that fail are not played as good silence. The voice
+    fades out where the data ends, the underruns are counted, and the render finishes."""
+    data = busy(6.0, 6, 300.0)
+    path = tmp_path / "cut.sf2"
+    write_sf2(str(path), [preset("Cut", 0, 0, [zone(0)])], [dict(name="cut", data=data, rate=SR, pitch=60, loop=None)])
+    ev = "midi 144 60 100 0"
+    ref, _ = render_file(lib, path, ev, 4.0, tmp_path, whole=True)
+    cut_at = open(path, "rb").read().index(data[:64].tobytes()) + 2 * 2 * SR   # 2 s into the sample
+
+    def cut(s):
+        with open(path, "r+b") as fh:
+            fh.truncate(cut_at)
+
+    x, under = render_file(lib, path, ev, 4.0, tmp_path, realtime=True, before=cut)
+    assert under > 0
+    assert err_db(ref[:int(1.8 * OUT)], x[:int(1.8 * OUT)]) < -90           # everything read plays as it should
+    assert np.max(np.abs(x[int(2.1 * OUT):])) < 1e-6                         # then silence, not stale data
+
+
+def _blocks(lib, s, n, bufs_arr):
+    for _ in range(n):
+        lib.smp_synth_process(s, bufs_arr, 256)
+
+
+def test_stream_font_switch_lifetime(lib, tmp_path):
+    """A font switch, an unload and a free while long samples are streaming (and once with the streamer paused): the
+    old font is closed only after the streamer has let go, and every hold on its samples goes."""
+    a = tmp_path / "a.sf2"
+    write_sf2(str(a), [preset("A", 0, 0, [zone(i, keys=(60 + i, 60 + i)) for i in range(3)])],
+              [dict(name="a%d" % i, data=busy(10.0, 300 + i), rate=SR, pitch=60 + i, loop=None) for i in range(3)])
+    bpath = tmp_path / "b.sf2"
+    write_font(bpath)
+    bufs = [np.zeros(256, np.float32) for _ in range(32)]
+    arr = (FP * 32)(*[bb.ctypes.data_as(FP) for bb in bufs])
+    err = ctypes.create_string_buffer(512)
+    lib.smp_sf_test_grace(20)
+    fa = lib.smp_sf_open(str(a).encode(), err, 512)
+    assert fa
+    try:
+        for how in ("switch", "switch paused", "unload", "free"):
+            s = lib.smp_synth_new(float(OUT), 256)
+            try:
+                assert lib.smp_synth_load(s, str(a).encode(), err, 512) == 1
+                lib.smp_synth_process(s, arr, 256)
+                assert lib.smp_synth_wait_loaded(s, 5000) == 0
+                for k in range(3):
+                    lib.smp_synth_midi(s, bytes([0x90, 60 + k, 100]), 3, 0)
+                _blocks(lib, s, 80, arr)                          # 0.43 s: well past the heads, streaming
+                assert lib.smp_synth_underruns(s) == 0
+                if how == "switch paused":
+                    lib.smp_synth_test_stream_pause(s, 1)
+                if how == "free":
+                    lib.smp_synth_free(s)
+                    s = None
+                else:
+                    if how == "unload":
+                        assert lib.smp_synth_unload(s) == 1
+                    else:
+                        assert lib.smp_synth_load(s, str(bpath).encode(), err, 512) == 1
+                    t0 = time.time()
+                    while True:
+                        _blocks(lib, s, 1, arr)
+                        if lib.smp_synth_collect(s) == 0 or time.time() - t0 > 3:
+                            break
+                    assert lib.smp_synth_collect(s) == 0, how
+                t0 = time.time()
+                while lib.smp_sf_loaded_samples(fa) and time.time() - t0 < 3:
+                    time.sleep(0.01)
+                assert lib.smp_sf_loaded_samples(fa) == 0, how      # nothing of A is held any more
+            finally:
+                if s:
+                    lib.smp_synth_free(s)
+    finally:
+        lib.smp_sf_close(fa)
+        lib.smp_sf_test_grace(0)

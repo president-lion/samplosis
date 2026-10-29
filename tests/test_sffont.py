@@ -425,7 +425,7 @@ def test_sf3_decoded_once(lib, tmp_path):
             assert lib.smp_sf_wait_idle(f, 10000) == 0
             assert lib.smp_sf_loaded_samples(f) == 3
             assert lib.smp_sf_test_decodes() - d0 == (3 if attempt == 0 else 0)
-            heads = []
+            heads, tails = [], 0
             for i, s in enumerate(samples):
                 v = SmpSfView()
                 assert lib.smp_sf_pcm_acquire(f, i, ctypes.byref(v))
@@ -434,10 +434,13 @@ def test_sf3_decoded_once(lib, tmp_path):
                     assert abs(v.frames - len(s["data"])) <= 2048          # within one Ogg packet
                     assert v.head_frames == head_frames(v.frames, rate)
                     heads.append(head_array(v).copy())
+                    tails += v.tail_frames
+                    if i == 2:                     # the looped one keeps a quarter second from its loop end
+                        assert (v.tail_start, v.tail_frames) == (rate, rate // 4)
                 finally:
                     lib.smp_sf_pcm_release(f, i)
             views.append(heads)
-            assert lib.smp_sf_loaded_bytes(f) < 1.2 * sum(4 * len(h) for h in heads)
+            assert lib.smp_sf_loaded_bytes(f) < 1.2 * (sum(4 * len(h) for h in heads) + 4 * tails)
             lib.smp_sf_use(f, 0, -1)
         finally:
             lib.smp_sf_close(f)
