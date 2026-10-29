@@ -52,6 +52,8 @@ struct SmpFont {
   volatile LONG *voices;                /* per sample: holders between pcm_acquire and pcm_release */
   struct SfPcm *volatile *pcm;          /* per sample: the published data, or NULL */
   volatile LONG use_gen, done_gen;      /* use() calls so far, and the count the loader last finished */
+  volatile LONG stuck_gen;              /* the count of the loader's last pass that could load nothing more for now
+                                           (the file can't be opened, or memory ran out): waiters stop waiting */
   volatile LONG nloaded;                /* samples in memory (published or retired) */
   volatile LONG64 loaded_bytes;
   /* the loader thread's own: */

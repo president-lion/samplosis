@@ -382,6 +382,29 @@ def test_plugin_offline_render_waits(P):
     assert first_sound(y) is None or first_sound(y) >= 256
 
 
+def test_plugin_offline_render_font_gone(P, tmp_path):
+    # the font file goes away after the state loaded: an offline render with a program change still finishes
+    # quickly, silent where the samples are missing, and the samples already loaded still play
+    import time
+    f = P.font()
+    away = tmp_path / "away.sf2"
+    text = 'plays soundfont\nsoundfont "%s"\n' % f            # the channels' power-on presets: piano and kit
+    frames = 3 * 48000
+    events = ("render offline 0\nrename %s %s 0\nmidi 193 33 0 0\nmidi 145 57 100 0\nmidi 144 57 100 48000\n"
+              "midi 194 33 0 96000\nmidi 146 57 100 96000" % (f, away))
+    try:
+        t0 = time.time()
+        y, d, r = P.play(text, events, frames)
+        took = time.time() - t0
+    finally:
+        if away.exists():
+            away.rename(f)
+    assert took < 5, took
+    assert np.max(np.abs(y[:48000])) == 0                     # the bass on channel 2: its sample can't load
+    assert db(y[48000:96000]) > -40                           # the piano on channel 1 was loaded before
+    assert abs(peak_hz(y[52800:72000, 0]) - 220) < 3
+
+
 def test_plugin_font_missing(P, tmp_path):
     f = P.font("gone.sf2")
     text = ('plays soundfont\nsoundfont "%s"\nsf_channel_preset 3 0 25\nsf_output 2 3\nsf_used 0:0 0:33\n'

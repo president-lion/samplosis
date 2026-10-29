@@ -226,9 +226,13 @@ static DWORD pass(SmpFont *f) {
     }
   }
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-  /* a pass that left a needed sample unloaded for now isn't done: wait_idle keeps waiting, and it runs again */
+  /* A pass that left a needed sample unloaded for now (the file can't be opened, or memory ran out) isn't done: it
+     runs again in RETRY_MS, and the status still counts the presets as loading. But it is as done as it can be
+     for now, so wait_idle stops waiting (an offline render goes on, silent where samples are missing, rather than
+     waiting 10 s a block); a later use() makes waiters wait for the next pass again. */
   if (retry && RETRY_MS < next) next = RETRY_MS;
   if (!aborted && !retry) InterlockedExchange(&f->done_gen, gen);
+  if (!aborted && retry) InterlockedExchange(&f->stuck_gen, gen);
   return next ? next : 1;
 }
 
@@ -286,6 +290,7 @@ static int setup(SmpFont *f) {
   f->state = calloc(ns, 1);
   f->need = calloc(ns, 1);
   f->idle_since = calloc(ns, sizeof(ULONGLONG));
+  f->stuck_gen = -1;
   return f->users && f->voices && f->pcm && f->held && f->state && f->need && f->idle_since;
 }
 
@@ -415,12 +420,15 @@ void smp_sf_pcm_release(SmpFont *f, int sample) {
   InterlockedDecrement(&f->voices[sample]);
 }
 
-/* pending retires (unneeded samples waiting out the grace or a holder) don't count as busy */
+/* pending retires (unneeded samples waiting out the grace or a holder) don't count as busy, and neither do
+   samples that can't load for now (see the end of pass) */
 int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
   ULONGLONG end = GetTickCount64() + (ULONGLONG)(timeout_ms > 0 ? timeout_ms : 0);
   if (!f) return 0;
   for (;;) {
-    if (InterlockedCompareExchange(&f->done_gen, 0, 0) == InterlockedCompareExchange(&f->use_gen, 0, 0)) return 0;
+    LONG u = InterlockedCompareExchange(&f->use_gen, 0, 0);
+    if (InterlockedCompareExchange(&f->done_gen, 0, 0) == u || InterlockedCompareExchange(&f->stuck_gen, 0, 0) == u)
+      return 0;
     if (GetTickCount64() >= end) return 1;
     Sleep(1);
   }

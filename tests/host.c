@@ -6,8 +6,9 @@
    "cycle frame" (deactivate and activate again), "state <file> frame" (load another state), "render offline|realtime
    frame" (the render extension's set); and "rawon key vel frame time" (a note-on in the block holding frame, with its
    time field set to time as is: a sloppy host). "sleep ms frame" lets wall time pass between
-   blocks. With SAMPLOSIS_TEST_PAUSE_LOADER set, the SoundFont loader is paused; SAMPLOSIS_TEST_GRACE_MS sets how
-   soon it frees samples no preset in use needs. Blocks of 256 frames. The host gives one stereo output, or with
+   blocks; "rename <from> <to> frame" renames a file between blocks (paths without spaces). With
+   SAMPLOSIS_TEST_PAUSE_LOADER set, the SoundFont loader is paused; SAMPLOSIS_TEST_GRACE_MS sets how soon it frees
+   samples no preset in use needs. Blocks of 256 frames. The host gives one stereo output, or with
    `all` every output port the plugin has, each written to the wav as 2 channels in port order.
    play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks.
      host.exe samplosis.clap gui <state.txt> <actions.txt>
@@ -189,9 +190,10 @@ static int cmd_state(const clap_plugin_t *p, const char *path) {
 }
 
 typedef struct { long frame; clap_event_param_value_t pv; clap_event_note_t note; clap_event_midi_t midi; int kind;
-                 int action; char path[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and activate, 3 load state,
-                                                                     4 render offline, 5 render realtime, 6 sleep
-                                                                     (rawtime ms) */
+                 int action; char path[600], path2[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and
+                                                                     activate, 3 load state, 4 render offline,
+                                                                     5 render realtime, 6 sleep (rawtime ms),
+                                                                     7 rename path to path2 */
 static Ev *evs; static int nev;
 typedef struct { const Ev *const *list; uint32_t n; } EvList;
 static const clap_event_header_t *ev_header(const Ev *e) {
@@ -227,6 +229,7 @@ static int parse_events(const char *text, long *length) {
       else if (!strcmp(w, "render") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2 &&
                (!strcmp(e.path, "offline") || !strcmp(e.path, "realtime"))) { e.action = strcmp(e.path, "offline") ? 5 : 4; ok = 1; }
       else if (!strcmp(w, "sleep") && sscanf(p + used, "%ld %ld", &e.rawtime, &e.frame) == 2) { e.action = 6; ok = 1; }
+      else if (!strcmp(w, "rename") && sscanf(p + used, "%599s %599s %ld", e.path, e.path2, &e.frame) == 3) { e.action = 7; ok = 1; }
       else if (!strcmp(w, "rawon") && sscanf(p + used, "%d %d %ld %ld", &a, &b, &e.frame, &e.rawtime) == 4) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; e.rawtime++; ok = 1;
       } else if (!strcmp(w, "on") && sscanf(p + used, "%d %d %ld", &a, &b, &e.frame) == 3) {
@@ -320,6 +323,10 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
         continue;
       }
       if (evs[k].action == 6) { Sleep((DWORD)evs[k].rawtime); main_thread(p); continue; }   /* wall time passes */
+      if (evs[k].action == 7) {                                              /* a file goes away (or comes back) */
+        if (!MoveFileA(evs[k].path, evs[k].path2)) { printf("error: can't rename %s\n", evs[k].path); return 1; }
+        continue;
+      }
       h->time = (uint32_t)(evs[k].rawtime ? evs[k].rawtime - 1 : evs[k].frame < b ? 0 : evs[k].frame - b);
       list[el.n++] = &evs[k];
     }

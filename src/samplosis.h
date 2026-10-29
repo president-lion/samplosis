@@ -165,7 +165,8 @@ SMP_API const int16_t *smp_sf_pcm_acquire(SmpFont *f, int sample, uint32_t *fram
                                     readable before the start and after the end */
 SMP_API void smp_sf_pcm_release(SmpFont *f, int sample);   /* any thread: after a non-NULL acquire */
 SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once every sample the presets in use
-                                    need is loaded (or broken), 1 on timeout. Pending retires don't count as busy */
+                                    need is loaded (or broken, or can't load for now: the file is gone or memory ran out; the loader
+                                    keeps trying every 500 ms), 1 on timeout. Pending retires don't count as busy */
 SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
