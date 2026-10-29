@@ -789,3 +789,207 @@ def test_windows_too_long(lib, tmp_path):
     s, err = load(lib, f)
     assert s, err
     lib.smp_sample_free(s)
+
+
+def mf_flags(lib, f):
+    lib.smp_test_only_decode_flags.restype = None
+    lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_test_only_decode_flags(f)
+
+
+@need_ffmpeg
+def test_windows_deadline(lib, tmp_path):
+    # a stuck Windows decoder (the helper sleeps 3 s; the deadline is 0.5 s): the load returns quickly with a plain
+    # reason, and the helper finishes later on its own without harm
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "stuck.m4a", ["-c:a", "aac"])
+    lib.smp_test_only_mf_helpers.restype = ctypes.c_long
+    mf_flags(lib, 4)
+    try:
+        t = time.perf_counter()
+        s, err = load(lib, f)
+        secs = time.perf_counter() - t
+    finally:
+        mf_flags(lib, 0)
+    assert not s and err == "Windows took too long to decode it", err
+    assert secs < 2, secs
+    assert lib.smp_test_only_mf_helpers() == 1                    # still asleep
+    t = time.perf_counter()
+    while lib.smp_test_only_mf_helpers() and time.perf_counter() - t < 10:
+        time.sleep(0.05)
+    assert lib.smp_test_only_mf_helpers() == 0                    # it woke, saw it was abandoned, and freed its job
+    s, err = load(lib, f)
+    assert s and s.contents.by == BY_WINDOWS, err
+    lib.smp_sample_free(s)
+
+
+@need_ffmpeg
+def test_windows_buffer_fails(lib, tmp_path):
+    # a sample whose buffer can't be read is a read error: nothing before it gives "damaged"; some before it keeps
+    # exactly that much (no hole that shifts what follows)
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
+    s, err = load(lib, f)
+    assert s, err
+    full = whole(lib, s.contents.fwd)
+    lib.smp_sample_free(s)
+    for flag, name in ((16, "first.m4a"), (32, "third.m4a")):
+        g = tmp_path / name
+        g.write_bytes(f.read_bytes())                              # a new name, so not the cached copy
+        mf_flags(lib, flag)
+        try:
+            s, err = load(lib, g)
+        finally:
+            mf_flags(lib, 0)
+        if flag == 16:
+            assert not s and err == "Windows couldn't decode it; it may be damaged", err
+        else:
+            assert s, err
+            part = whole(lib, s.contents.fwd)
+            lib.smp_sample_free(s)
+            assert 0 < len(part) < len(full)
+            assert np.array_equal(part, full[:len(part)])
+
+
+@need_ffmpeg
+def test_windows_missing(lib, tmp_path):
+    # no Media Foundation (a Windows N edition): the usual Windows names say so, other names get the plain message,
+    # and it is tried again on the next load
+    point_cache(lib, tmp_path / "cache")
+    f, _ = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac"])
+    other = tmp_path / "tone.xyz"
+    other.write_bytes(f.read_bytes())
+    mf_flags(lib, 8)
+    try:
+        s, err = load(lib, f)
+        assert not s and err == "Windows Media Foundation isn't installed", err
+        s, err = load(lib, other)
+        assert not s and err == "it isn't a sound file Samplosis can read", err
+    finally:
+        mf_flags(lib, 0)
+    s, err = load(lib, f)
+    assert s, err
+    lib.smp_sample_free(s)
+
+
+@need_ffmpeg
+def test_windows_from_sta_thread(lib, tmp_path):
+    # a caller whose thread is already a single-threaded apartment (a window's thread)
+    import threading
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "tone.m4a", ["-c:a", "aac", "-b:a", "192k"])
+    out = {}
+
+    def run():
+        ole = ctypes.WinDLL("ole32")
+        ole.CoInitializeEx.restype = ctypes.c_long
+        out["co"] = ole.CoInitializeEx(None, 2)                     # COINIT_APARTMENTTHREADED
+        try:
+            s, err = load(lib, f)
+            out["by"], out["frames"], out["err"] = (s.contents.by, s.contents.frames, err) if s else (None, 0, err)
+            if s:
+                lib.smp_sample_free(s)
+        finally:
+            ole.CoUninitialize()
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(30)
+    assert out["co"] == 0                                          # S_OK: the thread really was made an STA
+    assert out["by"] == BY_WINDOWS and out["frames"] == len(src), out
+
+
+def id3_tag():
+    """a small ID3v2.3 tag with a title"""
+    frame = b"TIT2" + struct.pack(">I", 6) + b"\0\0" + b"\0tone!"
+    n = len(frame)
+    return b"ID3\x03\0\0" + bytes([(n >> 21) & 127, (n >> 14) & 127, (n >> 7) & 127, n & 127]) + frame
+
+
+@need_ffmpeg
+def test_id3_adts(lib, tmp_path):
+    # an ADTS .aac with an ID3 tag in front: not taken for MP3, decoded by Windows
+    point_cache(lib, tmp_path / "cache")
+    f, src = windows_file(tmp_path, "plain.aac", ["-c:a", "aac", "-b:a", "192k", "-f", "adts"])
+    g = tmp_path / "tagged.aac"
+    g.write_bytes(id3_tag() + f.read_bytes())
+    s, err = load(lib, g)
+    assert s, err
+    try:
+        assert s.contents.by == BY_WINDOWS and s.contents.rate == 44100
+    finally:
+        lib.smp_sample_free(s)
+    x, why = decode_mem(lib, g.read_bytes())                       # and from memory it isn't read as MP3 junk
+    assert x is None and why
+
+
+def mp4_box(t, payload=b"", size=None):
+    return struct.pack(">I", len(payload) + 8 if size is None else size) + t + payload
+
+
+def mp4_edit(lib, b):
+    lib.smp_test_only_mp4_edit.restype = ctypes.c_int
+    lib.smp_test_only_mp4_edit.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_double),
+                                           ctypes.POINTER(ctypes.c_double)]
+    s, d = ctypes.c_double(-7), ctypes.c_double(-7)
+    r = lib.smp_test_only_mp4_edit(b, len(b), ctypes.byref(s), ctypes.byref(d))
+    assert r in (0, 1)
+    if r:
+        assert np.isfinite(s.value) and s.value >= 0 and np.isfinite(d.value) and d.value >= 0, (s.value, d.value)
+    return r, s.value, d.value
+
+
+def test_mp4_edit_hostile(lib):
+    # the edit-list reader on hostile boxes: never reads outside the bytes, never a crazy answer
+    def hdr(v, ts, n=None):
+        """mvhd or mdhd: version v, timescale ts (n cuts it short)"""
+        body = bytes([v, 0, 0, 0]) + (bytes(16) + struct.pack(">I", ts) + bytes(8) if v == 1 else
+                                      bytes(8) + struct.pack(">I", ts) + bytes(4))
+        return body if n is None else body[:n]
+
+    def elst(v=0, entries=((44100, 1024),), count=None):
+        e = b"".join(struct.pack(">QqI" if v == 1 else ">IiI", seg, mt, 1 << 16) for seg, mt in entries)
+        return bytes([v, 0, 0, 0]) + struct.pack(">I", len(entries) if count is None else count) + e
+
+    def movie(mvhd=hdr(0, 44100), mdhd=hdr(0, 44100), el=elst(), moov_size=None, handler=b"soun"):
+        trak = mp4_box(b"trak", mp4_box(b"mdia", mp4_box(b"hdlr", bytes(8) + handler + bytes(12)) +
+                                        mp4_box(b"mdhd", mdhd)) + mp4_box(b"edts", mp4_box(b"elst", el)))
+        body = mp4_box(b"mvhd", mvhd) + trak
+        return mp4_box(b"ftyp", b"M4A " + bytes(4)) + mp4_box(b"moov", body, moov_size)
+
+    good = movie()
+    r, s, d = mp4_edit(lib, good)
+    assert r == 1 and abs(s - 1024 / 44100) < 1e-12 and abs(d - 1.0) < 1e-12
+    assert mp4_edit(lib, movie(el=elst(1, ((44100, 1024),))))[:2] == (1, 1024 / 44100)     # version 1
+    assert mp4_edit(lib, movie(mvhd=hdr(1, 44100), mdhd=hdr(1, 44100)))[0] == 1          # version 1 headers
+    assert mp4_edit(lib, movie(moov_size=0))[0] == 1                                       # size 0: to the end
+    assert mp4_edit(lib, movie(handler=b"vide"))[0] == 0                                   # no sound track
+    assert mp4_edit(lib, movie(el=elst(entries=((100, -1), (44100, 2112)))))[1] == 2112 / 44100   # an empty edit first
+    must_refuse = {
+        "huge 64-bit size": good[:16] + struct.pack(">I", 1) + b"moov" + struct.pack(">Q", 1 << 63) + good[24:],
+        "64-bit size under its header": good[:16] + struct.pack(">I", 1) + b"moov" + struct.pack(">Q", 9) + good[24:],
+        "size 4": good[:16] + struct.pack(">I", 4) + good[20:],
+        "size past the end": good[:16] + struct.pack(">I", 0xFFFFFFF0) + good[20:],
+        "elst version 2": movie(el=bytes([2]) + elst()[1:]),
+        "elst version 255": movie(el=bytes([255]) + elst()[1:]),
+        "elst too short": movie(el=elst()[:6]),
+        "mdhd version 2": movie(mdhd=bytes([2]) + hdr(0, 44100)[1:]),
+        "mdhd v1 too short": movie(mdhd=hdr(1, 44100, 24)),
+        "mvhd v0 too short": movie(mvhd=hdr(0, 44100, 16)),
+        "timescale 0": movie(mdhd=hdr(0, 0)),
+        "ftyp only": good[:16],
+        "count 0xFFFFFFFF, only empty edits": movie(el=elst(entries=((1, -1),) * 3, count=0xFFFFFFFF)),
+    }
+    for name, b in must_refuse.items():
+        assert mp4_edit(lib, b)[0] == 0, name
+    for b in (movie(el=elst(count=0xFFFFFFFF)), movie(el=elst(1, count=0xFFFFFFFF)),
+              movie(el=elst(1, ((1, 1 << 62),)))):
+        mp4_edit(lib, b)                                           # any answer, as long as it is sane
+    rnd = np.random.default_rng(5)
+    for cut in range(len(good)):                                   # cut short at every byte
+        mp4_edit(lib, good[:cut])
+    for _ in range(3000):                                          # scribbled
+        c = bytearray(good)
+        for at in rnd.integers(0, len(c), int(rnd.integers(1, 8))):
+            c[at] = int(rnd.integers(0, 256))
+        mp4_edit(lib, bytes(c))

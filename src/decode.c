@@ -14,7 +14,8 @@
       in nearly anything). First bytes that name a container only Windows reads (MPEG-4 and 3GP "ftyp", ASF, AMR,
       ADTS AAC) skip this, so MP3 can't find false frames in them.
    5. a file (never bytes in memory) that nothing above read, and that isn't a raw name, goes to Windows Media
-      Foundation (mfdecode.c): AAC, WMA, and whatever else this machine's Windows decodes. by says Windows.
+      Foundation (mfdecode.c, on a helper thread with a deadline): AAC, WMA, and whatever else this machine's
+      Windows decodes. by says Windows.
    Later stages add decoders after these. Whatever decodes a file, its result passes one place (finish): a sample
    that isn't finite, or is absurdly large (a damaged file), becomes silence. Never called on the audio thread. */
 #include <stdio.h>
@@ -52,9 +53,11 @@ void *smp_ape_open(const unsigned char *b, size_t len, unsigned *ch, unsigned *s
 int smp_ape_read(void *h, float *out, int frames);
 void smp_ape_close(void *h);
 void smp_ape_set_debug_flags(long f);
-/* TESTS ONLY: 1 = Monkey's Audio throws inside its guard; 2 = the size limit is 65536 floats instead of 2 GiB */
+/* TESTS ONLY: 1 = Monkey's Audio throws inside its guard; 2 = the size limit is 65536 floats instead of 2 GiB;
+   4, 8, 16 and 32 are the Windows stage's (SMP_MF_TEST_* in mfdecode.h) */
 SMP_API void smp_test_only_decode_flags(long f) {
   smp_ape_set_debug_flags(f & 1);
+  smp_mf_set_test_flags(f & (SMP_MF_TEST_SLOW | SMP_MF_TEST_NO_MF | SMP_MF_TEST_BUFFER_FAILS_FIRST | SMP_MF_TEST_BUFFER_FAILS_THIRD));
   dec_max_floats = f & 2 ? 65536 : (size_t)1 << 29;
 }
 SMP_API void smp_free(void *p) { free(p); }
@@ -450,6 +453,7 @@ static int sniff(const unsigned char *b, size_t len, int strict) {
     size_t skip = 10 + ((size_t)(b[6] & 127) << 21 | (size_t)(b[7] & 127) << 14 | (size_t)(b[8] & 127) << 7 | (b[9] & 127));
     if (b[5] & 0x10) skip += 10;
     if (skip + 4 <= len && !memcmp(b + skip, "MAC ", 4)) return D_APE;
+    if (skip + 7 <= len && b[skip] == 0xFF && (b[skip + 1] & 0xF6) == 0xF0) return D_WINDOWS;   /* ADTS AAC */
     return skip + 4 <= len && !memcmp(b + skip, "fLaC", 4) ? D_FLAC : D_MP3;
   }
   if (len >= 7 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0) return D_WINDOWS;   /* ADTS AAC: an MPEG sync with layer 0 */
@@ -533,39 +537,44 @@ float *smp_decode_memory(const void *bytes, size_t len, int *chans, long *frames
   return decode_memory(bytes, len, chans, frames, rate, err, cap);
 }
 
-/* Media Foundation's floats into a Grow (mfdecode.c's put) */
-static int mf_put(void *ctx, const float *x, size_t k) {
-  Grow *g = ctx;
-  if (!grow_need(g, k)) return 0;
-  memcpy(g->x + g->n, x, k * sizeof(float));
-  g->n += k;
-  return 1;
+/* the extensions a file Windows decodes usually has: when Windows has no Media Foundation, these say so */
+static int windows_name(const char *path) {
+  static const char *const ext[] = {".m4a", ".mp4", ".aac", ".wma", ".3gp", ".amr", ".ac3", ".alac"};
+  const char *e = ext_of(path);
+  for (size_t i = 0; i < sizeof ext / sizeof ext[0]; i++)
+    if (!_stricmp(e, ext[i])) return 1;
+  return 0;
 }
 
 /* The Windows stage on a file the chain refused. Its result, channel after channel, or NULL; err keeps the chain's
-   message unless that was only "not a sound file" and Windows knows better (no decoder for it, damaged). */
+   message unless that was only "not a sound file" and Windows knows better (no decoder for it, damaged), or Windows
+   stopped (too long, too slow, cancelled). */
 static float *windows_stage(const char *path, int edit, double start, double dur, unsigned *ch, unsigned *sr,
                             unsigned long long *n, int (*cancel)(void *), void *arg, char *err, int cap) {
-  Grow g = {0}; char why[300] = ""; float *x = NULL; int trimmed = 0;
-  int r = smp_mf_decode(path, ch, sr, mf_put, &g, cancel, arg, &trimmed, why, sizeof why);
+  char why[300] = ""; float *g = NULL, *x = NULL; size_t floats = 0; int trimmed = 0;
+  int r = smp_mf_decode(path, DEC_MAX_FLOATS, &g, &floats, ch, sr, &trimmed, cancel, arg, why, sizeof why);
   if (r == SMP_MF_OK) {
-    *n = g.n / *ch;
+    *n = floats / *ch;
     if (edit && !trimmed && start >= 0 && start < 1e6 && dur >= 0 && dur < 1e7) {
       /* an MPEG-4 edit list (absurd values ignored): the coder's start delay, and the length */
       unsigned long long cut = (unsigned long long)(start * *sr + 0.5), keep = (unsigned long long)(dur * *sr + 0.5);
       if (cut < *n) {
-        memmove(g.x, g.x + (size_t)cut * *ch, (size_t)(*n - cut) * *ch * sizeof(float));
+        memmove(g, g + (size_t)cut * *ch, (size_t)(*n - cut) * *ch * sizeof(float));
         *n -= cut;
         if (keep && keep < *n) *n = keep;
       }
     }
-    if (!(x = planar(g.x, *n, *ch))) snprintf(err, (size_t)cap, "out of memory");
+    if (!(x = planar(g, *n, *ch))) snprintf(err, (size_t)cap, "out of memory");
+  } else if (r == SMP_MF_TOO_LONG) {
+    snprintf(err, (size_t)cap, TOO_LONG);
   } else if (r == SMP_MF_STOPPED) {
-    snprintf(err, (size_t)cap, "%s", g.too_long ? TOO_LONG : why[0] ? why : "out of memory");
+    snprintf(err, (size_t)cap, "%s", why);
+  } else if (r == SMP_MF_NO_MF && !strcmp(err, NOT_SOUND) && windows_name(path)) {
+    snprintf(err, (size_t)cap, "Windows Media Foundation isn't installed");
   } else if (r == SMP_MF_FAILED && !strcmp(err, NOT_SOUND)) {
     snprintf(err, (size_t)cap, "%s", why);
   }
-  free(g.x);
+  free(g);
   return x;
 }
 
