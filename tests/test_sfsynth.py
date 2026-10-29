@@ -70,10 +70,13 @@ def S(lib, font, tmp_path):
     class H:
         synths = []
 
-        def new(self, load=True):
+        def new(self, load=True, dry=True):
+            """dry: sf_effects off, so the tests of notes and controllers hear the voices alone (the effect tests ask for dry=False)"""
             s = lib.smp_synth_new(float(OUT), 256)
             assert s
             self.synths.append(s)
+            if dry:
+                lib.smp_synth_set_param(s, P_EFFECTS, 0)
             if load:
                 err = ctypes.create_string_buffer(512)
                 assert lib.smp_synth_load(s, str(font).encode(), err, 512) == 1, err.value
@@ -430,7 +433,7 @@ def test_state_lines_roundtrip(lib, S, font):
     assert r != 0 and err.startswith("line 2: "), err
     assert S.write(s2) == w1
     # defaults: absent lines go back to them; no font yet writes no soundfont line
-    s3 = S.new(load=False)
+    s3 = S.new(load=False, dry=False)
     assert S.write(s3) == ("sf_mode all\nsf_preset 0 0\nsf_channel all\n"
                            "sf_volume 0.0 dB\nsf_voices 256\nsf_effects on\nsf_transpose +0 st\n")
 
@@ -494,3 +497,91 @@ def test_font_switch_while_playing(lib, S, font, tmp_path):
     finally:
         lib.smp_sf_close(fa)
         lib.smp_sf_test_grace(0)
+
+
+# ---- reverb and chorus (sffx.c) ----
+BURST = "midi 192 33 0\nmidi 176 91 {rev} 0\nmidi 176 93 {cho} 0\nmidi 144 69 127 100\nmidi 128 69 0 580\n"
+
+
+def windows(x, a, b, step=0.1):
+    return [rms(seg(x, t, t + step)) for t in np.arange(a, b - 1e-9, step)]
+
+
+def test_reverb_send(lib, S):
+    s = S.new(dry=False)
+    ev = BURST.format(rev=127, cho=0)
+    x = S.render(s, ev, 1.0)
+    top = np.max(np.abs(x[:int(0.02 * OUT)]))           # the burst is over by 0.02 s: after it is all tail
+    w = [np.max(np.abs(seg(x, t, t + 0.1))) for t in np.arange(0.05, 0.55, 0.1)]
+    assert min(w) > top * 10 ** (-60 / 20), (top, w)    # above -60 dB (re the burst) for 0.5 s
+    assert abs(x[:, 0] - x[:, 1]).max() > 1e-5          # the reverb is stereo
+    x = S.render(s, BURST.format(rev=0, cho=0), 1.0)
+    assert np.max(np.abs(x[int(0.05 * OUT):])) < 1e-6
+    lib.smp_synth_set_param(s, P_EFFECTS, 0)
+    x = S.render(s, ev, 1.0)
+    assert np.max(np.abs(x[int(0.05 * OUT):])) < 1e-6
+
+
+def test_effects_off_clears_tail(lib, S):
+    s = S.new(dry=False)
+    lib.smp_synth_set_param(s, P_EFFECTS, 1)
+    S.render(s, BURST.format(rev=127, cho=0), 0.1)      # leaves a tail behind in the reverb
+    lib.smp_synth_set_param(s, P_EFFECTS, 0)
+    S.render(s, "midi 144 69 100 0", 0.2)
+    lib.smp_synth_set_param(s, P_EFFECTS, 1)
+    x = S.render(s, "midi 192 33 0", 0.3)               # nothing plays: no old tail may come back
+    assert np.max(np.abs(x)) < 1e-6
+
+
+def test_effects_follow_volume(lib, S):
+    s = S.new(dry=False)
+    ev = BURST.format(rev=127, cho=0)
+    a = S.render(s, ev, 0.6)
+    lib.smp_synth_set_param(s, P_VOLUME, -12)
+    b = S.render(s, ev, 0.6)
+    ra, rb = rms(seg(a, 0.2, 0.5)), rms(seg(b, 0.2, 0.5))
+    assert abs(20 * np.log10(rb / ra) + 12) < 0.1
+
+
+def test_chorus_send(lib, S):
+    s = S.new(dry=False)
+    hold = "midi 192 33 0\nmidi 176 91 0 0\nmidi 176 93 {cho} 0\nmidi 144 69 127 100\n"
+    x = S.render(s, hold.format(cho=127), 1.2)
+    a, b = seg(x, 0.3, 1.1, 0), seg(x, 0.3, 1.1, 1)
+    side = rms(a - b)
+    assert side > rms(a) * 10 ** (-30 / 20), (side, rms(a))           # the image is wide
+    x = S.render(s, hold.format(cho=0), 1.2)
+    assert np.max(np.abs(x[:, 0] - x[:, 1])) < 1e-6                   # mono without the send
+    # the delay swings, so the pitch stays within 10 cents of the note
+    x = S.render(s, hold.format(cho=127), 1.2)
+    f = peak_freq(seg(x, 0.3, 1.1, 0))
+    assert abs(1200 * np.log2(f / 220)) < 10
+
+
+def test_fx_cpu(lib):
+    vp, fp, c_dbl, c_int = ctypes.c_void_p, FP, ctypes.c_double, ctypes.c_int
+    lib.smp_sffx_new.restype = vp
+    lib.smp_sffx_new.argtypes = [c_dbl]
+    lib.smp_sffx_free.argtypes = [vp]
+    lib.smp_sffx_process.argtypes = [vp, fp, fp, fp, fp, c_int]
+    fx = lib.smp_sffx_new(48000.0)
+    assert fx
+    n = 48000
+    rng = np.random.default_rng(1)
+    rev = (rng.standard_normal(n) * 0.1).astype(np.float32)
+    cho = (rng.standard_normal(n) * 0.1).astype(np.float32)
+    l, r = np.zeros(n, np.float32), np.zeros(n, np.float32)
+    p = lambda a: a.ctypes.data_as(FP)
+    best = 1e9
+    for _ in range(5):
+        t = time.perf_counter()
+        lib.smp_sffx_process(fx, p(rev), p(cho), p(l), p(r), n)
+        best = min(best, time.perf_counter() - t)
+    lib.smp_sffx_free(fx)
+    assert np.all(np.isfinite(l)) and np.max(np.abs(l)) > 0
+    assert best < 0.005, best
+    for rate in (22050.0, 96000.0, 192000.0):               # every supported rate builds and runs
+        fx = lib.smp_sffx_new(rate)
+        assert fx
+        lib.smp_sffx_process(fx, p(rev), p(cho), p(l), p(r), 4096)
+        lib.smp_sffx_free(fx)

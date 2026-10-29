@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include "sf2.h"
 #include "sfvoice.h"
+#include "sffx.h"
 
 #define NCH 16
 #define NOUT 16
@@ -109,7 +110,8 @@ struct SmpSynth {
   uint64_t age;
   uint64_t protect;               /* during a note-on: voices this old or newer were started by it (0: none) */
   Ev ev[MAXEV]; int nev;
-  float *rev, *cho;               /* effect sends of output 1 (Task 6 processes them) */
+  float *rev, *cho;               /* effect sends of output 1, one block at a time */
+  SmpSfFx *fx;                    /* the reverb and chorus: their output joins output 1 before sf_volume */
   double gain;                    /* the volume gain at the end of the last block */
   int offline;                    /* wait for the loader (the offline test render) */
   int test_wait;                  /* render_test's waiting, on by default */
@@ -494,7 +496,10 @@ SMP_API SmpSynth *smp_synth_new(double rate, int max_block) {
   s->sl = (Slot *)calloc(MAXV, sizeof *s->sl);
   s->rev = (float *)calloc((size_t)max_block, sizeof(float));
   s->cho = (float *)calloc((size_t)max_block, sizeof(float));
-  if (!s->v || !s->sl || !s->rev || !s->cho) { free(s->v); free(s->sl); free(s->rev); free(s->cho); free(s); return NULL; }
+  s->fx = smp_sffx_new(rate);
+  if (!s->v || !s->sl || !s->rev || !s->cho || !s->fx) {
+    free(s->v); free(s->sl); free(s->rev); free(s->cho); smp_sffx_free(s->fx); free(s); return NULL;
+  }
   for (i = SMP_NPARAMS; i < SMP_NALLPARAMS; i++) s->p[i - SMP_NPARAMS] = bits_of(smp_param_info(i)->def);
   for (i = 0; i < NCH; i++) { s->ch[i].preset = -1; chan_defaults(&s->ch[i]); s->chan_preset[i] = -1; }
   cfg_default(&s->mcfg); cfg_default(&s->cfg);
@@ -522,6 +527,7 @@ SMP_API void smp_synth_free(SmpSynth *s) {
   if (s->font) smp_sf_close(s->font);
   for (i = 0; i < s->nret; i++) smp_sf_close(s->ret[i].f);
   free(s->ret); free(s->v); free(s->sl); free(s->rev); free(s->cho);
+  smp_sffx_free(s->fx);
   free(s);
 }
 
@@ -620,6 +626,7 @@ static void reset_now(SmpSynth *s) {
   sound_off(s, -1);
   for (c = 0; c < NCH; c++) { chan_controllers(&s->ch[c]); tuning(&s->ch[c]); }
   used_release(s, U_AUDIO);                    /* the song's own program changes have settled by now */
+  smp_sffx_clear(s->fx);                       /* and no reverb or chorus tail survives a reset */
 }
 
 /* ---- process ---- */
@@ -680,7 +687,9 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
       handle(s, &s->ev[k]);
     }
     render(s, outs, pos, end, base);
-    /* Task 6: the reverb and chorus process rev and cho here */
+    /* the effects add to output 1 here, before sf_volume below, so their return gets the same gain and ramp */
+    smp_sffx_enable(s->fx, param(s, SMP_P_SF_EFFECTS) >= 0.5);
+    smp_sffx_process(s->fx, s->rev, s->cho, outs[0] + base, outs[1] + base, end - base);
   }
   s->nev = 0;
   /* sf_volume, stepped over the block */
@@ -981,6 +990,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   for (i = 0; i < NCH; i++) chan_defaults(&s->ch[i]);
   resolve_all(s);
   s->nev = 0; s->peak = 0;
+  smp_sffx_clear(s->fx);
   s->offline = s->test_wait;
   QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
   for (b = 0; b < frames; b += block) {
