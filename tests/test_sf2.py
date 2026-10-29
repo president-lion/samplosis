@@ -142,11 +142,12 @@ CLAMPS = {8: (1500, 13500), 9: (0, 960), 17: (-500, 500), 29: (0, 1000), 34: (-1
 # SF2.04 section 8.4's default modulators, in the spec's order
 DEFAULT_MODS = [
     (0x0502, 48, 960, 0, 0),        # note-on velocity to initial attenuation
-    (0x0102, 8, -2400, 0x0C02, 0),  # note-on velocity to filter cutoff, FluidSynth's form (the voice skips it)
+    (0x0102, 8, 0, 0, 0),           # velocity to filter cutoff: present but 0, the 2.04 default is treated as an
+                                    # erratum (FluidSynth disables it too); a font's identical one still replaces it
     (0x000D, 6, 50, 0, 0),          # channel pressure to vibrato LFO pitch depth
     (0x0081, 6, 50, 0, 0),          # CC1 to vibrato LFO pitch depth
     (0x0587, 48, 960, 0, 0),        # CC7 to initial attenuation
-    (0x028A, 17, 1000, 0, 0),       # CC10 to pan
+    (0x028A, 17, 500, 0, 0),        # CC10 to pan (500: 64 centre, 0 and 127 the ends)
     (0x058B, 48, 960, 0, 0),        # CC11 to initial attenuation
     (0x00DB, 16, 200, 0, 0),        # CC91 to reverb send
     (0x00DD, 15, 200, 0, 0),        # CC93 to chorus send

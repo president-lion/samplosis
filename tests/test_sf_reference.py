@@ -140,13 +140,13 @@ def pitch(lib, x):
     return lib.smp_detect_pitch(m.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(m), RATE)
 
 
-def lag(fl, us, t0, span=0.2, most=256):
+def lag(fl, us, t0, span=0.2, most=128):
     """FluidSynth's delay in samples against ours for the note at t0: it starts notes at its next 64-sample
-    block, so its note sits up to 64 samples later. Found by cross-correlation, so each player is analysed over
-    the same stretch of its own note."""
-    a = seg(fl, t0, t0 + span + 2 * most / RATE).mean(axis=1)
+    block, so its note sits 0 to 64 samples later (searched up to 128). Found by cross-correlation, so each
+    player is analysed over the same stretch of its own note."""
+    a = seg(fl, t0, t0 + span + (most + 1) / RATE).mean(axis=1)
     b = seg(us, t0, t0 + span).mean(axis=1)
-    c = [np.dot(a[k:k + len(b)], b) for k in range(2 * most)]
+    c = [np.dot(a[k:k + len(b)], b) for k in range(most + 1)]
     return int(np.argmax(c))
 
 
@@ -204,7 +204,8 @@ def test_reference_velocity_and_cc(lib, both):
     notes = [(0, 0 if i == 0 else None, 60, vel, pre) for i, (_, vel, pre) in enumerate(cases)]
     ev, times, end = notes_events(notes)
     fl, us = both(ev, end)
-    la = [level_db(seg(fl, t + lag(fl, us, t) / RATE, t + lag(fl, us, t) / RATE + HELD)) for t in times]
+    tf = [t + lag(fl, us, t) / RATE for t in times]       # the same notes in FluidSynth's render
+    la = [level_db(seg(fl, t, t + HELD)) for t in tf]
     lb = [level_db(seg(us, t, t + HELD)) for t in times]
     bad = []
     print()
@@ -213,6 +214,43 @@ def test_reference_velocity_and_cc(lib, both):
         print("%-8s FluidSynth %+7.2f dB  ours %+7.2f dB  (absolute %7.2f / %7.2f)" % (name, da, db, a, b))
         if abs(db - da) > 1:
             bad.append("%s: %+.2f dB vs FluidSynth %+.2f dB" % (name, db, da))
+    assert not bad, "\n".join(bad)
+
+
+def test_reference_pan(lib, tmp_path):
+    """CC10 at 0, 64 and 127 on a centred mono sine, against FluidSynth: the left-right balance of each. At 127
+    the default pan modulator's bipolar source keeps its top value (127/128, not 2 * 127/128 - 1), so the pan is
+    496 of 500 and the left channel is about -44 dB, not silent. That is FluidSynth's reading of SF2.04's
+    127/128 ranges (fluid_mod.c, fluid_mod_transform_source_value: `val = (val_norm == (range - 1) / range) ?
+    val_norm : -1.0f + 2.0f * val_norm`), and ours."""
+    from sf2make import write_sf2
+    sr = 44100
+    data = (16000 * np.sin(2 * np.pi * 441 * np.arange(sr) / sr)).astype(np.int16)
+    font = tmp_path / "pan.sf2"
+    write_sf2(str(font), [dict(name="p", bank=0, program=0, gens={}, pmods=[], instruments=[dict(
+        name="i", gens={}, mods=[], zones=[dict(keys=(0, 127), vels=(0, 127), sample=0, gens={54: 1}, mods=[])])])],
+        [dict(name="s", data=data, rate=sr, pitch=69, loop=(100, 100 + 100 * 400))])
+    s = lib.smp_synth_new(float(RATE), 256)
+    assert s
+    try:
+        lib.smp_synth_set_param(s, P_EFFECTS, 0)
+        err = ctypes.create_string_buffer(512)
+        assert lib.smp_synth_load(s, str(font).encode(), err, 512) == 1, err.value
+        ev, times, end = notes_events([(0, None, 69, 100, [(0xB0, 10, v)]) for v in (0, 64, 127)])
+        fl = render_fluid(tmp_path, ev, end, font)
+        us = render_ours(lib, s, tmp_path, ev, end)
+    finally:
+        lib.smp_synth_free(s)
+    bad = []
+    print()
+    for v, t in zip((0, 64, 127), times):
+        tf = t + lag(fl, us, t) / RATE
+        a, b = seg(fl, tf + 0.1, tf + HELD), seg(us, t + 0.1, t + HELD)
+        bal = lambda x: float(np.clip(level_db(x[:, 1]) - level_db(x[:, 0]), -80, 80))   # a silent side: 80 dB
+        da, db = bal(a), bal(b)
+        print("CC10 %3d  right - left: FluidSynth %+8.2f dB  ours %+8.2f dB" % (v, da, db))
+        if abs(db - da) > 0.5:
+            bad.append("CC10 %d: %+.2f dB vs FluidSynth %+.2f dB" % (v, db, da))
     assert not bad, "\n".join(bad)
 
 

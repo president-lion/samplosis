@@ -53,6 +53,7 @@ typedef struct SmpSfVoice {
   double ratio, d_ratio;
   double gl, gr, grev, gcho, d_gl, d_gr, d_grev, d_gcho;
   double b0, b1, b2, a1, a2, d_b0, d_b1, d_b2, d_a1, d_a2;
+  int filt_on;                           /* 0 while the filter is a straight wire now and at the next update */
   double x1, x2, y1, y2;
   double level;                          /* the last envelope level times the attenuation, for stealing */
   /* kill: a linear fade */

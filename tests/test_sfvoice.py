@@ -163,8 +163,8 @@ def test_volume_envelope(lib, tmp_path):
     e = env_of(render(lib, tmp_path, dc_sample(), {MODES: 1, ATTACK_VOL: tc(0.1), DELAY_VOL: tc(0.1)}, secs=0.5))
     assert np.max(np.abs(e[:int(0.095 * OUT)])) < 1e-4
     assert abs(first_at_or_above(e, 0.999 * e.max()) - 0.2) < 0.005
-    # sustain 200 cB: -19.2 dB once the decay is done (FluidSynth's 96 dB scale, measured against it in Task 7:
-    # 1000 cB is the bottom, 96 dB down); hold 0.2 s holds the top for 0.2 s after the attack
+    # sustain 200 cB: -20 dB once the decay is done (the spec's exact centibels); hold 0.2 s holds the top for
+    # 0.2 s after the attack
     e = env_of(render(lib, tmp_path, dc_sample(),
                       {MODES: 1, ATTACK_VOL: tc(0.1), HOLD_VOL: tc(0.2), DECAY_VOL: tc(1.0), SUSTAIN_VOL: 200},
                       secs=1.0))
@@ -173,7 +173,7 @@ def test_volume_envelope(lib, tmp_path):
     assert abs(fall - 0.3) < 0.005, fall
     # the decay is linear in dB: 96 dB per decay time, so 0.1 s in it is -9.6 dB
     assert abs(db(e[int(0.4 * OUT)] / top) - (-9.6)) < 0.5
-    assert abs(db(np.mean(e[int(0.8 * OUT):]) / top) - (-19.2)) < 0.2
+    assert abs(db(np.mean(e[int(0.8 * OUT):]) / top) - (-20)) < 0.5
     # release 0.5 s from full level reaches -96 dB (and the voice ends) 0.5 s after the note-off
     out = render(lib, tmp_path, dc_sample(), {MODES: 1, RELEASE_VOL: tc(0.5)}, secs=1.5, release=0.5)
     e = env_of(out)
@@ -223,13 +223,12 @@ def test_filter(lib, tmp_path):
     assert abs(f3 - fc) < 0.1 * fc, f3
     # an octave above the cutoff, 2 poles: about -12 dB or lower
     assert db(np.mean(h[(f > 2 * fc - 10) & (f < 2 * fc + 10)]) / ref) < -9
-    # Q 100 cB: FluidSynth's reading (measured against it in Task 7, 7.05 dB there): Q cB less 3.01 dB as a linear
-    # Q, so the peak is 10 dB over a non-resonant filter's -3 dB at the cutoff, about 7.2 dB over the passband
+    # Q 100 cB: a peak about 10 dB over the passband at the cutoff (SF2.04 gen 9)
     f, h = response(lib, tmp_path, {FC: 6000, Q: 100})
     ref = np.mean(h[(f > 20) & (f < 60)])
     near = (f > 0.7 * fc) & (f < 1.3 * fc)
     peak = db(h[near].max() / ref)
-    assert abs(peak - 7.2) < 0.5, peak
+    assert abs(peak - 10) < 2, peak
 
 
 def test_short_loop_is_seamless(lib, tmp_path):
