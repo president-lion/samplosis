@@ -364,8 +364,8 @@ SMP_API long smp_synth_underruns(const SmpSynth *s);   /* stream underruns so fa
 SMP_API long smp_synth_underruns_onset(const SmpSynth *s);   /* tests: of the underruns, those of voices whose first
                                     streamed read hadn't come yet (a note's onset), the rest being voices already fed */
 SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on);   /* tests: the streamer reads nothing */
-SMP_API int smp_sfs_test_features(int mask);   /* tests: the streamer features on (sfstream.h SFS_F_*; -1: all, the
-                                    default); returns the mask before */
+SMP_API int smp_sfs_test_features(int mask);   /* tests: the streamer features on (sfstream.h SFS_F_*; -1: the
+                                    default set); returns the mask before */
 SMP_API void smp_sfs_test_read_hist(long *out, int n, int reset);   /* tests: the streamers' read latencies so far
                                     (from issue to completion), counts in buckets under 1, 2, 5, 10, 20, 50, 100,
                                     200, 500 ms and over; then out[10] reads, out[11] kilobytes. reset: from zero */

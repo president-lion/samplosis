@@ -26,14 +26,17 @@
      streamer publishes a tag only after committing, so neither step needs a lock.
    A player waits for this thread (sfs_sync) before closing a font, so every hold on it is released first.
 
-   Scheduling (the cold-disk rule: notes struck together must not wait behind each other's first reads):
+   Scheduling (the cold-disk rule: notes struck together must not wait behind each other's first reads; sfstream.h
+   says which of the parts below are on by default, from measurements on a USB hard disk):
    - Each pass works out, for every record, the frames its voice already has ahead of it: the ring, plus the head
      and the post-loop head, which it plays from memory. Divided by the voice's speed (sample frames per second, from
      its pitch) that is its slack, the time until it runs dry.
-   - Records are served in slack order. Round 1 gives each record with under URGENT_MS of slack one read just big
-     enough to lift it to TARGET_MS; round 2 tops the rings up in the same order. A pass never blocks on a read:
-     up to NIO overlapped reads are in flight at once (the disk may reorder them), and the next pass, woken by a read
-     finishing or by the audio thread, sorts again, so a new note's first read never waits behind a whole round.
+   - Records are served in slack order. Round 1 gives each record with under URGENT_MS of slack its ring filled;
+     round 2 tops up the rings under half full in the same order. A visit reads the whole stretch to the ring's
+     limit as back-to-back overlapped reads (a seek costs far more on a hard disk than reading on: short reads
+     "just enough to lift a voice over a target" were measured to double the seeks at 128 voices). By default one
+     record's reads are in flight at a time (SFS_F_ASYNC lets up to NIO records' reads be in flight); a pass
+     doesn't wait for them, and the next pass, woken by a read finishing or by the audio thread, sorts again.
    - Urgent first reads of the same file within one 25 ms slack band go in byte order (a single-file font's
      samples sit together on the disk).
    - The two halves of a stereo file (two voices of one region, started in the same note event, with the same
@@ -52,9 +55,7 @@
 #define NIO 8                            /* overlapped reads in flight at most */
 #define MAX_READ (SF_RING / 2)           /* frames per read at most */
 #define SMALL_READ 16384                 /* bytes per read at most without SFS_F_BIGREAD (the old stack buffer) */
-#define MIN_READ 4096                    /* frames an urgent read asks for at least: a seek costs more than reading on */
 #define URGENT_MS 150.0                  /* slack under this gets a read in round 1 */
-#define TARGET_MS 250.0                  /* round 1 lifts a record to this much slack */
 #define SORT_BAND_MS 25.0                /* urgent first reads in one band of slack go in byte order */
 #define RETRY_MS 20                      /* a read that failed or came short is tried again after this */
 #define POOL_BYTES (256 * 1024)          /* the heap buffer for wide layouts: NIO pieces */
@@ -63,11 +64,11 @@
                                             voice streams, and a finished read wakes it too */
 #define CANCEL_WAIT_MS 5000              /* sfs_free waits this long for cancelled reads (a dead network share) */
 
-static volatile LONG g_feat = SFS_F_ALL;
+static volatile LONG g_feat = SFS_F_DEFAULT;
 int sfs_features(void) { return g_feat; }
 SMP_API int smp_sfs_test_features(int mask) {
   LONG old = g_feat;
-  InterlockedExchange(&g_feat, mask < 0 ? SFS_F_ALL : (mask & SFS_F_ALL));
+  InterlockedExchange(&g_feat, mask < 0 ? SFS_F_DEFAULT : (mask & SFS_F_ALL));
   return (int)old;
 }
 
@@ -110,7 +111,8 @@ typedef struct {
   int bad;                               /* a read of the stretch failed: the rest of it is thrown away */
   LONG fgen;                             /* the follower's generation when the reads started (a pair) */
   int dead;                              /* its voice is gone: dropped once its read finishes */
-  int has_pend; SfMsg pend;              /* a newer voice in the slot, started once that read finishes */
+  int pend;                              /* a newer voice in the slot, started once those reads finish: its message
+                                            in the streamer's pend pool, or -1 */
   int lead, led;                         /* a stereo pair: the follower's slot (in the leader), the leader's slot (in
                                             the follower, which then reads nothing itself); -1 when none */
   int reads;                             /* reads done for it */
@@ -135,7 +137,9 @@ struct SfStream {
   float *rings;                          /* nslots rings, reserved */
   Rec *rec;                              /* the streamer's own */
   int *act, nact;                        /* the slots whose records are on, so a pass touches only those */
-  Cand *cand;                            /* a pass's records in serving order */
+  Cand *cand; int ncand;                 /* a pass's records in serving order (grown with the active voices) */
+  SfMsg pendq[NIO]; int pend_on[NIO];    /* newer voices waiting for a slot's reads (only a record with reads in
+                                            flight has one, so NIO of them at most) */
   Io io[NIO];
   int nbusy;
   uint8_t *pool;                         /* the heap buffer for wide layouts, made the first time one is read */
@@ -181,9 +185,10 @@ static void drop(SfStream *st, Rec *r) {
   last = st->act[--st->nact];                      /* out of the active list: the last one takes its place */
   st->act[r->ai] = last;
   st->rec[last].ai = r->ai;
-  if (r->has_pend) {
-    SfMsg m = r->pend;
-    r->has_pend = 0;
+  if (r->pend >= 0) {
+    SfMsg m = st->pendq[r->pend];
+    st->pend_on[r->pend] = 0;
+    r->pend = -1;
     start_rec(st, r, &m);
   }
 }
@@ -213,8 +218,13 @@ static void drain(SfStream *st) {
     Rec *r = &st->rec[m.slot];
     InterlockedIncrement(&st->qr);
     if (r->on && r->nio) {                     /* a read for the older voice is in flight: this one waits */
-      if (r->has_pend) smp_sf_pcm_release(r->pend.f, r->pend.sample);
-      r->pend = m; r->has_pend = 1; r->dead = 1;
+      if (r->pend < 0) {                           /* a free place in the pool (there always is: see pendq) */
+        int k;
+        for (k = 0; k < NIO && st->pend_on[k]; k++) {}
+        if (k == NIO) { smp_sf_pcm_release(m.f, m.sample); prev = -1; continue; }   /* (never): it plays its head */
+        r->pend = k; st->pend_on[k] = 1;
+      } else smp_sf_pcm_release(st->pendq[r->pend].f, st->pendq[r->pend].sample);   /* replaced: let go */
+      st->pendq[r->pend] = m; r->dead = 1;
       prev = -1;
       continue;
     }
@@ -435,6 +445,12 @@ static int pass_once(SfStream *st) {
   ULONGLONG now = GetTickCount64();
   for (k = st->nact - 1; k >= 0; k--) if (k < st->nact) prep(st, st->act[k]);   /* (a prep may drop a record) */
   if (st->paused) return st->nbusy == 0;            /* tests: no reads, but ended voices still let go */
+  if (st->ncand < st->nact) {                       /* room to sort every active record (this thread's own) */
+    int nc = st->nact < 64 ? 64 : st->nact * 2;
+    Cand *c = (Cand *)realloc(st->cand, (size_t)nc * sizeof *c);
+    if (!c) return st->nbusy == 0;                  /* tried again next pass */
+    st->cand = c; st->ncand = nc;
+  }
   for (k = 0; k < st->nact; k++) {
     int i = st->act[k];
     Rec *r = &st->rec[i], *fo = NULL;
@@ -558,14 +574,13 @@ SfStream *sfs_new(int nslots) {
   st->slot = (SfSlot *)calloc((size_t)nslots, sizeof *st->slot);
   st->rec = (Rec *)calloc((size_t)nslots, sizeof *st->rec);
   st->act = (int *)calloc((size_t)nslots, sizeof *st->act);
-  st->cand = (Cand *)calloc((size_t)nslots, sizeof *st->cand);
   st->rings = (float *)VirtualAlloc(NULL, (SIZE_T)nslots * SF_RING * sizeof(float), MEM_RESERVE, PAGE_READWRITE);
   st->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
   st->idle = CreateEventW(NULL, FALSE, FALSE, NULL);
   for (i = 0; i < NIO; i++) st->io[i].o.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-  if (!st->slot || !st->rec || !st->act || !st->cand || !st->rings || !st->wake || !st->idle) { sfs_free(st); return NULL; }
+  if (!st->slot || !st->rec || !st->act || !st->rings || !st->wake || !st->idle) { sfs_free(st); return NULL; }
   for (i = 0; i < NIO; i++) if (!st->io[i].o.hEvent) { sfs_free(st); return NULL; }
-  for (i = 0; i < nslots; i++) { st->slot[i].rel = -1; st->rec[i].lead = st->rec[i].led = -1; }
+  for (i = 0; i < nslots; i++) { st->slot[i].rel = -1; st->rec[i].lead = st->rec[i].led = -1; st->rec[i].pend = -1; }
   st->thread = CreateThread(NULL, 256 * 1024, streamer, st, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
   if (!st->thread) { sfs_free(st); return NULL; }
   SetThreadPriority(st->thread, THREAD_PRIORITY_ABOVE_NORMAL);
@@ -585,7 +600,7 @@ void sfs_free(SfStream *st) {
     drain(st);                                     /* queued starts carry holds too */
     for (i = 0; i < st->nslots; i++) {
       Rec *r = &st->rec[i];
-      if (r->has_pend) { smp_sf_pcm_release(r->pend.f, r->pend.sample); r->has_pend = 0; }
+      if (r->pend >= 0) { smp_sf_pcm_release(st->pendq[r->pend].f, st->pendq[r->pend].sample); st->pend_on[r->pend] = 0; r->pend = -1; }
       drop(st, r);
     }
   }

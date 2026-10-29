@@ -236,8 +236,11 @@ static HANDLE font_handle(SmpFont *f, int path_id) {
                   FILE_ATTRIBUTE_NORMAL, NULL);
   if (h == INVALID_HANDLE_VALUE) return NULL;
   if (!f->fh[path_id]) {
+    /* sequential: each stream reads its file front to back, and Windows reads ahead further for such a handle,
+       so fewer reads wait for the disk */
     HANDLE d = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                           ((sfs_features() & SFS_F_SEQ) ? FILE_FLAG_SEQUENTIAL_SCAN : 0), NULL);
     if (d == INVALID_HANDLE_VALUE) { CloseHandle(h); return NULL; }
     f->fh[path_id] = d;
   }

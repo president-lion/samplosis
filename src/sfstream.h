@@ -62,8 +62,13 @@ void sfs_sync(SfStream *st);             /* offline and main thread: returns aft
 int sfs_sync_for(SfStream *st, int timeout_ms);   /* the same, giving up after timeout_ms: 1 done, 0 timed out */
 void sfs_pause(SfStream *st, int on);    /* tests: the streamer reads nothing (forces underruns) */
 
-/* The streamer's features, all on by default; tests and tests\measure.py turn some off to measure each one
-   (smp_sfs_test_features). */
+/* The streamer's features. The default (SFS_F_DEFAULT) is what measured best on a USB hard disk (Bulk-Only
+   Transport, one command at a time), cold, 64 and 128 voices: deadline order and whole-stretch reads, with first
+   reads in byte order. The others measured no better or worse there and stay off: several records' reads in
+   flight (the disk can't reorder them, and they break up each file's sequential reads), one read for both halves
+   of a stereo pair (Windows serves the second half from its cache anyway), reading 0.4 s past each head at load
+   (it only moves the chord's dropouts from 0.6 s to 1.4 s) and sequential-scan handles. tests\measure.py turns
+   them on and off to measure them (smp_sfs_test_features). */
 enum {
   SFS_F_DEADLINE = 1,                    /* records served in deadline order, urgent ones first with short reads */
   SFS_F_BIGREAD = 2,                     /* reads up to half a ring (else at most 16 KB, as stage 3 first did) */
@@ -71,7 +76,9 @@ enum {
   SFS_F_ASYNC = 8,                       /* several records' reads in flight at once (else one record's at a time) */
   SFS_F_SORT = 16,                       /* urgent first reads of one file in byte order */
   SFS_F_WARM = 32,                       /* the loader reads 0.4 s past each head into the file cache */
-  SFS_F_ALL = 63
+  SFS_F_SEQ = 64,                        /* streaming handles opened for sequential reads (more Windows read-ahead) */
+  SFS_F_ALL = 127,
+  SFS_F_DEFAULT = SFS_F_DEADLINE | SFS_F_BIGREAD | SFS_F_SORT
 };
 int sfs_features(void);
 
