@@ -15,6 +15,15 @@
    is told (plugin.c).
    A 250 ms timer brings the controls up to date (automation, renders) and frees replaced samples; a value is set
    only when it changes, so the screen reader isn't interrupted.
+   Two players, two main pages. The first control of both is one tab control, "Player" (its accessible name, by
+   annotation), with the tabs Sampler and SoundFont: the tab chosen is what the instance plays, and its page shows.
+   Left and Right on it change the tab, and Ctrl+Tab or Ctrl+Shift+Tab do from any control on either main page; the
+   focus is then on the tab control. The window opens on the tab that plays, and follows it when something else
+   (a state, a dropped file) changes it. Settings is the third page; Back goes to the main page that plays.
+   On the SoundFont page, the controls of the mode not chosen (One preset: Preset and Channel; All channels: the 16
+   channels and their outputs) are hidden, and Tab skips hidden controls. The preset lists are built once per font.
+   Each channel's first entry, "From the song (now <preset>)", follows what the song plays, but not while its list is
+   open. A dropped .sf2 or .sf3 loads as the SoundFont, and a dropped audio file into the sampler, and the tab follows.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
 #include <commctrl.h>
@@ -38,10 +47,18 @@
 #define LIMIT_HI 10000.0
 #define NOTE_MS 6000
 
+#define NCH 16                                /* MIDI channels */
 enum { ID_VAL = 100,                          /* + parameter id: its slider or combo box */
        ID_SAMPLE = 200, ID_BROWSE, ID_PREV, ID_NEXT, ID_STATUS, ID_SETTINGS,
        ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
-       ID_EDIT = 300 };                       /* + slider number: the edit box that stands in for it */
+       ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFPREV, ID_SFNEXT, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
+       ID_SFSETTINGS,
+       ID_EDIT = 300,                         /* + slider number: the edit box that stands in for it */
+       ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
+       ID_OUT = 420 };                        /* + channel - 1: its output combo box */
+enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, NPAGES = 3 };
+#define PAGE_CTLS 128
+#define PAGE_STOPS 64
 #define SL_LIMIT (-1)                         /* the slider that isn't a parameter: the cache size limit */
 enum { T_REFRESH = 1, T_OPEN = 2 };
 #define WM_DROPPED (WM_APP + 1)
@@ -54,17 +71,26 @@ typedef struct { HWND tb, ed; int what; char said[64]; bool editing; } Slider;
 typedef struct Gui {
   Plug *P;
   HWND win; HFONT font;
-  int page;                                   /* 0 the main page, 1 Settings */
+  int page;                                   /* PG_SAMPLER, PG_SETTINGS or PG_FONT */
+  HWND tabs;                                  /* the Player tab control: first on both main pages */
+  bool setting_tab;                           /* the window moves the tab itself: not the user's choice */
   HWND sample, browse, prev, next, status, settings;
-  HWND val[SMP_NPARAMS];                      /* each parameter's slider or combo box */
-  Slider sl[SMP_NPARAMS + 1]; int nsl;
-  Slider *sl_of[SMP_NPARAMS];                 /* a parameter's slider, or NULL (a choice) */
+  HWND val[SMP_NALLPARAMS];                   /* each parameter's slider or combo box */
+  Slider sl[SMP_NALLPARAMS + 1]; int nsl;
+  Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
   IAccPropServices *aps;                      /* the words a screen reader reads for a slider; NULL: numbers */
   HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
   Slider *limit;
   char dir_shown[1024], used_text[700];
-  HWND all[2][96]; int nall[2];               /* every window on each page (labels too), to show and hide */
-  HWND order[2][48]; int norder[2];           /* the Tab order of each page */
+  /* the SoundFont page */
+  HWND sffile, sfbrowse, sfprev, sfnext, sfmode, sfpreset, sfchannel, chan[NCH], out[NCH], sfstatus, sfsettings;
+  HWND mode_one[4], mode_all[4 * NCH];        /* each mode's own controls with their labels: shown in that mode only */
+  int nmode_one, nmode_all;
+  bool sf_one;                                /* the mode the page shows: One preset */
+  const void *list_font; char list_key[1200]; /* the font the preset lists were built for (and its text) */
+  char from_song[NCH][300];                   /* each channel's first entry as it reads now */
+  HWND all[NPAGES][PAGE_CTLS]; int nall[NPAGES];      /* every window on each page (labels too), to show and hide */
+  HWND order[NPAGES][PAGE_STOPS]; int norder[NPAGES]; /* the Tab order of each page */
   HWND last; bool had_focus, closing;
   char note[800]; ULONGLONG note_until;       /* a message the status box shows for a while (a file that won't load) */
   Drop drop; int ole_init, drop_registered;
@@ -367,7 +393,7 @@ static void browse_folder(Gui *g) {
   focus(g->dirbrowse);
 }
 
-/* ---- the sample ---- */
+/* ---- the sample and the SoundFont ---- */
 static void say_note(Gui *g, const char *msg) {
   snprintf(g->note, sizeof g->note, "%s", msg);
   g->note_until = GetTickCount64() + NOTE_MS;
@@ -377,28 +403,161 @@ static void show_status(Gui *g) {
   if (g->note[0] && GetTickCount64() < g->note_until) snprintf(t, sizeof t, "%s", g->note);
   else { g->note[0] = 0; smp_plug_status_text(g->P, t, sizeof t); }
   set_text(g->status, t);
+  set_text(g->sfstatus, t);
 }
 static void show_sample(Gui *g) {
   char t[1500]; smp_plug_sample_text(g->P, t, sizeof t); set_text(g->sample, t);
 }
+
+/* the SoundFont player's settings, read from its state lines */
+typedef struct { int one, bank, program, channel, pin[NCH], out[NCH]; } SfCfg;   /* pin: bank * 128 + program, or -1 */
+static void sf_cfg(Gui *g, SfCfg *c) {
+  SmpSynth *s = smp_plug_synth(g->P);
+  int n = s ? smp_synth_script_write(s, NULL, 0) : 0, i;
+  char *t = n > 0 ? malloc((size_t)n + 1) : NULL, *p;
+  memset(c, 0, sizeof *c);
+  for (i = 0; i < NCH; i++) c->pin[i] = -1;
+  if (!t) return;
+  smp_synth_script_write(s, t, n + 1);
+  for (p = t; p && *p; ) {
+    char *e = strchr(p, '\n'), w[32] = "", a[32] = ""; int x, y, z;
+    if (e) *e = 0;
+    if (sscanf(p, "%31s %31s", w, a) >= 1) {
+      if (!strcmp(w, "sf_mode")) c->one = !strcmp(a, "one");
+      else if (!strcmp(w, "sf_preset") && sscanf(p + 9, "%d %d", &x, &y) == 2) { c->bank = x; c->program = y; }
+      else if (!strcmp(w, "sf_channel")) c->channel = strcmp(a, "all") ? atoi(a) : 0;
+      else if (!strcmp(w, "sf_channel_preset") && sscanf(p + 17, "%d %d %d", &x, &y, &z) == 3 && x >= 1 && x <= NCH)
+        c->pin[x - 1] = y * 128 + z;
+      else if (!strcmp(w, "sf_output") && sscanf(p + 9, "%d %d", &x, &y) == 2 && x >= 1 && x <= NCH) c->out[x - 1] = y - 1;
+    }
+    p = e ? e + 1 : NULL;
+  }
+  free(t);
+}
+static SmpFont *sf_font(Gui *g) { SmpSynth *s = smp_plug_synth(g->P); return s ? smp_synth_font(s) : NULL; }
+static void cb_add(HWND c, const char *s) {
+  wchar_t w[400]; MultiByteToWideChar(CP_UTF8, 0, s, -1, w, 400); SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)w);
+}
+static void cb_select(HWND c, int k) { if (SendMessageW(c, CB_GETCURSEL, 0, 0) != k) SendMessageW(c, CB_SETCURSEL, (WPARAM)k, 0); }
+
+/* the preset lists: Preset's, and each channel's after its first entry; built again only when the font changes */
+static void sf_lists(Gui *g) {
+  SmpFont *f = sf_font(g);
+  char key[1200], name[200], t[300]; int n = f ? smp_sf_preset_count(f) : 0, i, c, b, p;
+  smp_plug_font_text(g->P, key, sizeof key);
+  if (g->list_key[0] && (const void *)f == g->list_font && !strcmp(key, g->list_key)) return;
+  g->list_font = f; snprintf(g->list_key, sizeof g->list_key, "%s", key);
+  SendMessageW(g->sfpreset, CB_RESETCONTENT, 0, 0);
+  for (c = 0; c < NCH; c++) {
+    SendMessageW(g->chan[c], CB_RESETCONTENT, 0, 0);
+    cb_add(g->chan[c], "From the song");
+    g->from_song[c][0] = 0;                    /* the timer writes it */
+  }
+  for (i = 0; i < n; i++) {
+    if (!smp_sf_preset_info(f, i, &b, &p, name, sizeof name)) name[0] = 0, b = p = 0;
+    snprintf(t, sizeof t, "%s, bank %d program %d", name, b, p + 1);
+    cb_add(g->sfpreset, t);
+    for (c = 0; c < NCH; c++) cb_add(g->chan[c], t);
+  }
+}
+static int sf_index(Gui *g, int bank, int program) {   /* the preset's place in the lists, or -1 */
+  SmpFont *f = sf_font(g);
+  return f ? smp_sf_find_preset(f, bank, program) : -1;
+}
+
+static bool in_list(HWND *list, int n, HWND h) { int i; for (i = 0; i < n; i++) if (list[i] == h) return true; return false; }
+/* a window of the SoundFont page that its mode hides */
+static bool mode_hides(Gui *g, HWND h) {
+  return g->sf_one ? in_list(g->mode_all, g->nmode_all, h) : in_list(g->mode_one, g->nmode_one, h);
+}
+/* the SoundFont page shows its mode's controls; the focus never stays on one that hides */
+static void sf_layout(Gui *g) {
+  HWND f = GetFocus(); int i;
+  if (g->page != PG_FONT) return;
+  if (f && mode_hides(g, f)) focus(g->sfmode);
+  for (i = 0; i < g->nmode_one; i++) ShowWindow(g->mode_one[i], g->sf_one ? SW_SHOW : SW_HIDE);
+  for (i = 0; i < g->nmode_all; i++) ShowWindow(g->mode_all[i], g->sf_one ? SW_HIDE : SW_SHOW);
+}
+
+static void sf_show(Gui *g) {
+  char t[1500], name[200]; SfCfg c; SmpFont *f; int i, b, p;
+  smp_plug_font_text(g->P, t, sizeof t); set_text(g->sffile, t);
+  sf_lists(g);
+  sf_cfg(g, &c);
+  f = sf_font(g);
+  if ((bool)c.one != g->sf_one) { g->sf_one = c.one != 0; sf_layout(g); }
+  cb_select(g->sfmode, c.one ? 1 : 0);
+  cb_select(g->sfpreset, sf_index(g, c.bank, c.program));
+  cb_select(g->sfchannel, c.channel);
+  for (i = 0; i < NCH; i++) {
+    int k = c.pin[i] >= 0 ? sf_index(g, c.pin[i] / 128, c.pin[i] % 128) : -1;
+    /* the first entry says what the song plays there now; never while the list is open (it would jump) */
+    if (f && smp_plug_sf_channel_now(g->P, i + 1, &b, &p)) {
+      int at = smp_sf_find_preset(f, b, p);
+      if (at < 0 || !smp_sf_preset_info(f, at, NULL, NULL, name, sizeof name)) snprintf(name, sizeof name, "bank %d program %d", b, p + 1);
+      snprintf(t, sizeof t, "From the song (now %s)", name);
+    } else snprintf(t, sizeof t, "From the song");
+    if (strcmp(t, g->from_song[i]) && !SendMessageW(g->chan[i], CB_GETDROPPEDSTATE, 0, 0)) {
+      wchar_t w[400]; LRESULT was = SendMessageW(g->chan[i], CB_GETCURSEL, 0, 0);
+      snprintf(g->from_song[i], sizeof g->from_song[i], "%s", t);
+      MultiByteToWideChar(CP_UTF8, 0, t, -1, w, 400);
+      SendMessageW(g->chan[i], CB_DELETESTRING, 0, 0);
+      SendMessageW(g->chan[i], CB_INSERTSTRING, 0, (LPARAM)w);
+      if (was == 0) SendMessageW(g->chan[i], CB_SETCURSEL, 0, 0);     /* showing it: the new words show */
+    }
+    cb_select(g->chan[i], c.pin[i] >= 0 ? (k >= 0 ? k + 1 : -1) : 0);
+    cb_select(g->out[i], c.out[i]);
+  }
+}
+
+/* a SoundFont combo box chose entry k: one state line to the player (one it won't take beeps) */
+static void sf_choose(Gui *g, int id, int k) {
+  char line[200] = ""; int b = 0, p = 0; SmpFont *f = sf_font(g);
+  if (k < 0) return;
+  if (id == ID_SFMODE) snprintf(line, sizeof line, "sf_mode %s", k ? "one" : "all");
+  else if (id == ID_SFPRESET) { if (f && smp_sf_preset_info(f, k, &b, &p, NULL, 0)) snprintf(line, sizeof line, "sf_preset %d %d", b, p); }
+  else if (id == ID_SFCHANNEL) { if (k) snprintf(line, sizeof line, "sf_channel %d", k); else snprintf(line, sizeof line, "sf_channel all"); }
+  else if (id >= ID_CHAN && id < ID_CHAN + NCH) {
+    if (!k) snprintf(line, sizeof line, "sf_channel_preset %d song", id - ID_CHAN + 1);
+    else if (f && smp_sf_preset_info(f, k - 1, &b, &p, NULL, 0)) snprintf(line, sizeof line, "sf_channel_preset %d %d %d", id - ID_CHAN + 1, b, p);
+  } else if (id >= ID_OUT && id < ID_OUT + NCH) snprintf(line, sizeof line, "sf_output %d %d", id - ID_OUT + 1, k + 1);
+  if (!line[0] || !smp_plug_sf_set(g->P, line)) beep();
+  sf_show(g);
+}
+
+static void show_page(Gui *g, int page, HWND to);
 static void refresh(Gui *g) {
   int id;
   if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
+  if (g->page != PG_SETTINGS && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
+    show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* the tab follows what plays (it refreshes) */
+    return;
+  }
   show_sample(g);
-  for (id = 0; id < SMP_NPARAMS; id++) show_param(g, id, false);
+  for (id = 0; id < SMP_NALLPARAMS; id++) show_param(g, id, false);
   show_status(g);
-  if (g->page == 1) show_settings(g);
+  if (g->page == PG_FONT) sf_show(g);
+  if (g->page == PG_SETTINGS) show_settings(g);
 }
 
-static void load_path_w(Gui *g, const wchar_t *w) {
-  char u[1100], err[700], msg[1900];
+static bool font_name(const wchar_t *n) {
+  const wchar_t *dot = wcsrchr(n, L'.');
+  return dot && (!_wcsicmp(dot, L".sf2") || !_wcsicmp(dot, L".sf3"));
+}
+/* a file to load: a .sf2 or .sf3 as the SoundFont (which then plays), anything else as the sample; dropped: the
+   sample then plays too */
+static void load_path_w(Gui *g, const wchar_t *w, bool dropped) {
+  char u[1100], err[700], msg[1900]; bool sf = font_name(w);
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
-  if (!smp_plug_load(g->P, u, err, sizeof err)) {
+  if (!(sf ? smp_plug_load_font(g->P, u, err, sizeof err) : smp_plug_load(g->P, u, err, sizeof err))) {
     const char *base = strrchr(u, '\\'), *b2 = strrchr(u, '/');
     if (b2 > base) base = b2;
     snprintf(msg, sizeof msg, "Can't load %s: %s", base ? base + 1 : u, err);
     say_note(g, msg); beep();
-  } else g->note[0] = 0;
+  } else {
+    g->note[0] = 0;
+    if (dropped && !sf) smp_plug_set_plays(g->P, 0);
+  }
   refresh(g);
 }
 
@@ -411,12 +570,29 @@ static bool audio_name(const wchar_t *n) {
 }
 static int by_name(const void *a, const void *b) { return _wcsicmp(*(const wchar_t *const *)a, *(const wchar_t *const *)b); }
 
-/* Previous or next file: the audio files in the sample's folder, alphabetical (ignoring case), wrapping round */
-static void step_file(Gui *g, int dir) {
+/* what Browse, Previous file and Next file work on: the sample (0) or the SoundFont (1) */
+typedef struct {
+  int (*path)(Plug *, char *, int);
+  bool (*ours)(const wchar_t *);
+  const char *none, *no_files, *only;
+  const wchar_t *filter, *title;
+} FileKind;
+static const FileKind kinds[2] = {
+  {smp_plug_sample_path, audio_name, "No sample loaded", "No audio files in the sample's folder",
+   "It's the only audio file in its folder", L"Audio files\0*.wav;*.flac;*.mp3;*.ogg;*.aif;*.aiff\0All files\0*.*\0",
+   L"Load a sample"},
+  {smp_plug_font_path, font_name, "No SoundFont loaded", "No SoundFonts in the SoundFont's folder",
+   "It's the only SoundFont in its folder", L"SoundFonts\0*.sf2;*.sf3\0All files\0*.*\0", L"Load a SoundFont"},
+};
+
+/* Previous or next file: the files of its kind in the current one's folder, alphabetical (ignoring case), wrapping
+   round */
+static void step_file(Gui *g, int kind, int dir) {
+  const FileKind *K = &kinds[kind];
   char path[1100]; wchar_t w[1100], pat[1200], *slash, *name, **names = NULL, out[1200];
   WIN32_FIND_DATAW fd; HANDLE f; int n = 0, cap = 0, i, at = -1, ins = 0;
-  if (!smp_plug_sample_path(g->P, path, sizeof path) || !MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1100)) {
-    beep(); say_note(g, "No sample loaded"); show_status(g); return;
+  if (!K->path(g->P, path, sizeof path) || !MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1100)) {
+    beep(); say_note(g, K->none); show_status(g); return;
   }
   for (slash = w; *slash; slash++) if (*slash == L'/') *slash = L'\\';
   slash = wcsrchr(w, L'\\');
@@ -426,7 +602,7 @@ static void step_file(Gui *g, int dir) {
   f = FindFirstFileW(pat, &fd);
   if (f != INVALID_HANDLE_VALUE) {
     do {
-      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !audio_name(fd.cFileName)) continue;
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !K->ours(fd.cFileName)) continue;
       if (n == cap) {
         wchar_t **nn = realloc(names, sizeof *names * (size_t)(cap = cap ? cap * 2 : 64));
         if (!nn) break;
@@ -437,7 +613,7 @@ static void step_file(Gui *g, int dir) {
     } while (FindNextFileW(f, &fd));
     FindClose(f);
   }
-  if (!n) { free(names); beep(); say_note(g, "No audio files in the sample's folder"); show_status(g); return; }
+  if (!n) { free(names); beep(); say_note(g, K->no_files); show_status(g); return; }
   qsort(names, (size_t)n, sizeof *names, by_name);
   for (i = 0; i < n; i++) {
     int c = _wcsicmp(names[i], name);
@@ -446,15 +622,16 @@ static void step_file(Gui *g, int dir) {
   }
   i = at >= 0 ? at + dir : dir > 0 ? ins : ins - 1;        /* the file gone: its neighbours */
   i = ((i % n) + n) % n;
-  if (at >= 0 && i == at) { beep(); say_note(g, "It's the only audio file in its folder"); show_status(g); }
-  else { swprintf(out, 1200, L"%s\\%s", w, names[i]); load_path_w(g, out); }
+  if (at >= 0 && i == at) { beep(); say_note(g, K->only); show_status(g); }
+  else { swprintf(out, 1200, L"%s\\%s", w, names[i]); load_path_w(g, out, false); }
   for (i = 0; i < n; i++) free(names[i]);
   free(names);
 }
 
-static void browse_file(Gui *g) {
+static void browse_file(Gui *g, int kind) {
+  const FileKind *K = &kinds[kind];
   wchar_t file[1100] = L"", dirw[1100] = L""; char path[1100]; OPENFILENAMEW of; int ok;
-  if (smp_plug_sample_path(g->P, path, sizeof path) && MultiByteToWideChar(CP_UTF8, 0, path, -1, dirw, 1100)) {
+  if (K->path(g->P, path, sizeof path) && MultiByteToWideChar(CP_UTF8, 0, path, -1, dirw, 1100)) {
     wchar_t *s = wcsrchr(dirw, L'\\'), *s2 = wcsrchr(dirw, L'/');
     if (s2 > s) s = s2;
     if (s) *s = 0; else dirw[0] = 0;
@@ -462,16 +639,16 @@ static void browse_file(Gui *g) {
   memset(&of, 0, sizeof of);
   of.lStructSize = sizeof of;
   of.hwndOwner = GetAncestor(g->win, GA_ROOT);
-  of.lpstrFilter = L"Audio files\0*.wav;*.flac;*.mp3;*.ogg;*.aif;*.aiff\0All files\0*.*\0";
+  of.lpstrFilter = K->filter;
   of.lpstrFile = file; of.nMaxFile = 1100;
   of.lpstrInitialDir = dirw[0] ? dirw : NULL;
-  of.lpstrTitle = L"Load a sample";
+  of.lpstrTitle = K->title;
   of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
   modal_begin(g);
   ok = test_dialog ? stub_dialog(g, file, 1100) : GetOpenFileNameW(&of);
   if (modal_end(g)) return;               /* the window (and maybe the plugin) went while the dialog was open */
-  if (ok) load_path_w(g, file);
-  focus(g->browse);
+  if (ok) load_path_w(g, file, false);
+  focus(g->page == PG_FONT ? g->sfbrowse : g->browse);   /* the page showing now (a font chosen here switches) */
 }
 
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
@@ -493,7 +670,7 @@ static HRESULT STDMETHODCALLTYPE d_over(IDropTarget *t, DWORD k, POINTL p, DWORD
 static HRESULT STDMETHODCALLTYPE d_leave(IDropTarget *t) { ((Drop *)t)->ok = 0; return S_OK; }
 static void drop_hdrop(Gui *g, HDROP h) {
   wchar_t w[1100];
-  if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w);
+  if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w, true);
 }
 /* The drop only notes the file and posts WM_DROPPED: the load (maybe a decode) runs after the drag has returned, so
    Explorer or the Media Explorer isn't kept waiting, and nothing loads inside OLE's drag loop. */
@@ -527,13 +704,14 @@ static void drop_start(Gui *g) {
 }
 
 /* ---- Tab and focus ---- */
+/* the next control in the page's Tab order that shows (the SoundFont page hides one mode's controls); past either
+   end, out of the plugin */
 static void tab_key(Gui *g, HWND h, bool back) {
-  HWND *o = g->order[g->page]; int n = g->norder[g->page], at = -1, i, to;
+  HWND *o = g->order[g->page]; int n = g->norder[g->page], at = -1, i, d = back ? -1 : 1;
   for (i = 0; i < n; i++) if (o[i] == h) at = i;
-  to = at + (back ? -1 : 1);
-  if (at >= 0 && to >= 0 && to < n) { focus(o[to]); return; }
+  if (at >= 0) for (i = at + d; i >= 0 && i < n; i += d) if (IsWindowVisible(o[i])) { focus(o[i]); return; }
   if (tab_out(g->win, back)) return;
-  focus(o[back ? n - 1 : 0]);
+  for (i = back ? n - 1 : 0; i >= 0 && i < n; i += d) if (IsWindowVisible(o[i])) { focus(o[i]); return; }
 }
 
 /* If the focus was ours and is now on nothing that shows (its page hidden), or on the window itself (REAPER focuses
@@ -546,23 +724,53 @@ static void keep_focus(Gui *g) {
   focus(to);
 }
 
+/* a window that shows on the page: one of its own, and not one its SoundFont mode hides */
+static bool shows_on(Gui *g, int page, HWND h) {
+  return in_list(g->all[page], g->nall[page], h) && !(page == PG_FONT && mode_hides(g, h));
+}
+/* Shows a page. The focus goes to `to`, or, when it was on one of ours that won't show, to the page's first control
+   (the tab control on a main page); focus outside the plugin stays where it is. The new page shows before the old
+   one hides, so the focus never falls to nothing. */
 static void show_page(Gui *g, int page, HWND to) {
-  int i;
-  if (page == 1) { rescan_used(g); show_settings(g); }
+  HWND f = GetFocus(); int i, q;
+  if (page == PG_SETTINGS) { rescan_used(g); show_settings(g); }
+  if (page == PG_FONT) { SfCfg c; sf_cfg(g, &c); g->sf_one = c.one != 0; }
   g->page = page;
-  for (i = 0; i < g->nall[page]; i++) ShowWindow(g->all[page][i], SW_SHOW);
-  focus(to ? to : g->order[page][0]);        /* before the old page hides, so the focus never falls to nothing */
-  for (i = 0; i < g->nall[!page]; i++) ShowWindow(g->all[!page][i], SW_HIDE);
-  if (page == 0) refresh(g);
+  if (page != PG_SETTINGS) {                  /* the tab control shows the page's tab */
+    int k = page == PG_FONT ? 1 : 0;
+    g->setting_tab = true;
+    if (SendMessageW(g->tabs, TCM_GETCURFOCUS, 0, 0) != k) SendMessageW(g->tabs, TCM_SETCURFOCUS, (WPARAM)k, 0);
+    if (SendMessageW(g->tabs, TCM_GETCURSEL, 0, 0) != k) SendMessageW(g->tabs, TCM_SETCURSEL, (WPARAM)k, 0);
+    g->setting_tab = false;
+  }
+  for (i = 0; i < g->nall[page]; i++) if (shows_on(g, page, g->all[page][i])) ShowWindow(g->all[page][i], SW_SHOW);
+  if (to) focus(to);
+  else if (f && (f == g->win || IsChild(g->win, f)) && !shows_on(g, page, f)) focus(g->order[page][0]);
+  for (q = 0; q < NPAGES; q++)
+    for (i = 0; i < g->nall[q]; i++) if (!shows_on(g, page, g->all[q][i])) ShowWindow(g->all[q][i], SW_HIDE);
+  if (page != PG_SETTINGS) refresh(g);
+}
+
+/* the user chose a tab: that player plays, its page shows, and the focus is on the tab control */
+static void set_tab(Gui *g, int which) {
+  smp_plug_set_plays(g->P, which);
+  show_page(g, which ? PG_FONT : PG_SAMPLER, g->tabs);
 }
 
 static void click(Gui *g, int id) {
+  int m;
   switch (id) {
-    case ID_BROWSE: browse_file(g); break;
-    case ID_PREV: step_file(g, -1); break;
-    case ID_NEXT: step_file(g, 1); break;
-    case ID_SETTINGS: show_page(g, 1, NULL); break;
-    case ID_BACK: show_page(g, 0, g->settings); break;
+    case ID_BROWSE: browse_file(g, 0); break;
+    case ID_PREV: step_file(g, 0, -1); break;
+    case ID_NEXT: step_file(g, 0, 1); break;
+    case ID_SFBROWSE: browse_file(g, 1); break;
+    case ID_SFPREV: step_file(g, 1, -1); break;
+    case ID_SFNEXT: step_file(g, 1, 1); break;
+    case ID_SETTINGS: case ID_SFSETTINGS: show_page(g, PG_SETTINGS, NULL); break;
+    case ID_BACK:                             /* to the main page that plays, on its Settings button */
+      m = smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER;
+      show_page(g, m, m == PG_FONT ? g->sfsettings : g->settings);
+      break;
     case ID_DIRBROWSE: browse_folder(g); break;
     case ID_CLEAR: clear_cache(g); break;
   }
@@ -585,6 +793,14 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
   if (m == WM_KILLFOCUS && !(w && IsChild(g->win, (HWND)w))) g->had_focus = false;   /* gone out of the window */
   shift = GetKeyState(VK_SHIFT) < 0; ctrl = GetKeyState(VK_CONTROL) < 0;
   s = slider_of(g, h);
+  if (m == WM_KEYDOWN && w == VK_TAB && ctrl) {           /* Ctrl+Tab, Ctrl+Shift+Tab: the next or previous tab */
+    if (g->page != PG_SETTINGS) {
+      int n = (int)SendMessageW(g->tabs, TCM_GETITEMCOUNT, 0, 0), k = (int)SendMessageW(g->tabs, TCM_GETCURSEL, 0, 0);
+      if (s && h == s->ed) edit_end(g, s, true, false);  /* a value being typed is read first */
+      if (n > 0) set_tab(g, ((k < 0 ? 0 : k) + (shift ? n - 1 : 1)) % n);
+    }
+    return 0;
+  }
   if (s && h == s->ed) {                                  /* typing a value in place of its slider */
     if (m == WM_KEYDOWN && w == VK_TAB) { tab_key(g, s->tb, shift); return 0; }   /* leaving the box reads it */
     if (m == WM_KEYDOWN && (w == VK_RETURN || w == VK_ESCAPE)) { edit_end(g, s, w == VK_RETURN, true); return 0; }
@@ -629,12 +845,15 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       return 0;
     case WM_COMMAND: {
       int id = LOWORD(w), code = HIWORD(w);
-      if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NPARAMS) {
+      if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NALLPARAMS) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) smp_plug_set_param(g->P, id - ID_VAL, (double)k);
       } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE)) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) choose(g, id, (int)k);
+      } else if (code == CBN_SELCHANGE && (id == ID_SFMODE || id == ID_SFPRESET || id == ID_SFCHANNEL ||
+                                           (id >= ID_CHAN && id < ID_CHAN + NCH) || (id >= ID_OUT && id < ID_OUT + NCH))) {
+        sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
       } else if (code == BN_CLICKED) click(g, id);
       return 0;
     }
@@ -644,9 +863,15 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (s && (code == TB_THUMBTRACK || code == TB_THUMBPOSITION || code == TB_PAGEUP || code == TB_PAGEDOWN)) sl_dragged(g, s);
       return 0;
     }
+    case WM_NOTIFY: {                          /* the tab control's own keys (Left, Right) or the mouse chose a tab */
+      const NMHDR *n = (const NMHDR *)l;
+      if (n && n->hwndFrom == g->tabs && n->code == TCN_SELCHANGE && !g->setting_tab)
+        set_tab(g, (int)SendMessageW(g->tabs, TCM_GETCURSEL, 0, 0));
+      return 0;
+    }
     case WM_SETFOCUS: keep_focus(g); return 0;
     case WM_DROPFILES: drop_hdrop(g, (HDROP)w); DragFinish((HDROP)w); return 0;
-    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f); } return 0;
+    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f, true); } return 0;
   }
   return DefWindowProcW(h, m, w, l);
 }
@@ -657,13 +882,12 @@ static HWND ctl(Gui *g, int page, const wchar_t *cls, const wchar_t *text, DWORD
                            x, y, w, h, g->win, (HMENU)(INT_PTR)id, module(), NULL);
   if (!c) return NULL;
   SendMessageW(c, WM_SETFONT, (WPARAM)g->font, FALSE);
-  if (g->nall[page] < 96) g->all[page][g->nall[page]++] = c;
+  if (g->nall[page] < PAGE_CTLS) g->all[page][g->nall[page]++] = c;
   if (style & WS_TABSTOP) {
     SetWindowSubclass(c, ctl_proc, (UINT_PTR)id, (DWORD_PTR)g);
-    if (g->norder[page] < 48) g->order[page][g->norder[page]++] = c;
+    if (g->norder[page] < PAGE_STOPS) g->order[page][g->norder[page]++] = c;
   }
-  if (page == 0) ShowWindow(c, SW_SHOWNA);
-  return c;
+  return c;                                   /* hidden: the page shows it (show_page) */
 }
 /* a label, then its control: the order a screen reader names it by */
 static HWND labelled(Gui *g, int page, const char *label, const wchar_t *cls, DWORD style, int x, int y, int lw, int cw, int ch, int id) {
@@ -697,12 +921,12 @@ static Slider *slider(Gui *g, int page, const char *label, int what, int x, int 
   return s;
 }
 
-static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
+static HWND param_box(Gui *g, int page, int id, int x, int y, int lw, int cw) {
   const DWORD T = WS_TABSTOP;
   HWND c;
   if (is_choice(id)) {
     int n = (int)(smp_param_info(id)->hi + 0.5), k;
-    c = labelled(g, 0, smp_param_label[id], L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, x, y, lw, cw, 200, ID_VAL + id);
+    c = labelled(g, page, smp_param_label[id], L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, x, y, lw, cw, 200, ID_VAL + id);
     for (k = 0; k <= n; k++) {
       char t[64]; wchar_t wt[64];
       param_text(id, k, t, sizeof t);
@@ -710,7 +934,7 @@ static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
       SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)wt);
     }
   } else {
-    g->sl_of[id] = slider(g, 0, smp_param_label[id], id, x, y, lw, cw, ID_VAL + id);
+    g->sl_of[id] = slider(g, page, smp_param_label[id], id, x, y, lw, cw, ID_VAL + id);
     c = g->sl_of[id]->tb;
   }
   g->val[id] = c;
@@ -719,12 +943,13 @@ static HWND param_box(Gui *g, int id, int x, int y, int lw, int cw) {
 
 #define N_REST (SMP_NPARAMS - 2)
 #define REST_ROWS ((N_REST + 1) / 2)
-#define W_HEIGHT (8 + (3 + REST_ROWS + 2) * ROW + 8)
+#define W_HEIGHT (8 + (4 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page, the taller: the tabs, 3 rows, the
+                                                           rest in two columns, Status and Settings */
 
 static bool build(Gui *g, HWND parent) {
   HINSTANCE hi = module();
   WNDCLASSW wc; NONCLIENTMETRICSW nm; const DWORD T = WS_TABSTOP; int id, k, y;
-  INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
+  INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES};
   InitCommonControlsEx(&icc);
   memset(&wc, 0, sizeof wc);
   wc.lpfnWndProc = win_proc; wc.hInstance = hi; wc.lpszClassName = CLASS_NAME;
@@ -741,26 +966,79 @@ static bool build(Gui *g, HWND parent) {
   drop_start(g);                               /* OLE first: the sliders' words need COM */
   if (FAILED(CoCreateInstance(&CLSID_AccPropServices, NULL, CLSCTX_INPROC_SERVER, &IID_IAccPropServices, (void **)&g->aps))) g->aps = NULL;
 
-  /* the main page, in Tab order */
+  /* the tab control: the first control of both main pages */
   y = 8;
+  g->tabs = ctl(g, PG_SAMPLER, WC_TABCONTROLW, L"", T | WS_CLIPSIBLINGS, 8, y, 300, 26, ID_TABS);
+  {
+    TCITEMW it; wchar_t t0[] = L"Sampler", t1[] = L"SoundFont";
+    memset(&it, 0, sizeof it); it.mask = TCIF_TEXT;
+    it.pszText = t0; SendMessageW(g->tabs, TCM_INSERTITEMW, 0, (LPARAM)&it);
+    it.pszText = t1; SendMessageW(g->tabs, TCM_INSERTITEMW, 1, (LPARAM)&it);
+  }
+  annotate(g, g->tabs, PROPID_ACC_NAME, "Player");
+  g->all[PG_FONT][g->nall[PG_FONT]++] = g->tabs;
+  g->order[PG_FONT][g->norder[PG_FONT]++] = g->tabs;
+
+  /* the Sampler page, in Tab order */
+  y += ROW;
   g->sample = labelled(g, 0, "Sample", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_SAMPLE);
   y += ROW;
   g->browse = ctl(g, 0, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_BROWSE);
   g->prev = ctl(g, 0, L"BUTTON", L"Previous file", T | BS_PUSHBUTTON, 240, y, 120, 26, ID_PREV);
   g->next = ctl(g, 0, L"BUTTON", L"Next file", T | BS_PUSHBUTTON, 368, y, 120, 26, ID_NEXT);
   y += ROW;
-  param_box(g, SMP_P_KEEP_LENGTH, 8, y, 120, 130);
-  param_box(g, SMP_P_MODE, 384, y, 160, 130);
+  param_box(g, PG_SAMPLER, SMP_P_KEEP_LENGTH, 8, y, 120, 130);
+  param_box(g, PG_SAMPLER, SMP_P_MODE, 384, y, 160, 130);
   y += ROW;
   for (id = 0, k = 0; id < SMP_NPARAMS; id++) {
     if (id == SMP_P_KEEP_LENGTH || id == SMP_P_MODE) continue;
-    param_box(g, id, k % 2 ? 384 : 8, y + (k / 2) * ROW, k % 2 ? 160 : 120, k % 2 ? 200 : 236);
+    param_box(g, PG_SAMPLER, id, k % 2 ? 384 : 8, y + (k / 2) * ROW, k % 2 ? 160 : 120, k % 2 ? 200 : 236);
     k++;
   }
   y += REST_ROWS * ROW;
   g->status = labelled(g, 0, "Status", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_STATUS);
   y += ROW;
   g->settings = ctl(g, 0, L"BUTTON", L"Settings", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_SETTINGS);
+
+  /* the SoundFont page, in Tab order (after the tab control) */
+  y = 8 + ROW;
+  g->sffile = labelled(g, PG_FONT, "SoundFont", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_FONT);
+  y += ROW;
+  g->sfbrowse = ctl(g, PG_FONT, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_SFBROWSE);
+  g->sfprev = ctl(g, PG_FONT, L"BUTTON", L"Previous file", T | BS_PUSHBUTTON, 240, y, 120, 26, ID_SFPREV);
+  g->sfnext = ctl(g, PG_FONT, L"BUTTON", L"Next file", T | BS_PUSHBUTTON, 368, y, 120, 26, ID_SFNEXT);
+  y += ROW;
+  g->sfmode = labelled(g, PG_FONT, "Mode", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 120, 200, 200, ID_SFMODE);
+  cb_add(g->sfmode, "All channels");
+  cb_add(g->sfmode, "One preset");
+  y += ROW;
+  k = g->nall[PG_FONT];                        /* One preset: in the place of the channels */
+  g->sfpreset = labelled(g, PG_FONT, "Preset", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 120, 400, 320, ID_SFPRESET);
+  g->sfchannel = labelled(g, PG_FONT, "Channel", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y + ROW, 120, 200, 320, ID_SFCHANNEL);
+  cb_add(g->sfchannel, "All channels");
+  for (id = 1; id <= NCH; id++) { char t[32]; snprintf(t, sizeof t, "Channel %d", id); cb_add(g->sfchannel, t); }
+  for (; k < g->nall[PG_FONT] && g->nmode_one < 4; k++) g->mode_one[g->nmode_one++] = g->all[PG_FONT][k];
+  k = g->nall[PG_FONT];                        /* All channels: two columns of 8, a channel and its output a row */
+  for (id = 0; id < NCH; id++) {
+    char t[48]; int x = id < 8 ? 8 : 384, yy = y + (id % 8) * ROW, o;
+    snprintf(t, sizeof t, "Channel %d", id + 1);
+    g->chan[id] = labelled(g, PG_FONT, t, L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, x, yy, 66, 120, 320, ID_CHAN + id);
+    SendMessageW(g->chan[id], CB_SETDROPPEDWIDTH, 320, 0);
+    snprintf(t, sizeof t, "Channel %d output", id + 1);
+    g->out[id] = labelled(g, PG_FONT, t, L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, x + 194, yy, 96, 76, 320, ID_OUT + id);
+    for (o = 1; o <= NCH; o++) { snprintf(t, sizeof t, "Output %d", o); cb_add(g->out[id], t); }
+  }
+  for (; k < g->nall[PG_FONT] && g->nmode_all < 4 * NCH; k++) g->mode_all[g->nmode_all++] = g->all[PG_FONT][k];
+  y += 8 * ROW;
+  param_box(g, PG_FONT, SMP_P_SF_VOLUME, 8, y, 120, 236);
+  param_box(g, PG_FONT, SMP_P_SF_VOICES, 384, y, 160, 200);
+  y += ROW;
+  param_box(g, PG_FONT, SMP_P_SF_TRANSPOSE, 8, y, 120, 236);
+  param_box(g, PG_FONT, SMP_P_SF_EFFECTS, 384, y, 160, 200);
+  y += ROW;
+  g->sfstatus = labelled(g, PG_FONT, "Status", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_SFSTATUS);
+  y += ROW;
+  g->sfsettings = ctl(g, PG_FONT, L"BUTTON", L"Settings", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_SFSETTINGS);
 
   /* Settings */
   y = 8;
@@ -784,8 +1062,8 @@ static bool build(Gui *g, HWND parent) {
   y += ROW;
   g->back = ctl(g, 1, L"BUTTON", L"Back", T | BS_PUSHBUTTON, 152, y, 120, 26, ID_BACK);
 
-  for (id = 0; id < SMP_NPARAMS; id++) show_param(g, id, true);
-  refresh(g);
+  for (id = 0; id < SMP_NALLPARAMS; id++) show_param(g, id, true);
+  show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* opens on the tab that plays */
   SetTimer(g->win, T_REFRESH, 250, NULL);
   SetTimer(g->win, T_OPEN, 150, NULL);          /* just opened: start on the first control */
   return true;
@@ -804,6 +1082,7 @@ void smp_gui_close(Plug *P) {
         g->aps->lpVtbl->ClearHwndProps(g->aps, g->sl[i].tb, (DWORD)OBJID_CLIENT, CHILDID_SELF, props, 2);
         g->aps->lpVtbl->ClearHwndProps(g->aps, g->sl[i].ed, (DWORD)OBJID_CLIENT, CHILDID_SELF, props, 1);
       }
+      g->aps->lpVtbl->ClearHwndProps(g->aps, g->tabs, (DWORD)OBJID_CLIENT, CHILDID_SELF, props, 1);
     }
     if (g->drop_registered) RevokeDragDrop(g->win);
     DestroyWindow(g->win); g->win = NULL;

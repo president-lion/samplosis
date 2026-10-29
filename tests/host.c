@@ -16,7 +16,8 @@
    message (never SendInput: someone is using the desktop). A line "focus: <class> | <name> | <value>" tells what a
    screen reader would find focused: a button's name is its text; another control's name is its accessible name
    (MSAA, as a screen reader asks for it), else the label just before it. A slider (a trackbar) shows as class
-   "Slider" with its accessible value.
+   "Slider" with its accessible value; a tab control as class "Tab" with its accessible name and, as its value, the
+   name of the tab MSAA says is selected.
      key <tab|up|down|enter|space|escape|left|right|pageup|pagedown|home|end> [shift] [ctrl]   a key, then the focus line
      char <c>                a character typed (WM_CHAR), then the focus line
      say                     the focus line
@@ -27,7 +28,11 @@
      dump                    "control: <class> | <name> | <value>" for every control that shows
      param <id>              "param <id>: <value>"
      flush                   the host's params flush: "out: gesture_begin|value|gesture_end <id> [value]"
-     state                   the saved state's sample line: "state: sample ..."
+     state [word]            the saved state's sample line: "state: sample ..."; with a word, every saved line
+                             starting with it ("state: sf_preset 0 1"), or "state: (none)"
+     midi <status> <d1> <d2> one block of 256 frames through the plugin with that MIDI event at frame 0 (the plugin
+                             is activated at 48 kHz first, and deactivated at the end)
+     drop <path>             drop the file on the plugin's window (WM_DROPFILES)
      counts                  "counts: beeps N | request_flush N | mark_dirty N"
      pump <ms>               let the window's timers run
      dialog <pick|closegui|destroy> <path>   the next file or folder dialog returns path at once; closegui first
@@ -35,6 +40,7 @@
      alive                   "alive: plugin" or "alive: plugin destroyed" (the host got this far) */
 #include <windows.h>
 #include <oleacc.h>
+#include <shlobj.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdint.h>
@@ -353,6 +359,7 @@ static int msaa(HWND h, char *name, char *value) {
   return 1;
 }
 
+static void selected_tab(HWND h, char *value);
 /* class, name and value as a screen reader finds them */
 static void describe(HWND h, char *cls, char *name, char *value) {
   wchar_t c[64] = L"", t[1100] = L"";
@@ -362,6 +369,7 @@ static void describe(HWND h, char *cls, char *name, char *value) {
   GetWindowTextW(h, t, 1100);
   if (cls_is(h, L"Button")) { utf8(t, name, 300); return; }
   if (cls_is(h, L"msctls_trackbar32")) { strcpy(cls, "Slider"); msaa(h, name, value); return; }
+  if (cls_is(h, L"SysTabControl32")) { strcpy(cls, "Tab"); msaa(h, name, NULL); selected_tab(h, value); return; }
   msaa(h, name, NULL);
   if (!name[0]) {
     HWND prev = GetWindow(h, GW_HWNDPREV);
@@ -373,6 +381,20 @@ static void describe(HWND h, char *cls, char *name, char *value) {
     if (i >= 0) SendMessageW(h, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
   }
   utf8(t, value, 1100);
+}
+/* a tab control: the name of the tab MSAA reports as selected */
+static void selected_tab(HWND h, char *value) {
+  IAccessible *a = NULL; long n = 0, i;
+  if (FAILED(AccessibleObjectFromWindow(h, (DWORD)OBJID_CLIENT, &IID_IAccessible, (void **)&a)) || !a) return;
+  a->lpVtbl->get_accChildCount(a, &n);
+  for (i = 1; i <= n; i++) {
+    VARIANT c, st; BSTR b = NULL;
+    VariantInit(&c); VariantInit(&st); c.vt = VT_I4; c.lVal = i;
+    if (FAILED(a->lpVtbl->get_accState(a, c, &st)) || st.vt != VT_I4 || !(st.lVal & STATE_SYSTEM_SELECTED)) continue;
+    if (SUCCEEDED(a->lpVtbl->get_accName(a, c, &b)) && b) { utf8(b, value, 1100); SysFreeString(b); }
+    break;
+  }
+  a->lpVtbl->Release(a);
 }
 static void say(void) {
   char c[64], n[300], v[1100];
@@ -419,7 +441,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
   DialogFn dialog = (DialogFn)GetProcAddress(dll, "smp_test_gui_dialog");
   char *text = read_file(actions, NULL), *line, *next;
   HWND top, holder; clap_window_t cw; uint32_t w = 0, h = 0;
-  HDESK desk;
+  HDESK desk; int active = 0;
   if (!gui || !beeps || !quiet) { printf("error: no gui extension or test hooks\n"); return 1; }
   if (!text) { printf("error: can't read %s\n", actions); return 1; }
   /* The window lives on a desktop of its own, before this thread has any window: it can never become the
@@ -505,10 +527,52 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       const clap_plugin_state_t *st = p->get_extension(p, CLAP_EXT_STATE);
       Mem m = {0}; clap_ostream_t os = {&m, os_write}; char *sl;
       st->save(p, &os);
-      sl = m.buf ? strstr(m.buf, "\nsample ") : NULL;
-      if (sl) { char *e = strchr(sl + 1, '\n'); if (e) *e = 0; printf("state: %s\n", sl + 1); }
-      else printf("state: no sample\n");
+      if (arg[0]) {                          /* every line starting with the word */
+        size_t k = strlen(arg); int any = 0; char *q = m.buf;
+        while (q && *q) {
+          char *e = strchr(q, '\n');
+          if (e) *e = 0;
+          if (!strncmp(q, arg, k) && (q[k] == ' ' || !q[k])) { printf("state: %s\n", q); any = 1; }
+          q = e ? e + 1 : NULL;
+        }
+        if (!any) printf("state: (none)\n");
+      } else {
+        sl = m.buf ? strstr(m.buf, "\nsample ") : NULL;
+        if (sl) { char *e = strchr(sl + 1, '\n'); if (e) *e = 0; printf("state: %s\n", sl + 1); }
+        else printf("state: no sample\n");
+      }
       free(m.buf);
+    } else if (!strcmp(a, "midi")) {        /* one block with this MIDI event at its start */
+      static float l[BLOCK], r[BLOCK]; float *ch[2] = {l, r};
+      clap_audio_buffer_t ob; clap_process_t pr; Ev e; const Ev *one[1]; EvList el = {one, 1};
+      clap_input_events_t in = {&el, el_size, el_get}; clap_output_events_t oe = {NULL, oe_push};
+      int st_ = 0, d1 = 0, d2 = 0;
+      sscanf(arg, "%d %d %d", &st_, &d1, &d2);
+      if (!active) {
+        if (!p->activate(p, 48000.0, 1, BLOCK)) { printf("error: activate failed\n"); return 1; }
+        p->start_processing(p); active = 1;
+      }
+      memset(&e, 0, sizeof e);
+      e.kind = 1; e.midi.header.type = CLAP_EVENT_MIDI; e.midi.header.size = sizeof e.midi;
+      e.midi.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+      e.midi.data[0] = (uint8_t)st_; e.midi.data[1] = (uint8_t)d1; e.midi.data[2] = (uint8_t)d2;
+      one[0] = &e;
+      memset(&ob, 0, sizeof ob); ob.data32 = ch; ob.channel_count = 2;
+      memset(&pr, 0, sizeof pr);
+      pr.frames_count = BLOCK; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
+      p->process(p, &pr);
+      main_thread(p);
+    } else if (!strcmp(a, "drop")) {        /* a file dropped on the window, as Explorer's WM_DROPFILES gives it */
+      wchar_t wp[1100]; size_t k; HGLOBAL hg; DROPFILES *df;
+      MultiByteToWideChar(CP_UTF8, 0, arg, -1, wp, 1100);
+      k = wcslen(wp);
+      hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DROPFILES) + (k + 2) * sizeof(wchar_t));
+      if (!hg || !(df = GlobalLock(hg))) { printf("error: drop\n"); return 1; }
+      df->pFiles = sizeof(DROPFILES); df->fWide = TRUE;
+      memcpy((char *)df + sizeof(DROPFILES), wp, (k + 1) * sizeof(wchar_t));
+      GlobalUnlock(hg);
+      SendMessageW(plugwin, WM_DROPFILES, (WPARAM)hg, 0);   /* the window calls DragFinish, which frees it */
+      pump(100);
     } else if (!strcmp(a, "counts")) printf("counts: beeps %ld | request_flush %d | mark_dirty %d\n", beeps(), flushes, dirties);
     else if (!strcmp(a, "pump")) pump(atoi(arg));
     else if (!strcmp(a, "dialog")) {     /* the next file or folder dialog: returns the path at once */
@@ -522,6 +586,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     else { printf("error: unknown action %s\n", a); return 1; }
   }
   free(text);
+  if (active && !plugin_gone) { p->stop_processing(p); p->deactivate(p); main_thread(p); }
   if (!plugin_gone) gui->destroy(p);
   DestroyWindow(top);
   if (!plugin_gone) main_thread(p);

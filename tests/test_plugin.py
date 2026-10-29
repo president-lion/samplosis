@@ -465,7 +465,7 @@ def test_plugin_params(P):
 
 # ---- the window, driven by messages through host.exe's gui command ----
 MAIN_ORDER = [
-    ("Edit", "Sample"), ("Button", "Browse"), ("Button", "Previous file"), ("Button", "Next file"),
+    ("Tab", "Player"), ("Edit", "Sample"), ("Button", "Browse"), ("Button", "Previous file"), ("Button", "Next file"),
     ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
     ("Slider", "Root note"), ("Slider", "Transpose"), ("Slider", "Fine tune"), ("Slider", "Volume"), ("Slider", "Pan"),
     ("Slider", "Attack"), ("Slider", "Decay"), ("Slider", "Sustain"), ("Slider", "Release"),
@@ -496,7 +496,7 @@ def got(out, tag):
 def test_gui_tab_order(P, tmp_path):
     text = P.script(P.sample())
     out = gui(P, tmp_path, text, ["say"] + ["key tab"] * len(MAIN_ORDER) +
-              ["focus Sample", "key tab shift", "focus Volume", "window", "say"])
+              ["focus Player", "key tab shift", "focus Volume", "window", "say"])
     f = got(out, "focus")
     assert [x[:2] for x in f[:len(MAIN_ORDER)]] == [list(x) for x in MAIN_ORDER], out   # opens on the first control
     assert f[len(MAIN_ORDER)][:2] == ["Button", "after"], out
@@ -654,3 +654,108 @@ def test_gui_closed_during_dialog(P, tmp_path, settings_file):
     assert got(out, "focus")[-1][:2] == ["Button", "Browse folder"]
     with open(settings_file) as fh:
         assert ("cache_dir %s\n" % new) in fh.read()
+
+
+# ---- the window's SoundFont tab ----
+SF_ORDER = ([("Tab", "Player"), ("Edit", "SoundFont"), ("Button", "Browse"), ("Button", "Previous file"),
+             ("Button", "Next file"), ("ComboBox", "Mode")] +
+            [x for n in range(1, 17) for x in (("ComboBox", "Channel %d" % n), ("ComboBox", "Channel %d output" % n))] +
+            [("Slider", "SoundFont volume"), ("Slider", "SoundFont voices"), ("Slider", "SoundFont transpose"),
+             ("ComboBox", "Reverb and chorus"), ("Edit", "Status"), ("Button", "Settings")])
+
+
+def test_gui_soundfont_tab(P, tmp_path):
+    f = P.font()
+    text = "plays sampler\n" + P.script(P.sample()) + 'soundfont "%s"\n' % f
+    out = gui(P, tmp_path, text, ["say", "key right", "state plays"] + ["key tab"] * (len(SF_ORDER) - 1) +
+              ["key tab", "dump",
+               "focus Mode", "key down", "state sf_mode", "dump",
+               "focus Preset", "key down", "state sf_preset", "key up", "key up",
+               "focus Channel", "key down", "state sf_channel", "key tab",
+               "key up", "param 31",
+               "key tab ctrl", "state plays", "focus Volume", "key tab ctrl shift", "key left", "key left",
+               "key right", "focus Mode", "key up", "say",
+               "focus Settings", "key enter", "key tab ctrl", "focus Back", "key enter", "key tab shift",
+               "key tab shift"])
+    f = got(out, "focus")
+    st = [x[0] for x in got(out, "state")]
+    assert f[0] == ["Tab", "Player", "Sampler"], out                 # opens on the tab that plays
+    assert f[1] == ["Tab", "Player", "SoundFont"], out               # Right: the SoundFont tab, and it plays
+    assert st[0] == "plays soundfont"
+    n = len(SF_ORDER)
+    assert [x[:2] for x in f[1:1 + n]] == [list(x) for x in SF_ORDER], out
+    assert f[1 + n][:2] == ["Button", "after"]
+    d = {x[1]: x[2] for x in got(out, "control")[:n]}
+    assert d["SoundFont"] == "gm.sf2, 6 presets"
+    assert d["Mode"] == "All channels" and d["Channel 1 output"] == "Output 1"
+    assert d["Reverb and chorus"] == "On" and d["SoundFont volume"] == "0.0 dB"
+    assert "Preset" not in d and "Channel" not in d
+    k = n + 2
+    assert f[k] == ["ComboBox", "Mode", "One preset"] and st[1] == "sf_mode one"
+    d2 = [x[:2] for x in got(out, "control")[n:]]
+    assert ["ComboBox", "Preset"] in d2 and ["ComboBox", "Channel"] in d2
+    assert not [x for x in d2 if x[1].startswith("Channel ")], d2   # the 32 channel combos are hidden
+    assert f[k + 1] == ["ComboBox", "Preset", "Stereo, bank 0 program 2"] and st[2] == "sf_preset 0 1"
+    assert f[k + 2] == ["ComboBox", "Preset", "Piano, bank 0 program 1"]
+    assert f[k + 3] == ["ComboBox", "Preset", "Piano, bank 0 program 1"]    # Up stops at the first
+    assert f[k + 4] == ["ComboBox", "Channel", "Channel 1"] and st[3] == "sf_channel 1"
+    assert f[k + 5][:2] == ["Slider", "SoundFont volume"]                   # Tab skips the hidden channel combos
+    assert f[k + 6] == ["Slider", "SoundFont volume", "1.0 dB"] and "param 31: 1" in out
+    assert f[k + 7] == ["Tab", "Player", "Sampler"] and st[4] == "plays sampler"     # Ctrl+Tab from any control
+    assert f[k + 8] == ["Tab", "Player", "SoundFont"]                        # Ctrl+Shift+Tab from the sampler page
+    assert f[k + 9] == f[k + 10] == ["Tab", "Player", "Sampler"]             # Left stops at the first tab
+    assert f[k + 11] == ["Tab", "Player", "SoundFont"]
+    assert f[k + 12] == ["ComboBox", "Mode", "All channels"] and f[k + 13] == f[k + 12]
+    # Settings from the SoundFont page (Ctrl+Tab does nothing there), and Back to the SoundFont page's Settings
+    assert f[k + 14][:2] == ["ComboBox", "Stretcher"] and f[k + 15] == f[k + 14]
+    assert f[k + 16][:2] == ["Button", "Settings"] and f[k + 17][:2] == ["Edit", "Status"]
+    assert f[k + 18] == ["ComboBox", "Reverb and chorus", "On"]
+
+
+def test_gui_soundfont_browse_and_drop(P, tmp_path):
+    d = tmp_path / "fonts"
+    d.mkdir()
+    for n in ("a.sf2", "B.sf2", "c.sf3"):
+        write_sf_font(d / n)
+    (d / "notes.txt").write_text("not a font")
+    wav = P.sample("drop A3.wav")
+    text = P.script(P.sample())
+    out = gui(P, tmp_path, text, ["key right", "read SoundFont", "dialog pick %s" % (d / "a.sf2"), "focus Browse",
+                                  "key enter", "read SoundFont", "focus Next file", "key enter", "read SoundFont",
+                                  "key enter", "read SoundFont", "key enter", "read SoundFont",
+                                  "focus Previous file", "key space", "read SoundFont", "state soundfont",
+                                  "drop %s" % wav, "say", "read Sample", "state plays",
+                                  "drop %s" % (d / "B.sf2"), "say", "read SoundFont", "state plays", "counts"])
+    r = [x[1] for x in got(out, "read")]
+    f = got(out, "focus")
+    assert r[0] == "No SoundFont loaded"
+    assert f[1][:2] == ["Button", "Browse"] and r[1] == "a.sf2, 6 presets"
+    assert r[2:5] == ["B.sf2, 6 presets", "c.sf3, 6 presets", "a.sf2, 6 presets"]    # wraps round
+    assert r[5] == "c.sf3, 6 presets"
+    st = [x[0] for x in got(out, "state")]
+    assert st[0] == 'soundfont "%s"' % (d / "c.sf3")
+    assert f[-2] == ["Tab", "Player", "Sampler"]                     # a dropped sample: the Sampler tab
+    assert r[6].startswith("drop A3.wav, ") and st[1] == "plays sampler"
+    assert f[-1] == ["Tab", "Player", "SoundFont"]                   # a dropped font: the SoundFont tab
+    assert r[7] == "B.sf2, 6 presets" and st[2] == "plays soundfont"
+    assert got(out, "counts")[0][0] == "beeps 0"
+
+
+def test_gui_channel_from_song(P, tmp_path):
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\n' % f
+    out = gui(P, tmp_path, text, ["say", "read Channel 2", "read Channel 10", "midi 193 33 0", "pump 400",
+                                  "read Channel 2", "focus Channel 2", "key down", "state sf_channel_preset",
+                                  "key up", "state sf_channel_preset", "focus Channel 2 output", "key down",
+                                  "state sf_output", "key end", "key down", "counts"])
+    r = [x[1] for x in got(out, "read")]
+    f = got(out, "focus")
+    st = [x[0] for x in got(out, "state")]
+    assert f[0] == ["Tab", "Player", "SoundFont"]                    # opens on the tab that plays
+    assert r[0] == "From the song (now Piano)" and r[1] == "From the song (now Kit)"
+    assert r[2] == "From the song (now Bass)"                        # program 33 on channel 2 played through
+    assert f[1] == ["ComboBox", "Channel 2", "Piano, bank 0 program 1"] and st[0] == "sf_channel_preset 2 0 0"
+    assert f[2] == ["ComboBox", "Channel 2", "From the song (now Bass)"] and st[1] == "(none)"
+    assert f[3] == ["ComboBox", "Channel 2 output", "Output 2"] and st[2] == "sf_output 2 2"
+    assert f[4] == f[5] == ["ComboBox", "Channel 2 output", "Output 16"]   # Down stops at the last
+    assert got(out, "counts")[0][0] == "beeps 0"

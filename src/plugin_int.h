@@ -57,6 +57,7 @@ int smp_plug_sf_set(Plug *P, const char *line);    /* 1 taken; 0 the line didn't
                                     One state line, like "sf_mode one", "sf_preset 0 25",
                                     "sf_channel_preset 3 0 25", "sf_channel_preset 3 song" (the song chooses again)
                                     or "sf_output 3 2"; the other settings stay. Marks the project dirty */
+int smp_plug_font_path(Plug *P, char *path, int cap);   /* 1 a font, 2 a missing one, 0 none */
 int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program);  /* the preset channel ch (1 to 16) plays
                                     now (all mode); 1 found, 0 none */
 

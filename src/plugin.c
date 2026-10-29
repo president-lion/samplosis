@@ -925,6 +925,15 @@ int smp_plug_sf_set(Plug *P, const char *line) {
   return ok;
 }
 
+int smp_plug_font_path(Plug *P, char *path, int cap) {
+  SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
+  char line[1200];
+  if (P->sf_missing && P->sf_line && font_line(P->sf_line, line, sizeof line, path, cap) == 2) return 2;
+  if (f) { snprintf(path, (size_t)cap, "%s", f->path); return 1; }
+  if (cap > 0) path[0] = 0;
+  return 0;
+}
+
 int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program) {
   return P->s ? smp_synth_channel_preset(P->s, ch, bank, program) : 0;
 }
