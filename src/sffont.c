@@ -654,7 +654,7 @@ static int setup(SmpFont *f) {
 }
 
 /* the file's full path as a new wide string, or NULL */
-static wchar_t *full_path(const char *path) {
+wchar_t *sf_full_path(const char *path) {
   wchar_t w[2048], *full; DWORD n;
   if (!path || !MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048)) return NULL;
   n = GetFullPathNameW(w, 0, NULL, NULL);
@@ -664,7 +664,7 @@ static wchar_t *full_path(const char *path) {
 }
 
 SmpFont *smp_sf_open(const char *path, char *err, int cap) {
-  wchar_t *full = full_path(path);
+  wchar_t *full = sf_full_path(path);
   WIN32_FILE_ATTRIBUTE_DATA a;
   SmpFont *f;
   int i;
@@ -690,8 +690,13 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
   }
   f = sf_parse(path, err, cap);
   if (!f) { free(full); return NULL; }
+  return sf_register(f, full, err, cap);
+}
+
+SmpFont *sf_register(SmpFont *f, wchar_t *full, char *err, int cap) {
+  const char *path = f->path ? f->path : "the font";
   f->wpath = full;
-  if (!setup(f)) goto no_memory;
+  if (!sf_finish_regions(f) || !setup(f)) goto no_memory;
   f->refs = 1;
   AcquireSRWLockExclusive(&g_lock);
   if (g_nfonts == g_capfonts) {

@@ -79,6 +79,10 @@ struct SmpFont {
      regions [rstart[i], rstart[i+1]). The modulator lists live in the same block, shared where identical. */
   SmpSfRegion *regions; int nregions;
   int *rstart;
+  /* per phdr preset, 32 bytes (sf_finish_regions): a 128-bit mask of the keys that set the last keyswitch (the
+     regions' sw_lokey..sw_hikey ranges and sw_last keys), then one of the keys that never sound (those and the
+     sw_down and sw_up keys). NULL when no region of the font has a keyswitch. */
+  uint8_t *swmask;
 
   /* ---- sharing and loading (sffont.c) ---- */
   wchar_t *wpath;                       /* the full path, compared case-insensitively by the registry */
@@ -148,6 +152,18 @@ int sf_gen_clamp(int i, int v);
 const SmpSfMod *sf_default_mods(void);
 int sf_merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz);
 int sf_build_order(SmpFont *f);
+/* sf2.c: a region's conditions at "always" (every loader calls it for each region it makes); and, once a font's
+   regions are built, the round-robin set ids and the keyswitch masks (sffont.c calls it at open; 0 out of memory).
+   A round-robin set is the regions of one preset with the same key and velocity ranges and the same conditions
+   except seq_pos (trigger, seq_len, the random range, keyswitches and CC ranges); ids count from 0 per preset. */
+void sf_cond_defaults(SmpSfCond *c);
+int sf_finish_regions(SmpFont *f);
+const uint8_t *sf_preset_swmask(const SmpFont *f, int preset);   /* public preset index: its 32 bytes, or NULL */
+/* sffont.c: registers a font a builder made (f->path, size and mtime set; wpath is taken over), as smp_sf_open does
+   after parsing: finishes its regions, sets up its loader arrays and adds it to the registry with one reference.
+   On failure the font is freed and NULL returned with a reason. */
+SmpFont *sf_register(SmpFont *f, wchar_t *full, char *err, int cap);
+wchar_t *sf_full_path(const char *path);
 #define SF_MAX_ZONE_MODS 1024
 #define SF_MAX_REGIONS (1 << 17)
 #define SF_MAX_POOL_MODS (1 << 20)

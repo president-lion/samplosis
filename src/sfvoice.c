@@ -112,12 +112,16 @@ static double source(unsigned s, const ModCtx *m) {
   }
 }
 
-static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m) {
+/* the default velocity-to-attenuation modulator (SF2.04 section 8.4.1), which a region's amp_veltrack replaces */
+static int is_vel_atten(const SmpSfMod *d) { return d->src == 0x0502 && d->dest == G_ATTEN && d->amt_src == 0; }
+
+static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m, int no_vel) {
   int i;
   for (i = 0; i < n; i++) {
     const SmpSfMod *d = &list[i];
     double y;
     if (d->dest >= SMP_SF_NGEN) continue;     /* the parser drops these; be safe */
+    if (no_vel && is_vel_atten(d)) continue;
     y = d->amount * source(d->src, m) * source(d->amt_src, m);
     if (d->trans == 2) y = fabs(y);
     sum[d->dest] += y;
@@ -132,8 +136,8 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   int i, k;
   m.c = c; m.key = v->pkey; m.vel = v->vel; m.poly_key = v->key;   /* the key source is keynum when set, as in FluidSynth */
   memset(v->mod, 0, sizeof v->mod);
-  add_mods(v->mod, r->imod, r->nimod, &m);
-  add_mods(v->mod, r->pmod, r->npmod, &m);
+  add_mods(v->mod, r->imod, r->nimod, &m, r->cond.amp_veltrack == r->cond.amp_veltrack);   /* not NaN: replaced */
+  add_mods(v->mod, r->pmod, r->npmod, &m, r->cond.amp_veltrack == r->cond.amp_veltrack);
   for (i = 0; i < SMP_SF_NGEN; i++) g[i] = r->gen[i] + v->mod[i];
 
   /* Pitch, in cents from the sample as recorded. The channel's pitch bend is not added here: it comes through
@@ -145,7 +149,7 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->ratio_k = v->srate / rate;
 
   /* gain: initialAttenuation times the EMU factor, plus the modulators' attenuation (velocity, CC7, CC11) */
-  v->atten_gain = pow(10.0, -clampd(ATTEN_FACTOR * r->gen[G_ATTEN] + v->mod[G_ATTEN], 0, 1440) / 200.0);
+  v->atten_gain = pow(10.0, -clampd(ATTEN_FACTOR * r->gen[G_ATTEN] + v->mod[G_ATTEN], 0, 1440) / 200.0) * v->cond_gain;
   {
     double th = (clampd(g[G_PAN], -500, 500) + 500) / 1000.0 * (PI / 2);   /* constant power, -3 dB each at 0 */
     v->pan_l = cos(th); v->pan_r = sin(th);
@@ -358,6 +362,37 @@ static void control(SmpSfVoice *v) {
   if (!v->filt_on) v->x1 = v->x2 = v->y1 = v->y2 = 0;
 }
 
+/* ---- the region conditions' gain ---- */
+
+/* A crossfade's position, 0..1, for value x: fading in over lo..hi it is 0 at or below lo and 1 at or above hi
+   (hi is checked first, so lo == hi is a plain step); fading out, 1 at or below lo and 0 at or above hi. As sfizz
+   and sfzformat.com's xfin_ and xfout_ opcodes have it, linear between. */
+static double xf_in(int x, int lo, int hi) { return x >= hi ? 1 : x <= lo ? 0 : (double)(x - lo) / (hi - lo); }
+static double xf_out(int x, int lo, int hi) { return x <= lo ? 1 : x >= hi ? 0 : (double)(hi - x) / (hi - lo); }
+
+/* The fixed gain of a region's conditions, as an amplitude factor:
+   - crossfades by key (when set) and velocity: the product of the fade-in and fade-out positions, through
+     xf_curve: gain is the position itself, power its square root (so two regions fading across each other keep
+     the same power: at the midpoint each is at sqrt(0.5), -3 dB);
+   - amp_veltrack (when not NaN; then the default velocity modulator is skipped): sfizz's reading of the SFZ
+     default velocity curve, amplitude (vel / 127)^2, tracked by t = amp_veltrack / 100: gain = 1 - t (1 - c)
+     for t >= 0, and |t| (1 - c) for t < 0, so 100 % is (vel / 127)^2 (-40 log10(127 / vel) dB), 0 % is flat;
+   - a release trigger's rt_decay: -rt_decay dB per second the note was held. */
+static double cond_gain(const SmpSfRegion *r, int key, int vel, double held) {
+  const SmpSfCond *c = &r->cond;
+  double x = 1, g;
+  if (c->xfin_lokey >= 0 && c->xfin_hikey >= 0) x *= xf_in(key, c->xfin_lokey, c->xfin_hikey);
+  if (c->xfout_lokey >= 0 && c->xfout_hikey >= 0) x *= xf_out(key, c->xfout_lokey, c->xfout_hikey);
+  x *= xf_in(vel, c->xfin_lovel, c->xfin_hivel) * xf_out(vel, c->xfout_lovel, c->xfout_hivel);
+  g = c->xf_curve == 1 ? x : sqrt(x);
+  if (c->amp_veltrack == c->amp_veltrack) {
+    double t = clampd(c->amp_veltrack / 100.0, -1, 1), cv = (vel / 127.0) * (vel / 127.0);
+    g *= t >= 0 ? 1 - t * (1 - cv) : -t * (1 - cv);
+  }
+  if (held >= 0 && c->rt_decay > 0) g *= pow(10.0, -c->rt_decay * held / 20.0);
+  return g;
+}
+
 /* ---- the voice ---- */
 
 static void end_voice(SmpSfVoice *v) {
@@ -392,7 +427,7 @@ static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stre
 }
 
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
-                  double rate, double transpose, SfStream *st, int slot) {
+                  double rate, double transpose, SfStream *st, int slot, double held) {
   const SmpSfSample *sh;
   SmpSfView vw;
   uint32_t frames, ls, le;
@@ -441,6 +476,7 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   v->streaming = vw.stream && ((v->looping && v->mode != 3) ? lpe > v->hf : end > v->hf);
   v->live = 1;
   if (v->streaming && st) stream_start(v, st, slot, vw.stream);
+  v->cond_gain = cond_gain(r, v->key, v->vel, held);
   derive(v, c);
   v->venv.stage = E_DELAY; v->menv.stage = E_DELAY;
   v->fade = 1;
@@ -759,7 +795,7 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
   for (i = 0; i < nreg; i++) {
     const SmpSfRegion *g = &regs[i];
     if (key < g->lokey || key > g->hikey || vel < g->lovel || vel > g->hivel) continue;
-    if (smp_sfv_start(&vs[nv], f, g, key, vel, &ch, rate, 0, st, nv)) nv++;
+    if (smp_sfv_start(&vs[nv], f, g, key, vel, &ch, rate, 0, st, nv, -1)) nv++;
   }
   for (at = 0; at < frames;) {
     long n = frames - at < TEST_BLOCK ? frames - at : TEST_BLOCK;

@@ -870,6 +870,7 @@ int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *wh
         for (k = 0; k < nch; k++) {
           SmpSfRegion r; int e;
           memset(&r, 0, sizeof r);
+          sf_cond_defaults(&r.cond);
           r.lokey = (uint8_t)lo; r.hikey = (uint8_t)hi; r.lovel = (uint8_t)vlo; r.hivel = (uint8_t)vhi;
           r.sample = w->first + chans[k];
           /* a stereo wave's left and right channels, when the region plays both, sit at the left and right; one

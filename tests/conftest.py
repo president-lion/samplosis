@@ -44,11 +44,29 @@ class SmpSfSample(ctypes.Structure):
                 ("type", ctypes.c_uint16)]
 
 
+class SmpSfCcRange(ctypes.Structure):
+    _fields_ = [("cc", ctypes.c_uint8), ("lo", ctypes.c_uint8), ("hi", ctypes.c_uint8)]
+
+
+class SmpSfCond(ctypes.Structure):
+    i8, u8 = ctypes.c_int8, ctypes.c_uint8
+    _fields_ = [("trigger", u8), ("seq_len", ctypes.c_uint16), ("seq_pos", ctypes.c_uint16),
+                ("lorand", ctypes.c_float), ("hirand", ctypes.c_float),
+                ("sw_lokey", i8), ("sw_hikey", i8), ("sw_last", i8), ("sw_down", i8), ("sw_up", i8),
+                ("sw_previous", i8), ("sw_default", i8),
+                ("locc_n", u8), ("locc", SmpSfCcRange * 4),
+                ("xfin_lokey", i8), ("xfin_hikey", i8), ("xfout_lokey", i8), ("xfout_hikey", i8),
+                ("xfin_lovel", u8), ("xfin_hivel", u8), ("xfout_lovel", u8), ("xfout_hivel", u8),
+                ("xf_curve", u8), ("group", ctypes.c_uint32), ("off_by", ctypes.c_uint32), ("off_mode", u8),
+                ("rt_decay", ctypes.c_float), ("amp_veltrack", ctypes.c_float)]
+
+
 class SmpSfRegion(ctypes.Structure):
     _fields_ = [("lokey", ctypes.c_uint8), ("hikey", ctypes.c_uint8), ("lovel", ctypes.c_uint8),
                 ("hivel", ctypes.c_uint8), ("sample", ctypes.c_int), ("gen", ctypes.c_int16 * 60),
                 ("imod", ctypes.POINTER(SmpSfMod)), ("nimod", ctypes.c_int),
-                ("pmod", ctypes.POINTER(SmpSfMod)), ("npmod", ctypes.c_int)]
+                ("pmod", ctypes.POINTER(SmpSfMod)), ("npmod", ctypes.c_int),
+                ("cond", SmpSfCond), ("rr_set", ctypes.c_int)]
 
 
 class SmpSfView(ctypes.Structure):
@@ -231,7 +249,9 @@ def lib(settings_file):
                             ("smp_synth_underruns", c_long, [vp]),
                             ("smp_synth_test_stream_pause", None, [vp, c_int]),
                             ("smp_synth_set_offline", None, [vp, c_int]),
-                            ("smp_synth_unload", c_int, [vp])):
+                            ("smp_synth_unload", c_int, [vp]),
+                            ("smp_sf_test_font", vp, [c_char_p, c_char_p, c_char_p, c_int]),
+                            ("smp_synth_test_seed", None, [vp, ctypes.c_uint])):
         if hasattr(dll, name):
             getattr(dll, name).restype = res
             getattr(dll, name).argtypes = args

@@ -161,11 +161,32 @@ typedef struct {
   char name[21]; uint32_t start, end, loop_start, loop_end;   /* SF2: sample frames into smpl; SF3: see Task 3 */
   uint32_t rate; uint8_t pitch; int8_t correction; uint16_t link, type;
 } SmpSfSample;
+/* A region's conditions (SFZ's, which Decent Sampler and GigaStudio instruments map onto). Every field defaults to
+   "always" (sf_cond_defaults in sf2.h); the SF2 family's loaders leave them so. The player checks them at note-on,
+   and at note-off for release triggers; sfsynth.c's top comment says exactly how each one works. */
+enum { SMP_TRIG_ATTACK = 0, SMP_TRIG_RELEASE = 1, SMP_TRIG_FIRST = 2, SMP_TRIG_LEGATO = 3 };
+typedef struct {
+  uint8_t trigger;              /* SMP_TRIG_* */
+  uint16_t seq_len, seq_pos;    /* round robin: plays when (counter % seq_len) + 1 == seq_pos; 0 = always */
+  float lorand, hirand;         /* random 0..1: plays when lorand <= the note's draw < hirand (0 and 1 by default) */
+  int8_t sw_lokey, sw_hikey, sw_last, sw_down, sw_up, sw_previous;   /* keyswitches; -1 = unused */
+  int8_t sw_default;            /* the keyswitch taken as last pressed before any is; -1 = none */
+  uint8_t locc_n; struct { uint8_t cc, lo, hi; } locc[4];           /* CC ranges: each must hold at note-on */
+  int8_t xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey;          /* crossfades; -1 = none */
+  uint8_t xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel;         /* 0, 0, 127, 127 by default (no fade) */
+  uint8_t xf_curve;             /* 0 power, 1 gain */
+  uint32_t group, off_by;       /* SFZ group / off_by (exclusive class is SF2's narrower form); off_by 0 = none */
+  uint8_t off_mode;             /* 0 fast, 1 normal (release) */
+  float rt_decay;               /* dB per second held, for release triggers */
+  float amp_veltrack;           /* percent; NaN = use SF2 modulators */
+} SmpSfCond;
 typedef struct {
   uint8_t lokey, hikey, lovel, hivel; int sample;            /* index into the font's samples */
   int16_t gen[SMP_SF_NGEN];
   const SmpSfMod *imod; int nimod;   /* instrument level, the 10 default modulators merged in (identical ones replaced) */
   const SmpSfMod *pmod; int npmod;   /* preset level, added on top */
+  SmpSfCond cond;
+  int rr_set;                        /* its round-robin set within its preset (worked out at open), -1 without seq */
 } SmpSfRegion;
 typedef struct SmpFont SmpFont;
 SMP_API SmpFont *smp_sf_open(const char *path, char *err, int cap);  /* headers only; NULL and a plain reason */
@@ -226,6 +247,16 @@ SMP_API long smp_sf_test_decodes(void);                     /* tests: compressed
    preset and waits for its samples first (main thread). Returns the number of voices started, -1 on error. */
 SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double rate, long frames, long release_at,
                              float *out_lr);
+/* sftest.c, tests only: a font built from a description, so region conditions can be tested without a loader for
+   them. One item per line:
+     sample NAME FRAMES RATE ROOT sine HZ AMP [loop START END]     (a generated sine, 16-bit)
+     preset BANK PROGRAM NAME
+     region name=value ...    (in the last preset: sample=N, lokey hikey lovel hivel, gN=V for generator N, and the
+                               condition fields by their SmpSfCond names; locc<N>=lo and hicc<N>=hi for CC N;
+                               trigger=attack|release|first|legato, xf_curve=power|gain, off_mode=fast|normal)
+   The samples are written to path, and the font is registered under it, so smp_synth_load(path) (or smp_sf_open)
+   while it is open shares it. Returns it with one reference (smp_sf_close), or NULL and a reason. Main thread. */
+SMP_API SmpFont *smp_sf_test_font(const char *desc, const char *path, char *err, int cap);
 
 /* The SoundFont player (sfsynth.c): 16 MIDI channels on one font, up to 1024 voices, 16 stereo outputs.
    Threads: main (new, free, load, script, collect, font), audio (midi, process, reset), and set_param from any
@@ -292,6 +323,8 @@ SMP_API long smp_synth_underruns(const SmpSynth *s);   /* stream underruns so fa
 SMP_API void smp_synth_test_stream_pause(SmpSynth *s, int on);   /* tests: the streamer reads nothing */
 SMP_API int smp_synth_test_voice(const SmpSynth *s, int i, int *chan, int *key, int *released);   /* tests: 1 when
                                     voice slot i (0..1087) is sounding, with its channel (0..15), key and release */
+SMP_API void smp_synth_test_seed(SmpSynth *s, unsigned seed);   /* tests: seeds the random draw of lorand/hirand
+                                    (main thread while nothing processes) */
 #ifdef __cplusplus
 }
 #endif

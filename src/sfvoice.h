@@ -48,6 +48,8 @@ typedef struct SmpSfVoice {
   double chan_tune;                      /* RPN fine and coarse tuning, in cents */
   /* what the generators work out to */
   double cents0, ratio_k, atten_gain, pan_l, pan_r, rev_send, cho_send, q_lin, q_gain;
+  double cond_gain;                      /* the region conditions' fixed gain: crossfades, amp_veltrack and a release
+                                            trigger's rt_decay, worked out at start (1 for the SF2 family) */
   double v_delay, v_attack, v_hold, v_decay, v_sus_db, v_release;       /* samples, and dB of attenuation */
   double m_delay, m_attack, m_hold, m_decay, m_sus, m_release;          /* samples, and the 0..1 level */
   SmpSfEnv venv, menv;
@@ -75,10 +77,12 @@ typedef struct SmpSfVoice {
 } SmpSfVoice;
 
 /* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. st and slot:
-   the player's streamer and the voice's slot in it, for samples longer than their head (st may be NULL). */
+   the player's streamer and the voice's slot in it, for samples longer than their head (st may be NULL). held: for
+   a release trigger, the seconds its note was held (its level falls rt_decay dB per second of that); negative for
+   any other voice. */
 struct SfStream;
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
-                  double rate, double transpose, struct SfStream *st, int slot);
+                  double rate, double transpose, struct SfStream *st, int slot, double held);
 int smp_sfv_needs_ring_now(const SmpSfVoice *v);       /* the voice's first frames are past its head (an offline
                                                           render waits for the streamer then) */
 int smp_sfv_ring_low(SmpSfVoice *v);                   /* the voice streams and its ring holds less than half a ring

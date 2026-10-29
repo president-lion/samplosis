@@ -698,6 +698,7 @@ static int build_regions(SmpFont *f, char *why, int wcap) {
         r = &reg[nreg];
         memset(r, 0, sizeof *r);
         r->lokey = klo; r->hikey = khi; r->lovel = vlo; r->hivel = vhi; r->sample = s;
+        sf_cond_defaults(&r->cond);
         if (v1) {
           sf1_region(r, &iz, have_ig ? &ig : NULL, &pz, have_pg ? &pg : NULL);
         } else for (i = 0; i < SMP_SF_NGEN; i++) {
@@ -743,6 +744,100 @@ fail:
   free(ibase); free(ibase_n); free(pbase);
   free(rstart); free(pool.m); free(pool.slot_off); free(pool.slot_n);
   return ok;
+}
+
+/* ---- region conditions ---- */
+
+void sf_cond_defaults(SmpSfCond *c) {
+  memset(c, 0, sizeof *c);
+  c->lorand = 0; c->hirand = 1;
+  c->sw_lokey = c->sw_hikey = c->sw_last = c->sw_down = c->sw_up = c->sw_previous = c->sw_default = -1;
+  c->xfin_lokey = c->xfin_hikey = c->xfout_lokey = c->xfout_hikey = -1;
+  c->xfin_lovel = 0; c->xfin_hivel = 0; c->xfout_lovel = 127; c->xfout_hivel = 127;
+  c->amp_veltrack = (float)NAN;
+}
+
+/* the parts of a region that decide its round-robin set: its ranges and its conditions but seq_pos. Copied field
+   by field into a zeroed key, so padding never makes two equal regions differ. */
+typedef struct {
+  uint8_t lokey, hikey, lovel, hivel, trigger, locc_n;
+  int8_t sw[7];
+  uint16_t seq_len;
+  float lorand, hirand;
+  uint8_t locc[12];
+} SetKey;
+
+static void set_key(const SmpSfRegion *r, SetKey *k) {
+  const SmpSfCond *c = &r->cond; int i;
+  memset(k, 0, sizeof *k);
+  k->lokey = r->lokey; k->hikey = r->hikey; k->lovel = r->lovel; k->hivel = r->hivel;
+  k->trigger = c->trigger; k->locc_n = c->locc_n > 4 ? 4 : c->locc_n; k->seq_len = c->seq_len;
+  k->sw[0] = c->sw_lokey; k->sw[1] = c->sw_hikey; k->sw[2] = c->sw_last; k->sw[3] = c->sw_down;
+  k->sw[4] = c->sw_up; k->sw[5] = c->sw_previous; k->sw[6] = c->sw_default;
+  k->lorand = c->lorand; k->hirand = c->hirand;
+  for (i = 0; i < k->locc_n; i++) { k->locc[3 * i] = c->locc[i].cc; k->locc[3 * i + 1] = c->locc[i].lo; k->locc[3 * i + 2] = c->locc[i].hi; }
+}
+
+static void mask_set(uint8_t *m, int key) { if (key >= 0 && key < 128) m[key >> 3] |= (uint8_t)(1 << (key & 7)); }
+
+/* Round-robin set ids, per preset, by a hash table of the set keys (open addressing, sized at twice the preset's
+   regions with seq), so a preset of many thousands of regions takes no quadratic search. And the keyswitch masks. */
+int sf_finish_regions(SmpFont *f) {
+  int p, i, any_sw = 0, maxn = 0;
+  int *slot = NULL; SetKey *keys = NULL;
+  if (!f->regions || f->nphdr <= 0) return 1;
+  for (i = 0; i < f->nregions; i++) {
+    const SmpSfCond *c = &f->regions[i].cond;
+    f->regions[i].rr_set = -1;
+    if (c->sw_lokey >= 0 || c->sw_last >= 0 || c->sw_down >= 0 || c->sw_up >= 0) any_sw = 1;
+  }
+  for (p = 0; p < f->nphdr; p++) {
+    int n = 0;
+    for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) if (f->regions[i].cond.seq_len) n++;
+    if (n > maxn) maxn = n;
+  }
+  if (maxn) {
+    int cap = 4;
+    while (cap < 2 * maxn) cap *= 2;
+    slot = malloc((size_t)cap * sizeof *slot);   /* a region index per slot, -1 empty */
+    keys = malloc((size_t)cap * sizeof *keys);
+    if (!slot || !keys) { free(slot); free(keys); return 0; }
+    for (p = 0; p < f->nphdr; p++) {
+      int next = 0;
+      for (i = 0; i < cap; i++) slot[i] = -1;
+      for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) {
+        SmpSfRegion *r = &f->regions[i]; SetKey k; unsigned h = 2166136261u; size_t b; int j;
+        if (!r->cond.seq_len) continue;
+        set_key(r, &k);
+        for (b = 0; b < sizeof k; b++) h = (h ^ ((const uint8_t *)&k)[b]) * 16777619u;
+        for (j = (int)(h & (unsigned)(cap - 1)); ; j = (j + 1) & (cap - 1)) {
+          if (slot[j] < 0) { slot[j] = i; keys[j] = k; r->rr_set = next++; break; }
+          if (!memcmp(&keys[j], &k, sizeof k)) { r->rr_set = f->regions[slot[j]].rr_set; break; }
+        }
+      }
+    }
+    free(slot); free(keys);
+  }
+  if (any_sw) {
+    f->swmask = calloc((size_t)f->nphdr, 32);
+    if (!f->swmask) return 0;
+    for (p = 0; p < f->nphdr; p++) {
+      uint8_t *last = f->swmask + 32 * (size_t)p, *quiet = last + 16;
+      for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) {
+        const SmpSfCond *c = &f->regions[i].cond; int k;
+        if (c->sw_lokey >= 0) for (k = c->sw_lokey; k <= c->sw_hikey && k < 128; k++) mask_set(last, k);
+        mask_set(last, c->sw_last);
+        mask_set(quiet, c->sw_down); mask_set(quiet, c->sw_up);
+      }
+      for (i = 0; i < 16; i++) quiet[i] |= last[i];
+    }
+  }
+  return 1;
+}
+
+const uint8_t *sf_preset_swmask(const SmpFont *f, int preset) {
+  if (!f || !f->swmask || preset < 0 || preset >= f->nphdr) return NULL;
+  return f->swmask + 32 * (size_t)f->order[preset];
 }
 
 /* parses a font's headers into a new SmpFont (sffont.c's smp_sf_open shares it through the registry) */
@@ -903,6 +998,7 @@ void sf_free(SmpFont *f) {
   free(f->path); free(f->phdr); free(f->pbag); free(f->pmod); free(f->pgen); free(f->inst);
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */
+  free(f->swmask);
   free(f);
 }
 
