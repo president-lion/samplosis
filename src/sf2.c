@@ -164,8 +164,11 @@ static int parse_pdta(SmpFont *f, const uint8_t *p, uint32_t size, char *why, in
   }
   for (i = 0; i < f->nshdr; i++) {
     SmpSfSample *s = &f->shdr[i];
+    /* stereo links are never used (each zone plays its own sample), so a bad one is cleared, not refused: the
+       sample plays as a mono one */
     if ((s->type & (SF_RIGHT | SF_LEFT | SF_LINKED)) && s->link >= f->nshdr) {
-      snprintf(why, wcap, "sample %s is linked to sample %u, but there are %d", s->name, s->link, f->nshdr); return 0;
+      s->link = 0;
+      s->type = (uint16_t)((s->type & ~(SF_RIGHT | SF_LEFT | SF_LINKED)) | SF_MONO);
     }
     if (s->type & SF_VORBIS) f->is_sf3 = 1;
   }

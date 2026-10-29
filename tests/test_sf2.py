@@ -374,6 +374,28 @@ def test_bad_instrument_in_a_zone_fails(lib, tmp_path):
     assert "badinst.sf2 isn't a SoundFont this can read (" in err and "instrument 9" in err, err
 
 
+def test_bad_stereo_link_is_cleared(lib, tmp_path):
+    # a right sample linked to sample 99 of 3: links are never used, so the font opens and the sample is mono
+    samples = [dict(SAMPLES[0], type=2, link=99), SAMPLES[1], dict(SAMPLES[2], type=4, link=1)]
+    path = tmp_path / "badlink.sf2"
+    write_sf2(str(path), PRESETS, samples)
+    f, err = sf_open(lib, path)
+    assert f, err
+    try:
+        h = lib.smp_sf_sample(f, 0).contents
+        assert (h.type, h.link) == (1, 0)
+        h = lib.smp_sf_sample(f, 2).contents
+        assert (h.type, h.link) == (4, 1)                  # a good link stays as it is
+        walk_font(lib, f)
+        piano = lib.smp_sf_find_preset(f, 0, 0)
+        lib.smp_sf_use(f, piano, 1)                         # the piano (sample 0) still loads
+        assert lib.smp_sf_wait_idle(f, 5000) == 0
+        assert lib.smp_sf_loaded_samples(f) == 1
+        lib.smp_sf_use(f, piano, -1)
+    finally:
+        lib.smp_sf_close(f)
+
+
 def test_duplicate_presets_first_wins(lib, tmp_path):
     path = tmp_path / "dup.sf2"
     write_sf2(str(path), [preset([inst([zone(0)])], name="First"), preset([inst([zone(2)])], name="Second")],
