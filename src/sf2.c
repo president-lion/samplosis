@@ -435,7 +435,7 @@ static const SmpSfMod DEFMODS[SF_NDEFMOD] = {
 
 /* a fair cap on how many regions one font may make, so a damaged file can't ask for gigabytes
    (a big General MIDI font makes a few thousand) */
-#define MAX_REGIONS (1 << 17)
+#define MAX_REGIONS SF_MAX_REGIONS
 
 /* one zone's generators as read: the values it sets (a bit per generator in set), its ranges, and the instrument
    or sample id it ends with (link; -1 when there is none, which makes a first zone the global one) */
@@ -534,7 +534,7 @@ static int mod_ok(const SmpSfMod *m) {
 
 /* at most this many modulators are read from one zone (the rest are ignored), so a damaged or hostile file
    can't make merging take hours. Real zones have a handful. */
-#define MAX_ZONE_MODS 1024
+#define MAX_ZONE_MODS SF_MAX_ZONE_MODS
 
 /* adds a zone's modulators to list (n long): each replaces an identical one already there, or is added to the end.
    Invalid ones are skipped. Within one zone a later identical modulator replaces the earlier one, as SF2.04
@@ -551,6 +551,13 @@ static int merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz) {
   return n;
 }
 
+/* for the other loaders (sf2.h) */
+void sf_gen_defaults(int16_t *gen) { int i; for (i = 0; i < SMP_SF_NGEN; i++) gen[i] = GENS[i].def; }
+int sf_gen_clamp(int i, int v) { return i >= 0 && i < SMP_SF_NGEN ? clampi(v, GENS[i].lo, GENS[i].hi) : v; }
+const SmpSfMod *sf_default_mods(void) { return DEFMODS; }
+int sf_merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz) { return merge_mods(list, n, zm, nz); }
+int sf_build_order(SmpFont *f) { return build_order(f); }
+
 /* the modulator lists, stored once each: identical lists share one copy. The defaults are always at 0. */
 typedef struct {
   SmpSfMod *m; int n, cap;
@@ -564,7 +571,7 @@ static unsigned hash_mods(const SmpSfMod *m, int n) {
 }
 
 /* the most modulators all the lists together may hold (10 MB), so a hostile file can't fill memory */
-#define MAX_POOL_MODS (1 << 20)
+#define MAX_POOL_MODS SF_MAX_POOL_MODS
 
 /* the offset of this list in the pool, adding it if it isn't there yet; -1 when out of memory, -2 when the
    pool would grow past MAX_POOL_MODS */
@@ -768,8 +775,17 @@ SmpFont *sf_parse(const char *path, char *err, int cap) {
   f->size = s.size;
   f->mtime = (uint64_t)mt.dwHighDateTime << 32 | mt.dwLowDateTime;
 
-  if (!rd(&s, 0, h, 12) || memcmp(h, "RIFF", 4) || (memcmp(h + 8, "sfbk", 4) && memcmp(h + 8, "sfpk", 4))) {
+  if (!rd(&s, 0, h, 12) || memcmp(h, "RIFF", 4) ||
+      (memcmp(h + 8, "sfbk", 4) && memcmp(h + 8, "sfpk", 4) && memcmp(h + 8, "DLS ", 4))) {
     if (err && cap > 0) snprintf(err, cap, "%s isn't a SoundFont", base_name(path));
+    goto done;
+  }
+  if (!memcmp(h + 8, "DLS ", 4)) {   /* Downloadable Sounds: sfdls.c builds the same model */
+    f->is_dls = 1;
+    f->path = _strdup(path);
+    if (!f->path) snprintf(why, sizeof why, "out of memory");
+    else if (sf_parse_dls(f, s.h, s.size, path, why, sizeof why)) { ok = 1; goto done; }
+    if (err && cap > 0) snprintf(err, cap, "%s isn't a DLS file this can read (%s)", base_name(path), why);
     goto done;
   }
   f->is_pack = !memcmp(h + 8, "sfpk", 4);

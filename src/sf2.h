@@ -47,6 +47,8 @@ typedef struct {
   uint8_t enc;               /* PCM_FILE: SMP_PCM_* */
   uint8_t channels, channel; /* PCM_FILE: frames are interleaved over channels; this sample is one channel */
   uint64_t key;              /* DECODED: cache key of a decoded mono float copy in the disk cache (sffont.c) */
+  uint8_t wrap;              /* DECODED: the bytes are a DLS wave's LIST chunk, which reads as a RIFF WAVE file once
+                                its two ids are changed (LIST to RIFF, wave to WAVE); sffont.c does that */
 } SmpSrc;
 
 struct SmpFont {
@@ -57,6 +59,8 @@ struct SmpFont {
   int is_sf3;                           /* any sample is compressed (SF3 or SF4) */
   int version;                          /* ifil's major number (1 for SoundFont 1; 0 when the file has no ifil) */
   int is_pack;                          /* SF2Pack: smpl is one compressed stream of the whole 16-bit sample data */
+  int is_dls;                           /* DLS (sfdls.c): only phdr, shdr, src, paths, order and regions are filled */
+  int dls_ignored;                      /* DLS: connection blocks that map to nothing here (see sfdls.c) */
   SfPhdr *phdr; int nphdr;
   SfBag *pbag; int npbag;
   SmpSfMod *pmod; int npmod;
@@ -135,6 +139,19 @@ enum { SF_ST_NONE, SF_ST_PUBLISHED, SF_ST_RETIRED, SF_ST_BROKEN };
 /* sf2.c: parse a font's headers into a new SmpFont, and free one */
 SmpFont *sf_parse(const char *path, char *err, int cap);
 void sf_free(SmpFont *f);
+/* sf2.c, for the other loaders that build SF2's model themselves: every generator's default; a value held to its
+   generator's range; SF2's ten default modulators; merging a zone's modulators into a list (identical ones
+   replaced, invalid ones skipped; returns the new length); and the sorted preset order (0 when out of memory) */
+void sf_gen_defaults(int16_t *gen);
+int sf_gen_clamp(int i, int v);
+const SmpSfMod *sf_default_mods(void);
+int sf_merge_mods(SmpSfMod *list, int n, const SmpSfMod *zm, int nz);
+int sf_build_order(SmpFont *f);
+#define SF_MAX_ZONE_MODS 1024
+#define SF_MAX_REGIONS (1 << 17)
+#define SF_MAX_POOL_MODS (1 << 20)
+/* sfdls.c: fills f from a DLS file (RIFF form "DLS ", already checked) open on h; 0 with why when it can't */
+int sf_parse_dls(SmpFont *f, HANDLE h, uint64_t size, const char *path, char *why, int wcap);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);
 /* cache.c: a positional read on a handle opened with FILE_FLAG_OVERLAPPED, waited for on an event of the calling

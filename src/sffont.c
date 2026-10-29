@@ -217,6 +217,10 @@ static SfPcm *load_decoded(SmpFont *f, const SmpSrc *c, uint32_t rate, int *brok
       if (c->length > 0x7fffffffu) { *broken = 1; return NULL; }
       if (!(bytes = malloc((size_t)c->length))) return NULL;
       if (!read_at(h, c->offset, bytes, c->length)) { free(bytes); *broken = 1; return NULL; }
+      if (c->wrap && c->length >= 12) {   /* a DLS wave's LIST chunk: the same bytes as a RIFF WAVE file but the ids */
+        memcpy(bytes, "RIFF", 4);
+        memcpy(bytes + 8, "WAVE", 4);
+      }
       x = decode_memory(bytes, (size_t)c->length, &ch, &frames, &r, err, sizeof err);
       free(bytes);
     } else {
