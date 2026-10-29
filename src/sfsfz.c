@@ -1772,6 +1772,7 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
   p->collect = 0;
   if (!feed(p, ctx, full, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
+  if (p->too_many) ignored(p, "too many regions (some left out)");   /* a partly loaded instrument says so */
   if (cancelled(p)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
   if (p->oom) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
   pcache_write(p, full);

@@ -25,19 +25,25 @@
    - start, end, loopStart, loopEnd: offset, end, loop_start, loop_end (frames; end and loopEnd are the last frame
      played, as Decent Sampler's defaults of the length minus 1 say);
    - loopEnabled: true is loop_continuous, looping the whole sample when no loop points are given and the file has
-     none; false is no_loop; left out, the file's own loop counts (SFZ's rule);
+     none; false is no_loop; left out, the file's own loop counts (SFZ's rule: the guide gives loopEnabled no
+     default, and says embedded loop markers are used when loopStart and loopEnd aren't given);
    - ampEnvEnabled false: one_shot (the sample plays to its end whatever the note-offs), unless it loops;
    - attack, decay, sustain, release (seconds; sustain 0..1, as percent), and ampEnvAttack, ampEnvDecay,
      ampEnvSustain, ampEnvRelease, which win over them on the same element; ampEnvDelay, ampEnvHold: ampeg_*.
      Decent Sampler's guide gives no defaults, so SFZ's apply (instant attack and release, full sustain);
-   - pitchKeyTrack, ampVelTrack (0..1): pitch_keytrack, amp_veltrack (percent);
+   - pitchKeyTrack, ampVelTrack (0..1): pitch_keytrack, amp_veltrack (percent). Velocity sets the gain linearly
+     (the guide: at ampVelTrack 1, velocity 63 is gain 0.5), so every region gets a straight velocity curve
+     (amp_velcurve_127=1) in place of SFZ's squared one;
    - trigger: attack, release, first, legato (continuous is counted and plays as attack);
-   - releaseTriggerDecay: rt_decay (dB a second with a dB suffix; a linear value v is the share lost a second, so
-     -20 log10(1 - v) dB);
+   - releaseTriggerDecay: rt_decay (dB a second with a dB suffix, either sign, as the guide turns a positive value
+     into a decay; a linear value v, "the linear gain decay factor per second" with 0 for no decay, is taken as
+     the share lost a second, so -20 log10(1 - v) dB);
    - seqMode round_robin: seq_length and seq_position (seqPosition 1 by default; seqLength 0 or left out is the
-     highest seqPosition among the round-robin samples with the same key and velocity ranges, which is the set the
-     player cycles); random and true_random: the note's random draw split by position, lorand (position - 1) /
-     length to hirand position / length (both kinds may repeat a sample); always: every time;
+     highest seqPosition among the instrument's round-robin samples, since the guide asks for seqLength when sets of
+     different lengths are mixed; the counter is the player's, per set of regions with the same ranges); random
+     and true_random: the note's random draw split by position, lorand (position - 1) / length to hirand position
+     / length, the length found the same way among random samples (both kinds may repeat a sample, where the
+     guide's random avoids repeating one); always: every time;
    - tags and silencedByTags: SFZ's group and off_by. Each tag named in some silencedByTags gets a number; a
      sample's group is its first such tag (its own tags, then its group's), its off_by the first tag of its
      silencedByTags. A sample with two such tags, or silenced by two, is counted ("tags beyond the first"): the
@@ -49,7 +55,8 @@
    <effects>, <modulators>, <midi>, <tags>, <keyswitches> ...), as "<name>". The UI's knobs then stay at their
    defaults: a library whose release or tone is only set by a knob's binding plays without it. name, enabled and
    the root's own attributes are read past. Decent Sampler plays a centred voice 5.3 dB below its source (its
-   limiter's headroom); that isn't copied, so presets may sound louder here. */
+   limiter's headroom); that isn't copied, so presets may sound louder here. A cap reached while reading (too many
+   elements, attributes or silencing tags) is counted too, so a partly loaded preset says so. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,22 +96,25 @@ static const char *const anames[NA] = {
 typedef struct {
   const char *a[NA];
   int ncc; int cc[MAX_CC]; const char *cclo[MAX_CC], *cchi[MAX_CC];
+  /* its tags (pass 1, read once per element): the first silencing tag's number and whether there is another one;
+     the same for its silencedByTags */
+  int tag_id, tag_more, by_id, by_more;
 } Look;
 
 /* a string to number map (open addressing) */
 typedef struct { char **key; int *val; int n, cap; } Map;
-
-/* the round-robin lengths found: key (kind, ranges) to the highest position */
-typedef struct { uint64_t *key; int *max; int n, cap; } SeqMap;
 
 typedef struct {
   char *pool; size_t npool, cappool;
   El *el; int nel, capel;
   Attr *at; int nat, capat;
   Map silencers;                         /* tags named in some silencedByTags, numbered from 1 */
-  SeqMap seq;
+  int seq_max[2];                        /* the highest seqPosition of round_robin [0] and random [1] samples */
   int pass;                              /* 0: the scan before the builder; 1: feeding it */
   SfzBuild *b;
+  int (*cancel)(void *); void *carg;
+  /* caps reached while reading: told in the ignored count */
+  int elems_capped, attrs_capped, tags_capped;
   char num[64];
 } D;
 
@@ -216,27 +226,6 @@ static void map_free(Map *m) {
   memset(m, 0, sizeof *m);
 }
 
-/* the round-robin lengths: a slot for key, made when absent (NULL when memory ran out) */
-static int *seq_slot(SeqMap *s, uint64_t key) {
-  unsigned i;
-  if ((s->n + 1) * 2 > s->cap) {
-    int nc = s->cap ? s->cap * 2 : 64, j;
-    uint64_t *nk = malloc((size_t)nc * sizeof *nk); int *nm = malloc((size_t)nc * sizeof *nm);
-    if (!nk || !nm || nc > (1 << 26)) { free(nk); free(nm); return NULL; }
-    for (j = 0; j < nc; j++) nk[j] = 0;
-    for (j = 0; j < s->cap; j++) if (s->key[j]) {
-      unsigned q = (unsigned)fnv(&s->key[j], 8) & (unsigned)(nc - 1);
-      while (nk[q]) q = (q + 1) & (unsigned)(nc - 1);
-      nk[q] = s->key[j]; nm[q] = s->max[j];
-    }
-    free(s->key); free(s->max); s->key = nk; s->max = nm; s->cap = nc;
-  }
-  i = (unsigned)fnv(&key, 8) & (unsigned)(s->cap - 1);
-  while (s->key[i] && s->key[i] != key) i = (i + 1) & (unsigned)(s->cap - 1);
-  if (!s->key[i]) { s->key[i] = key; s->max[i] = 0; s->n++; }
-  return &s->max[i];
-}
-
 /* ---- the XML into the tree ---- */
 
 static int pool_add(D *d, const char *s, size_t n) {
@@ -258,7 +247,7 @@ static int parse_xml(D *d, const char *t, size_t n, char *why, int wcap) {
   yxml_t x;
   void *stack = malloc(DS_STACK);
   char *val = malloc(DS_MAX_VALUE + 1);
-  int cur[DS_LEVELS], depth = 0, attr_el = -1, ok = 0, k;
+  int cur[DS_LEVELS], depth = 0, attr_el = -1, ok = 0, k, vfull = 0;
   size_t vn = 0, i;
   if (!stack || !val) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
   for (k = 0; k < DS_LEVELS; k++) cur[k] = -1;
@@ -269,6 +258,7 @@ static int parse_xml(D *d, const char *t, size_t n, char *why, int wcap) {
     switch (r) {
       case YXML_ELEMSTART: {
         int parent = depth > 0 && depth <= DS_LEVELS ? cur[depth - 1] : -1, e = -1;
+        if (depth < DS_LEVELS && (depth == 0 || parent >= 0) && d->nel >= DS_MAX_ELEMS) d->elems_capped = 1;
         if (depth < DS_LEVELS && (depth == 0 || parent >= 0) && d->nel < DS_MAX_ELEMS &&
             grow((void **)&d->el, &d->capel, d->nel + 1, sizeof *d->el)) {
           int nm = pool_add(d, x.elem, strlen(x.elem));
@@ -292,13 +282,16 @@ static int parse_xml(D *d, const char *t, size_t n, char *why, int wcap) {
         if (depth < DS_LEVELS) cur[depth] = -1;
         attr_el = -1;
         break;
-      case YXML_ATTRSTART: vn = 0; break;
+      case YXML_ATTRSTART: vn = 0; vfull = 0; break;
       case YXML_ATTRVAL: {
         size_t L = strlen(x.data);
-        if (vn + L <= DS_MAX_VALUE) { memcpy(val + vn, x.data, L); vn += L; }
+        /* past 64 KB nothing more is kept, so the value is its first 64 KB, never pieces spliced together */
+        if (!vfull && vn + L <= DS_MAX_VALUE) { memcpy(val + vn, x.data, L); vn += L; }
+        else vfull = 1;
         break;
       }
       case YXML_ATTREND:
+        if (attr_el >= 0 && d->nat >= DS_MAX_ATTRS) d->attrs_capped = 1;
         if (attr_el >= 0 && d->el[attr_el].first_attr + d->el[attr_el].nattr == d->nat && d->nat < DS_MAX_ATTRS &&
             grow((void **)&d->at, &d->capat, d->nat + 1, sizeof *d->at)) {
           int an = pool_add(d, x.attr, strlen(x.attr)), av = an >= 0 ? pool_add(d, val, vn) : -1;
@@ -327,6 +320,18 @@ static void ignored(D *d, const char *name) {
   if (d->pass == 1) sfz_ignored(d->b, name);
 }
 
+/* the next tag of a comma-separated list from *p: its start and length (0 at the end) */
+static size_t next_tag(const char **p, const char **start) {
+  const char *s = *p, *e;
+  size_t n;
+  while (*s && (sp(*s) || *s == ',')) s++;
+  for (e = s; *e && *e != ','; e++) {}
+  *p = e;
+  for (n = (size_t)(e - s); n && sp(s[n - 1]); n--) {}
+  *start = s;
+  return n;
+}
+
 /* an element's attributes by number; others counted (unless count is 0) */
 static void look(D *d, int e, Look *l, int count) {
   int k, j;
@@ -350,6 +355,28 @@ static void look(D *d, int e, Look *l, int count) {
       }
     }
     if (count) ignored(d, nm);
+  }
+  /* tags, read once per element: pass 0 numbers every tag named in a silencedByTags; pass 1 finds this element's
+     first silencing tag and first silencer (and whether it has more than one of either) */
+  {
+    const char *v, *t; size_t n;
+    if (d->pass == 0) {
+      if ((v = l->a[A_SILENCEDBY]) != NULL)
+        while ((n = next_tag(&v, &t)) != 0) if (!map_add(&d->silencers, t, n)) { d->tags_capped = 1; break; }
+      return;
+    }
+    if ((v = l->a[A_TAGS]) != NULL)
+      while ((n = next_tag(&v, &t)) != 0) {
+        int id = map_find(&d->silencers, t, n);
+        if (!id || id == l->tag_id) continue;
+        if (!l->tag_id) l->tag_id = id; else { l->tag_more = 1; break; }
+      }
+    if ((v = l->a[A_SILENCEDBY]) != NULL)
+      while ((n = next_tag(&v, &t)) != 0) {
+        int id = map_find(&d->silencers, t, n);
+        if (!id || id == l->by_id) continue;
+        if (!l->by_id) l->by_id = id; else { l->by_more = 1; break; }
+      }
   }
 }
 
@@ -385,23 +412,6 @@ static int seq_mode(const char *v) {
   return SEQ_BAD;
 }
 
-static uint64_t seq_key(int kind, int lokey, int hikey, int lovel, int hivel) {
-  return (uint64_t)1 << 40 | (uint64_t)(kind == SEQ_RR) << 32 | (uint64_t)(uint8_t)lokey << 24 |
-         (uint64_t)(uint8_t)hikey << 16 | (uint64_t)(uint8_t)lovel << 8 | (uint8_t)hivel;
-}
-
-/* the next tag of a comma-separated list from *p: its start and length (0 at the end) */
-static size_t next_tag(const char **p, const char **start) {
-  const char *s = *p, *e;
-  size_t n;
-  while (*s && (sp(*s) || *s == ',')) s++;
-  for (e = s; *e && *e != ','; e++) {}
-  *p = e;
-  for (n = (size_t)(e - s); n && sp(s[n - 1]); n--) {}
-  *start = s;
-  return n;
-}
-
 static void op(D *d, const char *name, const char *value) { sfz_opcode(d->b, name, value); }
 
 static void opn(D *d, const char *name, double v) {
@@ -419,14 +429,7 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   if ((v = inh(s, g, gs, A_SEQPOSITION)) != NULL && num(v, &x)) pos = x < 1 ? 1 : x > 65535 ? 65535 : (int)floor(x + 0.5);
   if ((v = inh(s, g, gs, A_SEQLENGTH)) != NULL && num(v, &x)) len = x < 0 ? 0 : x > 65535 ? 65535 : (int)floor(x + 0.5);
   if (d->pass == 0) {
-    if ((mode == SEQ_RR || mode == SEQ_RANDOM) && !len) {
-      int *m = seq_slot(&d->seq, seq_key(mode, lokey, hikey, lovel, hivel));
-      if (m && pos > *m) *m = pos;
-    }
-    if ((v = inh(s, g, gs, A_SILENCEDBY)) != NULL) {
-      const char *t; size_t n;
-      while ((n = next_tag(&v, &t)) != 0) map_add(&d->silencers, t, n);
-    }
+    if ((mode == SEQ_RR || mode == SEQ_RANDOM) && pos > d->seq_max[mode == SEQ_RANDOM]) d->seq_max[mode == SEQ_RANDOM] = pos;
     return;
   }
   if (!path || !path[0]) return;                     /* no sample to play */
@@ -439,7 +442,7 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   if (level_db(gs->a[A_GLOBALVOLUME] ? gs->a[A_GLOBALVOLUME] : gs->a[A_VOLUME], &x)) total += x;
   if (level_db(g->a[A_GROUPVOLUME] ? g->a[A_GROUPVOLUME] : g->a[A_VOLUME], &x)) total += x;
   if (level_db(s->a[A_VOLUME], &x)) total += x;
-  opn(d, "volume", total < -144 ? -144 : total);
+  opn(d, "volume", total < -144 ? -144 : total > 24 ? 24 : total);   /* the builder's range */
   total = 0;
   if (num(gs->a[A_GLOBALTUNING], &x)) total += x;
   if (num(g->a[A_GROUPTUNING], &x)) total += x;
@@ -452,6 +455,7 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   opn(d, "pan", total < -100 ? -100 : total > 100 ? 100 : total);
   if (num(inh(s, g, gs, A_PITCHKEYTRACK), &x)) opn(d, "pitch_keytrack", x * 100);
   if (num(inh(s, g, gs, A_AMPVELTRACK), &x)) opn(d, "amp_veltrack", x * 100);
+  op(d, "amp_velcurve_127", "1");      /* gain linear in velocity (63 is 0.5 at ampVelTrack 1), as the guide says */
   /* playback and the loop */
   if ((v = inh(s, g, gs, A_START)) != NULL) op(d, "offset", v);
   if ((v = inh(s, g, gs, A_END)) != NULL) op(d, "end", v);
@@ -485,16 +489,13 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
     r = strtod(q, &e);
     if (e != q && isfinite(r)) {
       while (sp(*e)) e++;
-      if (!((e[0] == 'd' || e[0] == 'D') && (e[1] == 'b' || e[1] == 'B')))
-        r = r <= 0 ? 0 : r >= 1 ? 200 : -20 * log10(1 - r);   /* linear: the share lost a second */
+      if ((e[0] == 'd' || e[0] == 'D') && (e[1] == 'b' || e[1] == 'B')) r = fabs(r);   /* a decay either sign */
+      else r = r <= 0 ? 0 : r >= 1 ? 200 : -20 * log10(1 - r);   /* linear: the share lost a second */
       opn(d, "rt_decay", r < 0 ? 0 : r > 200 ? 200 : r);
     }
   }
   if (mode == SEQ_RR || mode == SEQ_RANDOM) {
-    if (!len) {
-      int *m = seq_slot(&d->seq, seq_key(mode, lokey, hikey, lovel, hivel));
-      len = m && *m > 0 ? *m : pos;
-    }
+    if (!len) len = d->seq_max[mode == SEQ_RANDOM] > 0 ? d->seq_max[mode == SEQ_RANDOM] : pos;
     if (len < 1) len = 1;
     if (pos > len) pos = len;
     if (mode == SEQ_RR) { opn(d, "seq_length", len); opn(d, "seq_position", pos); }
@@ -504,24 +505,9 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   }
   /* tags: the sample's group is its first silencing tag (its own, then its group's), off_by its first silencer */
   {
-    int grp = 0, extra = 0, by = 0, pass;
-    for (pass = 0; pass < 2; pass++) {
-      const char *list = pass == 0 ? s->a[A_TAGS] : g->a[A_TAGS], *t; size_t n;
-      if (!list) continue;
-      while ((n = next_tag(&list, &t)) != 0) {
-        int id = map_find(&d->silencers, t, n);
-        if (!id || id == grp) continue;
-        if (!grp) grp = id; else extra = 1;
-      }
-    }
-    if ((v = inh(s, g, gs, A_SILENCEDBY)) != NULL) {
-      const char *t; size_t n;
-      while ((n = next_tag(&v, &t)) != 0) {
-        int id = map_find(&d->silencers, t, n);
-        if (!id || id == by) continue;
-        if (!by) by = id; else extra = 1;
-      }
-    }
+    const Look *byl = s->a[A_SILENCEDBY] ? s : g->a[A_SILENCEDBY] ? g : gs;
+    int grp = s->tag_id ? s->tag_id : g->tag_id, by = byl->by_id;
+    int extra = s->tag_more || g->tag_more || (s->tag_id && g->tag_id && s->tag_id != g->tag_id) || byl->by_more;
     if (grp) opn(d, "group", grp);
     if (by) opn(d, "off_by", by);
     if (extra) ignored(d, "tags beyond the first");
@@ -573,7 +559,7 @@ static int walk(D *d) {
         }
         look(d, smp, &s, 1);
         sample(d, &s, &g, &gs);
-        if ((++done & 0xFFF) == 0 && d->b && sfz_cancelled(d->b)) return 0;
+        if ((++done & 0xFFF) == 0 && (d->b ? sfz_cancelled(d->b) : d->cancel && d->cancel(d->carg))) return 0;
       }
     }
   }
@@ -585,6 +571,9 @@ static int feed_ds(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int w
   (void)full;
   d->b = b; d->pass = 1;
   sfz_header(b, "global");                           /* SFZ's defaults; every value is given per region */
+  if (d->elems_capped) sfz_ignored(b, "too many elements (some samples left out)");
+  if (d->attrs_capped) sfz_ignored(b, "too many attributes (some left out)");
+  if (d->tags_capped) sfz_ignored(b, "too many silencing tags (some left out)");
   if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); return 0; }
   return 1;
 }
@@ -618,7 +607,8 @@ int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg,
   if (!parse_xml(d, t, (size_t)sz.QuadPart, why, wcap)) goto done;
   free(t); t = NULL;
   d->pass = 0;
-  walk(d);                                           /* the round-robin lengths and the silencing tags */
+  d->cancel = cancel; d->carg = carg;
+  if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }   /* round-robin lengths, silencing tags */
   ok = sfz_build(f, path, feed_ds, d, cancel, carg, why, wcap);
   if (ok == 0 && !strcmp(why, "it has no regions with samples")) snprintf(why, (size_t)wcap, "it has no samples to play");
 done:
@@ -627,7 +617,6 @@ done:
   if (d) {
     free(d->pool); free(d->el); free(d->at);
     map_free(&d->silencers);
-    free(d->seq.key); free(d->seq.max);
     free(d);
   }
   return ok;

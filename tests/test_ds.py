@@ -56,6 +56,7 @@ def test_ds_mapping(lib, tmp_path):
       <sample path="st.flac" rootNote="76" loNote="76" hiNote="76"/>
       <sample path="sub/a&amp;b.wav" rootNote="77" loNote="77" hiNote="77" ampEnvAttack="0.5" attack="2"/>
     </group>
+    <group ampVelTrack="1"><sample path="a.wav" rootNote="78" loNote="78" hiNote="78"/></group>
     <group enabled="false"><sample path="a.wav" rootNote="80" loNote="80" hiNote="80"/></group>
   </groups>
   <effects><effect type="lowpass" frequency="22000"/></effects>
@@ -67,7 +68,7 @@ def test_ds_mapping(lib, tmp_path):
     try:
         assert presets(lib, f) == [(0, 0, "Mapped Keys")]
         r = regions(lib, f, 0)
-        assert [x.lokey for x in r] == [60, 70, 72, 73, 74, 75, 76, 76, 77]
+        assert [x.lokey for x in r] == [60, 70, 72, 73, 74, 75, 76, 76, 77, 78]
         a = r[0]
         assert (a.lokey, a.hikey, a.lovel, a.hivel, a.gen[58]) == (60, 64, 10, 100, 62)
         assert cents(a) == 70                                       # groupTuning 1 + tuning -0.3 semitones
@@ -98,6 +99,9 @@ def test_ds_mapping(lib, tmp_path):
         assert rms(x[2000:20000, 0]) > 1.5 * rms(x[2000:20000, 1])  # panned left
         y, nv = note(lib, f, 77)
         assert nv == 1 and rms(y) > 0.01                            # the &amp; in its path was decoded
+        hi, _ = note(lib, f, 78, vel=127)
+        lo, _ = note(lib, f, 78, vel=63)
+        assert abs(db(rms(lo[2000:20000]), rms(hi[2000:20000])) - db(63, 127)) < 0.2   # gain linear in velocity
         x, nv = note(lib, f, 80)
         assert nv == 0                                              # the disabled group
     finally:
@@ -182,7 +186,7 @@ def test_ds_release_trigger(lib, tmp_path):
     path = write_ds(tmp_path / "rel.dspreset", """<DecentSampler>
   <groups>
     <group><sample path="s300.wav" rootNote="60" loNote="60" hiNote="60"/></group>
-    <group trigger="release" releaseTriggerDecay="6dB">
+    <group trigger="release" releaseTriggerDecay="-6dB">
       <sample path="s900.wav" rootNote="60" loNote="60" hiNote="60"/>
     </group>
     <group><sample path="s300.wav" rootNote="61" loNote="61" hiNote="61" trigger="first"/>
@@ -191,6 +195,8 @@ def test_ds_release_trigger(lib, tmp_path):
       <sample path="s300.wav" rootNote="62" loNote="62" hiNote="62" silencingMode="normal"/>
     </group>
     <group tags="closed"><sample path="s500.wav" rootNote="64" loNote="64" hiNote="64"/></group>
+    <group trigger="release" releaseTriggerDecay="0.5"><sample path="s900.wav" rootNote="66" loNote="66" hiNote="66"/>
+    </group>
   </groups>
 </DecentSampler>
 """)
@@ -201,6 +207,7 @@ def test_ds_release_trigger(lib, tmp_path):
         assert (r[2].cond.trigger, r[3].cond.trigger) == (2, 3)
         assert r[4].cond.off_by != 0 and r[4].cond.off_by == r[5].cond.group and r[4].cond.off_mode == 1
         assert r[4].cond.group != r[5].cond.group and r[5].cond.off_by == 0
+        assert abs(r[6].cond.rt_decay - 20 * math.log10(2)) < 1e-3      # linear 0.5: half the gain lost a second
     finally:
         lib.smp_sf_close(f)
     p = Player(lib, tmp_path, path)
@@ -295,6 +302,8 @@ def test_ds_corrupt(lib, tmp_path):
                     b'><sample path="a.wav" rootNote="60"/></group></groups></DecentSampler>')
     variants.append(b'<DecentSampler><groups><group><sample path="a.wav" rootNote="60" ' + b"x" * 100000 +
                     b'="1"/></group></groups></DecentSampler>')
+    variants.append(b'<DecentSampler><groups><group><sample path="' + b"x" * 65535 + "é".encode() + b'a.wav"'
+                    b' rootNote="60"/></group></groups></DecentSampler>')        # a character across the 64 KB cap
     variants.append(b"\xef\xbb\xbf<DecentSampler><groups><group><sample path=\"a.wav\" rootNote=\"60\" "
                     b"loNote=\"-5\" hiNote=\"300\" loVel=\"200\" start=\"-7\" end=\"99999999999\" seqPosition=\"-1\""
                     b" seqLength=\"70000\" volume=\"nan\" pan=\"1e300\" tuning=\"inf\" attack=\"-1\"/>"
@@ -315,3 +324,35 @@ def test_ds_corrupt(lib, tmp_path):
         else:
             assert err
     assert opened_n > 0
+
+
+def test_ds_xml_refusals_and_caps(lib, tmp_path):
+    """A DOCTYPE with entities (one a billion-laughs chain) and a &#0; reference are refused quickly, never
+    expanded; a preset past the element cap opens with what fits and says so in the ignored count."""
+    import time
+    write_wav(tmp_path / "a.wav", sine(RATE // 4, 440.0))
+    laughs = b'<!DOCTYPE DecentSampler [<!ENTITY a "aaaaaaaaaa">' + b"".join(
+        b'<!ENTITY %c "%s">' % (98 + i, (b"&%c;" % (97 + i)) * 10) for i in range(9)) + b"]>"
+    bad = [
+        laughs + b'<DecentSampler><groups><group><sample path="&j;.wav" rootNote="60"/></group></groups></DecentSampler>',
+        b'<!DOCTYPE DecentSampler [<!ENTITY p "a.wav">]><DecentSampler><groups><group><sample path="&p;"'
+        b' rootNote="60"/></group></groups></DecentSampler>',
+        b'<DecentSampler><groups><group><sample path="a&#0;.wav" rootNote="60"/></group></groups></DecentSampler>',
+    ]
+    path = tmp_path / "x.dspreset"
+    for v in bad:
+        path.write_bytes(v)
+        t = time.time()
+        f, err = sf_open(lib, path)
+        assert time.time() - t < 2
+        assert not f and "x.dspreset" in err, err
+    many = (b'<DecentSampler><groups><group><sample path="a.wav" rootNote="60" loNote="60" hiNote="60"/>' +
+            b"<sample/>" * (1 << 18) + b"</group></groups></DecentSampler>")
+    path.write_bytes(many)
+    f = opened(lib, path)
+    try:
+        assert len(regions(lib, f, 0)) == 1
+        n, first = ignored(lib, f)
+        assert n >= 1 and first.startswith("too many elements"), (n, first)
+    finally:
+        lib.smp_sf_close(f)
