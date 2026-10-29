@@ -334,7 +334,8 @@ not its name, so a misnamed file still loads.
    before version 4) and Monkey's Audio (.ape).
 3. Windows (Media Foundation, whatever this Windows decodes; files only): on Windows 11 here that is AAC and ALAC
    in .m4a, .mp4 and .m4b, WMA, AC-3 and AMR (.amr, .3gp). Other machines may decode more or less (a Windows "N"
-   edition needs the Media Feature Pack). The status then says "Ready: x.m4a (decoded by Windows)".
+   edition needs the Media Feature Pack). AC-3 in particular depends on the machine: it needs Windows' Dolby
+   decoder, which some Windows installations don't have; there FFmpeg decodes it, if it is installed. The status then says "Ready: x.m4a (decoded by Windows)".
 4. FFmpeg, if it is installed (files only): anything else it decodes, such as DSF and DFF (DSD), TTA, Musepack
    (.mpc), Speex (.spx), E-AC-3, DTS, MLP and TrueHD, AU (.au, .snd), VOC, and the sound of Matroska, WebM and
    QuickTime files (.mka, .mkv, .webm, .mov). While it works the status says "Decoding x.dsf with FFmpeg", then
@@ -503,10 +504,13 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 - `install.bat` copies `samplosis.clap` to `D:\clap`. If the copy fails, close REAPER first.
 - `python -m pytest tests -q` runs the tests (needs numpy, soundfile and psutil). Some of them open test windows.
 - `python tests\measure.py` prints the CPU and memory numbers below, the SoundFont ones too when
-  E:\samplepacks\soundfonts\just_t4_fixed.sf2 exists. Set MEASURE_DIR to a folder on a roomy drive; it needs a few GB for a
-  while and deletes its work folder at the end. MEASURE_PARTS picks parts (sampler, sf2, stream, dls, sfz; all by
-  default). The stream part writes a 1 GB instrument to MEASURE_STREAM_DIR (default
-  E:\samplepacks\_build\samplosis_stream_test) and deletes it; MEASURE_SFZ names a real .sfz to try.
+  E:\samplepacks\soundfonts\just_t4_fixed.sf2 exists. Its work folder is MEASURE_DIR, else E:\samplepacks\_build, else
+  the drive of the cache folder (never the system temp folder on C:); it needs a few GB for a while and deletes its
+  work folder at the end. MEASURE_PARTS picks parts (sampler, sf2, stream, gig, dls, sfz; all by default). The
+  stream part writes a 1 GB instrument to MEASURE_STREAM_DIR (default E:\samplepacks\_build\samplosis_stream_test)
+  and deletes it (MEASURE_STREAM_NOTES, _RUNS, _PURGE, _REF, _KEEP and _FEATURES change what it plays; the top of
+  measure.py says how); the gig part writes a 2 GB compressed .gig and deletes it; MEASURE_SFZ names a real .sfz to
+  try; MEASURE_DLL measures another build (for before-and-after numbers).
 
 ## Measured numbers
 
@@ -562,7 +566,9 @@ warm-cache times; a first read from a cold disk is slower.
 Measured on 2026-10-29 on the same machine, with `python tests\measure.py` (MEASURE_DIR on D:), the SoundFont parts at
 below-normal priority. E: is a USB hard disk.
 
-just_t4_fixed.sf2 against the stage 2 numbers above (the rule: at most 10 percent worse), four runs:
+just_t4_fixed.sf2 against the stage 2 numbers above (the rule: at most 10 percent worse), four runs, each one
+`MEASURE_PARTS=sf2 python tests\measure.py` (the 40-open median came from a loop of 40 smp_sf_open calls on the
+same file, run by hand):
 
 - Opening the font: 3 to 4 ms in a single open, 2.18 ms median over 40 opens (1.83 to 2.58), against stage 2's 2 ms;
   1.6 to 3.2 MB, against 1 to 3 MB.
@@ -570,37 +576,68 @@ just_t4_fixed.sf2 against the stage 2 numbers above (the rule: at most 10 percen
   against 11, 8 and 7 ms and 52.4 MB in all. Much better: only the heads are loaded.
 - CPU for 66 organ voices: 2.63 to 3.05 percent with reverb and chorus off (stage 2: 2.7), 2.88 to 3.18 percent with
   them on (stage 2: 2.9). The medians, 2.67 and 3.08, are within the 10 percent; single runs vary by about 0.4.
-- A second instance with a note playing: 2.1 to 2.7 MB, against 2.3 MB. The worst run is 17 percent more: the
-  64 KB ring of each streaming voice, accepted when streaming came in.
+- A second instance with a note playing: 2.1 to 2.7 MB, against 2.3 MB. The worst run is 17 percent more, which is
+  over the 10 percent rule: it is the 64 KB ring of each streaming voice, accepted when streaming came in (idle,
+  the second instance is within the rule: 6.8 to 8.2 percent more).
 - The Sampler, for reference: 0.79 and 0.85 percent CPU for 16 voices (keep length off and on), 8.9 MB idle, 23.2 MB
   with a 60 second sample and its 97 copies.
 
 A GigaStudio-sized instrument streaming from E:. measure.py writes an SFZ piano to
 E:\samplepacks\_build\samplosis_stream_test: 88 keys, 4 velocity layers, 352 stereo 16-bit 44.1 kHz WAV files of
-17 seconds each, 1.06 GB in all, made from 8 repeated test tones, and deletes it afterwards.
+17 seconds each, 1.06 GB in all, made from 8 repeated test tones, and deletes it afterwards. E: is a Transcend
+StoreJet USB hard disk on Windows' Bulk-Only driver (USBSTOR, not UAS: one command at a time, so it can't reorder
+reads).
 
 - What "cold" means here: Windows keeps files it has read in memory, and the cache can't be emptied without
   administrator rights. So after writing, each file is opened once unbuffered while nothing else has it open, which
-  makes Windows drop its cached pages. Proof that it worked: a test file then read at 23 to 28 MB per second (the
-  USB disk), and at 2 to 3.4 GB per second the second time (from memory). Before each run everything is closed and
+  makes Windows drop its cached pages. Proof that it worked: a test file then read at 22 to 28 MB per second (the
+  USB disk), and at 2 to 3.2 GB per second the second time (from memory). Before each run everything is closed and
   purged this way, and the frames that stream were never read before, so they come from the disk: the disk counters
-  showed 54 MB read during the 64-voice runs and 105 MB during the 128-voice ones, which is what the notes need.
-- Opening it cold (every sample file's header read): 4.9 to 5.1 seconds. Opening it again: 10 ms (the headers are
-  remembered in the cache folder). Memory for the open instrument: 0.2 to 1.3 MB.
-- Loading its heads cold (the first quarter second of all 704 mono halves): 8.3 to 8.6 seconds including the open,
-  15.6 MB of heads for 1.06 GB of samples; the process grew 17 to 19 MB (the player and the heads).
-- 64 voices (32 stereo notes struck within 43 ms, each a different file) for 10 seconds in real time from the cold
-  disk, four runs: 0, 690, 708 and 1109 underruns (counted per voice and per 256-frame block, out of about 120,000).
-  Compared with the same notes rendered offline (which waits for the disk), the dropouts were in the first second
-  (0.5 to 0.8 s: every voice needs its first read from the disk at once, and 32 cold seeks take longer than the
-  quarter second of head), plus one 100 ms window at 4.5 seconds in two runs. Elsewhere the output was exact. CPU:
-  0.67 s for the 10 s; memory grew 2 to 4 MB while playing (the rings).
-- 128 voices (64 stereo notes struck within 85 ms), five runs: 676 to 11118 underruns, all in the first 1.5
-  seconds; exact after that.
-- The same piano from the file cache (warm, read before): 0 underruns at 128 voices, in runs of 1, 3 and 10 seconds.
-- So streaming keeps up with 64 voices from a USB hard disk once notes are under way, but a big chord struck all at
-  once on samples never read since the computer started can drop out for about half a second. **The target of no
-  underruns from a cold disk is missed** for that case; see "Known limits".
+  show 30, 56 and 107 MB read during the 32-, 64- and 128-voice runs, which is what the notes need.
+- Opening it cold (every sample file's header read): 4.7 to 5.1 seconds. Opening it again: 8 to 12 ms (the headers
+  are remembered in the cache folder). Loading its heads cold: 6.2 to 9.2 seconds including the open, 15.6 MB of
+  heads for 1.06 GB of samples.
+- The final streaming fixes (deadline order: the voices with the least sound left go first, counting their head in
+  memory; each visit reads a voice's ring full in one go) against the build before them, measured on 2026-10-29
+  with `MEASURE_PARTS=stream MEASURE_STREAM_RUNS=1 python tests\measure.py` (32, 64 and 128 voices: 16, 32 and 64
+  stereo notes struck within 85 ms, each a different file, 10 seconds in real time), three rounds alternating the
+  old build (MEASURE_DLL) and the new one. Underruns, counted per voice and per 256-frame block (out of about
+  60,000, 120,000 and 240,000):
+
+  | voices | before (three runs) | after (three runs) |
+  |---|---|---|
+  | 32 | 138, 180, 2 | 10, 45, 80 |
+  | 64 | 1015, 1528, 222 | 1640, 94, 0 |
+  | 128 | 8284, 10074, 10547 | 5594, 1782, 4291 |
+
+  Earlier clean runs of the same setting gave 12, 108 and 596 at 64 voices and 3635, 11393 and 3918 at 128.
+- Compared with the same notes rendered offline (which waits for the disk), the dropouts are a few 100 ms windows
+  around 0.6 to 1.3 seconds: every voice's first refill after its head and the first ring comes from the disk at
+  about the same moment, and 32 to 64 cold seeks on this disk take longer than the 0.37 seconds a ring holds. After
+  that the voices drift apart and Windows' read-ahead keeps up (a stray window or two later in some runs).
+- From the file cache (warm: not purged), 128 voices: 25 underruns (before: 353); 64 voices: 0 (before: 8).
+- What was tried and measured no better on this disk, and is off (switches for measuring, smp_sfs_test_features):
+  several voices' reads in flight at once (worse at 64 and 128 voices: the disk can't reorder them, and they break
+  up each file's sequential reads), one read for both halves of a stereo file (Windows serves the second half from
+  its cache anyway), short urgent reads "just enough" to lift a voice over a target (twice the seeks), reading
+  0.4 seconds past each head into the file cache at load (it only moves the dropouts from 0.6 to 1.4 seconds), and
+  handles opened for sequential reads.
+- So streaming keeps up with 64 voices from a USB hard disk in most cold runs and with 128 voices from the file
+  cache, but a big chord struck all at once, on samples never read since the computer started, can still drop out
+  for a few hundred milliseconds about 0.6 to 1.3 seconds in, more often at 128 voices. **The target of no
+  underruns from a cold disk is not fully met**; the physics: a ring holds 0.37 s, and one seek on this disk takes
+  10 to 20 ms, so about 20 to 35 voices can be refilled from cold places within one ring. Longer heads or rings
+  (memory) would be the next step; see "Known limits".
+
+A compressed GigaStudio file at project open (measure.py's "gig" part: a 2.02 GB .gig of 352 compressed waves,
+written by tests\gigmake.exe on E: and deleted afterwards). A project's state load parses on the main thread.
+
+- Before: opening it cold took 726 seconds (3 GB read: libgig scanned every compressed frame), 93 seconds the
+  second time, 1.9 seconds warm.
+- Now libgig scans a wave's frames only when it is first decoded, and the parse is kept in the cache folder: the
+  first open cold takes 4.0 seconds (2 MB read: the chunk headers), every later open of the unchanged file 0.15
+  seconds cold and 1 ms warm. Decoding the first wave cold: 0.4 seconds (its bytes are read through first, in big
+  pieces; it took 58 seconds when libgig read it frame by frame).
 
 gm.dls (C:\Windows\System32\drivers\gm.dls, read only): opens in 12 ms with 235 presets and 495 samples (1.5 to
 1.9 MB). The piano loads in 4 ms (0.5 MB of samples). A C major chord and the C above, offline and in real time:
@@ -629,9 +666,11 @@ offline and in real time:
   copies it no longer reaches.
 - One sample per instance in the Sampler.
 - Streaming from a slow disk: a big chord struck all at once, on samples not read since the computer started, can
-  drop out for about half a second on a USB hard disk before the disk catches up (see "Formats (stage 3)" in the
-  measured numbers). Notes already playing, and samples read before, keep up. Each sample keeps only a quarter
-  second in memory.
+  drop out for a few hundred milliseconds about 0.6 to 1.3 seconds in on a USB hard disk (rarely at 64 voices, more
+  often at 128) before the disk catches up (see "Formats (stage 3)" in the measured numbers). Notes already playing,
+  and samples read before, keep up. Each sample keeps only a quarter second in memory.
+- A GigaStudio file's first open reads its chunk headers all through the file (4 seconds for a 2 GB file on the USB
+  disk, cold); later opens of the unchanged file read the parse from the cache folder.
 - A saved project loads its sample while REAPER waits. A sample not yet in the cache that needs FFmpeg can hold up
   opening the project while it decodes (up to 60 seconds without output before FFmpeg is given up).
 - Windows decoding: when Windows marks an encoder delay itself, the padding at the end isn't trimmed; files that
@@ -652,9 +691,10 @@ offline and in real time:
 - NRPN and SysEx beyond the GM, GS and XG resets are ignored. There are no data increment and decrement (CC96, CC97).
 - Reverb and chorus are not on the extra outputs (those channels are dry).
 - Linked modulators are ignored (as in FluidSynth).
-- One loader thread serves every instance: while an SF2Pack unpacks (up to about 10 seconds), other instances'
-  presets wait. If the cache folder doesn't exist the first time an SF2Pack is used, that pack stays unplayable until
-  it is opened again.
+- One loader thread and one decode worker serve every instance. Heads load at once whatever is decoding, but
+  decodes take turns: while an SF2Pack unpacks (up to about 10 seconds) or a big compressed sample decodes, another
+  instance's samples that need decoding wait for it. If the cache folder doesn't exist the first time an SF2Pack is
+  used, that pack stays unplayable until it is opened again.
 - DLS: a bank with both bank select bytes set uses only the MSB; when a region has its own articulation it replaces
   the instrument's whole articulation (the usual reading of the DLS text); the sustain level is read as 1000 minus
   the level in centibels (Wine and SpessaSynth agree), which can differ by up to 4 dB from other readings.
