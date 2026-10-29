@@ -18,6 +18,7 @@ typedef struct Plug {
   volatile LONG silence;             /* the audio thread resets the player not playing at its next block */
   volatile LONG offline;             /* the host renders offline (clap.render) */
   int bad;                           /* the last state was refused: the status says why */
+  int active;                        /* between activate and deactivate (main thread): process may run */
   int sf_missing;                    /* the state's SoundFont couldn't be loaded: silent; its lines are kept */
   char *sf_line, *sf_used;           /* then its soundfont and sf_used lines, written back on save */
   char sf_err[1400];                 /* then "Missing: <path>" or why it didn't load */
@@ -48,10 +49,12 @@ void smp_plug_status_text(Plug *P, char *out, int cap);  /* "Keep length: 40 of 
 int smp_plug_plays(Plug *P);                       /* 0 the sampler, 1 the SoundFont player */
 void smp_plug_set_plays(Plug *P, int which);       /* marks the project dirty and silences the other player */
 int smp_plug_load_font(Plug *P, const char *path, char *err, int cap);  /* 1 loaded (and plays it); 0 and a reason */
-SmpSynth *smp_plug_synth(Plug *P);
+SmpSynth *smp_plug_synth(Plug *P);                 /* ask each time: activate at a new rate replaces the player,
+                                                      so a pointer kept from before may have been freed */
 void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "No SoundFont loaded" or
                                                           "Missing: <path>" */
-void smp_plug_sf_set(Plug *P, const char *line);   /* one state line, like "sf_mode one", "sf_preset 0 25",
+int smp_plug_sf_set(Plug *P, const char *line);    /* 1 taken; 0 the line didn't read (nothing changed: beep).
+                                    One state line, like "sf_mode one", "sf_preset 0 25",
                                     "sf_channel_preset 3 0 25", "sf_channel_preset 3 song" (the song chooses again)
                                     or "sf_output 3 2"; the other settings stay. Marks the project dirty */
 int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program);  /* the preset channel ch (1 to 16) plays

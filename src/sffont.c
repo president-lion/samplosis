@@ -58,6 +58,12 @@ static volatile LONG g_grace = DEFAULT_GRACE_MS;
 
 void smp_sf_test_grace(int ms) { InterlockedExchange(&g_grace, ms > 0 ? ms : DEFAULT_GRACE_MS); }
 
+static volatile LONG g_pause;              /* tests: the loader does nothing while set */
+void smp_sf_test_pause(int on) {
+  InterlockedExchange(&g_pause, on ? 1 : 0);
+  if (!on && g_wake) SetEvent(g_wake);
+}
+
 /* ---- loading one sample ---- */
 
 static SfPcm *new_pcm(uint32_t frames) {
@@ -234,6 +240,7 @@ static DWORD WINAPI loader(void *arg) {
     int i;
     WaitForSingleObject(g_wake, wait);
     if (g_stop) break;
+    if (g_pause) { wait = 10; continue; }
     /* a font closed mid-walk shifts the list; its close sets g_wake, so a skipped font gets the next pass */
     for (i = 0;; i++) {
       SmpFont *f; DWORD t;

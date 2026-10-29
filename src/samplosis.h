@@ -168,6 +168,7 @@ SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once eve
                                     need is loaded (or broken), 1 on timeout. Pending retires don't count as busy */
 SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
+SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_grace(int ms);                     /* tests: the time before an unneeded sample is freed
                                     (0 or less: back to 2000) */
 /* sfvoice.c, tests: plays one note of a preset (public index) on a default channel (GM reset controllers, bend
@@ -189,7 +190,12 @@ SMP_API void smp_synth_midi(SmpSynth *s, const uint8_t *msg, int len, int at);  
                                     note_on: note on and off, CC, program, pressure, poly pressure, bend, and the GM,
                                     GS and XG reset SysEx; at is the frame offset in the next block */
 SMP_API void smp_synth_process(SmpSynth *s, float *const *outs /* 32: L,R per output */, int n);  /* audio thread */
-SMP_API void smp_synth_reset(SmpSynth *s);       /* audio thread: every voice off, controllers reset */
+SMP_API void smp_synth_reset(SmpSynth *s);       /* audio thread: every voice off, controllers reset, and the
+                                    sf_used presets let go */
+SMP_API void smp_synth_flush(SmpSynth *s, int now);   /* audio thread, or main while nothing processes: every voice
+                                    off (now: at once, else a 5 ms fade), controllers reset, reverb and chorus tails
+                                    cleared; the sf_used presets stay held (their countdown or the next state lets
+                                    them go). For a host's reset, which comes on stop, seek and loop */
 SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v);   /* ids SMP_P_SF_*, any thread */
 SMP_API double smp_synth_get_param(const SmpSynth *s, int id);
 SMP_API int smp_synth_script_write(const SmpSynth *s, char *out, int cap);     /* like snprintf; main thread */
@@ -208,6 +214,9 @@ SMP_API int smp_synth_collect(SmpSynth *s);   /* main thread: closes replaced fo
                                     of; returns how many still wait */
 SMP_API SmpFont *smp_synth_font(const SmpSynth *s);   /* main thread: the font loaded last, or NULL */
 /* for the plugin (plugin.c) */
+SMP_API void smp_synth_collect_now(SmpSynth *s);   /* main thread, only while nothing processes (the plugin
+                                    isn't active): takes the newest font and configuration as the audio thread
+                                    would, then closes every replaced font */
 SMP_API int smp_synth_unload(SmpSynth *s);   /* main thread: no font (silence); the old one closes like a replaced
                                     one (smp_synth_collect). 1 ok, 0 out of memory (the font stays) */
 SMP_API void smp_synth_set_offline(SmpSynth *s, int on);   /* any thread: an offline render (the host's

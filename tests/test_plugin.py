@@ -18,8 +18,9 @@ NP = 35         # the sampler's 31 and the SoundFont player's 4
 VOLUME = 3
 
 
-def host(*args, timeout=120):
-    r = subprocess.run([HOST, CLAP, *[str(a) for a in args]], capture_output=True, text=True, timeout=timeout)
+def host(*args, timeout=120, env=None):
+    r = subprocess.run([HOST, CLAP, *[str(a) for a in args]], capture_output=True, text=True, timeout=timeout,
+                       env=dict(os.environ, **env) if env else None)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -86,13 +87,13 @@ def P(lib, tmp_path):
             y, _ = sf.read(str(out), dtype="float32")
             return y
 
-        def play(self, text, events, frames, rate=None, all_outputs=False):
+        def play(self, text, events, frames, rate=None, all_outputs=False, env=None):
             st = self.state_file(text)
             ev = tmp_path / "events.txt"
             ev.write_text(events + "\nlength %d\n" % frames)
             out = tmp_path / "plug.wav"
             args = ["play", st, ev, out] + ([rate or 48000, "all"] if all_outputs else [rate] if rate else [])
-            code, so, se = host(*args)
+            code, so, se = host(*args, env=env)
             assert code == 0, so + se
             y, r = sf.read(str(out), dtype="float32")
             assert y.shape == (frames, 32 if all_outputs else 2)
@@ -388,10 +389,10 @@ def test_plugin_font_missing(P, tmp_path):
     code, out, err = host("state", P.state_file(text))
     assert code == 0, out + err
     st = lines(out)["status"]
-    assert st == "Ready: gone.sf2, 6 presets" or st in ("Loading samples for 1 preset", "Loading samples for 2 presets")
+    assert st == "Ready: gone.sf2, 6 presets" or st.startswith("Loading samples for ")
     saved = saved_state(out)
     assert saved.startswith('plays soundfont\n# Samplosis 0.1.0\n')
-    assert ('soundfont "%s"\n' % f) in saved and "sf_used 0:0 0:33\n" in saved and "sf_volume -3.0 dB\n" in saved
+    assert ('soundfont "%s"\n' % f) in saved and "\nsf_used 0:0 0:33" in saved and "sf_volume -3.0 dB\n" in saved
     f.unlink()
     code, out, err = host("state", P.state_file(saved, "s2.txt"))
     assert code == 0, out + err
@@ -401,6 +402,43 @@ def test_plugin_font_missing(P, tmp_path):
     assert saved_state(out) == saved
     y, d, r = P.play(saved, "midi 144 57 100 0", 4800)
     assert np.max(np.abs(y)) == 0
+
+
+def test_plugin_reset_keeps_used_presets(P):
+    # REAPER resets on stop, seek and loop. A reset just before the song must not let go of the state's sf_used
+    # presets: a program change and a note right after it still sound on time, in real time
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\n' % f
+    for at in (0, 256):
+        ref = P.sf_reference(text, "midi 193 33 %d\nmidi 145 57 100 %d" % (at, at), 24000)
+        # samples nothing holds are freed after 20 ms here, and 300 ms pass after the reset
+        y, d, r = P.play(text, "reset 0\nsleep 300 0\nmidi 193 33 0 %d\nmidi 145 57 100 %d" % (at, at), 24000,
+                         env={"SAMPLOSIS_TEST_GRACE_MS": "20"})
+        assert db(ref) > -40
+        assert db(y - ref) - db(ref) < -90, at
+
+
+def test_plugin_reactivate_is_silent_soundfont(P):
+    # a held note with reverb and chorus on: deactivate and activate again, and nothing sounds after, tails included
+    f = P.font()
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:16 128:0\n' % f
+    at = 19 * 256
+    y, d, r = P.play(text, "midi 192 16 0 0\nmidi 144 69 100 0\ncycle %d" % at, 24000)   # the looping organ
+    assert np.max(np.abs(y[at - 2000:at])) > 0.01
+    assert np.max(np.abs(y[at:])) == 0
+    assert d["voices"] == "0"
+
+
+def test_plugin_loading_status(P):
+    # with the loader paused, the status counts the presets still loading
+    f = P.font()
+    # one mode on channel 1: only the bass is in use; all mode: the channels' piano and kit, and the bass
+    for extra, want in (("sf_mode one\nsf_preset 0 33\nsf_channel 1\nsf_used 0:33", "Loading samples for 1 preset"),
+                        ("sf_used 0:33", "Loading samples for 3 presets")):
+        st = P.state_file('plays soundfont\nsoundfont "%s"\n%s\n' % (f, extra), "load.txt")
+        code, out, err = host("state", st, env={"SAMPLOSIS_TEST_PAUSE_LOADER": "1"})
+        assert code == 0, out + err
+        assert lines(out)["status"] == want
 
 
 SF_PARAMS = ["param 31 SoundFont volume -60 12 0 automatable text 0.0 dB",

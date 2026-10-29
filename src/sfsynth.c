@@ -621,13 +621,19 @@ static void handle(SmpSynth *s, const Ev *e) {
   }
 }
 
-/* every voice off (5 ms), controllers reset, and the sf_used presets let go */
-static void reset_now(SmpSynth *s) {
-  int c;
-  sound_off(s, -1);
+/* every voice off (5 ms, or at once), controllers reset and no reverb or chorus tail; the sf_used presets stay */
+static void flush_now(SmpSynth *s, int now) {
+  int c, i;
+  if (now) { for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; } }
+  else sound_off(s, -1);
   for (c = 0; c < NCH; c++) { chan_controllers(&s->ch[c]); tuning(&s->ch[c]); }
+  smp_sffx_clear(s->fx);
+}
+
+/* the flush, and the sf_used presets let go */
+static void reset_now(SmpSynth *s) {
+  flush_now(s, 0);
   used_release(s, U_AUDIO);                    /* the song's own program changes have settled by now */
-  smp_sffx_clear(s->fx);                       /* and no reverb or chorus tail survives a reset */
 }
 
 /* ---- process ---- */
@@ -715,6 +721,12 @@ SMP_API void smp_synth_reset(SmpSynth *s) {
   s->nev = 0;
 }
 
+SMP_API void smp_synth_flush(SmpSynth *s, int now) {
+  if (!s) return;
+  flush_now(s, now);
+  s->nev = 0;
+}
+
 SMP_API int smp_synth_voices(const SmpSynth *s, int *peak) {
   int i, n = 0;
   if (peak) *peak = s ? s->peak : 0;
@@ -752,6 +764,13 @@ SMP_API int smp_synth_unload(SmpSynth *s) {
   InterlockedExchangePointer((PVOID volatile *)&s->want, NULL);
   smp_synth_collect(s);
   return 1;
+}
+
+SMP_API void smp_synth_collect_now(SmpSynth *s) {
+  if (!s) return;
+  block_start(s, 0);                           /* nothing processes: do the audio thread's switch here */
+  InterlockedExchangeAdd64(&s->epoch, 2);
+  smp_synth_collect(s);
 }
 
 SMP_API void smp_synth_set_offline(SmpSynth *s, int on) { if (s) InterlockedExchange(&s->render_offline, on ? 1 : 0); }

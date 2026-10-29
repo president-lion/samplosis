@@ -5,7 +5,9 @@
    "bend fraction frame" (a MIDI pitch bend), "param id value frame", "length frames"; between blocks: "reset frame",
    "cycle frame" (deactivate and activate again), "state <file> frame" (load another state), "render offline|realtime
    frame" (the render extension's set); and "rawon key vel frame time" (a note-on in the block holding frame, with its
-   time field set to time as is: a sloppy host). Blocks of 256 frames. The host gives one stereo output, or with
+   time field set to time as is: a sloppy host). "sleep ms frame" lets wall time pass between
+   blocks. With SAMPLOSIS_TEST_PAUSE_LOADER set, the SoundFont loader is paused; SAMPLOSIS_TEST_GRACE_MS sets how
+   soon it frees samples no preset in use needs. Blocks of 256 frames. The host gives one stereo output, or with
    `all` every output port the plugin has, each written to the wav as 2 channels in port order.
    play makes the real-time plugin render exactly, like smp_engine_render_test, through its smp_test_* hooks.
      host.exe samplosis.clap gui <state.txt> <actions.txt>
@@ -179,7 +181,8 @@ static int cmd_state(const clap_plugin_t *p, const char *path) {
 
 typedef struct { long frame; clap_event_param_value_t pv; clap_event_note_t note; clap_event_midi_t midi; int kind;
                  int action; char path[600]; long rawtime; } Ev;   /* action: 1 reset, 2 deactivate and activate, 3 load state,
-                                                                     4 render offline, 5 render realtime */
+                                                                     4 render offline, 5 render realtime, 6 sleep
+                                                                     (rawtime ms) */
 static Ev *evs; static int nev;
 typedef struct { const Ev *const *list; uint32_t n; } EvList;
 static const clap_event_header_t *ev_header(const Ev *e) {
@@ -214,6 +217,7 @@ static int parse_events(const char *text, long *length) {
       else if (!strcmp(w, "state") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2) { e.action = 3; ok = 1; }
       else if (!strcmp(w, "render") && sscanf(p + used, "%599s %ld", e.path, &e.frame) == 2 &&
                (!strcmp(e.path, "offline") || !strcmp(e.path, "realtime"))) { e.action = strcmp(e.path, "offline") ? 5 : 4; ok = 1; }
+      else if (!strcmp(w, "sleep") && sscanf(p + used, "%ld %ld", &e.rawtime, &e.frame) == 2) { e.action = 6; ok = 1; }
       else if (!strcmp(w, "rawon") && sscanf(p + used, "%d %d %ld %ld", &a, &b, &e.frame, &e.rawtime) == 4) {
         e.kind = 0; e.note.header.type = CLAP_EVENT_NOTE_ON; e.note.key = (int16_t)a; e.note.velocity = b / 127.0; e.rawtime++; ok = 1;
       } else if (!strcmp(w, "on") && sscanf(p + used, "%d %d %ld", &a, &b, &e.frame) == 3) {
@@ -306,6 +310,7 @@ static int cmd_play(const clap_plugin_t *p, const char *state, const char *event
         if (!rn || !rn->set(p, evs[k].action == 4 ? CLAP_RENDER_OFFLINE : CLAP_RENDER_REALTIME)) { printf("error: render set failed\n"); return 1; }
         continue;
       }
+      if (evs[k].action == 6) { Sleep((DWORD)evs[k].rawtime); main_thread(p); continue; }   /* wall time passes */
       h->time = (uint32_t)(evs[k].rawtime ? evs[k].rawtime - 1 : evs[k].frame < b ? 0 : evs[k].frame - b);
       list[el.n++] = &evs[k];
     }
@@ -532,6 +537,14 @@ int main(int argc, char **argv) {
   if (argc < 4) { printf("usage: host.exe samplosis.clap state <state.txt> | play <state.txt> <events> <out.wav> [rate [all]] | gui <state.txt> <actions.txt>\n"); return 2; }
   dll = LoadLibraryA(argv[1]);
   if (!dll) { printf("error: can't load %s\n", argv[1]); return 1; }
+  if (getenv("SAMPLOSIS_TEST_PAUSE_LOADER")) {   /* tests: the SoundFont loader loads nothing (a status while loading) */
+    void (*pause)(int) = (void (*)(int))GetProcAddress(dll, "smp_sf_test_pause");
+    if (pause) pause(1);
+  }
+  if (getenv("SAMPLOSIS_TEST_GRACE_MS")) {       /* tests: how soon an unneeded SoundFont sample is freed */
+    void (*grace)(int) = (void (*)(int))GetProcAddress(dll, "smp_sf_test_grace");
+    if (grace) grace(atoi(getenv("SAMPLOSIS_TEST_GRACE_MS")));
+  }
   entry = (const clap_plugin_entry_t *)GetProcAddress(dll, "clap_entry");
   if (!entry || !entry->init(argv[1])) { printf("error: no clap_entry\n"); return 1; }
   fac = entry->get_factory(CLAP_PLUGIN_FACTORY_ID);

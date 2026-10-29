@@ -305,9 +305,9 @@ static int apply_text(Plug *P, const char *text) {
   free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
   if (!smp_synth_script_apply(P->s, text, err, sizeof err)) {
     if (!fk) smp_synth_unload(P->s);      /* a state without a font has none, as one without a sample */
-  } else {                                /* the font didn't load: everything else, and silence */
+  } else {                                /* the font didn't load: silence, and everything else */
+    smp_synth_unload(P->s);               /* first, so sf_used doesn't ask for the old font's presets */
     smp_synth_script_apply(P->s, rest, NULL, 0);
-    smp_synth_unload(P->s);
     P->sf_missing = 1;
     P->sf_line = _strdup(line);
     if (word_line(text, "sf_used", used, sizeof used, NULL, 0, NULL)) P->sf_used = _strdup(used);
@@ -317,13 +317,12 @@ static int apply_text(Plug *P, const char *text) {
   free(rest);
   set_plays(P, plays);
   P->bad = 0;
+  if (!P->active) smp_synth_collect_now(P->s);   /* nothing processes: replaced fonts close now */
   ask_collect(P);
   return 1;
 }
 
 /* ---- life cycle ---- */
-static void midi3(SmpSynth *s, int st, int d1, int d2, int at);
-
 static bool p_init(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   P->rate = DEFAULT_RATE;
@@ -339,8 +338,9 @@ static bool p_init(const clap_plugin_t *p) {
 
 static void p_deactivate(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
+  P->active = 0;
   if (P->e) smp_engine_collect(P->e);
-  if (P->s) smp_synth_collect(P->s);
+  if (P->s) smp_synth_collect_now(P->s);  /* nothing processes now: every replaced font can close */
 }
 
 static void p_destroy(const clap_plugin_t *p) {
@@ -373,14 +373,12 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
     free(t);
     smp_synth_free(old);                 /* after the new one opened the same font, so it isn't loaded twice */
     smp_synth_set_offline(P->s, P->offline);
-  } else {                               /* nothing processes now: voices from before deactivate end */
-    int ch;
+  } else {                               /* nothing processes now: voices from before deactivate end at once */
     smp_engine_reset(P->e, 1);
-    /* All Sound Off and Reset All Controllers, queued for the first block. Not smp_synth_reset: that also lets
-       the state's sf_used presets go, which a song about to start still wants loaded. */
-    for (ch = 0; ch < 16; ch++) { midi3(P->s, 0xB0 | ch, 120, 0, 0); midi3(P->s, 0xB0 | ch, 121, 0, 0); }
+    smp_synth_flush(P->s, 1);            /* and no reverb tail; the state's sf_used presets stay loaded */
   }
   P->since = 0;
+  P->active = 1;
   return true;
 }
 
@@ -389,7 +387,9 @@ static void p_stop(const clap_plugin_t *p) { (void)p; }
 static void p_reset(const clap_plugin_t *p) {   /* audio thread: every voice ends (a 5 ms fade), bend to center */
   Plug *P = p->plugin_data;
   if (P->e) smp_engine_reset(P->e, 0);
-  if (P->s) smp_synth_reset(P->s);       /* and the SoundFont player's controllers go back to their defaults */
+  /* REAPER resets on stop, seek and loop: every SoundFont voice and effect tail ends and the controllers go back
+     to their defaults, but the state's sf_used presets stay loaded for the song's first notes */
+  if (P->s) smp_synth_flush(P->s, 0);
 }
 
 /* ---- events ---- */
@@ -437,8 +437,9 @@ static void synth_event(Plug *P, const clap_event_header_t *h, int at) {
   }
 }
 
-/* one event at offset `at` in the sub-block that follows; parameter values apply at once */
-static void event(Plug *P, const clap_event_header_t *h, int at) {
+/* one event at offset `at` in the sub-block that follows, for the player `plays` (the block's snapshot);
+   parameter values apply at once */
+static void event(Plug *P, const clap_event_header_t *h, int at, int plays) {
   SmpEngine *e = P->e;
   if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
   if (h->type == CLAP_EVENT_PARAM_VALUE) {
@@ -446,7 +447,7 @@ static void event(Plug *P, const clap_event_header_t *h, int at) {
     set_value(P, (int)v->param_id, v->value);
     return;
   }
-  if (P->plays) { synth_event(P, h, at); return; }
+  if (plays) { synth_event(P, h, at); return; }
   switch (h->type) {
     case CLAP_EVENT_NOTE_ON: {
       const clap_event_note_t *n = (const clap_event_note_t *)h;
@@ -502,6 +503,17 @@ static void zero_ports(const clap_process_t *pr, uint32_t from, uint32_t n) {
   }
 }
 
+/* a block that can't be played (no buffers to play into): its parameter values still apply, its notes are lost,
+   and the SoundFont player still takes its font */
+static void block_lost(Plug *P, const clap_process_t *pr) {
+  uint32_t i, ne = pr->in_events ? pr->in_events->size(pr->in_events) : 0;
+  for (i = 0; i < ne; i++) {
+    const clap_event_header_t *h = pr->in_events->get(pr->in_events, i);
+    if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) event(P, h, 0, 0);
+  }
+  if (P->s) smp_synth_skip(P->s, (int)pr->frames_count);
+}
+
 static void synth_run(Plug *P, float *const *outs, uint32_t a, uint32_t b) {
   float *o[2 * NOUTS]; int i;
   for (i = 0; i < 2 * NOUTS; i++) o[i] = outs[i] ? outs[i] + a : NULL;
@@ -523,7 +535,7 @@ static void process_synth(Plug *P, const clap_process_t *pr) {
   }
   if (!outs[0]) {
     const clap_audio_buffer_t *b = pr->audio_outputs_count ? &pr->audio_outputs[0] : NULL;
-    if (n > P->maxf) { smp_synth_skip(P->s, (int)n); return; }   /* a host past its own block limit */
+    if (n > P->maxf) { block_lost(P, pr); return; }   /* a host past its own block limit */
     outs[0] = P->scratch + P->maxf; outs[1] = P->scratch;
     if (b && b->data32 && b->channel_count == 1) mono = b->data32[0];
   }
@@ -534,7 +546,7 @@ static void process_synth(Plug *P, const clap_process_t *pr) {
     if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE && t > pos) {
       synth_run(P, outs, pos, t); pos = t;
     }
-    event(P, h, (int)(t - pos));
+    event(P, h, (int)(t - pos), 1);
   }
   if (n > pos) synth_run(P, outs, pos, n);
   else smp_synth_process(P->s, outs, 0);              /* clears events queued at the very end */
@@ -548,7 +560,7 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   float *l, *r;
   int plays = P->plays;
   if (P->e && P->s && InterlockedExchange(&P->silence, 0)) {   /* plays changed: the other player goes quiet */
-    if (plays) smp_engine_reset(P->e, 0); else smp_synth_reset(P->s);
+    if (plays) smp_engine_reset(P->e, 0); else smp_synth_flush(P->s, 0);
   }
   if (plays && P->e && P->s) {
     /* the sampler runs on silently, so its fades end and its replaced samples can be freed */
@@ -556,14 +568,16 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
     process_synth(P, pr);
     goto done;
   }
-  if (!pr->audio_outputs_count) return CLAP_PROCESS_CONTINUE;
+  if (!pr->audio_outputs_count) { block_lost(P, pr); return CLAP_PROCESS_CONTINUE; }
   ob = &pr->audio_outputs[0];
-  if (!ob->data32 || !ob->channel_count) return CLAP_PROCESS_ERROR;
-  l = ob->data32[0];
-  r = ob->channel_count > 1 ? ob->data32[1] : P->scratch;
-  if (!P->e || (ob->channel_count < 2 && n > P->maxf)) {
-    for (i = 0; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
-    zero_ports(pr, 1, n);
+  if (!ob->data32 || !ob->channel_count) { block_lost(P, pr); return CLAP_PROCESS_ERROR; }
+  /* a channel the host gave as NULL is played into scratch: a missing left is thrown away, a missing right is
+     folded into the left as for a mono output */
+  l = ob->data32[0] ? ob->data32[0] : P->scratch + P->maxf;
+  r = ob->channel_count > 1 && ob->data32[1] ? ob->data32[1] : P->scratch;
+  if (!P->e || ((l != ob->data32[0] || r == P->scratch) && n > P->maxf)) {
+    zero_ports(pr, 0, n);
+    block_lost(P, pr);
     return CLAP_PROCESS_CONTINUE;
   }
   /* the block runs in pieces between event times, so every event lands on its frame */
@@ -572,11 +586,11 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
     uint32_t t = h->time >= n ? (n ? n - 1 : 0) : h->time;   /* a time past the block: its last frame */
     if (t < pos) t = pos;
     if (t > pos) { smp_engine_process(P->e, l + pos, r + pos, (int)(t - pos)); pos = t; }
-    event(P, h, 0);
+    event(P, h, 0, 0);
   }
   if (n > pos) smp_engine_process(P->e, l + pos, r + pos, (int)(n - pos));
   else smp_engine_process(P->e, l, r, 0);              /* clears events queued at the very end */
-  if (ob->channel_count < 2) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
+  if (r == P->scratch && l == ob->data32[0]) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
   for (i = 2; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
   zero_ports(pr, 1, n);                  /* the sampler writes output 1 only */
   if (P->s) smp_synth_skip(P->s, (int)n);   /* the SoundFont player still takes its font, so replaced ones close */
@@ -594,6 +608,7 @@ static void p_main(const clap_plugin_t *p) {
   if (P->e) smp_engine_collect(P->e);
   if (P->collect_left > 0) InterlockedDecrement(&P->collect_left);
   /* a replaced font closes once the audio thread has let go of it: keep asking until it has */
+  if (P->s && !P->active) smp_synth_collect_now(P->s);   /* nothing processes: close them now */
   if (P->s && smp_synth_collect(P->s) > 0 && P->collect_left <= 0) InterlockedExchange(&P->collect_left, COLLECT_ROUNDS);
 }
 
@@ -671,7 +686,7 @@ static void pa_flush(const clap_plugin_t *p, const clap_input_events_t *in, cons
   if (!P->e || !P->s) return;
   for (i = 0; i < n; i++) {
     const clap_event_header_t *h = in->get(in, i);
-    if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) event(P, h, 0);
+    if (h->space_id == CLAP_CORE_EVENT_SPACE_ID && h->type == CLAP_EVENT_PARAM_VALUE) event(P, h, 0, P->plays);
   }
   emit_gui_params(P, out);
 }
@@ -782,6 +797,7 @@ int smp_plug_load(Plug *P, const char *path, char *err, int cap) {
   t = engine_text(P->e);
   if (t) { free(P->text); P->text = t; }
   snprintf(P->status, sizeof P->status, "Ready: %s", s->name);
+  P->bad = 0;
   tell_host(P, SMP_P_ROOT);
   mark_dirty(P);
   ask_collect(P);
@@ -826,6 +842,7 @@ int smp_plug_plays(Plug *P) { return P->plays ? 1 : 0; }
 
 void smp_plug_set_plays(Plug *P, int which) {
   which = which ? 1 : 0;
+  P->bad = 0;                            /* the window acted: an old refusal no longer says how things are */
   if (P->plays == which) return;
   set_plays(P, which);
   mark_dirty(P);
@@ -863,6 +880,8 @@ int smp_plug_load_font(Plug *P, const char *path, char *err, int cap) {
   if (!smp_synth_load(P->s, path, err, cap)) return 0;
   free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
   set_plays(P, 1);
+  P->bad = 0;
+  if (!P->active) smp_synth_collect_now(P->s);   /* nothing processes: the old font closes now */
   mark_dirty(P);
   ask_collect(P);
   return 1;
@@ -878,16 +897,16 @@ static int sf_key(const char *line, char *key, int cap) {
   return two && n == 3 && !strcmp(a, "sf_channel_preset") && !strcmp(c, "song");
 }
 
-void smp_plug_sf_set(Plug *P, const char *line) {
+int smp_plug_sf_set(Plug *P, const char *line) {
   char key[140], k2[140], err[700];
   char *cur, *out, *o; const char *p;
-  int n, drop;
-  if (!P->s || !line) return;
+  int n, drop, ok;
+  if (!P->s || !line) return 0;
   drop = sf_key(line, key, sizeof key);
   n = smp_synth_script_write(P->s, NULL, 0);
   cur = malloc((size_t)n + 1);
   out = malloc((size_t)n + strlen(line) + 2);
-  if (!cur || !out) { free(cur); free(out); return; }
+  if (!cur || !out) { free(cur); free(out); return 0; }
   smp_synth_script_write(P->s, cur, n + 1);
   /* the player's own lines with this one in place of the line it replaces; everything else stays */
   for (p = cur, o = out; *p; ) {
@@ -900,8 +919,10 @@ void smp_plug_sf_set(Plug *P, const char *line) {
   }
   if (!drop) { strcpy(o, line); o += strlen(line); *o++ = '\n'; }
   *o = 0;
-  if (!smp_synth_script_apply(P->s, out, err, sizeof err)) mark_dirty(P);
+  ok = !smp_synth_script_apply(P->s, out, err, sizeof err);
+  if (ok) mark_dirty(P);
   free(cur); free(out);
+  return ok;
 }
 
 int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program) {
