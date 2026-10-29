@@ -21,8 +21,10 @@
      fonts. smp_sf_close joins the loader thread when the last font goes, so it must never run inside
      DllMain or process detach. Free is therefore never called from there either.
    - The presets of the state's sf_used line are used (smp_sf_use) by the main thread when the state loads. They
-     are released once, by whichever side gets there first: the audio thread 10 s later or at a reset, or the
-     main thread when the next state or font replaces them. A small state word decides who does it. */
+     are released once, by whichever side gets there first: the audio thread 10 s after the first note-on it gets
+     (a project loads long before Play is pressed), at smp_synth_reset or when the player goes dormant (the
+     sampler plays), or the main thread when the next state or font replaces them. A small state word decides
+     who does it. The plugin's reset on stop, seek and loop is smp_synth_flush, which keeps them. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +43,8 @@
 #define KILL_MS 5.0               /* a stolen or killed voice fades out over this */
 #define PENDING_MS 1000           /* a voice waiting for its sample is dropped after this much real time (not in an
                                      offline render, which never drops one) */
-#define HOLD_SECONDS 10.0         /* sf_used presets are let go this long after the state loaded */
+#define HOLD_SECONDS 10.0         /* sf_used presets are let go this long after the first note-on after the state
+                                     loaded (a project loads long before Play is pressed) */
 #define G_EXCL 57                 /* exclusiveClass */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
 
@@ -102,6 +105,7 @@ struct SmpSynth {
   Cfg cfg_shared;
   volatile LONG used_state;       /* U_* */
   volatile LONG used_left;        /* frames until the audio thread lets the sf_used presets go */
+  volatile LONG used_armed;       /* the countdown runs: a note-on came after the state loaded */
   SmpFont *used_font; int used[MAXUSED]; int nused;
   volatile LONG chan_preset[NCH]; /* the channels' presets, for writing sf_used (-1 none) */
 
@@ -486,6 +490,7 @@ static void used_set(SmpSynth *s, SmpFont *f, const int *list, int n) {
   s->used_font = f; s->nused = n;
   for (i = 0; i < n; i++) { s->used[i] = list[i]; smp_sf_use(f, list[i], 1); }
   InterlockedExchange(&s->used_left, (LONG)(HOLD_SECONDS * s->rate));
+  InterlockedExchange(&s->used_armed, 0);
   InterlockedExchange(&s->used_state, U_HELD);
 }
 
@@ -615,7 +620,11 @@ static void handle(SmpSynth *s, const Ev *e) {
   if (e->kind == EV_RESET) { reset_now(s); return; }
   switch (e->b[0] & 0xF0) {
     case 0x80: note_off(s, c, d1); break;
-    case 0x90: if (d2) note_on(s, c, d1, d2); else note_off(s, c, d1); break;
+    case 0x90:
+      if (!d2) { note_off(s, c, d1); break; }
+      if (s->used_state == U_HELD && !s->used_armed) InterlockedExchange(&s->used_armed, 1);   /* the hold's 10 s start */
+      note_on(s, c, d1, d2);
+      break;
     case 0xA0: h->c.poly[d1] = d2; update_chan(s, c); break;
     case 0xB0: control(s, c, d1, d2); break;
     case 0xC0: program(s, c, d1); break;
@@ -655,7 +664,7 @@ static void render(SmpSynth *s, float *const *outs, int a, int b, int base) {
   }
 }
 
-/* the start of a block: configuration, the font, the sf_used countdown, pending voices */
+/* the start of a block: configuration, the font, the sf_used countdown (once a note-on armed it), pending voices */
 static void block_start(SmpSynth *s, int n) {
   SmpFont *w = s->want; int i, changed = cfg_take(s);
   if (w != s->cur) {
@@ -664,7 +673,8 @@ static void block_start(SmpSynth *s, int n) {
     changed = 1;
   }
   if (changed) resolve_all(s);
-  if (s->used_state == U_HELD && InterlockedExchangeAdd(&s->used_left, -n) - n <= 0) used_release(s, U_AUDIO);
+  if (s->used_state == U_HELD && s->used_armed && InterlockedExchangeAdd(&s->used_left, -n) - n <= 0)
+    used_release(s, U_AUDIO);
   for (i = 0; i < MAXV; i++) {
     Slot *t = &s->sl[i];
     if (t->st != V_PENDING) continue;

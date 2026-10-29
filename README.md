@@ -164,7 +164,10 @@ FluidSynth's, so its character differs) and the chorus depth is 8 ms. SoundFont 
 ### Loading ahead
 
 The state keeps an `sf_used` line: the presets in use when it was saved. They load as soon as the project loads, so the
-first notes aren't late. A program change right before the first notes loads that preset at once: in real time the
+first notes aren't late. They stay loaded until 10 seconds after the first note the player gets (however long the
+project sits before Play is pressed); by then the song's own program changes have chosen what it needs, and the rest
+are let go. REAPER's stop, seek and loop keep them; a new state, a new font, or switching to the Sampler lets them go
+at once. A program change right before the first notes loads that preset at once: in real time the
 first notes can be late by the load time (a note that waits more than a second of real time is dropped). A preset's
 samples are freed 2 seconds after no channel needs them.
 

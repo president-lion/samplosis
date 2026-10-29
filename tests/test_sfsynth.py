@@ -411,6 +411,34 @@ def test_used_presets_released_at_reset(lib, S):
         lib.smp_sf_test_grace(0)
 
 
+def test_used_presets_held_until_10s_after_first_note(lib, S):
+    """the state's sf_used presets are held until 10 s after the first note-on, not 10 s after the state loaded
+    (a project loads long before Play is pressed)"""
+    lib.smp_sf_test_grace(20)
+    try:
+        s = S.new()
+        r, err = S.apply(s, "sf_used 0:0 0:33 128:0\n")
+        assert r == 0, err
+        assert lib.smp_synth_wait_loaded(s, 5000) == 0
+        f = lib.smp_synth_font(s)
+        assert lib.smp_sf_loaded_samples(f) == 3
+        S.render(s, "midi 176 7 100 0", 12.0)              # 12 s without a note: still held
+        time.sleep(0.2)
+        assert lib.smp_sf_loaded_samples(f) == 3
+        assert "0:33" in S.write(s)
+        S.render(s, "midi 144 69 100 0\nmidi 128 69 0 4800", 9.5)   # the first note: 9.5 s later, still held
+        time.sleep(0.2)
+        assert lib.smp_sf_loaded_samples(f) == 3
+        S.render(s, "midi 176 7 100 0", 1.0)               # past 10 s: the bass goes
+        t0 = time.time()
+        while lib.smp_sf_loaded_samples(f) != 2 and time.time() - t0 < 3:
+            time.sleep(0.01)
+        assert lib.smp_sf_loaded_samples(f) == 2
+        assert "0:33" not in S.write(s)
+    finally:
+        lib.smp_sf_test_grace(0)
+
+
 def test_outputs(lib, S):
     s = S.new()
     r, err = S.apply(s, "sf_output 2 3\n")
