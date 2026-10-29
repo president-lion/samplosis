@@ -203,6 +203,10 @@ SMP_API int smp_synth_script_write(const SmpSynth *s, char *out, int cap);     /
 SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int cap);  /* 0 ok; nothing changes
                                     on error and err says "line N: ...". Lines not starting with sf_ or soundfont
                                     (the sampler's, plays) are ignored, so one state text serves both */
+SMP_API int smp_synth_script_cfg(SmpSynth *s, const char *text, char *err, int cap);  /* main thread: like apply,
+                                    but only the configuration lines (sf_mode, sf_preset, sf_channel,
+                                    sf_channel_preset, sf_output) are read; with none of a kind, its default. Every
+                                    other line is ignored: the font, sf_used and the parameters stay as they are */
 /* test helper: events one per line, "midi <byte> <byte> ... <frame>" (decimal; a SysEx is all its bytes) and
    "reset <frame>"; starts from silence with every channel reset. With waiting on (the default) it waits for the
    loader before each block and at notes whose samples aren't loaded, so the render is exact; with it off it

@@ -897,29 +897,40 @@ static int sf_key(const char *line, char *key, int cap) {
   return two && n == 3 && !strcmp(a, "sf_channel_preset") && !strcmp(c, "song");
 }
 
+/* 1 when a key from sf_key names a configuration line (the lines smp_synth_script_cfg reads) */
+static int cfg_key(const char *key) {
+  char w[64] = "";
+  sscanf(key, "%63s", w);
+  return !strcmp(w, "sf_mode") || !strcmp(w, "sf_preset") || !strcmp(w, "sf_channel") ||
+         !strcmp(w, "sf_channel_preset") || !strcmp(w, "sf_output");
+}
+
 int smp_plug_sf_set(Plug *P, const char *line) {
   char key[140], k2[140], err[700];
   char *cur, *out, *o; const char *p;
   int n, drop, ok;
   if (!P->s || !line) return 0;
   drop = sf_key(line, key, sizeof key);
+  if (!cfg_key(key)) return 0;
   n = smp_synth_script_write(P->s, NULL, 0);
   cur = malloc((size_t)n + 1);
   out = malloc((size_t)n + strlen(line) + 2);
   if (!cur || !out) { free(cur); free(out); return 0; }
   smp_synth_script_write(P->s, cur, n + 1);
-  /* the player's own lines with this one in place of the line it replaces; everything else stays */
+  /* the player's configuration lines with this one in place of the line it replaces. Only those are applied
+     (smp_synth_script_cfg): the parameters aren't sent round through text, which would round them and could
+     overwrite a value automation set meanwhile, and the font and sf_used stay as they are */
   for (p = cur, o = out; *p; ) {
     const char *eol = strchr(p, '\n'), *end = eol ? eol + 1 : p + strlen(p);
     char one[1200];
     snprintf(one, sizeof one, "%.*s", (int)(end - p), p);
     sf_key(one, k2, sizeof k2);
-    if (strcmp(k2, key)) { memcpy(o, p, (size_t)(end - p)); o += end - p; }
+    if (cfg_key(k2) && strcmp(k2, key)) { memcpy(o, p, (size_t)(end - p)); o += end - p; }
     p = end;
   }
   if (!drop) { strcpy(o, line); o += strlen(line); *o++ = '\n'; }
   *o = 0;
-  ok = !smp_synth_script_apply(P->s, out, err, sizeof err);
+  ok = !smp_synth_script_cfg(P->s, out, err, sizeof err);
   if (ok) mark_dirty(P);
   free(cur); free(out);
   return ok;

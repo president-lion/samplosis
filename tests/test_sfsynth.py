@@ -553,6 +553,32 @@ def test_state_lines_roundtrip(lib, S, font):
                            "sf_volume 0.0 dB\nsf_voices 256\nsf_effects on\nsf_transpose +0 st\n")
 
 
+def test_script_cfg_only(lib, S):
+    """smp_synth_script_cfg (the window's one-line changes): only the configuration lines apply; the parameters
+    keep their exact values (no rounding through text) and the font and sf_used stay"""
+    lib.smp_synth_script_cfg.restype = ctypes.c_int
+    lib.smp_synth_script_cfg.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    s = S.new()
+    r, err = S.apply(s, "sf_used 0:33\nsf_output 2 3\n")
+    assert r == 0, err
+    lib.smp_synth_set_param(s, P_VOLUME, -3.37)
+    err = ctypes.create_string_buffer(512)
+    assert lib.smp_synth_script_cfg(s, b"sf_mode one\nsf_preset 0 33\nsf_output 2 3\nsf_volume 6\n"
+                                    b"sf_used 0:16\nsoundfont \"nope.sf2\"\n", err, 512) == 0, err.value
+    assert lib.smp_synth_get_param(s, P_VOLUME) == -3.37
+    w = S.write(s)
+    assert "sf_mode one\nsf_preset 0 33\n" in w and "sf_output 2 3\n" in w and "0:33" in w and "0:16" not in w
+    assert lib.smp_synth_font(s)
+    # a bad configuration line: nothing changes
+    assert lib.smp_synth_script_cfg(s, b"sf_mode banana\n", err, 512) != 0
+    assert err.value.decode().startswith("line 1: ")
+    assert S.write(s) == w
+    # a missing kind goes back to its default (the window always sends the whole configuration)
+    assert lib.smp_synth_script_cfg(s, b"sf_mode one\nsf_preset 0 33\n", err, 512) == 0
+    assert "sf_output" not in S.write(s)
+    assert lib.smp_synth_get_param(s, P_VOLUME) == -3.37
+
+
 def test_font_switch_while_playing(lib, S, font, tmp_path):
     """load font B while a thread renders from font A: the audio thread switches at a block, the old font is
     closed only after it let go, and nothing it held stays in use"""

@@ -918,7 +918,13 @@ static int ints(const char *str, int n, int *v, const int *lo, const int *hi) {
   return *str == 0;
 }
 
-SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int cap) {
+static int is_cfg_line(const char *name) {
+  return !strcmp(name, "sf_mode") || !strcmp(name, "sf_preset") || !strcmp(name, "sf_channel") ||
+         !strcmp(name, "sf_channel_preset") || !strcmp(name, "sf_output");
+}
+
+/* cfg_only: only the configuration lines are read and applied; the font, sf_used and the parameters stay */
+static int script_apply(SmpSynth *s, const char *text, char *err, int cap, int cfg_only) {
   Cfg c; double val[NPAR]; char have[NPAR] = {0};
   char path[1024] = ""; int has_path = 0, path_line = 0;
   int ub[MAXUSED], up[MAXUSED], nu = 0, has_used = 0;
@@ -947,6 +953,7 @@ SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int
     name = rest = str;
     while (*rest && !isspace((unsigned char)*rest)) rest++;
     if (*rest) { *rest++ = 0; while (isspace((unsigned char)*rest)) rest++; }
+    if (cfg_only && !is_cfg_line(name)) continue;
     if (!strcmp(name, "soundfont")) {
       char *q, *end;
       if (*rest != '"') { fail(err, cap, lineno, "soundfont needs the path in quotes, like soundfont \"D:\\fonts\\GM.sf2\""); return 1; }
@@ -1012,6 +1019,7 @@ SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int
       have[id - SMP_NPARAMS] = 1;
     }
   }
+  if (cfg_only) { s->mcfg = c; cfg_publish(s); return 0; }
   /* every line is good; the font is the last thing that can fail, so load it before changing anything */
   if (has_path && !(s->font && !_stricmp(path, s->path))) {
     char why[600] = "";
@@ -1037,6 +1045,14 @@ SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int
   }
   smp_synth_collect(s);
   return 0;
+}
+
+SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int cap) {
+  return script_apply(s, text, err, cap, 0);
+}
+
+SMP_API int smp_synth_script_cfg(SmpSynth *s, const char *text, char *err, int cap) {
+  return script_apply(s, text, err, cap, 1);
 }
 
 /* ---- the test render ---- */
