@@ -433,6 +433,7 @@ def test_plugin_offline_render_font_gone(P, tmp_path):
         if away.exists():
             away.rename(f)
     assert took < 5, took
+    assert d["status after"] == "Loading samples for 1 preset", d     # the bass: still trying
     assert np.max(np.abs(y[:48000])) == 0                     # the bass on channel 2: its sample can't load
     assert db(y[48000:96000]) > -40                           # the piano on channel 1 was loaded before
     assert abs(peak_hz(y[52800:72000, 0]) - 220) < 3

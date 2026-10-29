@@ -256,7 +256,8 @@ def test_held_sample_survives_retire(lib, tmp_path):
 
 
 def test_load_retries_when_file_missing(lib, tmp_path):
-    """A file that can't be opened for loading isn't 'done': wait_idle keeps waiting, and the loader tries again."""
+    """A file that can't be opened for loading: wait_idle doesn't wait for it (an offline render must not hang on a
+    file that went away), and the loader keeps trying on its own."""
     path = str(tmp_path / "t.sf2")
     away = str(tmp_path / "away.sf2")
     write_sf2(path, PRESETS, SAMPLES)
@@ -264,10 +265,14 @@ def test_load_retries_when_file_missing(lib, tmp_path):
     try:
         os.rename(path, away)
         lib.smp_sf_use(f, 1, 1)
-        assert lib.smp_sf_wait_idle(f, 300) == 1         # not done: nothing loaded
+        t0 = time.time()
+        assert lib.smp_sf_wait_idle(f, 3000) == 0        # as done as it can be for now
+        assert time.time() - t0 < 0.5
         assert lib.smp_sf_loaded_samples(f) == 0
         os.rename(away, path)
-        assert lib.smp_sf_wait_idle(f, 3000) == 0        # retried on its own, no new use()
+        t0 = time.time()                                 # retried on its own, no new use()
+        while lib.smp_sf_loaded_samples(f) != 2 and time.time() - t0 < 3:
+            time.sleep(0.01)
         assert lib.smp_sf_loaded_samples(f) == 2
         lib.smp_sf_use(f, 1, -1)
     finally:
