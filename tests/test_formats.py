@@ -3,12 +3,14 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
+import time
 
 import numpy as np
 import pytest
 import soundfile as sf
 
-from conftest import SmpSettings, write_wav
+from conftest import ROOT, SmpSettings, write_wav
 from test_cache import point_cache
 from test_plugin import P  # noqa: F401 (the fixture)
 from test_sample import load, whole
@@ -274,15 +276,15 @@ def tone_ape_source():
 
 
 def decode_mem(lib, b):
-    """decode_memory on bytes: (frames x channels float32, rate), or (None, the reason)."""
-    lib.decode_memory.restype = ctypes.POINTER(ctypes.c_float)
-    lib.decode_memory.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int),
+    """smp_decode_memory on bytes: (frames x channels float32, rate), or (None, the reason)."""
+    lib.smp_decode_memory.restype = ctypes.POINTER(ctypes.c_float)
+    lib.smp_decode_memory.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
     lib.smp_free.restype = None
     lib.smp_free.argtypes = [ctypes.c_void_p]
     ch, n, r = ctypes.c_int(), ctypes.c_long(), ctypes.c_int()
     err = ctypes.create_string_buffer(300)
-    p = lib.decode_memory(b, len(b), ctypes.byref(ch), ctypes.byref(n), ctypes.byref(r), err, 300)
+    p = lib.smp_decode_memory(b, len(b), ctypes.byref(ch), ctypes.byref(n), ctypes.byref(r), err, 300)
     if not p:
         return None, err.value.decode()
     x = np.ctypeslib.as_array(p, shape=(ch.value * n.value,)).copy().reshape(ch.value, n.value).T
@@ -356,62 +358,199 @@ def test_ape(lib, tmp_path):
         lib.smp_sample_free(s)
 
 
+def test_ape_long_silence(lib):
+    # 60 s of silence in 736 bytes (over 14000:1): a real file, not a lying one, so it loads in full
+    b = open(os.path.join(FIXTURES, "silence60.ape"), "rb").read()
+    assert len(b) < 1024
+    x, r = decode_mem(lib, b)
+    assert x is not None, r
+    assert r == 44100 and x.shape == (44100 * 60, 2) and not np.any(x)
+
+
+def small_files(tmp_path):
+    """The three library formats, small: tone.ape, and an .opus and a .wv made by ffmpeg (bytes by extension)."""
+    out = {".ape": open(os.path.join(FIXTURES, "tone.ape"), "rb").read()}
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(24000, 48000), 48000)
+    for ext, codec in ((".opus", "libopus"), (".wv", "wavpack")):
+        f = tmp_path / ("good" + ext)
+        ffmpeg("-i", w, "-c:a", codec, f)
+        out[ext] = f.read_bytes()
+    return out
+
+
+@need_ffmpeg
 def test_library_decoders_refuse_damage(lib, tmp_path):
-    # cut short or scribbled on: refused with a reason or some audio, never a crash
-    point_cache(lib, tmp_path / "cache")
-    good = open(os.path.join(FIXTURES, "tone.ape"), "rb").read()
+    # cut short at every 97th byte, or scribbled on: refused with a reason or some audio, never a crash, and quickly
     rnd = np.random.default_rng(7)
-    for i, cut in enumerate((8, 40, 100, len(good) // 2, len(good) - 5)):
-        g = tmp_path / ("cut%d.ape" % i)
-        g.write_bytes(good[:cut])
-        n = try_load(lib, g)
-        assert n is None or n > 0
-    for i in range(4):
-        b = bytearray(good)
-        for k in rnd.integers(64, len(b), 40):
-            b[k] = int(rnd.integers(0, 256))
-        g = tmp_path / ("junk%d.ape" % i)
-        g.write_bytes(bytes(b))
-        n = try_load(lib, g)
-        assert n is None or n > 0
+    slowest = 0.0
+    for ext, good in small_files(tmp_path).items():
+        tries = [good[:cut] for cut in range(0, len(good), 97)]
+        for i in range(40):
+            b = bytearray(good)
+            for k in rnd.integers(64, len(b), 1 + i):
+                b[k] = int(rnd.integers(0, 256))
+            tries.append(bytes(b))
+        for b in tries:
+            t = time.perf_counter()
+            x, r = decode_mem(lib, b)
+            slowest = max(slowest, time.perf_counter() - t)
+            assert (x is None and r) or (x is not None and len(x) > 0), ext
     for magic in (b"wvpk", b"MAC ", b"OggS\0\2" + b"\0" * 20 + b"\x01\x13OpusHead"):
-        g = tmp_path / "fake.bin"
-        g.write_bytes(magic + bytes(range(256)) * 4)
-        n = try_load(lib, g)
-        assert n is None or n > 0
-    if FFMPEG:                                                     # Opus and WavPack, damaged the same ways
-        w = tmp_path / "src.wav"
-        write_wav(w, two_tones(24000, 48000), 48000)
-        for ext, codec in ((".opus", "libopus"), (".wv", "wavpack")):
-            f = tmp_path / ("good" + ext)
-            ffmpeg("-i", w, "-c:a", codec, f)
-            good = f.read_bytes()
-            for i, cut in enumerate((8, 40, 100, len(good) // 2, len(good) - 5)):
-                g = tmp_path / ("cut%d%s" % (i, ext))
-                g.write_bytes(good[:cut])
-                n = try_load(lib, g)
-                assert n is None or n > 0
-            for i in range(4):
-                b = bytearray(good)
-                for k in rnd.integers(64, len(b), 40):
-                    b[k] = int(rnd.integers(0, 256))
-                g = tmp_path / ("junk%d%s" % (i, ext))
-                g.write_bytes(bytes(b))
-                n = try_load(lib, g)
-                assert n is None or n > 0
+        x, r = decode_mem(lib, magic + bytes(range(256)) * 4)
+        assert (x is None and r) or len(x) > 0
+    assert slowest < 0.25, slowest
+
+
+def ogg_crc(page):
+    """An Ogg page's CRC (polynomial 0x04C11DB7, not reflected), computed with the CRC field zeroed."""
+    crc = 0
+    for byte in page:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7) if crc & 0x80000000 else crc << 1
+            crc &= 0xFFFFFFFF
+    return crc
+
+
+def ogg_last_granule(b, granule):
+    """The Ogg file b with its last page's granule position set to granule (and the CRC fixed)."""
+    at = b.rindex(b"OggS")
+    page = bytearray(b[at:])
+    page[6:14] = struct.pack("<q", granule)
+    page[22:26] = b"\0\0\0\0"
+    page[22:26] = struct.pack("<I", ogg_crc(page))
+    return b[:at] + bytes(page)
+
+
+def lying_headers(tmp_path):
+    """Tiny files whose headers claim about 2^31 frames (name, bytes)."""
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(4800, 48000), 48000)
+    made = {}
+    for ext, args in ((".opus", ["-c:a", "libopus"]), (".wv", ["-c:a", "wavpack"]), (".ogg", ["-c:a", "libvorbis"]),
+                      (".flac", ["-c:a", "flac"]), (".pcm.wav", ["-c:a", "pcm_s16le"])):
+        f = tmp_path / ("small" + ext)
+        ffmpeg("-i", w, *args, f)
+        made[ext] = f.read_bytes()
+    big = 0x7FFFFFF0
+    out = {}
+    out["opus granule"] = ogg_last_granule(made[".opus"], big)
+    out["vorbis granule"] = ogg_last_granule(made[".ogg"], big)
+    wv = bytearray(made[".wv"])                    # WavPack: total_samples (offset 12), then block_samples (offset 20)
+    wv[10:16] = b"\0\0" + struct.pack("<I", big)
+    out["wavpack total"] = bytes(wv)
+    wv = bytearray(made[".wv"])
+    wv[20:24] = struct.pack("<I", big)
+    out["wavpack block"] = bytes(wv)
+    fl = bytearray(made[".flac"])                  # FLAC STREAMINFO: 36-bit total samples at bytes 21..25 (low 4 bits of 21)
+    fl[21] = (fl[21] & 0xF0) | 0x0F
+    fl[22:26] = b"\xff\xff\xff\xff"
+    out["flac total"] = bytes(fl)
+    wav = bytearray(made[".pcm.wav"])              # WAV: the data chunk's size
+    at = wav.index(b"data")
+    wav[at + 4:at + 8] = struct.pack("<I", 0xFFFFFFF0)
+    out["wav data size"] = bytes(wav)
+    ape = bytearray(open(os.path.join(FIXTURES, "tone.ape"), "rb").read())
+    hdr = struct.unpack_from("<I", ape, 8)[0]      # APE_HEADER after the descriptor: blocks per frame, final, frames
+    a = bytearray(ape)
+    struct.pack_into("<I", a, hdr + 4, 1 << 30)
+    out["ape blocks per frame"] = bytes(a)
+    a = bytearray(ape)
+    struct.pack_into("<II", a, hdr + 8, 73728, 30000)
+    out["ape frames"] = bytes(a)
+    a = bytearray(ape)                             # and 8 bits per sample, mono: the old check sized for bytes
+    struct.pack_into("<IIIHH", a, hdr + 4, 1 << 30, 1 << 30, 2, 8, 1)
+    out["ape 8-bit"] = bytes(a)
+    # an APE tag footer claiming 200 MB of fields (the SDK allocates what it says before reading)
+    out["ape tag size"] = bytes(ape) + b"APETAGEX" + struct.pack("<IIII", 2000, 200 << 20, 1, 0) + b"\0" * 8
+    return out
+
+
+CHILD = r"""
+import ctypes, sys, time, psutil
+dll = ctypes.CDLL(sys.argv[1])
+f = dll.smp_decode_memory
+f.restype = ctypes.POINTER(ctypes.c_float)
+f.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_long),
+              ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+dll.smp_free.argtypes = [ctypes.c_void_p]
+p = psutil.Process()
+for path in sys.argv[2:]:
+    b = open(path, "rb").read()
+    before = p.memory_info().peak_pagefile
+    ch, n, r = ctypes.c_int(), ctypes.c_long(), ctypes.c_int()
+    err = ctypes.create_string_buffer(300)
+    t = time.perf_counter()
+    x = f(b, len(b), ctypes.byref(ch), ctypes.byref(n), ctypes.byref(r), err, 300)
+    secs = time.perf_counter() - t
+    grew = p.memory_info().peak_pagefile - before
+    print("%s|%d|%d|%d|%.3f|%s" % (path, bool(x), n.value if x else 0, grew, secs, err.value.decode()))
+    if x:
+        dll.smp_free(x)
+"""
+
+
+@need_ffmpeg
+def test_lying_headers_cost_nothing(tmp_path):
+    # a tiny file claiming about 2^31 frames: refused or small, quickly, and never a large allocation (each file in a
+    # fresh process, so its peak private memory is its own)
+    files = []
+    for name, b in lying_headers(tmp_path).items():
+        f = tmp_path / (name.replace(" ", "_") + ".bin")
+        f.write_bytes(b)
+        files.append(f)
+    for f in files:
+        r = subprocess.run([sys.executable, "-I", "-c", CHILD, os.path.join(ROOT, "samplosis.clap"), str(f)],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, f.name + r.stdout + r.stderr
+        path, ok, frames, grew, secs, why = r.stdout.strip().split("|", 5)
+        assert int(grew) < 64 << 20, (f.name, int(grew) >> 20, "MB")
+        assert float(secs) < 1.0, (f.name, secs)
+        assert (ok == "0" and why) or int(frames) < 10 ** 6, (f.name, frames, why)
+
+
+@need_ffmpeg
+def test_too_long_is_refused_plainly(lib, tmp_path):
+    # past the size limit (lowered by the test hook to 65536 floats; really 2 GiB), every decoder says so plainly
+    point_cache(lib, tmp_path / "cache")
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(48000, 48000), 48000)                  # 1 s stereo: 96000 floats
+    files = {"silence60.ape": open(os.path.join(FIXTURES, "silence60.ape"), "rb").read()}
+    for ext, args in ((".opus", ["-c:a", "libopus"]), (".wv", ["-c:a", "wavpack"]), (".ogg", ["-c:a", "libvorbis"]),
+                      (".flac", ["-c:a", "flac"]), (".mp3", ["-c:a", "libmp3lame"]), (".caf", ["-c:a", "pcm_s16le"])):
+        f = tmp_path / ("x" + ext)
+        ffmpeg("-i", w, *args, f)
+        files[ext] = f.read_bytes()
+    files[".wav"] = w.read_bytes()
+    lib.smp_test_only_decode_flags.restype = None
+    lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_test_only_decode_flags(2)
+    try:
+        for name, b in files.items():
+            x, r = decode_mem(lib, b)
+            assert x is None and r == "it's too long to load (over 2 GB decoded)", (name, r)
+        g = tmp_path / "x.raw"                                    # and a raw file, through the sampler
+        g.write_bytes(b"\0" * 400000)
+        s, err = load(lib, g)
+        assert not s and err == "it's too long to load (over 2 GB decoded)", err
+    finally:
+        lib.smp_test_only_decode_flags(0)
+    x, r = decode_mem(lib, files[".opus"])
+    assert x is not None, r
 
 
 def test_ape_exception_is_caught(lib, tmp_path):
     # a C++ exception inside Monkey's Audio never crosses into C: the load is refused with a plain reason
     point_cache(lib, tmp_path / "cache")
-    lib.smp_debug_decode_flags.restype = None
-    lib.smp_debug_decode_flags.argtypes = [ctypes.c_long]
-    lib.smp_debug_decode_flags(1)
+    lib.smp_test_only_decode_flags.restype = None
+    lib.smp_test_only_decode_flags.argtypes = [ctypes.c_long]
+    lib.smp_test_only_decode_flags(1)
     try:
         s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
         assert not s and "Monkey's Audio" in err, err
     finally:
-        lib.smp_debug_decode_flags(0)
+        lib.smp_test_only_decode_flags(0)
     s, err = load(lib, os.path.join(FIXTURES, "tone.ape"))
     assert s, err
     lib.smp_sample_free(s)

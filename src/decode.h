@@ -19,8 +19,10 @@ float *decode_audio_ex(const char *path, int *chans, long *frames, int *rate, Sm
 /* decode_audio_ex with no by and no cancel */
 float *decode_audio(const char *path, int *chans, long *frames, int *rate, char *err, int cap);
 /* Bytes in memory: the built-in and library decoders only, for compressed SoundFont streams (FLAC, Ogg Vorbis, Opus
-   and WavPack). Free the result with free(), or smp_free from outside the plugin. */
-SMP_API float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap);
+   and WavPack). Free the result with free(). smp_decode_memory is the same call exported (free its result with
+   smp_free). */
+float *decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap);
+SMP_API float *smp_decode_memory(const void *bytes, size_t len, int *chans, long *frames, int *rate, char *err, int cap);
 
 /* the extensions the sampler lists in Browse and the File combo box (".wav", ...); returns how many. Some need a
    decoder that a later stage adds, or Windows, or FFmpeg. */
@@ -35,5 +37,6 @@ SMP_API int smp_ffmpeg_find(char *out, int cap);     /* the same, UTF-8 */
 
 /* free() for memory the decode layer gave out, for callers outside the plugin (the tests) */
 SMP_API void smp_free(void *p);
-/* tests: 1 = the Monkey's Audio decoder throws inside its guard (the shim must catch it) */
-SMP_API void smp_debug_decode_flags(long f);
+/* TESTS ONLY: 1 = the Monkey's Audio decoder throws inside its guard (the shim must catch it); 2 = the size
+   limit is 65536 floats instead of 2 GiB; 0 = normal */
+SMP_API void smp_test_only_decode_flags(long f);

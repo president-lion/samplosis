@@ -13,3 +13,9 @@ made once on 2026-10-29:
 2. The console encoder of the Monkey's Audio SDK 13.43 (`Source\Console\Console.cpp` with all of MACLib and Shared,
    built with cl outside this repository) compressed it: `mac.exe tone.wav tone.ape -c2000` (normal).
 3. Checked: `ffmpeg -i tone.ape -f s16le -` gives exactly the WAV's samples.
+
+## silence60.ape
+
+60 s of digital silence, 16-bit stereo at 44100 Hz, in 736 bytes: a real file whose ratio (over 14000:1) is far past
+anything a size check by ratio could allow. Made the same way: Python wrote 2646000 frames of zeros as a 16-bit WAV,
+then `mac.exe silence.wav silence.ape -c2000`. ffmpeg decodes it without error.
