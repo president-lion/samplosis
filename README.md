@@ -19,7 +19,7 @@ Licence: GPL version 2 (see COPYING). It includes these libraries, each under it
 
 Samplosis has two players in one plugin, chosen by a tab: the Sampler, which plays one sample across the keyboard
 (stage 1), and the SoundFont player (stage 4, see "The SoundFont player"), which also plays SFZ, Decent Sampler,
-DLS and GigaStudio instruments. A new instance starts on the Sampler, and a project saved before the SoundFont
+Logic EXS, DLS and GigaStudio instruments. A new instance starts on the Sampler, and a project saved before the SoundFont
 player existed loads as it was. Every file format, and what reads it, is in "File formats".
 
 The Sampler:
@@ -105,7 +105,7 @@ The first control on both main pages is a tab control named Player, with two tab
   Switching during playback fades the old player's notes out over 5 ms (its reverb and chorus over 10 ms), so it
   doesn't click. While the Sampler plays, the SoundFont player lets go of its presets' samples (the font stays open,
   so switching back is quick; the presets load again then).
-- Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz or .dspreset) loads
+- Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset or .exs) loads
   into the SoundFont player and switches to it; any other audio file loads into the Sampler and switches to it.
 - Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
   stays; on the Sampler page a .sf2 does the same.
@@ -116,7 +116,7 @@ The first control on both main pages is a tab control named Player, with two tab
 File replaces the old Previous file and Next file buttons, on both main pages. It comes right after Browse.
 
 - It lists the files in the loaded file's folder of that page's kind (audio files on the Sampler page, every
-  instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz and .dspreset): names
+  instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset and .exs): names
   only, alphabetical, ignoring case. The loaded one is selected. Browse on the SoundFont page offers the same kinds
   ("SoundFonts and instruments"), and All files.
 - Choosing a file loads it at once. Up and Down on the closed box step through the folder and load each file as you
@@ -133,9 +133,9 @@ File replaces the old Previous file and Next file buttons, on both main pages. I
 ## The SoundFont player
 
 It plays a SoundFont 2 (.sf2) or SoundFont 3 (.sf3, Ogg compressed) file on 16 MIDI channels, as a General MIDI
-player does, and also SF4, SF2Pack, SoundFont 1, DLS, GigaStudio, SFZ and Decent Sampler instruments (see "File
+player does, and also SF4, SF2Pack, SoundFont 1, DLS, GigaStudio, SFZ, Decent Sampler and Logic EXS instruments (see "File
 formats"); the tab and the page keep the name SoundFont. Each instrument file is a font of presets: a DLS or
-GigaStudio file has one preset per instrument, an SFZ or Decent Sampler file is one preset (bank 0, program 1).
+GigaStudio file has one preset per instrument, an SFZ, Decent Sampler or EXS file is one preset (bank 0, program 1).
 Notes, program changes, controllers, pitch bend, pressure, sustain, RPN tuning and bend range, and the GM, GS and XG
 reset messages all work. Samples load in the background for the presets in use, and a font shared by several
 instances is kept in memory once.
@@ -158,7 +158,7 @@ The SoundFont page, in Tab order:
 1. Player (the tab control).
 2. SoundFont: the loaded font, its format and its preset count, read only, like "gm.sf2, 142 presets" (no format
    word for SoundFont 2 and 3), "Piano.sfz, SFZ, 1 preset", "gm.dls, DLS, 235 presets" or "Strings.gig, GigaStudio,
-   4 presets". The other format words are SF4, SF2Pack, SoundFont 1 and Decent Sampler.
+   4 presets". The other format words are SF4, SF2Pack, SoundFont 1, Decent Sampler and EXS.
 3. Browse button.
 4. File: the font files in that folder.
 5. Mode: All channels or One preset.
@@ -372,13 +372,21 @@ The file's first bytes choose the reader, then its name.
   groups and off_by, polyphony, envelopes, filters, LFOs and bend ranges play.
 - Decent Sampler (.dspreset, XML): read by Samplosis (yxml checks the XML) into the same player as SFZ, with
   inheritance from groups, round robins, tags and silencing, release triggers and CC ranges.
+- Logic EXS24 and Sampler (.exs, both the little-endian and the older big-endian layout): read by Samplosis into the
+  same player as SFZ. Zones and groups (key and velocity ranges, volume, pan, tuning, start and end, loops, one-shot,
+  pitch tracking off, mute), round robins, random select, keyswitch groups (enable by note), CC-range groups,
+  release triggers, exclusive groups, the amplitude envelope, velocity sensitivity, bend range and transpose play.
+  An .exs names its samples by a folder on the Mac it was made on, so each is looked for: beside the .exs, in its
+  subfolders, then in each folder above it (three at most, never a drive's root, at most 20000 folders and 3
+  seconds); where two files share a name, the one in a folder named like the Mac folder wins. Keep the library's
+  Sampler Instruments and Samples folders together, as Logic does, and they are found.
 
-Opening an SFZ or Decent Sampler instrument reads every sample file's header (never decoding a file to do so), so it
+Opening an SFZ, Decent Sampler or EXS instrument reads every sample file's header (never decoding a file to do so), so it
 opens in the background from the window. The headers are remembered in the cache folder, so the next open is quick.
 Samples that are missing or can't be read leave their regions out; the rest plays, and the status names the first
 (see "Status texts"). When none is left, the instrument doesn't load and that is the reason.
 
-### What SFZ, Decent Sampler and GigaStudio settings aren't supported
+### What SFZ, Decent Sampler, EXS and GigaStudio settings aren't supported
 
 These are counted: the status says how many different ones a file used, and the first ("Ignored 12 SFZ settings it
 doesn't support (first: lfo01_freq)"). The rest of the instrument plays without them.
@@ -398,6 +406,11 @@ doesn't support (first: lfo01_freq)"). The rest of the instrument plays without 
   trigger=continuous (plays as attack); a second silencing tag. Knob values set through <ui> are not applied (the
   preset plays at the bound parameters' defaults), Decent Sampler's own limiter headroom isn't copied (a preset may
   play louder than in Decent Sampler), and .dslibrary bundles (zips) aren't read: unzip them and open the .dspreset.
+- EXS: reversed zones, backward and alternating loops, loop crossfades and loop tuning, zone outputs, Flex, group
+  polyphony, release trigger decay, velocity and key crossfades, groups enabled by pitch bend, MIDI channel,
+  articulation or tempo (they play as if always on), the filter, mono legato, glide and volume key scaling. The
+  modulation matrix and LFOs are read past. Apple never published the format; the layout read is the one
+  ConvertWithMoss documents.
 - GigaStudio: EG1 and EG2 pre-attack and their controllers, the filter cutoff and resonance controllers, velocity
   to cutoff, a filter LFO beside the amplitude LFO at another speed, EG3 (the pitch envelope), dimension bypass,
   sustain defeat, mid/side decoding, ping-pong and backward loops (played forward), a second loop, velocity

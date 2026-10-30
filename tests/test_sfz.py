@@ -894,3 +894,20 @@ def test_sfz_long_decode_doesnt_hold_up_other_fonts(lib, tmp_path):
     finally:
         settings(lib, ffmpeg_path="")
     assert secs < 1, secs
+
+
+def test_sfz_global_reaches_regions_without_group(lib, tmp_path):
+    """Opcodes under <global> or <master> reach a <region> that follows with no <group> between (they used to stop
+    at the level they were set on)."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    path = write_sfz(tmp_path / "g.sfz", "<global> ampeg_attack=0.5 volume=-6\n<region> sample=a.wav key=60\n"
+                                         "<master> ampeg_release=2\n<region> sample=a.wav key=62\n"
+                                         "<group> ampeg_decay=1\n<region> sample=a.wav key=64\n")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.gen[34], x.gen[48]) for x in r] == [(-1200, 150)] * 3
+        assert [x.gen[38] for x in r] == [-12000, 1200, 1200]
+        assert [x.gen[36] for x in r] == [-12000, -12000, 0]
+    finally:
+        lib.smp_sf_close(f)

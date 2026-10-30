@@ -80,6 +80,7 @@ struct SmpFont {
   int dls_boosts;                       /* DLS: regions with a gain above 0 (see sfdls.c) */
   int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
   int is_ds;                            /* Decent Sampler (sfds.c, through sfsfz.c's builder): is_sfz is set too */
+  int is_exs;                           /* Logic EXS (sfexs.c, through sfsfz.c's builder): is_sfz is set too */
   int is_gig;                           /* GigaStudio (gigshim.cpp, through libgig): filled as DLS is */
   void *gig;                            /* GigaStudio: the loader's libgig file for decoding compressed waves, opened
                                            when the first is needed (sf_gig_decode), freed by sf_free; or NULL */
@@ -251,7 +252,7 @@ int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
 /* sfsfz.c: 1 when a file should be read as SFZ: its name ends .sfz, or its first bytes (head, n of them) are text with
    an SFZ header in them */
 int sf_is_sfz(const char *path, const uint8_t *head, size_t n);
-/* sfsfz.c's builder, shared by text formats read into the same model (sfds.c). sfz_build does what sf_parse_sfz
+/* sfsfz.c's builder, shared by formats read into the same model (sfds.c, sfexs.c). sfz_build does what sf_parse_sfz
    does (same return values) with feed in place of the .sfz text: feed is called twice (the first pass collects the
    sample files, the second builds the regions) and gives the levels and opcodes by SFZ's names and values through
    sfz_header ("global", "group", "region" ...) and sfz_opcode; sfz_ignored counts a name this can't play (once,
@@ -270,6 +271,10 @@ void sfz_loop_whole(SfzBuild *b);
    sf_parse_ds: as sf_parse_sfz, for a .dspreset */
 int sf_is_ds(const char *path, const uint8_t *head, size_t n);
 int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
+/* sfexs.c: Logic's EXS24 and Sampler instruments. sf_is_exs: the name ends .exs, or the first bytes are an EXS
+   block header. sf_parse_exs: as sf_parse_sfz, for an .exs (its samples are looked for near it) */
+int sf_is_exs(const char *path, const uint8_t *head, size_t n);
+int sf_parse_exs(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
 /* sffont.c: one more hold of a sample the caller already holds (a voice takes one for its streamer) */
 void sf_hold(SmpFont *f, int sample);
 /* cache.c: a positional read on a handle opened with FILE_FLAG_OVERLAPPED, waited for on an event of the calling

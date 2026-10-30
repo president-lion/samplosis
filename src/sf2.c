@@ -934,19 +934,22 @@ static SmpFont *parse_any(const char *path, int (*cancel)(void *), void *carg, c
 
   {
     /* SFZ: text, told by its name or by a header in its first bytes; sfsfz.c reads it (and its sample files). A
-       Decent Sampler preset (XML with <DecentSampler>, or .dspreset) is read by sfds.c into the same builder. */
+       Decent Sampler preset (XML with <DecentSampler>, or .dspreset) is read by sfds.c into the same builder, and a
+       Logic .exs (told by its name or its first block's header) by sfexs.c. */
     uint8_t head[4096];
     uint32_t n = s.size < sizeof head ? (uint32_t)s.size : (uint32_t)sizeof head;
-    int ds = 0;
+    int ds = 0, exs = 0;
     if (!(n >= 4 && rd(&s, 0, head, 4) && !memcmp(head, "RIFF", 4)) && (n == 0 || rd(&s, 0, head, n)) &&
-        ((ds = sf_is_ds(path, head, n)) != 0 || sf_is_sfz(path, head, n))) {
+        ((exs = sf_is_exs(path, head, n)) != 0 || (ds = sf_is_ds(path, head, n)) != 0 || sf_is_sfz(path, head, n))) {
       CloseHandle(s.h);
       f->is_sfz = 1;
       f->is_ds = ds;
+      f->is_exs = exs;
       f->path = _strdup(path);
       if (!f->path) snprintf(why, sizeof why, "out of memory");
       else {
-        int r = ds ? sf_parse_ds(f, path, cancel, carg, why, sizeof why) : sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
+        int r = exs ? sf_parse_exs(f, path, cancel, carg, why, sizeof why) :
+                ds ? sf_parse_ds(f, path, cancel, carg, why, sizeof why) : sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
         if (r > 0) return f;
         if (r < 0) {                         /* why is the whole reason (every sample missing, say) */
           if (err && cap > 0) snprintf(err, cap, "%s", why);
@@ -955,7 +958,7 @@ static SmpFont *parse_any(const char *path, int (*cancel)(void *), void *carg, c
         }
       }
       if (err && cap > 0) snprintf(err, cap, "%s isn't %s this can play (%s)", base_name(path),
-                                   ds ? "a Decent Sampler preset" : "an SFZ file", why);
+                                   exs ? "an EXS instrument" : ds ? "a Decent Sampler preset" : "an SFZ file", why);
       sf_free(f);
       return NULL;
     }

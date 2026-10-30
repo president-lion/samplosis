@@ -61,7 +61,7 @@
 
    Shared. Everything after the text (the two passes, probing, the probe cache, regions, stereo pairs, start heads,
    missing files and the ignored count) is sfz_build's, which other formats use too: a feed gives it headers and
-   opcodes by SFZ's names (sfz_header, sfz_opcode), once a pass. sfds.c feeds Decent Sampler presets that way. */
+   opcodes by SFZ's names (sfz_header, sfz_opcode), once a pass. sfds.c feeds Decent Sampler presets that way, and sfexs.c Logic's .exs instruments. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1473,8 +1473,10 @@ static void opcode_at(P *p, const char *name, size_t nn, const char *v, size_t v
   for (i = 0; i < vn; i++) if (!p->val[i]) p->val[i] = ' ';
   switch (p->level) {
     case LV_CONTROL: control_opcode(p, nm, p->val); break;
-    case LV_GLOBAL: opcode(p, &p->global, nm, p->val); break;
-    case LV_MASTER: opcode(p, &p->master, nm, p->val); break;
+    /* the levels below were copied at the header and have nothing of their own yet: a region straight after
+       <global> or <master> (no <group> between) inherits what they set */
+    case LV_GLOBAL: opcode(p, &p->global, nm, p->val); p->master = p->global; p->group = p->global; break;
+    case LV_MASTER: opcode(p, &p->master, nm, p->val); p->group = p->master; break;
     case LV_GROUP: opcode(p, &p->group, nm, p->val); break;
     case LV_REGION: opcode(p, &p->region, nm, p->val); break;
     default: break;                  /* before any header, or in <curve>, <effect>, <midi>: nothing to do */
@@ -1708,7 +1710,7 @@ static void free_parser(P *p) {
   free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves);
 }
 
-/* ---- the builder other text formats share (sfds.c): they feed headers and opcodes as SFZ names and values ---- */
+/* ---- the builder other formats share (sfds.c, sfexs.c): they feed headers and opcodes as SFZ names and values ---- */
 
 void sfz_header(SfzBuild *p, const char *name) { header(p, name, strlen(name)); }
 void sfz_opcode(SfzBuild *p, const char *name, const char *value) { opcode_at(p, name, strlen(name), value, strlen(value)); }

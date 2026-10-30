@@ -1136,6 +1136,7 @@ SmpSynth *smp_plug_synth(Plug *P) { return P->s; }
 static const char *font_kind(const SmpFont *f) {
   if (f->is_gig) return "GigaStudio";
   if (f->is_ds) return "Decent Sampler";
+  if (f->is_exs) return "EXS";
   if (f->is_sfz) return "SFZ";
   if (f->is_dls) return "DLS";
   if (f->is_pack) return "SF2Pack";
@@ -1178,7 +1179,7 @@ static void sf_status(Plug *P, char *out, int cap) {
     if (out[L - 1] == '.') out[L - 1] = 0;  /* statuses end without a full stop; ". " goes between parts */
   }
   k = smp_sf_ignored(f, first, sizeof first);
-  kind = f->is_gig ? "GigaStudio" : f->is_ds ? "Decent Sampler" : "SFZ";
+  kind = f->is_gig ? "GigaStudio" : f->is_ds ? "Decent Sampler" : f->is_exs ? "EXS" : "SFZ";
   if (k > 0 && (L = strlen(out)) + 4 < (size_t)cap)
     snprintf(out + L, (size_t)cap - L, first[0] ? ". Ignored %d %s %s it doesn't support (first: %s)" :
              ". Ignored %d %s %s it doesn't support%s", k, kind, k == 1 ? "setting" : "settings", first);
