@@ -198,8 +198,15 @@ typedef struct {
   float rt_linear;              /* a release trigger's level falls by this fraction of full per second held, in a
                                    straight line, to silence (GigaStudio's release trigger decay as LinuxSampler
                                    plays it: 1 - rt_linear x seconds); 0 = none */
+  /* added for SFZ's randoms and level tracking, worked out once per note */
+  float delay, delay_random;    /* the voice starts this many seconds late, plus a random 0..delay_random */
+  float amp_random;             /* a random 0..amp_random dB (either sign) on the level */
+  float pitch_random;           /* a random -pitch_random..+pitch_random cents */
+  float amp_keytrack;           /* dB per key away from amp_keycenter */
+  uint8_t amp_keycenter;
 } SmpSfCond;
-enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3 };   /* 2-pole lowpass, highpass, bandpass, notch */
+enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3,      /* 2-pole lowpass, highpass, bandpass, notch */
+       SMP_FIL_LP1 = 4, SMP_FIL_HP1 = 5 };                                  /* 1-pole lowpass and highpass (6 dB an octave) */
 typedef struct {
   uint8_t lokey, hikey, lovel, hivel; int sample;            /* index into the font's samples */
   int16_t gen[SMP_SF_NGEN];
@@ -216,6 +223,12 @@ SMP_API void smp_sf_close(SmpFont *f);
    thread then either adopts it (smp_sf_adopt: it joins the registry with one reference, as smp_sf_open's result,
    or is freed for the same file already open, whose reference is returned; NULL and a reason) or discards it. */
 SMP_API SmpFont *smp_sf_parse_detached(const char *path, int (*cancel)(void *), void *arg, char *err, int cap);
+/* the same, with progress (may be NULL): progress[1] is set to an SFZ's (Decent Sampler's, EXS's) sample files and
+   progress[0] counts them as they are read, for "Loading x.sfz: 412 of 1449 samples". With a cancel given, an
+   SFZ's compressed sample files (FLAC, Ogg, MP3, WavPack) are also decoded into the cache as they are read
+   (prefill), so each file on a cold disk is visited once, not twice; up to half the cache's limit. */
+SMP_API SmpFont *smp_sf_parse_detached_ex(const char *path, int (*cancel)(void *), void *arg, volatile long *progress,
+                                          char *err, int cap);
 SMP_API SmpFont *smp_sf_adopt(SmpFont *f, char *err, int cap);
 SMP_API void smp_sf_discard(SmpFont *f);
 SMP_API int smp_sf_preset_count(const SmpFont *f);
@@ -258,6 +271,8 @@ SMP_API int smp_sf_wait_idle(SmpFont *f, int timeout_ms);   /* tests: 0 once eve
                                     need is loaded (or broken, or can't load for now: the file is gone or memory ran out; the loader
                                     keeps trying every 500 ms), 1 on timeout. Pending retires don't count as busy */
 SMP_API int smp_sf_loaded_samples(const SmpFont *f);        /* samples in memory */
+SMP_API int smp_sf_load_progress(const SmpFont *f, int *total);   /* of the samples the presets in use need (*total, may
+                                    be NULL), how many are loaded (or can't be), as of the loader's last pass */
 SMP_API uint64_t smp_sf_loaded_bytes(const SmpFont *f);
 /* a problem found after the font opened, in plain words (an SF2Pack that can't be unpacked: "can't unpack
    x.sf2pack (it may be damaged)", "the cache folder can't hold x.sf2pack's unpacked samples"), or "" when there is
@@ -268,6 +283,9 @@ SMP_API const char *smp_sf_problem(const SmpFont *f);
    them in first (may be NULL); GigaStudio: the same for its settings and dimensions (by plain names, such as "EG3
    (pitch envelope)"); 0 for every other format. Any thread. */
 SMP_API int smp_sf_ignored(const SmpFont *f, char *first, int cap);
+SMP_API void smp_sf_hint(SmpFont *f, int sample);          /* any thread, the audio thread too: sample is wanted now (a
+                                    note waits for it), so the loader fetches it, or its decode is moved to the front of
+                                    the workers' queue, ahead of the rest of the font */
 SMP_API void smp_sf_test_pause(int on);                     /* tests: the loader thread loads nothing while on */
 SMP_API void smp_sf_test_close_race(int on);                /* tests: the decode worker takes no job, and a decode
                                     being queued waits for its font's close to begin (sffont.c) */

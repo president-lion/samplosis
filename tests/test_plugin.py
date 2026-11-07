@@ -433,7 +433,7 @@ def test_plugin_offline_render_font_gone(P, tmp_path):
         if away.exists():
             away.rename(f)
     assert took < 5, took
-    assert d["status after"] == "Loading samples for 1 preset", d     # the bass: still trying
+    assert d["status after"] == "Loading samples: 2 of 3", d     # the bass: still trying (its sample of the 3 in use)
     assert np.max(np.abs(y[:48000])) == 0                     # the bass on channel 2: its sample can't load
     assert db(y[48000:96000]) > -40                           # the piano on channel 1 was loaded before
     assert abs(peak_hz(y[52800:72000, 0]) - 220) < 3
@@ -446,7 +446,7 @@ def test_plugin_font_missing(P, tmp_path):
     code, out, err = host("state", P.state_file(text))
     assert code == 0, out + err
     st = lines(out)["status"]
-    assert st == "Ready: gone.sf2, 6 presets" or st.startswith("Loading samples for ")
+    assert st == "Ready: gone.sf2, 6 presets" or st.startswith("Loading samples")
     saved = saved_state(out)
     assert saved.startswith('plays soundfont\n# Samplosis 0.1.0\n')
     assert ('soundfont "%s"\n' % f) in saved and "\nsf_used 0:0 0:33" in saved and "sf_volume -3.0 dB\n" in saved
@@ -882,7 +882,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     assert r[12] == "kit.sfz, SFZ, 1 preset", out
     assert got(out, "list")[1] == ["File", "bank.dls", "g.gig", "h.dspreset", "i.sf4", "j.sf2pack", "k.exs",
                                    "kit.sfz", "l.sbk", "m.sf2", "n.sf3"], out    # every kind; notes.txt and o.wav aren't
-    assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples for 1 preset. ")
+    assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples")
     assert r[13].endswith(". Missing 1 sample (first: gone.wav). "
                           "Ignored 1 SFZ setting it doesn't support (first: eq1_freq)"), out
     assert f[-2] == ["Tab", "Player", "Sampler"]
@@ -912,9 +912,9 @@ def test_gui_sfz_loads_in_background(P, tmp_path):
     r = [x[1] for x in got(out, "read")]
     ms = [int(ln.split(": ")[1].split()[0]) for ln in out.splitlines() if ln.startswith("clock: ")]
     assert ms[1] < 500, out                                          # the drop returned at once
-    assert r[0] == "Loading big.sfz", out
+    assert r[0].startswith("Loading big.sfz"), out
     assert r[1] == "big.sfz, SFZ, 1 preset", out
-    assert r[2].startswith("Ready: big.sfz") or r[2].startswith("Loading samples for "), out
+    assert r[2].startswith("Ready: big.sfz") or r[2].startswith("Loading samples"), out
     assert "state: plays soundfont" in out and ('state: soundfont "%s"' % sfz) in out
     assert got(out, "counts")[0][0] == "beeps 0"
 

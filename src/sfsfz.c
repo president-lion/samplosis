@@ -84,7 +84,8 @@
 #define MAX_SAMPLES (1 << 20)
 #define MAX_SET (1 << 16)                /* names a string set holds, at most */
 #define MAX_CHUNKS 4096                  /* chunks walked in one WAV or AIFF header */
-#define PROBE_THREADS 4
+#define PROBE_THREADS 32                 /* measured on a USB hard disk, cold, 1449 FLACs: 4 threads 26 s, 8 17 s, 16 12 s,
+                                            32 10-12 s, 64 25 s (the disk queues the reads; past 32 they fight) */
 #define MAX_DEAD 64                      /* share roots given up on */
 #define WPATH (MAX_PATH * 4)
 
@@ -101,6 +102,12 @@ enum {
 enum { LOOP_NONE, LOOP_ONESHOT, LOOP_CONT, LOOP_SUSTAIN };   /* SFZ loop_mode */
 enum { LV_NONE, LV_CONTROL, LV_GLOBAL, LV_MASTER, LV_GROUP, LV_REGION, LV_OTHER };
 enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
+
+#define MAX_CCM 16                       /* controller modulations a region keeps */
+/* what a controller modulates (Opts.ccm): level (dB), pitch (cents), cutoff (cents), pan (percent), the amplitude
+   envelope's stages (seconds, sustain percent), the vibrato's depth (cents) and rate (Hz) */
+enum { CM_GAIN, CM_PITCH, CM_CUTOFF, CM_PAN, CM_AMPEG0 /* delay; +1 attack ... +5 release */, CM_VIBDEPTH = CM_AMPEG0 + 6,
+       CM_VIBFREQ };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -132,6 +139,12 @@ typedef struct {
   double bend_up, bend_down; int bend_set;      /* cents */
   int loop_whole;                              /* Decent Sampler's loopEnabled: with no loop given or in the file,
                                                   the whole sample loops */
+  /* the randoms and level tracking the player works out at each note (SmpSfCond) */
+  double delay, delay_random, amp_random, pitch_random, amp_keytrack;   /* s, s, dB, cents, dB per key */
+  int amp_keycenter;
+  /* controllers modulating the region (gain_ccN, pitch_onccN, ampeg_decayccN...): the last one given per CC and
+     target wins */
+  int nccm; struct { uint8_t cc, target; double amount; } ccm[MAX_CCM];
 } Opts;
 
 /* where a sample start head begins, and its sample per channel */
@@ -179,6 +192,7 @@ typedef struct SfzBuild {
   int level;
   char default_path[MAX_SPATH];
   int note_offset, octave_offset;
+  int16_t cc_init[128];              /* set_ccN: a controller's value before any MIDI sets it, -1 when not given */
   /* defines: names (with the $) and values, and an open-addressing table of their indices */
   char **def_name, **def_val; int ndef; int *def_slot;
   /* includes */
@@ -194,6 +208,12 @@ typedef struct SfzBuild {
   int probed;                        /* files probed now (not from the cache) */
   SRWLOCK dead_lock; wchar_t dead[MAX_DEAD][WPATH / 4]; int ndead;
   volatile LONG next_probe;
+  int *porder;                       /* the files in probe order: by path, so a cold disk reads them folder by folder */
+  /* prefill (a background open only): compressed sample files decoded into the cache as they are probed */
+  volatile LONG prefill;             /* 1 while it goes on (0 once the budget runs out) */
+  volatile LONG64 pf_left;           /* decoded bytes it may still write (half the cache limit) */
+  volatile LONG64 pf_wrote;          /* decoded bytes written */
+  volatile LONG *prog;               /* the caller's progress: [0] files done, [1] files in all (may be NULL) */
   /* the model being built */
   SmpSfSample *shdr; SmpSrc *src; int ns, caps;
   char **paths; int npaths, cappaths;
@@ -353,6 +373,7 @@ static void opts_default(Opts *o) {
   o->xfin_lokey = o->xfin_hikey = o->xfout_lokey = o->xfout_hikey = -1;
   o->xfin_lovel = 0; o->xfin_hivel = 0; o->xfout_lovel = 127; o->xfout_hivel = 127;
   o->bend_up = 200; o->bend_down = -200;
+  o->amp_keycenter = 60;
 }
 
 /* ---- opcodes ---- */
@@ -381,11 +402,52 @@ static int label(const char *nm) {
          !strcmp(nm, "image") || !strcmp(nm, "md5") || !strcmp(nm, "output") || !strcmp(nm, "off_time");
 }
 
+/* name = prefix then a CC number (0..127) then nothing: the number, else -1 */
+static int cc_suffix(const char *nm, const char *prefix) {
+  size_t n = strlen(prefix); char *e; long k;
+  if (strncmp(nm, prefix, n) || nm[n] < '0' || nm[n] > '9') return -1;
+  k = strtol(nm + n, &e, 10);
+  return !*e && k >= 0 && k <= 127 ? (int)k : -1;
+}
+
+/* a controller modulation: replaces the same CC and target's, else is added (up to MAX_CCM) */
+static void add_ccm(P *p, Opts *o, const char *nm, int cc, int target, const char *v) {
+  double d; int i;
+  if (!num(v, &d)) return;
+  for (i = 0; i < o->nccm && !(o->ccm[i].cc == cc && o->ccm[i].target == target); i++) {}
+  if (i == o->nccm) { if (o->nccm >= MAX_CCM) { ignored(p, nm); return; } o->nccm++; }
+  o->ccm[i].cc = (uint8_t)cc; o->ccm[i].target = (uint8_t)target; o->ccm[i].amount = d;
+}
+
+/* SFZ's controller opcodes, SFZ 1 and 2 spellings: 1 when nm was one */
+static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
+  static const struct { const char *prefix; int target; } T[] = {
+    {"gain_cc", CM_GAIN}, {"gain_oncc", CM_GAIN}, {"volume_oncc", CM_GAIN}, {"amp_cc", CM_GAIN},
+    {"pitch_cc", CM_PITCH}, {"pitch_oncc", CM_PITCH}, {"tune_cc", CM_PITCH}, {"tune_oncc", CM_PITCH},
+    {"cutoff_cc", CM_CUTOFF}, {"cutoff_oncc", CM_CUTOFF}, {"pan_cc", CM_PAN}, {"pan_oncc", CM_PAN},
+    {"ampeg_delaycc", CM_AMPEG0}, {"ampeg_delay_oncc", CM_AMPEG0}, {"ampeg_attackcc", CM_AMPEG0 + 1},
+    {"ampeg_attack_oncc", CM_AMPEG0 + 1}, {"ampeg_holdcc", CM_AMPEG0 + 2}, {"ampeg_hold_oncc", CM_AMPEG0 + 2},
+    {"ampeg_decaycc", CM_AMPEG0 + 3}, {"ampeg_decay_oncc", CM_AMPEG0 + 3}, {"ampeg_sustaincc", CM_AMPEG0 + 4},
+    {"ampeg_sustain_oncc", CM_AMPEG0 + 4}, {"ampeg_releasecc", CM_AMPEG0 + 5}, {"ampeg_release_oncc", CM_AMPEG0 + 5},
+    {"pitchlfo_depthcc", CM_VIBDEPTH}, {"pitchlfo_depth_oncc", CM_VIBDEPTH}, {"pitchlfo_freqcc", CM_VIBFREQ},
+    {"pitchlfo_freq_oncc", CM_VIBFREQ},
+  };
+  int i, cc;
+  if ((cc = cc_suffix(nm, "set_cc")) >= 0) {   /* a level's set_cc (<control> is where it belongs): the same */
+    double d; if (num(v, &d)) p->cc_init[cc] = (int16_t)clampi((int)floor(d + 0.5), 0, 127);
+    return 1;
+  }
+  for (i = 0; i < (int)(sizeof T / sizeof *T); i++)
+    if ((cc = cc_suffix(nm, T[i].prefix)) >= 0) { add_ccm(p, o, nm, cc, T[i].target, v); return 1; }
+  return 0;
+}
+
 /* one opcode of a level (nm is lower case; v trimmed) */
 static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   double d; int k, i;
   char w[64];
 #define IS(s) (!strcmp(nm, s))
+  if (strstr(nm, "cc") && cc_opcode(p, o, nm, v)) return;   /* the controller opcodes first: pitchlfo_depthccN isn't an LFO field */
   /* the sample */
   if (IS("sample")) {
     size_t n = strlen(v);
@@ -411,6 +473,12 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   if (IS("pan")) { num(v, &o->pan); return; }
   if (IS("width")) { num(v, &o->width); return; }
   if (IS("amp_veltrack")) { num(v, &o->veltrack); return; }
+  if (IS("amp_keytrack")) { num(v, &o->amp_keytrack); return; }
+  if (IS("amp_keycenter")) { int kc; if (key(p, v, &kc) && kc >= 0) o->amp_keycenter = kc; return; }
+  if (IS("amp_random")) { num(v, &o->amp_random); return; }
+  if (IS("pitch_random")) { num(v, &o->pitch_random); return; }
+  if (IS("delay")) { if (num(v, &d)) o->delay = d < 0 ? 0 : d; return; }
+  if (IS("delay_random")) { if (num(v, &d)) o->delay_random = d < 0 ? 0 : d; return; }
   if (!strncmp(nm, "amp_velcurve_", 13)) {
     char *e; long n = strtol(nm + 13, &e, 10);
     if (e != nm + 13 && !*e && n >= 0 && n <= 127 && num(v, &d)) {
@@ -433,6 +501,8 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
     else if (ieq(v, "hpf_2p")) o->fil_type = SMP_FIL_HP;
     else if (ieq(v, "bpf_2p")) o->fil_type = SMP_FIL_BP;
     else if (ieq(v, "brf_2p")) o->fil_type = SMP_FIL_BR;
+    else if (ieq(v, "lpf_1p")) o->fil_type = SMP_FIL_LP1;
+    else if (ieq(v, "hpf_1p")) o->fil_type = SMP_FIL_HP1;
     else { o->fil_type = -1; snprintf(w, sizeof w, "fil_type=%.40s", v); ignored(p, w); }
     return;
   }
@@ -553,6 +623,8 @@ static void control_opcode(P *p, const char *nm, const char *v) {
     int k; if (inum(v, &k)) p->note_offset = clampi(k, -127, 127);
   } else if (!strcmp(nm, "octave_offset")) {
     int k; if (inum(v, &k)) p->octave_offset = clampi(k, -10, 10);
+  } else if (cc_suffix(nm, "set_cc") >= 0) {
+    cc_opcode(p, NULL, nm, v);
   } else if (!label(nm)) {
     ignored(p, nm);
   }
@@ -823,6 +895,64 @@ static const Cached *cache_find(P *p, const wchar_t *lw) {
   return NULL;
 }
 
+/* Prefill. A background open (the window's) reads each compressed sample file whole as it probes it, decodes it on
+   the probe thread and writes its channels to the decode cache, exactly as the loader's decode would (the same keys),
+   so the loader then only reads heads from the cache. On a cold hard disk each file costs a seek; this visits each
+   once instead of twice (once for the header here, once for the decode later), and the decoding runs on all the
+   probe threads at once. It knows the channels for sure, so nothing is guessed. Only files a built-in or library
+   decoder reads from memory (FLAC, Ogg Vorbis, Opus, MP3, WavPack, compressed WAV), up to 64 MB each, and only while
+   the decoded total stays under half the cache's limit; the rest is left to the loader. A file whose copies are all
+   in the cache already isn't read. */
+#define PF_MAX_FILE (64u << 20)
+#define PF_SMALL (2u << 20)                /* a file over this decodes alone (g_pf_big): 32 threads of small ones at once are
+                                              well under 1 GB, the big ones one at a time */
+static SRWLOCK g_pf_big = SRWLOCK_INIT;
+static int pf_cancel(void *a) { return cancelled((P *)a); }
+
+static uint64_t pf_key(const char *u, const File *fl, int ch) {
+  char d[2048 * 3 + 160];
+  snprintf(d, sizeof d, "sfdec1|%s|%llu|%llu|0|0|%u", u, (unsigned long long)fl->size, (unsigned long long)fl->mtime, (unsigned)ch);
+  return smp_key(d);
+}
+
+static void prefill(P *p, File *fl, HANDLE h) {
+  char u[2048 * 3], err[256];
+  int nch = fl->in.channels > 2 ? 2 : fl->in.channels, c, ch = 0, r = 0, have = 1, big;
+  long frames = 0;
+  LONG64 est;
+  uint8_t *bytes;
+  float *x;
+  DWORD got = 0;
+  if (!p->prefill || fl->in.guessed || nch < 1 || fl->size == 0 || fl->size > PF_MAX_FILE) return;
+  if (!WideCharToMultiByte(CP_UTF8, 0, fl->wpath, -1, u, (int)sizeof u, NULL, NULL)) return;
+  for (c = 0; c < nch && have; c++) {          /* there already? (by name only: opening each costs a scan) */
+    char cp[1200 * 3]; wchar_t wc[1200];
+    if (!smp_cache_path(pf_key(u, fl, c), cp, (int)sizeof cp) || !MultiByteToWideChar(CP_UTF8, 0, cp, -1, wc, 1200) ||
+        GetFileAttributesW(wc) == INVALID_FILE_ATTRIBUTES) have = 0;
+  }
+  if (have) return;                                             /* decoded before: nothing to do */
+  est = fl->in.frames < SF_UNKNOWN_FRAMES ? (LONG64)fl->in.frames * nch * 4 : (LONG64)fl->size * 8;
+  if (InterlockedExchangeAdd64(&p->pf_left, -est) - est < 0) { InterlockedExchange(&p->prefill, 0); return; }
+  big = fl->size > PF_SMALL;
+  if (big) AcquireSRWLockExclusive(&g_pf_big);                /* one big file at a time: memory stays bounded */
+  if (!(bytes = malloc((size_t)fl->size))) { if (big) ReleaseSRWLockExclusive(&g_pf_big); return; }
+  {
+    OVERLAPPED o; memset(&o, 0, sizeof o);
+    if (!ReadFile(h, bytes, (DWORD)fl->size, &got, &o) || got != fl->size) { free(bytes); if (big) ReleaseSRWLockExclusive(&g_pf_big); return; }
+  }
+  x = decode_memory_ex(bytes, (size_t)fl->size, &ch, &frames, &r, pf_cancel, p, err, sizeof err);
+  free(bytes);
+  if (x && ch >= 1 && frames > 0 && frames < (long)SF_UNKNOWN_FRAMES && r > 0) {
+    for (c = 0; c < ch && c < 2; c++)
+      if (smp_cache_write_mono(pf_key(u, fl, c), x + (size_t)c * (size_t)frames, (uint64_t)frames, r) == 0)
+        InterlockedExchangeAdd64(&p->pf_wrote, (LONG64)frames * 4);
+    fl->in.channels = ch; fl->in.frames = (uint32_t)frames; fl->in.rate = (uint32_t)r;
+  }
+  free(x);                                                      /* (one that didn't decode: the loader tries it its own way, and says) */
+  if (big) ReleaseSRWLockExclusive(&g_pf_big);
+}
+
+
 /* A sample file's format, from its header (never decoded here): its size and time first, which may find it in the
    probe cache; then PCM_FILE when it streams as it is, else DECODED with what the header says. Sets status. Any
    thread (the probe workers): it touches only fl, and the dead roots under their lock. */
@@ -871,6 +1001,7 @@ static void probe(P *p, File *fl) {
     if (!ok) { int pitch = fl->in.pitch; unknown_info(&fl->in); fl->in.pitch = pitch; fl->in.guessed = 1; }
     if (fl->in.kind != SMP_SRC_PCM_FILE) fl->in.kind = SMP_SRC_DECODED;
     if (fl->in.channels <= 0) fl->in.channels = 2;
+    if (ok && fl->in.kind == SMP_SRC_DECODED) prefill(p, fl, h);
     fl->status = F_OK;   /* any other format is left to the loader's decoder, which says if it can't */
   } else {
     fl->status = F_UNREADABLE;                                  /* empty, or it can't be read */
@@ -884,21 +1015,46 @@ static DWORD WINAPI probe_worker(void *arg) {
   for (;;) {
     LONG i = InterlockedIncrement(&p->next_probe) - 1;
     if (i >= p->nfiles || cancelled(p)) break;
+    if (p->porder) i = p->porder[i];
     if (p->files[i].status == F_PENDING && p->files[i].wpath) probe(p, &p->files[i]);
+    if (p->prog) InterlockedIncrement(&p->prog[0]);
   }
   return 0;
 }
 
-/* every file the first pass found, probed on up to PROBE_THREADS threads (this one among them) */
+static const File *g_sort_files;             /* probe_all's sort (under g_sort_lock) */
+static SRWLOCK g_sort_lock = SRWLOCK_INIT;
+static int by_path(const void *a, const void *b) {
+  const wchar_t *x = g_sort_files[*(const int *)a].lw, *y = g_sort_files[*(const int *)b].lw;
+  if (!x || !y) return (x != NULL) - (y != NULL);
+  return wcscmp(x, y);
+}
+
+/* every file the first pass found, probed on up to PROBE_THREADS threads (this one among them), in path order: the
+   files of a library usually lie on the disk in the order they were copied, folder by folder, so a cold hard disk
+   moves forward instead of jumping between folders the way the instrument's text names them */
 static void probe_all(P *p) {
-  HANDLE t[PROBE_THREADS - 1]; int nt = 0, k, pending = 0;
+  HANDLE t[PROBE_THREADS - 1]; int nt = 0, k, pending = 0, want = PROBE_THREADS;
   for (k = 0; k < p->nfiles; k++) if (p->files[k].status == F_PENDING) pending++;
+  if ((p->porder = malloc((size_t)(p->nfiles ? p->nfiles : 1) * sizeof(int))) != NULL) {
+    for (k = 0; k < p->nfiles; k++) p->porder[k] = k;
+    AcquireSRWLockExclusive(&g_sort_lock);
+    g_sort_files = p->files;
+    qsort(p->porder, (size_t)p->nfiles, sizeof(int), by_path);
+    ReleaseSRWLockExclusive(&g_sort_lock);
+  }
+  if (p->prog) { InterlockedExchange(&p->prog[0], 0); InterlockedExchange(&p->prog[1], p->nfiles); }
   p->next_probe = 0;
-  for (k = 0; k < PROBE_THREADS - 1 && pending > 8 * (k + 1); k++)
-    if ((t[nt] = CreateThread(NULL, 0, probe_worker, p, 0, NULL)) != NULL) nt++;
+  for (k = 0; k < want - 1 && pending > 8 * (k + 1); k++)
+    if ((t[nt] = CreateThread(NULL, 0, probe_worker, p, CREATE_SUSPENDED, NULL)) != NULL) {
+      SetThreadPriority(t[nt], THREAD_PRIORITY_BELOW_NORMAL);   /* they decode too (prefill): never ahead of the host */
+      ResumeThread(t[nt]);
+      nt++;
+    }
   probe_worker(p);
   if (nt) WaitForMultipleObjects((DWORD)nt, t, TRUE, INFINITE);
   for (k = 0; k < nt; k++) CloseHandle(t[k]);
+  free(p->porder); p->porder = NULL;
 }
 
 /* ---- the probe cache: one small file per .sfz next to the decode cache ----
@@ -1233,8 +1389,8 @@ static void finish_region(P *p) {
   int64_t start, endx, ls_abs, le_abs;
   uint32_t at = 0, hf, rate;
   SmpSfRegion r;
-  SmpSfMod m[12];
-  double db;
+  SmpSfMod m[12 + MAX_CCM];
+  double db, fc_raw;
   if (p->collect) { if (o->sample[0]) sample_file(p, o->sample); return; }
   if (o->sw_default >= 0) p->swdef = o->sw_default;
   if (!o->sample[0] || p->too_many || p->oom) return;
@@ -1246,6 +1402,8 @@ static void finish_region(P *p) {
   fl = &p->files[fi];
   nch = fl->in.channels >= 2 ? 2 : 1;
   rate = fl->in.rate ? fl->in.rate : 44100;
+  /* the cutoff in absolute cents, its key-tracking centre taken off (the filter's and the modulators' start) */
+  fc_raw = o->cutoff > 0 ? 1200.0 * log2(o->cutoff / 8.176) - clampd(o->fil_keytrack, -255, 255) * o->fil_keycenter : 13500;
 
   /* Sample playback, in frames of the file. offset is the first frame; end the last one played (inclusive, as
      sfzformat.com has it), so the region plays [offset, end + 1), given as an absolute frame (cond.end_frame), so
@@ -1322,7 +1480,7 @@ static void finish_region(P *p) {
     double kt = clampd(o->fil_keytrack, -255, 255);
     r.cond.fil_type = (uint8_t)o->fil_type;
     r.cond.fil_unity = 1;
-    r.gen[G_FC] = (int16_t)clampi((int)floor(1200.0 * log2(o->cutoff / 8.176) - kt * o->fil_keycenter + 0.5), 1500, 13500);
+    r.gen[G_FC] = (int16_t)clampi((int)floor(fc_raw + 0.5), 1500, 13500);
     r.gen[G_Q] = (int16_t)clampi((int)floor(o->resonance * 10 + 0.5), 0, 960);
   }
 
@@ -1344,8 +1502,15 @@ static void finish_region(P *p) {
       r.gen[G_MODLFO_FC] = (int16_t)clampi((int)floor(fc + 0.5), -12000, 12000);
       r.gen[G_MODLFO_PITCH] = (int16_t)clampi((int)floor(pit + 0.5), -12000, 12000);
     }
-    if (b->freq > 0 && b->pitch != 0) {
-      r.gen[G_FREQ_VIBLFO] = (int16_t)hz_cents(b->freq, -16000, 4500);
+    double bf = b->freq; int depth_cc = 0, k;
+    for (k = 0; k < o->nccm; k++) {
+      /* pitchlfo_freqccN: the rate at the controller's set_cc value (SF2's rate is in cents, so a controller can't
+         move it in Hz; the instrument's starting value counts) */
+      if (o->ccm[k].target == CM_VIBFREQ) bf += o->ccm[k].amount * (p->cc_init[o->ccm[k].cc] > 0 ? p->cc_init[o->ccm[k].cc] : 0) / 127.0;
+      if (o->ccm[k].target == CM_VIBDEPTH && o->ccm[k].amount != 0) depth_cc = 1;
+    }
+    if (bf > 0 && (b->pitch != 0 || depth_cc)) {
+      r.gen[G_FREQ_VIBLFO] = (int16_t)hz_cents(bf, -16000, 4500);
       r.gen[G_DELAY_VIBLFO] = (int16_t)seconds_tc(b->delay, 5000);
       r.gen[G_VIBLFO_PITCH] = (int16_t)clampi((int)floor(b->pitch + 0.5), -12000, 12000);
     }
@@ -1372,8 +1537,44 @@ static void finish_region(P *p) {
       if (B) m[nmod++] = x;
     }
     if (o->cutoff > 0 && o->fil_type >= 0) {
-      if (o->fil_veltrack != 0) { SmpSfMod w = {0x0002, 8, (int16_t)clampi((int)floor(o->fil_veltrack + 0.5), -12000, 12000), 0, 0}; m[nmod++] = w; }
+      /* A cutoff below SF2's floor (1500 cents, 20 Hz) that velocity opens (cutoff=10 fil_veltrack=20000, a common
+         trick): the generator stays at the floor and the modulator takes what was cut off it, so full velocity
+         opens exactly where SFZ puts it (sfizz's reading); softer notes open a little more than SFZ's straight line
+         from 10 Hz would. */
+      double vt = o->fil_veltrack;
+      if (fc_raw < 1500 && vt > 0) vt = fc_raw + vt - 1500 > 0 ? fc_raw + vt - 1500 : 0;
+      if (vt != 0) { SmpSfMod w = {0x0002, 8, (int16_t)clampi((int)floor(vt + 0.5), -32768, 32767), 0, 0}; m[nmod++] = w; }
       if (o->fil_keytrack != 0) { SmpSfMod w = {0x0003, 8, (int16_t)clampi((int)floor(clampd(o->fil_keytrack, -255, 255) * 128 + 0.5), -32768, 32767), 0, 0}; m[nmod++] = w; }
+    }
+    /* Controllers (gain_ccN and the rest): a linear modulator from the CC (0x0080 | N: unipolar, positive) to the
+       generator. Level in dB is attenuation in cB (no EMU factor on modulators); pan percent is SF2's tenths;
+       cutoff only with a filter. An envelope time in seconds can't be added in timecents, so the modulator's
+       amount is the difference in timecents between the stage at the controller's 0 and at its 127 (exact at both
+       ends, in between geometric); the sustain level likewise in cB. */
+    {
+      int k;
+      for (k = 0; k < o->nccm; k++) {
+        int cc = o->ccm[k].cc, tg = o->ccm[k].target, dest = -1;
+        double a = o->ccm[k].amount, amt = 0;
+        if (tg == CM_GAIN) { dest = G_ATTEN; amt = -a * 10; }
+        else if (tg == CM_PITCH) { dest = 59; amt = a; }
+        else if (tg == CM_CUTOFF) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 8; amt = a; } }
+        else if (tg == CM_PAN) { dest = 17; amt = a * 5; }
+        else if (tg == CM_VIBDEPTH) { dest = 6; amt = a; }
+        else if (tg >= CM_AMPEG0 && tg < CM_AMPEG0 + 6) {
+          int st = tg - CM_AMPEG0;
+          dest = G_DELAY_VOLENV + st;
+          if (st == 4) {
+            double s0 = clampd(o->ampeg[4], 0.01, 100), s1 = clampd(o->ampeg[4] + a, 0.01, 100);
+            amt = -200.0 * log10(s1 / 100.0) - -200.0 * log10(s0 / 100.0);
+          } else {
+            double t0 = o->ampeg[st] > 0.001 ? o->ampeg[st] : 0.001, t1 = o->ampeg[st] + a > 0.001 ? o->ampeg[st] + a : 0.001;
+            amt = 1200.0 * log2(t1 / t0);
+          }
+        }
+        if (dest < 0 || amt == 0) continue;
+        { SmpSfMod w = {(uint16_t)(0x0080 | cc), (uint16_t)dest, (int16_t)clampi((int)floor(amt + 0.5), -32768, 32767), 0, 0}; m[nmod++] = w; }
+      }
     }
     if ((moff = add_mods(p, m, nmod)) < 0) return;
   }
@@ -1415,6 +1616,9 @@ static void finish_region(P *p) {
     c->polyphony = (uint16_t)clampi(o->polyphony, 0, 65535);
     c->note_polyphony = (uint16_t)clampi(o->note_polyphony, 0, 65535);
     c->one_shot = (uint8_t)(lm == LOOP_ONESHOT);
+    c->delay = (float)clampd(o->delay, 0, 100); c->delay_random = (float)clampd(o->delay_random, 0, 100);
+    c->amp_random = (float)clampd(o->amp_random, -96, 96); c->pitch_random = (float)clampd(o->pitch_random, 0, 9600);
+    c->amp_keytrack = (float)clampd(o->amp_keytrack, -96, 12); c->amp_keycenter = (uint8_t)clampi(o->amp_keycenter, 0, 127);
   }
 
   /* one region a channel: the sample from frame `at`, the address offsets relative to that sample (fine plus
@@ -1688,6 +1892,7 @@ static void restart_text(P *p) {
   opts_default(&p->global); p->master = p->group = p->region = p->global;
   p->level = LV_NONE;
   p->default_path[0] = 0; p->note_offset = p->octave_offset = 0;
+  for (i = 0; i < 128; i++) p->cc_init[i] = -1;
   p->nincludes = 0; p->text_bytes = 0;
   p->swdef = -1;
 }
@@ -1723,6 +1928,10 @@ static int feed_sfz(SfzBuild *p, void *ctx, const wchar_t *full, char *why, int 
   (void)ctx;
   return process_file(p, full, 0, why, wcap);
 }
+
+/* the calling thread's open progress for the next sfz_build (smp_sf_parse_detached_ex), or NULL */
+static __declspec(thread) volatile LONG *t_open_progress;
+void sf_set_open_progress(volatile LONG *prog) { t_open_progress = prog; }
 
 int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   return sfz_build(f, path, feed_sfz, NULL, cancel, carg, why, wcap);
@@ -1763,7 +1972,21 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
   if (p->level == LV_REGION) finish_region(p);
   InterlockedExchange(&g_wrote, 0); g_pcache_path[0] = 0;
   pcache_read(p, full);
+  p->prog = t_open_progress;
+  if (cancel) {                                 /* a background open (only it has a cancel): prefill, within budget */
+    SmpSettings st; char cwhy[8];
+    smp_settings_get(&st);
+    if (st.cache_limit_gb > 0 && smp_cache_ok(cwhy, sizeof cwhy)) {
+      p->pf_left = (LONG64)(st.cache_limit_gb * 1024.0 * 1024.0 * 1024.0 / 2);
+      p->prefill = 1;
+    }
+  }
   probe_all(p);
+  if (p->pf_wrote) {                            /* the cache keeps to its limit: one folder scan for them all */
+    SmpSettings st;
+    smp_settings_get(&st);
+    smp_cache_trim((uint64_t)(st.cache_limit_gb * 1024.0 * 1024.0 * 1024.0));
+  }
   {
     int k, cached = 0;
     for (k = 0; k < p->nfiles; k++) cached += p->files[k].from_cache;
@@ -1797,6 +2020,7 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
   /* the model: one preset owning every region, the samples, and the one block of regions, preset starts,
      modulator lists and velocity curves */
   if (p->swdef >= 0) for (i = 0; i < p->nr; i++) p->regs[i].r.cond.sw_default = (int8_t)p->swdef;
+  for (i = 0; i < 128; i++) { f->cc_init[i] = p->cc_init[i]; if (p->cc_init[i] >= 0) f->has_cc_init = 1; }
   f->version = 2;
   f->phdr = calloc(2, sizeof *f->phdr);
   f->order = calloc(1, sizeof *f->order);

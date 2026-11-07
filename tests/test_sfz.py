@@ -479,15 +479,15 @@ def test_sfz_unknown_opcodes_counted(lib, tmp_path):
     path = write_sfz(tmp_path / "u.sfz", """
 <control> hint_ram_based=1 label_cc7=Volume
 <global> eq1_freq=100 eq1_gain=3 region_label=Hi
-<group> foo_bar=1 amp_random=2 eq1_freq=200 group_label=x
+<group> foo_bar=1 bar_baz=2 eq1_freq=200 group_label=x
 <region> sample=a.wav key=60 sw_label=y
-<region> sample=a.wav key=61 amp_random=3
+<region> sample=a.wav key=61 bar_baz=3
 <weird> x=1
 """)
     f = opened(lib, path)
     try:
         assert len(regions(lib, f, 0)) == 2
-        assert ignored(lib, f) == (5, "eq1_freq")      # eq1_freq, eq1_gain, foo_bar, amp_random, <weird>
+        assert ignored(lib, f) == (5, "eq1_freq")      # eq1_freq, eq1_gain, foo_bar, bar_baz, <weird>
     finally:
         lib.smp_sf_close(f)
 

@@ -128,6 +128,8 @@ struct SmpFont {
   volatile LONG stuck_gen;              /* the count of the loader's last pass that could load nothing more for now
                                            (the file can't be opened, or memory ran out): waiters stop waiting */
   volatile LONG nloaded;                /* samples in memory (published or retired) */
+  int16_t cc_init[128]; int has_cc_init;  /* SFZ's set_ccN: controllers' values on a reset, -1 for one not given */
+  volatile LONG need_n, need_ready;     /* the loader's last pass: samples the presets in use need, and how many of them are loaded or broken */
   volatile LONG64 loaded_bytes;
   HANDLE *fh;                           /* per path: one shared read handle for streaming (full sharing, positional
                                            reads), made by the loader when it first needs it, closed with the font */
@@ -197,7 +199,7 @@ void sf_source_keys(SmpFont *f);
 /* sffont.c, for the player's offline renders: a pending voice's sample is loaded first (any thread); and the wait
    for it (sample) or for everything the presets in use need (-1), with no fixed cap while the loader keeps making
    progress (0 done, 1 gave up after a minute without any) */
-void smp_sf_hint(SmpFont *f, int sample);
+void sf_set_open_progress(volatile LONG *prog);   /* sfsfz.c: this thread's next SFZ open counts its sample files into prog[0] of prog[1] */
 int smp_sf_wait_loaded(SmpFont *f, int sample);
 void sf_free(SmpFont *f);
 /* sf2.c, for the other loaders that build SF2's model themselves: every generator's default; a value held to its

@@ -62,7 +62,9 @@ class SmpSfCond(ctypes.Structure):
                 ("gain", ctypes.c_float), ("amp_velcurve", ctypes.POINTER(ctypes.c_float)),
                 ("polyphony", ctypes.c_uint16), ("note_polyphony", ctypes.c_uint16),
                 ("one_shot", u8), ("fil_type", u8), ("fil_unity", u8), ("pair", u8),
-                ("end_frame", ctypes.c_uint32), ("rt_linear", ctypes.c_float)]
+                ("end_frame", ctypes.c_uint32), ("rt_linear", ctypes.c_float),
+                ("delay", ctypes.c_float), ("delay_random", ctypes.c_float), ("amp_random", ctypes.c_float),
+                ("pitch_random", ctypes.c_float), ("amp_keytrack", ctypes.c_float), ("amp_keycenter", ctypes.c_uint8)]
 
 
 class SmpSfRegion(ctypes.Structure):
@@ -257,7 +259,12 @@ def lib(settings_file):
                             ("smp_synth_set_offline", None, [vp, c_int]),
                             ("smp_synth_unload", c_int, [vp]),
                             ("smp_sf_test_font", vp, [c_char_p, c_char_p, c_char_p, c_int]),
-                            ("smp_synth_test_seed", None, [vp, ctypes.c_uint])):
+                            ("smp_synth_test_seed", None, [vp, ctypes.c_uint]),
+                            ("smp_sf_parse_detached_ex", vp, [c_char_p, vp, vp, vp, c_char_p, c_int]),
+                            ("smp_sf_adopt", vp, [vp, c_char_p, c_int]),
+                            ("smp_sf_load_progress", c_int, [vp, ip]),
+                            ("smp_sf_hint", None, [vp, c_int]),
+                            ("smp_sf_test_pause", None, [c_int])):
         if hasattr(dll, name):
             getattr(dll, name).restype = res
             getattr(dll, name).argtypes = args

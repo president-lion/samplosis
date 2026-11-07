@@ -145,7 +145,7 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
      the channel's bend range). RPN fine and coarse tuning are added directly. */
   v->chan_tune = c->fine_cents + 100.0 * c->coarse_semis;
   v->cents0 = (v->pkey - v->root) * g[G_SCALE] + 100.0 * g[G_COARSE] + g[G_FINE] + v->correction +
-              g[G_PITCH] + v->chan_tune + 100.0 * v->transpose;
+              g[G_PITCH] + v->chan_tune + 100.0 * v->transpose + v->rnd_cents;
   v->ratio_k = v->srate / rate;
 
   /* gain: initialAttenuation times the EMU factor, plus the modulators' attenuation (velocity, CC7, CC11) */
@@ -309,12 +309,21 @@ static double menv_out(const SmpSfEnv *e) { return e->stage == E_ATTACK ? curve(
 static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
   double hz, w, cs, alpha, a0;
   int kind = v->reg->cond.fil_type;
-  if (kind == SMP_FIL_LP && fc_cents >= 13500 && v->g[G_Q] <= 0) {
+  if ((kind == SMP_FIL_LP || kind == SMP_FIL_LP1) && fc_cents >= 13500 && (kind == SMP_FIL_LP1 || v->g[G_Q] <= 0)) {
     c[0] = 1; c[1] = c[2] = c[3] = c[4] = 0;
     return;
   }
   hz = clampd(abs_hz(clampd(fc_cents, 1500, 13500)), 5, 0.45 * v->rate);
   w = 2 * PI * hz / v->rate;
+  if (kind == SMP_FIL_LP1 || kind == SMP_FIL_HP1) {
+    /* SFZ's lpf_1p and hpf_1p: one pole (6 dB an octave, no resonance), by the bilinear transform with the cutoff
+       prewarped, as the biquad's first-order case */
+    double k = tan(w / 2), n = 1 / (1 + k);
+    if (kind == SMP_FIL_LP1) { c[0] = k * n; c[1] = k * n; }
+    else { c[0] = n; c[1] = -n; }
+    c[2] = 0; c[3] = (k - 1) * n; c[4] = 0;
+    return;
+  }
   cs = cos(w);
   alpha = sin(w) / (2 * v->q_lin);
   a0 = 1 + alpha;
@@ -469,6 +478,15 @@ static void stream_start(SmpSfVoice *v, SfStream *st, int slot, const void *stre
   v->fed0 = m.p0 > v->hf ? m.p0 : v->hf;
 }
 
+/* a random 0..1 for the randoms above: xorshift32 per thread (the audio thread's own; no lock, no allocation) */
+static __declspec(thread) uint32_t t_rnd = 0x2545F491u;
+static double rnd01(void) {
+  uint32_t x = t_rnd;
+  x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+  t_rnd = x;
+  return (x >> 8) * (1.0 / 16777216.0);
+}
+
 int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int vel, const SmpSfChan *c,
                   double rate, double transpose, SfStream *st, int slot, double held) {
   const SmpSfSample *sh;
@@ -520,6 +538,16 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   v->streaming = vw.stream && ((v->looping && v->mode != 3) ? lpe > v->hf : end > v->hf);
   v->live = 1;
   v->cond_gain = cond_gain(r, v->key, v->vel, held);
+  {
+    /* SFZ's per-note randoms and level tracking: amp_keytrack dB per key from amp_keycenter, amp_random a draw of
+       0..amp_random dB, pitch_random -x..+x cents, and delay plus 0..delay_random seconds before the voice starts */
+    const SmpSfCond *d = &r->cond;
+    double db = d->amp_keytrack * (v->key - d->amp_keycenter);
+    if (d->amp_random != 0) db += d->amp_random * rnd01();
+    if (db != 0) v->cond_gain *= pow(10.0, db / 20);
+    if (d->pitch_random > 0) v->rnd_cents = d->pitch_random * (2 * rnd01() - 1);
+    if (d->delay > 0 || d->delay_random > 0) v->wait = (int64_t)((d->delay + d->delay_random * rnd01()) * rate + 0.5);
+  }
   derive(v, c);
   if (v->streaming && st) stream_start(v, st, slot, vw.stream);   /* after derive: its pitch gives the speed */
   v->venv.stage = E_DELAY; v->menv.stage = E_DELAY;
@@ -804,6 +832,11 @@ static void publish_need(SmpSfVoice *v) {
 int smp_sfv_render(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int n) {
   int i = 0;
   if (!v->live) return 0;
+  if (v->wait > 0) {                             /* delay: nothing yet, and nothing moves */
+    if (v->killing) { end_voice(v); return 0; }  /* stopped before it began */
+    if (v->wait >= n) { v->wait -= n; return 1; }
+    i = (int)v->wait; v->wait = 0;
+  }
   while (i < n) {
     int m;
     if (v->ctl_left <= 0) {

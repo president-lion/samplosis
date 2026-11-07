@@ -82,12 +82,15 @@ static CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;   /* signalled when th
 static SmpFont **g_fonts; static int g_nfonts, g_capfonts;
 static SmpFont *g_busy;                    /* the font the loader is working on, outside the lock */
 static HANDLE g_thread;
-static HANDLE g_dthread;                   /* the decode worker (started and stopped with the loader) */
-static SmpFont *g_dbusy;                   /* the font the worker is decoding for, outside the lock */
+#define MAX_DECODERS 8                     /* decode workers at most (one fewer than the cores, at least one) */
+static HANDLE g_dthread[MAX_DECODERS];     /* the decode workers (started and stopped with the loader) */
+static int g_ndec;                         /* how many run */
+static SmpFont *g_dbusy[MAX_DECODERS];     /* the font each worker is decoding for, outside the lock */
+static int g_dbusy_s[MAX_DECODERS];        /* and the sample */
 typedef struct { SmpFont *f; int s; } Job;
-static Job *g_jobs; static int g_njobs, g_capjobs;   /* the worker's queue (under g_lock) */
+static Job *g_jobs; static int g_njobs, g_capjobs;   /* the workers' queue (under g_lock) */
 static CONDITION_VARIABLE g_jcv = CONDITION_VARIABLE_INIT;   /* signalled when a job comes, or to stop */
-static __declspec(thread) int t_decoder;   /* this thread is the decode worker */
+static __declspec(thread) int t_decoder;   /* this thread is a decode worker */
 static HANDLE g_wake;                      /* auto-reset; made once and never closed, so SetEvent is always safe */
 static volatile LONG g_stop;
 static volatile LONG g_grace = DEFAULT_GRACE_MS;
@@ -719,7 +722,21 @@ static void take(SmpFont *f, int s, SfPcm *pc, int broken, int *retry) {
 /* a job for the decode worker: sample s's decode, or (s = -1) the font's SF2Pack. Loader thread. Never for a
    closing font: its close has dropped its jobs and may free it as soon as the loader lets go, so a job queued after
    that would reach the worker with a freed font (closing is set under g_lock, and checked here under it). */
-static void queue_decode(SmpFont *f, int s) {
+static void queue_decode(SmpFont *f, int s, int front) {
+  if (s >= 0 && front && f->dq[s] == SF_DQ_QUEUED) {
+    /* a pending voice wants a sample already waiting in the queue: it moves to the front (one still in it; one a
+       worker has taken is nearly done anyway) */
+    int k;
+    AcquireSRWLockExclusive(&g_lock);
+    for (k = 0; k < g_njobs; k++) if (g_jobs[k].f == f && g_jobs[k].s == s) {
+      Job j = g_jobs[k];
+      memmove(g_jobs + 1, g_jobs, (size_t)k * sizeof *g_jobs);
+      g_jobs[0] = j;
+      break;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return;
+  }
   if (s < 0 ? f->pack_q : f->dq[s]) return;
   if (g_race) {                                 /* tests: wait for the close to begin */
     ULONGLONG end = GetTickCount64() + 5000;
@@ -734,28 +751,53 @@ static void queue_decode(SmpFont *f, int s) {
     if (!nj) { ReleaseSRWLockExclusive(&g_lock); return; }   /* tried again on a later pass */
     g_jobs = nj; g_capjobs = nc;
   }
-  g_jobs[g_njobs].f = f; g_jobs[g_njobs].s = s; g_njobs++;
+  if (front) {                                  /* a pending voice's sample: decoded next */
+    memmove(g_jobs + 1, g_jobs, (size_t)g_njobs * sizeof *g_jobs);
+    g_jobs[0].f = f; g_jobs[0].s = s;
+  } else {
+    g_jobs[g_njobs].f = f; g_jobs[g_njobs].s = s;
+  }
+  g_njobs++;
   if (s < 0) InterlockedExchange(&f->pack_q, 1);
   else InterlockedExchange8((volatile char *)&f->dq[s], SF_DQ_QUEUED);
   ReleaseSRWLockExclusive(&g_lock);
-  WakeConditionVariable(&g_jcv);
+  WakeAllConditionVariable(&g_jcv);             /* all: a worker that can't take this kind of job sleeps again */
 }
 
 
 /* Sample s, needed and not loaded: loaded now (its head from a PCM file, or from its decoded copy in the cache),
    published, or marked broken (or left for a retry). A DECODED sample with no copy in the cache yet goes to the
    decode worker instead: the loader never decodes, so one font's long decode never holds up another's heads. */
-static void load_one(SmpFont *f, int s, int *retry, int *cant_open, int *waiting) {
+static void load_one(SmpFont *f, int s, int *retry, int *cant_open, int *waiting, int front) {
   SfPcm *pc; int broken;
-  if (f->dq[s]) { *waiting = 1; return; }       /* the worker has it */
-  if (!font_handle(f, f->src[s].path_id)) { *cant_open = *retry = 1; return; }   /* tried again in RETRY_MS */
+  const SmpSrc *c = &f->src[s];
+  if (f->dq[s]) {                               /* a worker has it */
+    if (front) queue_decode(f, s, 1);           /* still queued: to the front */
+    *waiting = 1;
+    return;
+  }
+  /* A decoded sample file of its own (SFZ, Decent Sampler, EXS) isn't opened here: the worker decodes it by name, or
+     its decoded copy is read from the cache. Opening each of thousands of files first would cost a seek apiece on a
+     cold disk for nothing; a file that has gone is said by the decode that fails. */
+  if (c->kind == SMP_SRC_DECODED && !c->length && !c->giga && c->path_id > 0) {
+    /* and its load goes to the workers whether its decoded copy is in the cache or not: opening a cache file costs a
+       few milliseconds (the virus scanner looks at each), so thousands of them are opened on every worker at once
+       rather than one after another here */
+    queue_decode(f, s, front);
+    *waiting = 1;
+    return;
+  }
+  if (!font_handle(f, c->path_id)) {
+    *cant_open = *retry = 1;                    /* tried again in RETRY_MS */
+    return;
+  }
   pc = load_sample(f, s, &broken);
   InterlockedIncrement(&f->progress);
-  if (!pc && broken == SF_NEEDS_DECODE) { queue_decode(f, s); *waiting = 1; return; }
+  if (!pc && broken == SF_NEEDS_DECODE) { queue_decode(f, s, front); *waiting = 1; return; }
   take(f, s, pc, broken, retry);
 }
 
-/* the samples pending voices asked for first (smp_sf_hint): loaded before the walk */
+/* the samples pending voices asked for first (smp_sf_hint): loaded before the walk, or decoded next */
 static void serve_hints(SmpFont *f, int *retry, int *cant_open, int *waiting) {
   int k;
   for (k = 0; k < SF_HINTS; k++) {
@@ -763,7 +805,7 @@ static void serve_hints(SmpFont *f, int *retry, int *cant_open, int *waiting) {
     if (h <= 0 || s >= f->nshdr || f->closing || g_stop) continue;
     if (!f->need[s] || f->state[s] != SF_ST_NONE || *cant_open) continue;
     if (f->is_pack && f->pack_state != SF_PACK_READY) continue;
-    load_one(f, s, retry, cant_open, waiting);
+    load_one(f, s, retry, cant_open, waiting, 1);
   }
 }
 
@@ -793,7 +835,7 @@ static DWORD pass(SmpFont *f) {
   }
   if (f->is_pack && f->pack_state == SF_PACK_NONE && !f->closing && !g_stop) {   /* the pack first, once needed */
     for (s = 0; s < f->nshdr && !f->need[s]; s++) {}
-    if (s < f->nshdr) queue_decode(f, -1);                      /* the worker unpacks it */
+    if (s < f->nshdr) queue_decode(f, -1, 0);                      /* the worker unpacks it */
   }
   serve_hints(f, &retry, &cant_open, &waiting);
 
@@ -811,7 +853,7 @@ static DWORD pass(SmpFont *f) {
       } else if (f->state[s] == SF_ST_NONE && cant_open) {
         retry = 1;
       } else if (f->state[s] == SF_ST_NONE) {
-        load_one(f, s, &retry, &cant_open, &waiting);
+        load_one(f, s, &retry, &cant_open, &waiting, 0);
         serve_hints(f, &retry, &cant_open, &waiting);   /* a pending voice's sample doesn't wait out the walk */
       }
       continue;
@@ -842,7 +884,12 @@ static DWORD pass(SmpFont *f) {
     }
   }
   for (s = 0; s < f->npaths; s++) if (f->ph[s]) { CloseHandle(f->ph[s]); f->ph[s] = NULL; }
-  trim_after_writes(f, 1);
+  {                                                /* the status's "Loading samples: N of M" */
+    LONG nn = 0, nr = 0;
+    for (s = 0; s < f->nshdr; s++) if (f->need[s]) { nn++; nr += f->state[s] != SF_ST_NONE; }
+    InterlockedExchange(&f->need_n, nn); InterlockedExchange(&f->need_ready, nr);
+  }
+  trim_after_writes(f, !waiting);                 /* the folder scan once the workers are done with f */
   InterlockedIncrement(&f->progress);
   /* A pass that left a needed sample unloaded for now (the file can't be opened, or memory ran out) isn't done: it
      runs again in RETRY_MS, and the status still counts the presets as loading. But it is as done as it can be
@@ -889,17 +936,49 @@ static DWORD WINAPI loader(void *arg) {
    priority. It takes jobs in order (a sample's decode into the cache, or an SF2Pack's unpacking), runs the same
    load_sample the loader would, with handles of its own, and leaves the result for the loader to publish. A
    closing font's jobs are dropped, and its running decode stops at its next piece (f->closing). */
+/* the first job worker me may take (under g_lock), or -1: worker 0 takes any; the others leave SF2Pack unpacking
+   and GigaStudio waves (libgig isn't known to be safe on two threads at once) to worker 0 */
+/* 1 when job j reads the same file as one another worker is decoding: a stereo file's other channel, or a start head
+   of the same file. That worker writes the file's decoded copies for all of them from its one decode, so this job
+   waits and then finds them in the cache, instead of decoding the file a second time at once. */
+static int sibling_busy(const Job *j) {
+  int w;
+  const SmpSrc *c;
+  if (j->s < 0) return 0;
+  c = &j->f->src[j->s];
+  if (c->kind != SMP_SRC_DECODED) return 0;
+  for (w = 0; w < g_ndec; w++) {
+    const SmpSrc *o;
+    if (g_dbusy[w] != j->f || g_dbusy_s[w] < 0) continue;
+    o = &j->f->src[g_dbusy_s[w]];
+    if (o->kind == SMP_SRC_DECODED && o->path_id == c->path_id && o->offset == c->offset && o->length == c->length &&
+        o->giga == c->giga) return 1;
+  }
+  return 0;
+}
+
+static int pick_job(int me) {
+  int k;
+  for (k = 0; k < g_njobs; k++) {
+    const Job *j = &g_jobs[k];
+    if (me && (j->s < 0 || j->f->src[j->s].giga)) continue;
+    if (sibling_busy(j)) continue;
+    return k;
+  }
+  return -1;
+}
+
 static DWORD WINAPI decoder(void *arg) {
-  (void)arg;
+  int me = (int)(INT_PTR)arg, k = -1;
   t_decoder = 1;
   for (;;) {
     SmpFont *f = NULL; int s = 0;
     AcquireSRWLockExclusive(&g_lock);
-    while (!g_stop && (!g_njobs || g_race)) SleepConditionVariableSRW(&g_jcv, &g_lock, g_race ? 10 : INFINITE, 0);
+    while (!g_stop && (g_race || (k = pick_job(me)) < 0)) SleepConditionVariableSRW(&g_jcv, &g_lock, g_race ? 10 : INFINITE, 0);
     if (g_stop) { ReleaseSRWLockExclusive(&g_lock); break; }
-    f = g_jobs[0].f; s = g_jobs[0].s;
-    memmove(g_jobs, g_jobs + 1, (size_t)(--g_njobs) * sizeof *g_jobs);
-    g_dbusy = f;
+    f = g_jobs[k].f; s = g_jobs[k].s;
+    memmove(g_jobs + k, g_jobs + k + 1, (size_t)(--g_njobs - k) * sizeof *g_jobs);
+    g_dbusy[me] = f; g_dbusy_s[me] = s;
     ReleaseSRWLockExclusive(&g_lock);
     if (!f->closing && !g_stop) {
       if (s < 0) {
@@ -914,9 +993,11 @@ static DWORD WINAPI decoder(void *arg) {
       }
     }
     decoder_handles_close();
-    if (!f->closing) trim_after_writes(f, 1);       /* the cache keeps to its limit as the worker writes */
+    if (!f->closing) trim_after_writes(f, 0);       /* the cache keeps to its limit as the workers write (a folder
+                                                       scan every TRIM_EVERY bytes, and once the loader's pass finds
+                                                       the font's decodes done: not one per sample) */
     AcquireSRWLockExclusive(&g_lock);
-    g_dbusy = NULL;
+    g_dbusy[me] = NULL; g_dbusy_s[me] = -1;
     ReleaseSRWLockExclusive(&g_lock);
     WakeAllConditionVariable(&g_cv);
     if (g_wake) SetEvent(g_wake);                   /* the loader publishes what came */
@@ -1051,8 +1132,18 @@ SmpFont *smp_sf_open(const char *path, char *err, int cap) {
 
 /* the window's background loads: the parse on a worker, the registration on the main thread */
 SmpFont *smp_sf_parse_detached(const char *path, int (*cancel)(void *), void *arg, char *err, int cap) {
+  return smp_sf_parse_detached_ex(path, cancel, arg, NULL, err, cap);
+}
+
+/* the same, counting an SFZ's (Decent Sampler's, EXS's) sample files as they are read: progress[0] of progress[1] */
+SmpFont *smp_sf_parse_detached_ex(const char *path, int (*cancel)(void *), void *arg, volatile LONG *progress,
+                                  char *err, int cap) {
+  SmpFont *f;
   if (err && cap > 0) err[0] = 0;
-  return sf_parse_ex(path, cancel, arg, err, cap);
+  sf_set_open_progress(progress);
+  f = sf_parse_ex(path, cancel, arg, err, cap);
+  sf_set_open_progress(NULL);
+  return f;
 }
 
 void smp_sf_discard(SmpFont *f) { if (f) sf_free(f); }
@@ -1085,11 +1176,20 @@ SmpFont *sf_register(SmpFont *f, wchar_t *full, char *err, int cap) {
     g_thread = CreateThread(NULL, 0, loader, NULL, 0, NULL);
     if (g_thread) SetThreadPriority(g_thread, THREAD_PRIORITY_BELOW_NORMAL);
   }
-  if (g_thread && !g_dthread) {
-    g_dthread = CreateThread(NULL, 0, decoder, NULL, 0, NULL);
-    if (g_dthread) SetThreadPriority(g_dthread, THREAD_PRIORITY_BELOW_NORMAL);
+  if (g_thread && !g_ndec) {
+    /* one worker fewer than the cores (the loader, the audio and the host need some), at least one, at most
+       MAX_DECODERS; worker 0 must start, the rest are a bonus */
+    int want = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) - 1, k;
+    if (want < 1) want = 1;
+    if (want > MAX_DECODERS) want = MAX_DECODERS;
+    for (k = 0; k < want; k++) {
+      HANDLE h = CreateThread(NULL, 0, decoder, (void *)(INT_PTR)k, 0, NULL);
+      if (!h) break;
+      SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
+      g_dthread[g_ndec++] = h;
+    }
   }
-  if (!g_thread || !g_dthread) {
+  if (!g_thread || !g_ndec) {
     ReleaseSRWLockExclusive(&g_lock);
     free_font(f);
     if (err && cap > 0) snprintf(err, cap, "can't start loading %s", path);
@@ -1104,9 +1204,16 @@ no_memory:
   return NULL;
 }
 
+/* a worker decoding for f (under g_lock), or -1 */
+static int dbusy_with(const SmpFont *f) {
+  int k;
+  for (k = 0; k < g_ndec; k++) if (g_dbusy[k] == f) return k;
+  return -1;
+}
+
 void smp_sf_close(SmpFont *f) {
-  HANDLE t = NULL, dt = NULL;
-  int i;
+  HANDLE t = NULL, dt[MAX_DECODERS];
+  int i, ndt = 0;
   if (!f) return;
   AcquireSRWLockExclusive(&g_lock);
   if (--f->refs > 0) { ReleaseSRWLockExclusive(&g_lock); return; }
@@ -1122,16 +1229,18 @@ void smp_sf_close(SmpFont *f) {
   }
   /* A read the loader or the worker is stuck in for f (a dead network share, a disk that doesn't answer) is
      cancelled, so the close doesn't wait on it; decodes stop on f->closing themselves. */
-  while (g_busy == f || g_dbusy == f) {
+  while (g_busy == f || dbusy_with(f) >= 0) {
+    int k;
     if (g_busy == f && g_thread) CancelSynchronousIo(g_thread);
-    if (g_dbusy == f && g_dthread) CancelSynchronousIo(g_dthread);
+    for (k = 0; k < g_ndec; k++) if (g_dbusy[k] == f) CancelSynchronousIo(g_dthread[k]);
     SleepConditionVariableSRW(&g_cv, &g_lock, 50, 0);
   }
-  if (g_nfonts == 0 && g_thread) {                  /* the last font: the loader and the worker stop */
+  if (g_nfonts == 0 && g_thread) {                  /* the last font: the loader and the workers stop */
     t = g_thread; g_thread = NULL;
-    dt = g_dthread; g_dthread = NULL;
+    for (ndt = 0; ndt < g_ndec; ndt++) { dt[ndt] = g_dthread[ndt]; g_dthread[ndt] = NULL; }
+    g_ndec = 0;
     InterlockedExchange(&g_stop, 1);
-    g_njobs = 0;                                    /* nothing is left for the next worker (no font is open) */
+    g_njobs = 0;                                    /* nothing is left for the next workers (no font is open) */
   }
   ReleaseSRWLockExclusive(&g_lock);
   if (g_wake) SetEvent(g_wake);                     /* wakes it to stop, or to walk the shifted list again */
@@ -1139,9 +1248,9 @@ void smp_sf_close(SmpFont *f) {
     WakeAllConditionVariable(&g_jcv);
     while (WaitForSingleObject(t, 50) == WAIT_TIMEOUT) CancelSynchronousIo(t);   /* never stuck in a read either */
     CloseHandle(t);
-    if (dt) {
-      while (WaitForSingleObject(dt, 50) == WAIT_TIMEOUT) { WakeAllConditionVariable(&g_jcv); CancelSynchronousIo(dt); }
-      CloseHandle(dt);
+    for (i = 0; i < ndt; i++) {
+      while (WaitForSingleObject(dt[i], 50) == WAIT_TIMEOUT) { WakeAllConditionVariable(&g_jcv); CancelSynchronousIo(dt[i]); }
+      CloseHandle(dt[i]);
     }
     InterlockedExchange(&g_stop, 0);
   }
@@ -1256,6 +1365,10 @@ int smp_sf_wait_idle(SmpFont *f, int timeout_ms) {
 }
 
 int smp_sf_loaded_samples(const SmpFont *f) { return f ? (int)f->nloaded : 0; }
+int smp_sf_load_progress(const SmpFont *f, int *total) {
+  if (total) *total = f ? (int)f->need_n : 0;
+  return f ? (int)f->need_ready : 0;
+}
 
 const char *smp_sf_problem(const SmpFont *f) {
   if (f && InterlockedCompareExchange((volatile LONG *)&f->has_problem2, 0, 0)) return f->problem2;

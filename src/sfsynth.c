@@ -276,6 +276,16 @@ static void chan_defaults(Chan *h) {        /* power on, and the GM, GS and XG r
   h->sw_last = h->prev_key = -1;           /* the condition state too: no keys, keyswitch or counters */
 }
 
+/* SFZ's set_ccN: the font's starting controller values, after every reset (power on, the system resets, Reset All
+   Controllers, a stop or seek) and when the font comes in, so a region gated on a controller (locc/hicc) or scaled
+   by one (gain_ccN) starts where the instrument means it to */
+static void font_ccs(const SmpSynth *s, Chan *h) {
+  const SmpFont *f = s->cur;
+  int k;
+  if (!f || !f->has_cc_init) return;
+  for (k = 0; k < 128; k++) if (f->cc_init[k] >= 0) h->c.cc[k] = (uint8_t)f->cc_init[k];
+}
+
 /* the condition state that names keys and set ids of the font: on a font change, all of it */
 static void chan_cond_reset(Chan *h) {
   memset(h->held, 0, sizeof h->held); memset(h->rel_wait, 0, sizeof h->rel_wait); memset(h->ksost, 0, sizeof h->ksost);
@@ -506,9 +516,11 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   t->st = V_PENDING;
   t->since = GetTickCount64();
   if (try_start(s, i)) return;
+  /* not loaded yet (the font is still loading): the loader fetches or decodes this sample next, ahead of the rest,
+     so a note played while a big instrument loads sounds a moment late instead of not at all */
+  smp_sf_hint(s->cur, r->sample);
   if (s->offline || s->render_offline) {   /* an offline render waits, so the note starts on its frame: its sample
                                               first, for as long as the loader keeps making progress */
-    smp_sf_hint(s->cur, r->sample);
     smp_sf_wait_loaded(s->cur, r->sample);
     if (try_start(s, i)) return;
   }
@@ -712,7 +724,7 @@ static void control(SmpSynth *s, int c, int n, int v) {
   int was_sus = sustained(h), was_sost = sostenuto(h);
   if (n >= 120) {
     if (n == 120) sound_off(s, c);
-    else if (n == 121) { chan_controllers(h); tuning(h); let_go(s, c); update_chan(s, c); }
+    else if (n == 121) { chan_controllers(h); font_ccs(s, h); tuning(h); let_go(s, c); update_chan(s, c); }
     else if (n >= 123) all_notes_off(s, c);    /* 123, and the mode messages 124..127 that imply it */
     /* 122, Local Control, has nothing to do in a synth without a keyboard */
     return;
@@ -753,7 +765,7 @@ static void program(SmpSynth *s, int c, int p) {
 static void system_reset(SmpSynth *s) {           /* GM, GS and XG reset: every channel back to power-on */
   int c;
   sound_off(s, -1);
-  for (c = 0; c < NCH; c++) chan_defaults(&s->ch[c]);
+  for (c = 0; c < NCH; c++) { chan_defaults(&s->ch[c]); font_ccs(s, &s->ch[c]); }
   seq_clear(s, -1);
   resolve_all(s);
 }
@@ -963,7 +975,7 @@ static void flush_now(SmpSynth *s, int now) {
   if (now) { for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; } }
   else sound_off(s, -1);
   for (c = 0; c < NCH; c++) {
-    chan_controllers(&s->ch[c]); tuning(&s->ch[c]);
+    chan_controllers(&s->ch[c]); font_ccs(s, &s->ch[c]); tuning(&s->ch[c]);
     /* no key is down any more; the keyswitch, the previous note and the round-robin counters stay */
     memset(s->ch[c].held, 0, sizeof s->ch[c].held);
     memset(s->ch[c].rel_wait, 0, sizeof s->ch[c].rel_wait);
@@ -1044,6 +1056,7 @@ static void block_start(SmpSynth *s, int n) {
     s->sq = s->sq_want;                         /* published before the font, so it fits w */
     seq_clear(s, -1);
     InterlockedExchangePointer((PVOID volatile *)&s->cur, w);
+    for (i = 0; i < NCH; i++) font_ccs(s, &s->ch[i]);
     changed = 1;
   }
   if (s->dormant) {                             /* only what the channels would play, without using it */
@@ -1509,7 +1522,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   block_start(s, 0);
   s->dormant = 0;
   for (i = 0; i < MAXV; i++) { if (s->sl[i].st == V_LIVE) smp_sfv_kill(&s->v[i], 0); s->sl[i].st = V_FREE; }
-  for (i = 0; i < NCH; i++) chan_defaults(&s->ch[i]);
+  for (i = 0; i < NCH; i++) { chan_defaults(&s->ch[i]); font_ccs(s, &s->ch[i]); }
   seq_clear(s, -1);
   resolve_all(s);
   s->nev = 0; s->peak = 0;

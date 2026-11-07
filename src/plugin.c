@@ -874,6 +874,7 @@ struct Loader {
   Job *want, *busy, *done;               /* the next job, the one decoding, a finished one not yet taken */
   long serial;                           /* the newest job's (main thread writes it, under the lock) */
   volatile LONG ffmpeg;                  /* the serial of a job that got to FFmpeg */
+  volatile LONG prog[3];                 /* an SFZ's sample files read so far, of how many, and for which serial */
   const clap_host_t *host;
   volatile LONG refs;
   HMODULE self;
@@ -886,6 +887,13 @@ static int loading_text(Plug *P, char *out, int cap) {
   int ff;
   if (!P->loading || !P->loader) return 0;
   ff = !P->loading_font && InterlockedCompareExchange(&P->loader->ffmpeg, 0, 0) == P->loader->serial;
+  if (!ff && P->loading_font && P->loader->prog[2] == P->loader->serial && P->loader->prog[1] > 0) {
+    /* an SFZ (Decent Sampler, EXS) reading its sample files: how far, rounded to a tenth so the status changes
+       about ten times rather than thousands */
+    long n = P->loader->prog[1], d = P->loader->prog[0], step = n >= 100 ? n / 10 : 1;
+    snprintf(out, (size_t)cap, "Loading %s: %ld of %ld samples", P->loading_name, d >= n ? n : d / step * step, n);
+    return 1;
+  }
   snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
   return 1;
 }
@@ -904,7 +912,10 @@ static DWORD WINAPI load_worker(void *arg) {
     if (L->quit) break;
     j = L->want; L->want = NULL; L->busy = j;
     ReleaseSRWLockExclusive(&L->lock);
-    if (j->font) j->f = smp_sf_parse_detached(j->path, job_cancelled, j, j->err, sizeof j->err);
+    if (j->font) {
+      InterlockedExchange(&L->prog[1], 0); InterlockedExchange(&L->prog[0], 0); InterlockedExchange(&L->prog[2], j->serial);
+      j->f = smp_sf_parse_detached_ex(j->path, job_cancelled, j, L->prog, j->err, sizeof j->err);
+    }
     else j->s = smp_sample_load_ex(j->path, job_cancelled, job_at_ffmpeg, j, j->err, sizeof j->err);
     AcquireSRWLockExclusive(&L->lock);
     L->busy = NULL;
@@ -1170,7 +1181,12 @@ static void sf_status(Plug *P, char *out, int cap) {
   if (P->sf_missing) { snprintf(out, (size_t)cap, "%s", P->sf_err); return; }
   if (!(f = smp_synth_font(P->s))) { snprintf(out, (size_t)cap, "No SoundFont loaded"); return; }
   n = smp_synth_loading(P->s);
-  if (n > 0) snprintf(out, (size_t)cap, "Loading samples for %d %s", n, n == 1 ? "preset" : "presets");
+  if (n > 0) {
+    int total = 0, ready = smp_sf_load_progress(f, &total), step = total >= 100 ? total / 10 : 1;
+    if (total > 0 && ready < total)
+      snprintf(out, (size_t)cap, "Loading samples: %d of %d", ready / step * step, total);
+    else snprintf(out, (size_t)cap, "Loading samples for %d %s", n, n == 1 ? "preset" : "presets");
+  }
   else { smp_plug_font_text(P, t, sizeof t); snprintf(out, (size_t)cap, "Ready: %s", t); }
   prob = smp_sf_problem(f);
   if (prob && prob[0] && (L = strlen(out)) + 4 < (size_t)cap) {
