@@ -64,7 +64,8 @@ class SmpSfCond(ctypes.Structure):
                 ("one_shot", u8), ("fil_type", u8), ("fil_unity", u8), ("pair", u8),
                 ("end_frame", ctypes.c_uint32), ("rt_linear", ctypes.c_float),
                 ("delay", ctypes.c_float), ("delay_random", ctypes.c_float), ("amp_random", ctypes.c_float),
-                ("pitch_random", ctypes.c_float), ("amp_keytrack", ctypes.c_float), ("amp_keycenter", ctypes.c_uint8)]
+                ("pitch_random", ctypes.c_float), ("amp_keytrack", ctypes.c_float), ("amp_keycenter", ctypes.c_uint8),
+                ("layer", ctypes.c_uint16)]
 
 
 class SmpSfRegion(ctypes.Structure):

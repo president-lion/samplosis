@@ -145,6 +145,7 @@ typedef struct {
   /* controllers modulating the region (gain_ccN, pitch_onccN, ampeg_decayccN...): the last one given per CC and
      target wins */
   int nccm; struct { uint8_t cc, target; double amount; } ccm[MAX_CCM];
+  int layer;                                   /* samplosis_layer (Decent Sampler's knobs): cond.layer */
 } Opts;
 
 /* where a sample start head begins, and its sample per channel */
@@ -224,6 +225,11 @@ typedef struct SfzBuild {
   int oom;
   /* presets (sfz_preset): where each starts in regs and its name; none given is one preset named after the file */
   struct { int start; char name[21]; } *pre; int npre, cappre;
+  /* Decent Sampler's knobs, per preset (sfz_set_knobs; index 0 also when no preset was named), and the current
+     preset's internal global opcodes: CCs bound to knobs (their default modulators are left out) and no send to the
+     shared reverb */
+  SfKnobs **pk; int cappk;
+  uint8_t unbound[16]; int no_rev_send;
 } P;
 
 /* ---- small helpers ---- */
@@ -449,6 +455,12 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   double d; int k, i;
   char w[64];
 #define IS(s) (!strcmp(nm, s))
+  if (!strncmp(nm, "samplosis_", 10)) {      /* the builder's own, fed by sfds.c for Decent Sampler's knobs */
+    if (IS("samplosis_layer") && num(v, &d)) o->layer = clampi((int)d, 0, 65535);
+    else if (IS("samplosis_unbind_cc") && num(v, &d) && d >= 0 && d <= 127) p->unbound[(int)d >> 3] |= (uint8_t)(1 << ((int)d & 7));
+    else if (IS("samplosis_no_reverb_send")) p->no_rev_send = 1;
+    return;
+  }
   if (strstr(nm, "cc") && cc_opcode(p, o, nm, v)) return;   /* the controller opcodes first: pitchlfo_depthccN isn't an LFO field */
   /* the sample */
   if (IS("sample")) {
@@ -1529,7 +1541,15 @@ static void finish_region(P *p) {
     static const SmpSfMod base[5] = {
       {0x0587, 48, 960, 0, 0}, {0x028A, 17, 500, 0, 0}, {0x058B, 48, 960, 0, 0}, {0x00DB, 16, 200, 0, 0}, {0x00DD, 15, 200, 0, 0},
     };
-    memcpy(m, base, sizeof base); nmod = 5;
+    {                                           /* bound to a Decent Sampler knob: not its General MIDI default */
+      int k;
+      for (k = 0; k < 5; k++) {
+        int cc = base[k].src & 0x7F;
+        if ((p->unbound[cc >> 3] >> (cc & 7)) & 1) continue;
+        if (cc == 91 && p->no_rev_send) continue;
+        m[nmod++] = base[k];
+      }
+    }
     if (!o->bend_set) { SmpSfMod w = {0x020E, 59, 12700, 0x0010, 0}; m[nmod++] = w; }
     else {
       double up = clampd(o->bend_up, -9600, 9600), dn = clampd(o->bend_down, -9600, 9600);
@@ -1621,6 +1641,7 @@ static void finish_region(P *p) {
     c->delay = (float)clampd(o->delay, 0, 100); c->delay_random = (float)clampd(o->delay_random, 0, 100);
     c->amp_random = (float)clampd(o->amp_random, -96, 96); c->pitch_random = (float)clampd(o->pitch_random, 0, 9600);
     c->amp_keytrack = (float)clampd(o->amp_keytrack, -96, 12); c->amp_keycenter = (uint8_t)clampi(o->amp_keycenter, 0, 127);
+    c->layer = (uint16_t)o->layer;
   }
 
   /* one region a channel: the sample from frame `at`, the address offsets relative to that sample (fine plus
@@ -1897,6 +1918,7 @@ static void restart_text(P *p) {
   for (i = 0; i < 128; i++) p->cc_init[i] = -1;
   p->nincludes = 0; p->text_bytes = 0;
   p->swdef = -1;
+  memset(p->unbound, 0, sizeof p->unbound); p->no_rev_send = 0;
 }
 
 static void free_parser(P *p) {
@@ -1915,6 +1937,8 @@ static void free_parser(P *p) {
   free(p->cache); free(p->cslot);
   if (p->paths) for (i = 0; i < p->npaths; i++) free(p->paths[i]);
   free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->pre);
+  if (p->pk) for (i = 0; i < p->cappk; i++) sf_knobs_free(p->pk[i]);
+  free(p->pk);
 }
 
 /* ---- the builder other formats share (sfds.c, sfexs.c): they feed headers and opcodes as SFZ names and values ---- */
@@ -1923,6 +1947,18 @@ void sfz_header(SfzBuild *p, const char *name) { header(p, name, strlen(name)); 
 void sfz_opcode(SfzBuild *p, const char *name, const char *value) { opcode_at(p, name, strlen(name), value, strlen(value)); }
 void sfz_ignored(SfzBuild *p, const char *name) { ignored(p, name); }
 int sfz_cancelled(SfzBuild *p) { return cancelled(p); }
+
+/* the current preset's knobs (Decent Sampler): taken (1) in the second pass only, freed with the font; 0 in the
+   first, when the caller keeps it */
+int sfz_set_knobs(SfzBuild *p, SfKnobs *k) {
+  int at = p->npre ? p->npre - 1 : 0, old = p->cappk;
+  if (p->collect || !k) return 0;
+  if (!grow((void **)&p->pk, &p->cappk, at + 1, sizeof *p->pk)) { p->oom = 1; return 0; }
+  if (p->cappk > old) memset(p->pk + old, 0, (size_t)(p->cappk - old) * sizeof *p->pk);
+  sf_knobs_free(p->pk[at]);
+  p->pk[at] = k;
+  return 1;
+}
 void sfz_loop_whole(SfzBuild *p) { if (p->level == LV_REGION) p->region.loop_whole = 1; }
 
 /* a new preset from here on (its regions are the ones fed after this call): the levels start again from SFZ's
@@ -1933,6 +1969,7 @@ void sfz_preset(SfzBuild *p, const char *name) {
   opts_default(&p->global); p->master = p->group = p->region = p->global;
   p->level = LV_NONE;
   p->default_path[0] = 0; p->note_offset = p->octave_offset = 0;
+  memset(p->unbound, 0, sizeof p->unbound); p->no_rev_send = 0;
   if (p->collect) return;
   if (!grow((void **)&p->pre, &p->cappre, p->npre + 1, sizeof *p->pre)) { p->oom = 1; return; }
   if (L > 20) L = 20;
@@ -2087,6 +2124,14 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
     for (i = 0; i < p->npre; i++) f->rstart[i] = p->pre[i].start;
     f->rstart[p->npre] = p->nr;
     f->nregions = p->nr;
+  }
+  if (p->pk) {                                  /* Decent Sampler's knobs: the font owns them from here */
+    int any = 0;
+    for (i = 0; i < p->npre && i < p->cappk; i++) any |= p->pk[i] != NULL;
+    if (any) {
+      if (!(f->knobs = calloc((size_t)p->npre, sizeof *f->knobs))) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+      for (i = 0; i < p->npre && i < p->cappk; i++) { f->knobs[i] = p->pk[i]; p->pk[i] = NULL; }
+    }
   }
   if (!sf_build_order(f)) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
   if (problem[0]) { snprintf(f->problem, sizeof f->problem, "%s", problem); f->has_problem = 1; }

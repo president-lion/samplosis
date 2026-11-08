@@ -71,7 +71,7 @@
 #define DS_MAX_VALUE 65536               /* an attribute value's bytes kept */
 #define DS_MAX_ELEMS (SF_MAX_REGIONS * 2)
 #define DS_MAX_ATTRS (1 << 22)
-#define DS_LEVELS 4                      /* DecentSampler, groups, group, sample */
+#define DS_LEVELS 5                      /* DecentSampler, groups, group, sample; DecentSampler, ui, tab, control, binding */
 
 typedef struct { int name, value; } Attr;               /* offsets into the string pool */
 typedef struct { int name, first_attr, nattr, first_child, last_child, next; } El;
@@ -117,6 +117,12 @@ typedef struct {
   /* caps reached while reading: told in the ignored count */
   int elems_capped, attrs_capped, tags_capped;
   char num[64];
+  /* Decent Sampler's knobs (pass 1, made afresh for each feed): the description, or NULL for a preset without
+     knobs or effects (built as before); and the layer of the group being walked */
+  SfKnobs *k;
+  int layer;
+  int live[4];                           /* by SF_KT_*: some knob sets it, so it plays through the layer instead of
+                                            being baked into the regions */
   /* several presets in one font (sf_parse_ds_many): this preset's folder as UTF-8 with a trailing backslash, put
      before its relative sample paths (the builder's own folder is the font's); empty for a lone preset */
   char dir[1024];
@@ -486,14 +492,16 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   opn(d, "pitch_keycenter", note_num(inh(s, g, gs, A_ROOT), 60));
   opn(d, "lokey", lokey); opn(d, "hikey", hikey); opn(d, "lovel", lovel); opn(d, "hivel", hivel);
   /* volume, tuning and pan: the levels combined */
+  /* with knobs, a group's or <groups>' volume or tuning that some knob sets plays through the layer instead */
+  if (d->k) opn(d, "samplosis_layer", d->layer);
   total = 0;
-  if (level_db(gs->a[A_GLOBALVOLUME] ? gs->a[A_GLOBALVOLUME] : gs->a[A_VOLUME], &x)) total += x;
-  if (level_db(g->a[A_GROUPVOLUME] ? g->a[A_GROUPVOLUME] : g->a[A_VOLUME], &x)) total += x;
+  if (!d->live[SF_KT_GLOBAL_VOL] && level_db(gs->a[A_GLOBALVOLUME] ? gs->a[A_GLOBALVOLUME] : gs->a[A_VOLUME], &x)) total += x;
+  if (!d->live[SF_KT_GROUP_VOL] && level_db(g->a[A_GROUPVOLUME] ? g->a[A_GROUPVOLUME] : g->a[A_VOLUME], &x)) total += x;
   if (level_db(s->a[A_VOLUME], &x)) total += x;
   opn(d, "volume", total < -144 ? -144 : total > 24 ? 24 : total);   /* the builder's range */
   total = 0;
-  if (num(gs->a[A_GLOBALTUNING], &x)) total += x;
-  if (num(g->a[A_GROUPTUNING], &x)) total += x;
+  if (!d->live[SF_KT_GLOBAL_TUNE] && num(gs->a[A_GLOBALTUNING], &x)) total += x;
+  if (!d->live[SF_KT_GROUP_TUNE] && num(g->a[A_GROUPTUNING], &x)) total += x;
   if (num(inh(s, g, gs, A_TUNING), &x)) total += x;
   opn(d, "transpose", total < -120 ? -120 : total > 120 ? 120 : total);
   total = 0;
@@ -585,10 +593,14 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
 static int walk(D *d) {
   int c, done = 0;
   Look gs, g, s;
+  d->layer = 0;
   for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) {
     int grp;
     if (strcmp(d->pool + d->el[c].name, "groups")) {
-      char w[64]; snprintf(w, sizeof w, "<%.50s>", d->pool + d->el[c].name); ignored(d, w);
+      const char *nm = d->pool + d->el[c].name;
+      char w[64];
+      if (!strcmp(nm, "ui") || !strcmp(nm, "effects") || !strcmp(nm, "midi")) continue;   /* read by read_knobs */
+      snprintf(w, sizeof w, "<%.50s>", nm); ignored(d, w);
       continue;
     }
     look(d, c, &gs, 1);
@@ -600,6 +612,7 @@ static int walk(D *d) {
       }
       look(d, grp, &g, 1);
       if (is_false(g.a[A_ENABLED])) continue;
+      d->layer++;
       for (smp = d->el[grp].first_child; smp >= 0; smp = d->el[smp].next) {
         if (strcmp(d->pool + d->el[smp].name, "sample")) {
           char w[64]; snprintf(w, sizeof w, "<%.50s>", d->pool + d->el[smp].name); ignored(d, w);
@@ -614,15 +627,296 @@ static int walk(D *d) {
   return 1;
 }
 
+/* ---- the knobs: <ui> controls and their bindings, <effects>, <midi> CC bindings (sfknob.h) ---- */
+
+static const char *el_name(const D *d, int e) { return d->pool + d->el[e].name; }
+
+static const char *attr(const D *d, int e, const char *name) {
+  int k;
+  for (k = 0; k < d->el[e].nattr; k++) {
+    const Attr *a = &d->at[d->el[e].first_attr + k];
+    if (!strcmp(d->pool + a->name, name)) return d->pool + a->value;
+  }
+  return NULL;
+}
+
+static float attr_f(const D *d, int e, const char *name, float def) {
+  double x;
+  return num(attr(d, e, name), &x) ? (float)x : def;
+}
+
+/* 1 when the comma-separated lists a and b share a tag */
+static int tags_meet(const char *a, const char *b) {
+  const char *p = a, *t, *q, *u;
+  size_t n, m;
+  if (!a || !b) return 0;
+  while ((n = next_tag(&p, &t)) != 0) {
+    q = b;
+    while ((m = next_tag(&q, &u)) != 0) if (m == n && !memcmp(t, u, n)) return 1;
+  }
+  return 0;
+}
+
+/* a binding's or a CC's translation; linear's output defaults to lo..hi */
+static void read_trans(const D *d, int e, SfTrans *t, float lo, float hi) {
+  const char *tr = attr(d, e, "translation"), *tab = attr(d, e, "translationTable");
+  memset(t, 0, sizeof *t);
+  t->lo = attr_f(d, e, "translationOutputMin", lo);
+  t->hi = attr_f(d, e, "translationOutputMax", hi);
+  if (is_true(attr(d, e, "translationReversed"))) { float x = t->lo; t->lo = t->hi; t->hi = x; }
+  if (tr && word(tr, "fixed_value")) { t->kind = SF_TR_FIXED; t->fixed = attr_f(d, e, "translationValue", 0); }
+  else if (tr && word(tr, "table") && tab) {
+    const char *p = tab;
+    t->kind = SF_TR_TABLE;
+    while (*p && t->npts < SF_TABLE_MAX) {
+      char *e1, *e2; double x, y;
+      while (sp(*p) || *p == ';') p++;
+      if (!*p) break;
+      x = strtod(p, &e1);
+      if (e1 == p) break;
+      p = e1; while (sp(*p)) p++;
+      if (*p != ',') break;
+      p++;
+      y = strtod(p, &e2);
+      if (e2 == p) break;
+      p = e2;
+      t->x[t->npts] = (float)x; t->y[t->npts] = (float)y; t->npts++;
+    }
+    if (!t->npts) t->kind = SF_TR_LINEAR;
+  }
+}
+
+typedef struct { const char *tags; float vol, tune; } Layer;
+
+/* the layers (enabled <group>s in order) with their tags, volume and tuning; and <groups>' own */
+static int read_layers(D *d, Layer **out, float *gvol, float *gtune) {
+  int c, grp, n = 0, cap = 0;
+  double x;
+  *out = NULL; *gvol = 1; *gtune = 0;
+  for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) {
+    if (strcmp(el_name(d, c), "groups")) continue;
+    if (level_db(attr(d, c, "globalVolume") ? attr(d, c, "globalVolume") : attr(d, c, "volume"), &x)) *gvol = (float)pow(10, x / 20);
+    if (num(attr(d, c, "globalTuning"), &x)) *gtune = (float)x;
+    for (grp = d->el[c].first_child; grp >= 0; grp = d->el[grp].next) {
+      Layer *L;
+      if (strcmp(el_name(d, grp), "group") || is_false(attr(d, grp, "enabled"))) continue;
+      if (!grow((void **)out, &cap, n + 1, sizeof **out)) return -1;
+      L = &(*out)[n++];
+      L->tags = attr(d, grp, "tags");
+      L->vol = level_db(attr(d, grp, "groupVolume") ? attr(d, grp, "groupVolume") : attr(d, grp, "volume"), &x) ? (float)pow(10, x / 20) : 1;
+      L->tune = num(attr(d, grp, "groupTuning"), &x) ? (float)x : 0;
+    }
+  }
+  return n;
+}
+
+static int add_layer(SfKnobs *k, int *cap, int layer) {
+  if (!grow((void **)&k->layer_list, cap, k->nlayer_list + 1, sizeof *k->layer_list)) return 0;
+  k->layer_list[k->nlayer_list++] = (uint16_t)layer;
+  return 1;
+}
+
+/* one <binding> of knob n: added to it, or counted */
+static void read_binding(D *d, int e, SfKnobs *k, SfKnob *n, const Layer *layers, int nlayer, int *lcap) {
+  const char *type = attr(d, e, "type"), *level = attr(d, e, "level"), *par = attr(d, e, "parameter");
+  SfKBind b;
+  char w[80];
+  memset(&b, 0, sizeof b);
+  b.param = SF_FXP_NONE;
+  if (!par) { ignored(d, "binding without a parameter"); return; }
+  if (n->nb >= SF_KBIND_MAX) { ignored(d, "too many bindings on a knob"); return; }
+  if (type && word(type, "amp") && (word(par, "AMP_VOLUME") || word(par, "GLOBAL_TUNING") || word(par, "GROUP_TUNING"))) {
+    int group = level && word(level, "group");
+    if (word(par, "GLOBAL_TUNING")) b.target = SF_KT_GLOBAL_TUNE;
+    else if (word(par, "GROUP_TUNING")) b.target = group ? SF_KT_GROUP_TUNE : SF_KT_GLOBAL_TUNE;
+    else b.target = group ? SF_KT_GROUP_VOL : SF_KT_GLOBAL_VOL;
+    if (b.target == SF_KT_GROUP_VOL || b.target == SF_KT_GROUP_TUNE) {
+      const char *tags = attr(d, e, "tags"), *gi = attr(d, e, "groupIndex") ? attr(d, e, "groupIndex") : attr(d, e, "position");
+      double x; int i;
+      b.first_layer = (uint16_t)k->nlayer_list;
+      if (tags) {
+        for (i = 0; i < nlayer; i++) if (tags_meet(tags, layers[i].tags) && !add_layer(k, lcap, i + 1)) return;
+      } else if (num(gi, &x) && x >= 0 && x < nlayer) {
+        if (!add_layer(k, lcap, (int)x + 1)) return;
+      } else { ignored(d, "binding to a group that isn't there"); return; }
+      b.nlayers = (uint16_t)(k->nlayer_list - b.first_layer);
+    }
+  } else if (type && word(type, "effect")) {
+    static const struct { const char *name; int param; } P[] = {
+      {"FX_FILTER_FREQUENCY", SF_FXP_FREQ}, {"FX_FILTER_RESONANCE", SF_FXP_Q}, {"FX_FILTER_Q", SF_FXP_Q},
+      {"FX_REVERB_WET_LEVEL", SF_FXP_WET}, {"FX_REVERB_ROOM_SIZE", SF_FXP_ROOM}, {"FX_REVERB_DAMPING", SF_FXP_DAMP},
+      {"FX_WET_LEVEL", SF_FXP_WET}, {"FX_MIX", SF_FXP_WET}, {"FX_DELAY_TIME", SF_FXP_TIME}, {"FX_FEEDBACK", SF_FXP_FEEDBACK},
+    };
+    const char *ix = attr(d, e, "effectIndex") ? attr(d, e, "effectIndex") : attr(d, e, "position");
+    double x; size_t i;
+    if (level && word(level, "group")) { ignored(d, "binding to a group's effect"); return; }
+    for (i = 0; i < sizeof P / sizeof *P && !word(par, P[i].name); i++) {}
+    if (i == sizeof P / sizeof *P) { snprintf(w, sizeof w, "binding %.60s", par); ignored(d, w); return; }
+    if (!num(ix, &x) || x < 0 || x >= k->nfx || k->fx[(int)x].type == SF_FX_NONE) { ignored(d, "binding to an effect that isn't there"); return; }
+    b.target = SF_KT_FX; b.fx = (uint8_t)x; b.param = (int8_t)P[i].param;
+  } else { snprintf(w, sizeof w, "binding %.60s", par); ignored(d, w); return; }
+  read_trans(d, e, &b.tr, n->lo, n->hi);
+  if (b.target == SF_KT_GLOBAL_TUNE || b.target == SF_KT_GROUP_TUNE) n->words = SF_KW_SEMITONES;
+  n->b[n->nb++] = b;
+}
+
+/* one <control> or <labeled-knob> */
+static void read_knob(D *d, int e, SfKnobs *k, const char **ktags, const Layer *layers, int nlayer, int *lcap) {
+  SfKnob *n;
+  const char *vt = attr(d, e, "valueType") ? attr(d, e, "valueType") : attr(d, e, "type"), *lab;
+  int c;
+  if (vt && word(vt, "multi_state")) { ignored(d, "valueType multi_state"); return; }
+  if (k->nknob >= SF_KNOB_MAX) { ignored(d, "too many knobs"); return; }
+  n = &k->knob[k->nknob];
+  memset(n, 0, sizeof *n);
+  lab = attr(d, e, "label") ? attr(d, e, "label") : attr(d, e, "parameterName");
+  if (lab && *lab) snprintf(n->label, sizeof n->label, "%s", lab); else snprintf(n->label, sizeof n->label, "Knob %d", k->nknob + 1);
+  n->vtype = vt && word(vt, "integer") ? SF_KV_INT : vt && word(vt, "musical_time") ? SF_KV_MTIME : SF_KV_FLOAT;
+  n->lo = attr_f(d, e, "minValue", 0);
+  n->hi = attr_f(d, e, "maxValue", n->vtype == SF_KV_MTIME ? 20.0f : 1.0f);
+  if (n->hi < n->lo) { float x = n->lo; n->lo = n->hi; n->hi = x; }
+  n->value = attr_f(d, e, "value", n->lo > 0 ? n->lo : n->hi < 0 ? n->hi : 0);
+  if (n->value < n->lo) n->value = n->lo;
+  if (n->value > n->hi) n->value = n->hi;
+  if (n->vtype != SF_KV_FLOAT) n->value = (float)floor(n->value + 0.5);
+  n->words = n->vtype == SF_KV_MTIME ? SF_KW_MTIME : n->vtype == SF_KV_INT ? SF_KW_INT :
+             n->lo == 0 && n->hi == 1 ? SF_KW_PERCENT : SF_KW_NUMBER;
+  ktags[k->nknob] = attr(d, e, "tags");
+  k->nknob++;
+  for (c = d->el[e].first_child; c >= 0; c = d->el[c].next) {
+    if (!strcmp(el_name(d, c), "binding")) read_binding(d, c, k, n, layers, nlayer, lcap);
+  }
+  if (n->vtype == SF_KV_INT && n->words == SF_KW_NUMBER) n->words = SF_KW_INT;
+}
+
+/* a <ui>'s tab (or the <ui> itself): its knobs, and the controls this can't play counted */
+static void read_controls(D *d, int parent, SfKnobs *k, const char **ktags, const Layer *layers, int nlayer, int *lcap) {
+  int c;
+  for (c = d->el[parent].first_child; c >= 0; c = d->el[c].next) {
+    const char *nm = el_name(d, c);
+    char w[64];
+    if (!strcmp(nm, "control") || !strcmp(nm, "labeled-knob") || !strcmp(nm, "knob")) read_knob(d, c, k, ktags, layers, nlayer, lcap);
+    else if (!strcmp(nm, "tab")) read_controls(d, c, k, ktags, layers, nlayer, lcap);
+    else if (!strcmp(nm, "button") || !strcmp(nm, "menu") || !strcmp(nm, "xyPad") || !strcmp(nm, "drawbars") ||
+             !strcmp(nm, "slider")) {
+      snprintf(w, sizeof w, "<%.50s>", nm); ignored(d, w);
+    }
+    /* the rest (labels, images, the keyboard's colours) is the picture: read past */
+  }
+}
+
+static void read_effects(D *d, int parent, SfKnobs *k) {
+  int c;
+  for (c = d->el[parent].first_child; c >= 0; c = d->el[c].next) {
+    const char *ty;
+    SfFxDesc *x;
+    char w[80];
+    if (strcmp(el_name(d, c), "effect")) continue;
+    if (k->nfx >= SF_FX_MAX) { ignored(d, "too many effects"); return; }
+    x = &k->fx[k->nfx++];
+    memset(x, 0, sizeof *x);
+    ty = attr(d, c, "type");
+    x->freq = attr_f(d, c, "frequency", 22000); x->q = attr_f(d, c, "resonance", 0.7f);
+    x->room = attr_f(d, c, "roomSize", 0.7f); x->damp = attr_f(d, c, "damping", 0.3f);
+    x->time = attr_f(d, c, "delayTime", 0.7f); x->feedback = attr_f(d, c, "feedback", 0.2f);
+    x->offset = attr_f(d, c, "stereoOffset", 0); x->fb_cutoff = attr_f(d, c, "feedbackCutoff", 22000);
+    x->musical = attr(d, c, "delayTimeFormat") && word(attr(d, c, "delayTimeFormat"), "musical_time");
+    if (ty && (word(ty, "lowpass") || word(ty, "lowpass_4pl"))) x->type = SF_FX_LP;
+    else if (ty && word(ty, "lowpass_1pl")) x->type = SF_FX_LP1;
+    else if (ty && word(ty, "highpass")) x->type = SF_FX_HP;
+    else if (ty && word(ty, "bandpass")) x->type = SF_FX_BP;
+    else if (ty && word(ty, "reverb")) { x->type = SF_FX_REVERB; k->has_reverb = 1; }
+    else if (ty && word(ty, "delay")) x->type = SF_FX_DELAY;
+    else { x->type = SF_FX_NONE; snprintf(w, sizeof w, "effect %.60s", ty ? ty : "(no type)"); ignored(d, w); }
+    x->wet = attr_f(d, c, "wetLevel", x->type == SF_FX_REVERB ? 0 : 0.5f);
+  }
+}
+
+static void read_midi(D *d, int parent, SfKnobs *k, const char **ktags) {
+  int c, b;
+  for (c = d->el[parent].first_child; c >= 0; c = d->el[c].next) {
+    double x;
+    if (strcmp(el_name(d, c), "cc") || !num(attr(d, c, "number"), &x) || x < 0 || x > 127) {
+      if (strcmp(el_name(d, c), "cc")) { char w[64]; snprintf(w, sizeof w, "<midi> <%.40s>", el_name(d, c)); ignored(d, w); }
+      continue;
+    }
+    for (b = d->el[c].first_child; b >= 0; b = d->el[b].next) {
+      const char *lv = attr(d, b, "level"), *ty = attr(d, b, "type"), *par = attr(d, b, "parameter");
+      const char *ct = attr(d, b, "controlTags"), *ci = attr(d, b, "controlIndex") ? attr(d, b, "controlIndex") : attr(d, b, "position");
+      double y; int n, hit = 0;
+      if (strcmp(el_name(d, b), "binding")) continue;
+      if (!lv || !word(lv, "ui") || !ty || !word(ty, "control") || (par && !word(par, "VALUE"))) {
+        char w[80]; snprintf(w, sizeof w, "midi binding %.60s", par ? par : "(no parameter)"); ignored(d, w);
+        continue;
+      }
+      for (n = 0; n < k->nknob; n++) {
+        if (ct ? !tags_meet(ct, ktags[n]) : !(num(ci, &y) && (int)y == n)) continue;
+        if (k->ncc >= SF_KCC_MAX) { ignored(d, "too many CC bindings"); return; }
+        k->cc[k->ncc].cc = (uint8_t)x; k->cc[k->ncc].knob = (uint8_t)n;
+        read_trans(d, b, &k->cc[k->ncc].tr, k->knob[n].lo, k->knob[n].hi);
+        k->ncc++;
+        k->bound[(int)x >> 3] |= (uint8_t)(1 << ((int)x & 7));
+        hit = 1;
+      }
+      if (!hit) ignored(d, "midi binding to a knob that isn't there");
+    }
+  }
+}
+
+/* the preset's knobs, effects and CC bindings: NULL when it has no knob and no effect (or memory ran out) */
+static SfKnobs *read_knobs(D *d) {
+  SfKnobs *k = calloc(1, sizeof *k);
+  Layer *layers = NULL;
+  const char *ktags[SF_KNOB_MAX];
+  int nlayer, c, lcap = 0, i;
+  float gvol, gtune;
+  if (!k) return NULL;
+  memset((void *)ktags, 0, sizeof ktags);
+  nlayer = read_layers(d, &layers, &gvol, &gtune);
+  if (nlayer < 0) goto fail;
+  for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) if (!strcmp(el_name(d, c), "effects")) read_effects(d, c, k);
+  for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) if (!strcmp(el_name(d, c), "ui")) read_controls(d, c, k, ktags, layers, nlayer, &lcap);
+  for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) if (!strcmp(el_name(d, c), "midi")) read_midi(d, c, k, ktags);
+  if (!k->nknob && !k->nfx) goto fail;
+  k->nlayer = nlayer;
+  k->layer_vol = calloc((size_t)nlayer + 1, sizeof *k->layer_vol);
+  k->layer_tune = calloc((size_t)nlayer + 1, sizeof *k->layer_tune);
+  if (!k->layer_vol || !k->layer_tune) goto fail;
+  /* only what some knob sets plays through the layers; the rest stays baked into the regions (1 and 0 here) */
+  memset(d->live, 0, sizeof d->live);
+  for (i = 0; i < k->nknob; i++) { int j; for (j = 0; j < k->knob[i].nb; j++) if (k->knob[i].b[j].target < 4) d->live[k->knob[i].b[j].target] = 1; }
+  k->global_vol = d->live[SF_KT_GLOBAL_VOL] ? gvol : 1; k->global_tune = d->live[SF_KT_GLOBAL_TUNE] ? gtune : 0;
+  for (i = 0; i < nlayer; i++) {
+    k->layer_vol[i + 1] = d->live[SF_KT_GROUP_VOL] ? layers[i].vol : 1;
+    k->layer_tune[i + 1] = d->live[SF_KT_GROUP_TUNE] ? layers[i].tune : 0;
+  }
+  free(layers);
+  return k;
+fail:
+  free(layers);
+  sf_knobs_free(k);
+  return NULL;
+}
+
 static int feed_ds(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int wcap) {
   D *d = ctx;
+  int ok, taken = 0, i;
   (void)full;
   d->b = b; d->pass = 1;
   sfz_header(b, "global");                           /* SFZ's defaults; every value is given per region */
   if (d->elems_capped) sfz_ignored(b, "too many elements (some samples left out)");
   if (d->attrs_capped) sfz_ignored(b, "too many attributes (some left out)");
   if (d->tags_capped) sfz_ignored(b, "too many silencing tags (some left out)");
-  if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); return 0; }
+  if ((d->k = read_knobs(d)) != NULL) {
+    for (i = 0; i < 128; i++) if ((d->k->bound[i >> 3] >> (i & 7)) & 1) opn(d, "samplosis_unbind_cc", i);
+    if (d->k->has_reverb) op(d, "samplosis_no_reverb_send", "1");
+    taken = sfz_set_knobs(b, d->k);
+  }
+  ok = walk(d);
+  if (!taken) sf_knobs_free(d->k);
+  d->k = NULL;
+  memset(d->live, 0, sizeof d->live);
+  if (!ok) { snprintf(why, (size_t)wcap, "cancelled"); return 0; }
   return 1;
 }
 

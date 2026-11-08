@@ -1110,6 +1110,7 @@ void sf_free(SmpFont *f) {
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */
   free(f->swmask); free(f->pflags); free(f->kix_off); free(f->kix);
+  if (f->knobs) { for (i = 0; i < f->nphdr; i++) sf_knobs_free(f->knobs[i]); free(f->knobs); }
   if (f->dslib_pinned) smp_cache_unpin(f->dslib_key);   /* its unpacked folder may be trimmed from now on */
   free(f);
 }

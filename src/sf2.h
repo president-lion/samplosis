@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <windows.h>
 #include "samplosis.h"
+#include "sfknob.h"
 
 /* generator ids used by the parser (the SF2.04 numbers) */
 enum { SF_GEN_INSTRUMENT = 41, SF_GEN_KEYRANGE = 43, SF_GEN_VELRANGE = 44, SF_GEN_SAMPLEID = 53 };
@@ -81,6 +82,8 @@ struct SmpFont {
   int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
   int is_ds;                            /* Decent Sampler (sfds.c, through sfsfz.c's builder): is_sfz is set too */
   int is_exs;                           /* Logic EXS (sfexs.c, through sfsfz.c's builder): is_sfz is set too */
+  SfKnobs **knobs;                      /* Decent Sampler: per phdr preset, its knobs, effects and CC bindings, or
+                                           NULL (a preset without them); NULL when no preset has them */
   uint64_t dslib_key; int dslib_pinned; /* a Decent Sampler bundle: its unpacked folder's cache key, pinned while
                                            the font lives (sf_free unpins it) */
   int is_gig;                           /* GigaStudio (gigshim.cpp, through libgig): filled as DLS is */
@@ -276,6 +279,9 @@ void sfz_loop_whole(SfzBuild *b);
    regions fed after it are its own. Called at the same places in both passes. A feed that never calls it makes one
    preset named after the file. */
 void sfz_preset(SfzBuild *b, const char *name);
+/* sfz_set_knobs hands the current preset its Decent Sampler knobs: 1 when taken (the font frees it), which is in
+   the second pass only; 0 and the caller keeps it. */
+int sfz_set_knobs(SfzBuild *b, SfKnobs *k);
 /* sfds.c: Decent Sampler. sf_is_ds: the name ends .dspreset, or the first bytes have a <DecentSampler element.
    sf_parse_ds: as sf_parse_sfz, for a .dspreset */
 int sf_is_ds(const char *path, const uint8_t *head, size_t n);

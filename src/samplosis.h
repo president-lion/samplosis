@@ -204,6 +204,9 @@ typedef struct {
   float pitch_random;           /* a random -pitch_random..+pitch_random cents */
   float amp_keytrack;           /* dB per key away from amp_keycenter */
   uint8_t amp_keycenter;
+  /* added for Decent Sampler's knobs */
+  uint16_t layer;               /* the preset's layer (its <group>, 1-based) whose gain and tuning the knobs set at
+                                   play time (SfKnobs, sfknob.h); 0: none, the region's own values are all there is */
 } SmpSfCond;
 enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3,      /* 2-pole lowpass, highpass, bandpass, notch */
        SMP_FIL_LP1 = 4, SMP_FIL_HP1 = 5 };                                  /* 1-pole lowpass and highpass (6 dB an octave) */
@@ -315,6 +318,9 @@ SMP_API int smp_sf_test_note(SmpFont *f, int preset, int key, int vel, double ra
                                trigger=attack|release|first|legato, xf_curve=power|gain, off_mode=fast|normal)
    The samples are written to path, and the font is registered under it, so smp_synth_load(path) (or smp_sf_open)
    while it is open shares it. Returns it with one reference (smp_sf_close), or NULL and a reason. Main thread. */
+/* sfknob.c, tests: a Decent Sampler preset's knobs, bindings, effects and CC bindings as text (public preset index):
+   the length, 0 for a preset without them */
+SMP_API int smp_sf_test_knobs_text(const SmpFont *f, int preset, char *out, int cap);
 SMP_API SmpFont *smp_sf_test_font(const char *desc, const char *path, char *err, int cap);
 
 /* The SoundFont player (sfsynth.c): 16 MIDI channels on one font, up to 1024 voices, 16 stereo outputs.
