@@ -7,7 +7,8 @@
    The folder: <cache>\dslib\<016llx key>\, the key smp_key("dslib1|<full path, lower case>|<size>|<mtime>"), so a
    changed bundle unpacks into a new folder (the old one is trimmed in time). It is written as <key>.part and renamed
    when every entry is in, so a folder that exists is whole, and opening it again unpacks nothing (its files keep
-   their times, so the SFZ probe cache still knows them). Each open touches the folder's time, and the cache trims
+   their times, so the SFZ probe cache still knows them); the .part name is the process's and thread's own, so two
+   opens at once never write into one. Each open touches the folder's time, and the cache trims
    unpacked folders oldest first like its other files (cache.c), never one a font holds open (the key is pinned
    from here until sf_free).
 
@@ -240,7 +241,8 @@ int sf_parse_dslib(SmpFont *f, const char *path, int (*cancel)(void *), void *ca
 
   if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) {
     /* not unpacked yet: into <key>.part, then renamed (a .part left by a crash or a cancel is started again) */
-    swprintf(part, 1300, L"%s.part", dir);
+    /* a .part of this thread's own: two opens of the bundle at once (two instances, two hosts) never share one */
+    swprintf(part, 1300, L"%s.%lu.%lu.part", dir, GetCurrentProcessId(), GetCurrentThreadId());
     {
       wchar_t parent[1200], *bs;
       wcscpy(parent, dir);

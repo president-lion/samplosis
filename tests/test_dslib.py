@@ -160,3 +160,34 @@ def test_dslib_cache_counts_and_trims(lib, tmp_path):
     lib.smp_sf_close(f)
     lib.smp_cache_trim(1)
     assert unpack_dirs(tmp_path) == []
+
+
+def test_dslib_two_opens_at_once(lib, tmp_path):
+    """Two background opens of one bundle at the same moment (two instances, or two hosts) each unpack into a .part
+    folder of their own; the folder that ends up in place is whole."""
+    import threading
+    point_cache(lib, tmp_path / "cache")
+    files = {"Kit.dspreset": KIT % ("a.wav", 60, 60)}
+    w = wav_bytes(tmp_path, 440.0)
+    for i in range(400):
+        files["Samples/s%03d.wav" % i] = w
+    files["Samples/a.wav"] = w
+    path = make_bundle(tmp_path / "Big.dslibrary", files, zipfile.ZIP_STORED)
+    res, errs = [None] * 4, [None] * 4
+
+    def go(k):
+        e = ctypes.create_string_buffer(512)
+        res[k] = lib.smp_sf_parse_detached_ex(path.encode(), None, None, None, e, 512)
+        errs[k] = e.value.decode()
+    th = [threading.Thread(target=go, args=(k,)) for k in range(4)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    lib.smp_sf_discard.argtypes, lib.smp_sf_discard.restype = [ctypes.c_void_p], None
+    for k in range(4):
+        assert res[k], errs[k]
+        lib.smp_sf_discard(res[k])
+    dirs = unpack_dirs(tmp_path)
+    assert len(dirs) == 1 and len(files_under(dirs[0])) == 402, (dirs, len(files_under(dirs[0])) if dirs else 0)
+    assert not [d for d in glob.glob(str(tmp_path / "cache" / "dslib" / "*")) if d.endswith(".part")]
