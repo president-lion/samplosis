@@ -356,3 +356,21 @@ def test_ds_xml_refusals_and_caps(lib, tmp_path):
         assert n >= 1 and first.startswith("too many elements"), (n, first)
     finally:
         lib.smp_sf_close(f)
+
+
+def test_ds_attr_without_space(lib, tmp_path):
+    """An attribute right after another's closing quote, with no space between them (as Finnish Forest Percussion
+    has it), reads as Decent Sampler reads it; quotes inside a value of the other kind and comments are left alone."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    path = write_ds(tmp_path / "Tight.dspreset", """<?xml version="1.0" encoding="UTF-8"?>
+<DecentSampler>
+  <!-- x="1"y -->
+  <groups label='a"b'>
+    <group><sample path="a.wav"rootNote="60" loNote="60"hiNote="60"/></group>
+  </groups>
+</DecentSampler>
+""")
+    f = opened(lib, path)
+    rs = regions(lib, f, 0)
+    assert len(rs) == 1 and (rs[0].lokey, rs[0].hikey) == (60, 60)
+    lib.smp_sf_close(f)

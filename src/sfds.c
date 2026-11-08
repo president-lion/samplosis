@@ -57,6 +57,7 @@
    the root's own attributes are read past. Decent Sampler plays a centred voice 5.3 dB below its source (its
    limiter's headroom); that isn't copied, so presets may sound louder here. A cap reached while reading (too many
    elements, attributes or silencing tags) is counted too, so a partly loaded preset says so. */
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -244,6 +245,46 @@ static int pool_add(D *d, const char *s, size_t n) {
   memcpy(d->pool + d->npool, s, n); d->pool[d->npool + n] = 0;
   d->npool += n + 1;
   return (int)(d->npool - n - 1);
+}
+
+/* Decent Sampler (JUCE's XML parser) reads an attribute that follows another's closing quote with no space between
+   them (name="a"next="b"); yxml, rightly, doesn't. This copies in to out (room for 2 n bytes) with one space put
+   there, inside tags only: text, comments, CDATA, processing instructions and declarations are copied as they are,
+   and so is a quote of the other kind inside a value. Returns out's length. */
+static size_t ds_fix_attr_spaces(const char *in, size_t n, char *out) {
+  enum { TEXT, TAG, VALUE, COMMENT, CDATA, PI, DECL } st = TEXT;
+  char q = 0;
+  int after_value = 0;
+  size_t i, o = 0;
+  for (i = 0; i < n; i++) {
+    char c = in[i];
+    switch (st) {
+      case TEXT:
+        if (c == '<') {
+          if (i + 3 < n && !memcmp(in + i, "<!--", 4)) st = COMMENT;
+          else if (i + 8 < n && !memcmp(in + i, "<![CDATA[", 9)) st = CDATA;
+          else if (i + 1 < n && in[i + 1] == '?') st = PI;
+          else if (i + 1 < n && in[i + 1] == '!') st = DECL;
+          else { st = TAG; after_value = 0; }
+        }
+        break;
+      case TAG:
+        if (after_value && (isalpha((unsigned char)c) || c == '_' || c == ':' || (unsigned char)c >= 0x80)) out[o++] = ' ';
+        after_value = 0;
+        if (c == '"' || c == '\'') { st = VALUE; q = c; }
+        else if (c == '>') st = TEXT;
+        break;
+      case VALUE:
+        if (c == q) { st = TAG; after_value = 1; }
+        break;
+      case COMMENT: if (c == '>' && i >= 2 && in[i - 1] == '-' && in[i - 2] == '-') st = TEXT; break;
+      case CDATA: if (c == '>' && i >= 2 && in[i - 1] == ']' && in[i - 2] == ']') st = TEXT; break;
+      case PI: if (c == '>' && i >= 1 && in[i - 1] == '?') st = TEXT; break;
+      case DECL: if (c == '>') st = TEXT; break;
+    }
+    out[o++] = c;
+  }
+  return o;
 }
 
 /* the tree of t (n bytes): 1, or 0 with why */
@@ -620,7 +661,14 @@ static D *load_ds(const char *path, int (*cancel)(void *), void *carg, char *why
     goto done;
   }
   CloseHandle(h); h = INVALID_HANDLE_VALUE;
-  if (!parse_xml(d, t, (size_t)sz.QuadPart, why, wcap)) goto done;
+  {
+    char *fixed = malloc((size_t)sz.QuadPart * 2 + 1);
+    size_t fn;
+    if (!fixed) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+    fn = ds_fix_attr_spaces(t, (size_t)sz.QuadPart, fixed);
+    free(t); t = fixed;
+    if (!parse_xml(d, t, fn, why, wcap)) goto done;
+  }
   free(t); t = NULL;
   d->pass = 0;
   d->cancel = cancel; d->carg = carg;
