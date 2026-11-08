@@ -1131,3 +1131,62 @@ def test_gui_knob_follows_cc(P, tmp_path):
                                                   "midi 176 1 0", "pump 400", "read Pitch"])
     r = {x[0]: x[1] for x in got(out, "read")}
     assert r["Force"] == "100 percent" and r["Pitch"] == "minus 24 semitones", out
+
+
+# ---- knob positions in the project state ----
+
+def test_state_knobs_round_trip(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    text = 'plays soundfont\nsoundfont "%s"\nsf_knob 1 4 0.4\nsf_knob 1 7 10\n' % kit
+    out = gui(P, tmp_path, text, ["read Force", "read Delay Time", "read Tone", "state sf_knob", "focus Pitch",
+                                  "key down", "state sf_knob"])
+    r = {x[0]: x[1] for x in got(out, "read")}
+    assert r["Force"] == "40 percent" and r["Delay Time"] == "1/8" and r["Tone"] == "50 percent", out
+    st = [x[0] for x in got(out, "state")]
+    assert st[:2] == ["sf_knob 1 4 0.4", "sf_knob 1 7 10"], out          # only knobs away from their values
+    assert st[2:] == ["sf_knob 1 2 -1", "sf_knob 1 4 0.4", "sf_knob 1 7 10"], out
+
+
+def test_state_knobs_missing_font(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    gone = tmp_path / "gone"
+    os.replace(tmp_path / "kit", gone)
+    text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0\nsf_knob 1 4 0.4\n' % kit
+    out = gui(P, tmp_path, text, ["state sf_knob", "state sf_used"])
+    st = [x[0] for x in got(out, "state")]
+    assert st == ["sf_knob 1 4 0.4", "sf_used 0:0"], out                # kept for when the kit is back
+    os.replace(gone, tmp_path / "kit")
+    out = gui(P, tmp_path, text, ["read Force"])
+    assert got(out, "read")[0][1] == "40 percent", out
+
+
+def test_state_knob_bad_lines(P, lib, tmp_path):
+    kit = knob_kit(tmp_path)
+    text = 'plays soundfont\nsoundfont "%s"\nsf_knob 9 1 1\nsf_knob 1 99 1\nsf_knob 1 4 0.25\n' % kit
+    out = gui(P, tmp_path, text, ["read Force", "read Status"])
+    r = {x[0]: x[1] for x in got(out, "read")}
+    assert r["Force"] == "25 percent" and "doesn't read" not in r["Status"], out
+    e = lib_engine_apply(lib, 'plays soundfont\nsoundfont "%s"\nsf_knob x\n' % kit)
+    assert e and "sf_knob" in e, e
+
+
+def lib_engine_apply(lib, text):
+    """the reason the player refuses a state's SoundFont lines, or ''"""
+    import ctypes
+    s = lib.smp_synth_new(48000.0, 256)
+    err = ctypes.create_string_buffer(600)
+    try:
+        r = lib.smp_synth_script_apply(s, text.encode(), err, 600)
+        return err.value.decode() if r else ""
+    finally:
+        lib.smp_synth_free(s)
+
+
+def test_state_new_file_resets_knobs(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    other = tmp_path / "kit" / "Other.dspreset"
+    other.write_text(open(kit, encoding="utf-8").read(), encoding="utf-8")
+    text = 'plays soundfont\nsoundfont "%s"\nsf_knob 1 4 0.4\n' % kit
+    out = gui(P, tmp_path, text, ["read Force", "drop %s" % other, "say", "read Force", "drop %s" % kit, "say",
+                                  "read Force"])
+    assert [x[1] for x in got(out, "read")] == ["40 percent", "0 percent", "0 percent"], out

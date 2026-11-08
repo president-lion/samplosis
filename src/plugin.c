@@ -253,6 +253,29 @@ static char *sampler_text(Plug *P) {
   }
 }
 
+/* every line of text that starts with word (and a space), joined by newlines; NULL when none */
+static char *lines_of(const char *text, const char *word) {
+  size_t k = strlen(word), n = 0;
+  const char *q;
+  char *out = NULL;
+  for (q = text; q && *q; q = strchr(q, '\n') ? strchr(q, '\n') + 1 : NULL) {
+    const char *e = strchr(q, '\n'), *a = q;
+    size_t L;
+    while (*a == ' ' || *a == '\t') a++;
+    if (strncmp(a, word, k) || (a[k] != ' ' && a[k] != '\t')) continue;
+    L = e ? (size_t)(e - a) : strlen(a);
+    while (L && (a[L - 1] == '\r' || a[L - 1] == ' ')) L--;
+    {
+      char *m = realloc(out, n + L + 2);
+      if (!m) { free(out); return NULL; }
+      out = m;
+      if (n) out[n++] = '\n';
+      memcpy(out + n, a, L); n += L; out[n] = 0;
+    }
+  }
+  return out;
+}
+
 /* The SoundFont player's part: its lines, or with the font missing, its lines with the original soundfont line
    first and the original sf_used line just before the parameters, where the player writes them. */
 static char *synth_text(Plug *P) {
@@ -264,6 +287,24 @@ static char *synth_text(Plug *P) {
   smp_synth_script_write(P->s, t, n + 1);
   if (!P->sf_missing || !P->sf_line) return t;
   fl = strlen(P->sf_line); ul = P->sf_used ? strlen(P->sf_used) : 0;
+  if (P->sf_knobs) {                       /* the sf_knob lines go with sf_used, where the player writes them */
+    size_t kl = strlen(P->sf_knobs);
+    char *both = malloc(ul + kl + 2);
+    if (!both) return t;
+    if (ul) { memcpy(both, P->sf_used, ul); both[ul] = '\n'; memcpy(both + ul + 1, P->sf_knobs, kl + 1); ul += kl + 1; }
+    else { memcpy(both, P->sf_knobs, kl + 1); ul = kl; }
+    out = malloc((size_t)n + fl + ul + 3);
+    if (!out) { free(both); return t; }
+    for (at = t; at; at = strchr(at, '\n') ? strchr(at, '\n') + 1 : NULL)
+      if (!strncmp(at, first, k) && at[k] == ' ') break;
+    head = at ? (size_t)(at - t) : (size_t)n;
+    memcpy(out, P->sf_line, fl); out[fl] = '\n';
+    memcpy(out + fl + 1, t, head);
+    memcpy(out + fl + 1 + head, both, ul); out[fl + 1 + head + ul] = '\n';
+    strcpy(out + fl + 1 + head + ul + 1, t + head);
+    free(both); free(t);
+    return out;
+  }
   out = malloc((size_t)n + fl + ul + 3);
   if (!out) return t;
   for (at = t; at; at = strchr(at, '\n') ? strchr(at, '\n') + 1 : NULL)
@@ -317,7 +358,7 @@ static int apply_text(Plug *P, const char *text) {
   smp_synth_free(chk);
   if (r) { free(rest); refuse(P, r < 0 ? "out of memory" : err); return 0; }
   if (!apply_sampler(P, text)) { free(rest); P->bad = 1; return 0; }
-  free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
+  free(P->sf_line); free(P->sf_used); free(P->sf_knobs); P->sf_line = P->sf_used = P->sf_knobs = NULL; P->sf_missing = 0;
   if (!smp_synth_script_apply(P->s, text, err, sizeof err)) {
     if (!fk) smp_synth_unload(P->s);      /* a state without a font has none, as one without a sample */
   } else {                                /* the font didn't load: silence, and everything else */
@@ -326,6 +367,7 @@ static int apply_text(Plug *P, const char *text) {
     P->sf_missing = 1;
     P->sf_line = _strdup(line);
     if (word_line(text, "sf_used", used, sizeof used, NULL, 0, NULL)) P->sf_used = _strdup(used);
+    P->sf_knobs = lines_of(text, "sf_knob");
     if (!file_exists(path)) snprintf(P->sf_err, sizeof P->sf_err, "Missing: %s", path);
     else snprintf(P->sf_err, sizeof P->sf_err, "Can't load the SoundFont: %s", err);
   }
@@ -364,7 +406,7 @@ static void p_destroy(const clap_plugin_t *p) {
   loader_stop(P);                        /* a window load still decoding is cancelled */
   smp_engine_free(P->e);
   smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
-  free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used);
+  free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used); free(P->sf_knobs);
   free(P);
 }
 
@@ -1227,7 +1269,7 @@ int smp_plug_load_font(Plug *P, const char *path, char *err, int cap) {
 static int take_font(Plug *P, SmpFont *f, const char *path, char *err, int cap) {
   if (!P->s) { smp_sf_close(f); snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
   if (!smp_synth_load_font(P->s, f, path, err, cap)) return 0;
-  free(P->sf_line); free(P->sf_used); P->sf_line = P->sf_used = NULL; P->sf_missing = 0;
+  free(P->sf_line); free(P->sf_used); free(P->sf_knobs); P->sf_line = P->sf_used = P->sf_knobs = NULL; P->sf_missing = 0;
   set_plays(P, 1);
   P->bad = 0;
   if (!P->active) smp_synth_collect_now(P->s);   /* nothing processes: the old font closes now */

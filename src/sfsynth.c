@@ -284,10 +284,10 @@ static int kslot_of(const SmpSynth *s, int pub) {
 }
 
 /* a knob's value as its bindings read it: whole numbers for integer and musical-time knobs */
-static float kvalue(const SfKnob *n, double v) {
+static double kvalue(const SfKnob *n, double v) {
   if (v < n->lo) v = n->lo;
   if (v > n->hi) v = n->hi;
-  return (float)(n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5));
+  return n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5);
 }
 
 /* audio thread: every slot's layer gains and tunings from the values now (each binding sets its target, in knob
@@ -301,7 +301,7 @@ static void knob_apply(SmpSynth *s) {
     for (l = 1; l <= nl; l++) { lv[l] = k->layer_vol[l]; lt[l] = k->layer_tune[l]; }
     for (i = 0; i < k->nknob; i++) {
       const SfKnob *n = &k->knob[i];
-      float v = kvalue(n, kget(s, sl, i));
+      float v = (float)kvalue(n, kget(s, sl, i));
       for (j = 0; j < n->nb; j++) {
         const SfKBind *b = &n->b[j];
         float out = sf_trans(&b->tr, v, n->lo, n->hi);
@@ -1606,6 +1606,18 @@ SMP_API int smp_synth_script_write(const SmpSynth *s, char *out, int cap) {
       free(mark);
     }
   }
+  if (s->font) {                                /* knobs away from their presets' values (Decent Sampler) */
+    int pub[KSLOTS], n, sl, k;
+    const SfKnobs *kk[KSLOTS];
+    n = knob_slots(s->font, pub, kk);
+    for (sl = 0; sl < n; sl++)
+      for (k = 0; k < kk[sl]->nknob; k++) {
+        double v = kget(s, sl, k);
+        if (v == kk[sl]->knob[k].value) continue;
+        snprintf(line, sizeof line, "sf_knob %d %d %.9g\n", pub[sl] + 1, k + 1, v);
+        put(&o, line);
+      }
+  }
   for (i = SMP_NPARAMS; i < SMP_NALLPARAMS; i++) {
     char v[64];
     smp_value_text(i, param(s, i), v, sizeof v);
@@ -1644,6 +1656,7 @@ static int script_apply(SmpSynth *s, const char *text, char *err, int cap, int c
   Cfg c; double val[NPAR]; char have[NPAR] = {0};
   char path[1024] = ""; int has_path = 0, path_line = 0;
   int ub[MAXUSED], up[MAXUSED], nu = 0, has_used = 0;
+  int kp[KSLOTS * SF_KNOB_MAX], kn[KSLOTS * SF_KNOB_MAX], nk = 0; double kv[KSLOTS * SF_KNOB_MAX];
   const char *p = text; int lineno = 0, i;
   char m[1400];
   if (err && cap > 0) err[0] = 0;
@@ -1725,6 +1738,13 @@ static int script_apply(SmpSynth *s, const char *text, char *err, int cap, int c
     bad_used:
       snprintf(m, sizeof m, "sf_used lists presets as bank:program, like 0:25 128:0, not '%s'", rest);
       fail(err, cap, lineno, m); return 1;
+    } else if (!strcmp(name, "sf_knob")) {     /* a Decent Sampler knob: preset and knob (from 1), its value */
+      int a, b, used = 0; double v;
+      if (sscanf(rest, "%d %d %lf%n", &a, &b, &v, &used) != 3 || rest[used] || a < 1 || b < 1 || v != v) {
+        snprintf(m, sizeof m, "sf_knob needs a preset and a knob (from 1) and a value, like sf_knob 1 4 0.5, not '%s'", rest);
+        fail(err, cap, lineno, m); return 1;
+      }
+      if (nk < KSLOTS * SF_KNOB_MAX) { kp[nk] = a - 1; kn[nk] = b - 1; kv[nk] = v; nk++; }
     } else {
       int id = -1;
       for (i = SMP_NPARAMS; i < SMP_NALLPARAMS; i++) if (!strcmp(name, smp_param_info(i)->name)) id = i;
@@ -1749,6 +1769,14 @@ static int script_apply(SmpSynth *s, const char *text, char *err, int cap, int c
   cfg_publish(s);
   for (i = SMP_NPARAMS; i < SMP_NALLPARAMS; i++)
     smp_synth_set_param(s, i, have[i - SMP_NPARAMS] ? val[i - SMP_NPARAMS] : smp_param_info(i)->def);
+  if (s->font) {                                /* the knobs: their presets' values, then the state's (a knob the
+                                                   font no longer has is passed over) */
+    int pub[KSLOTS], n, sl, k;
+    const SfKnobs *kk[KSLOTS];
+    n = knob_slots(s->font, pub, kk);
+    for (sl = 0; sl < n; sl++) for (k = 0; k < kk[sl]->nknob; k++) kput(s, sl, k, kk[sl]->knob[k].value);
+    for (k = 0; k < nk; k++) smp_synth_knob_by_preset(s, kp[k], kn[k], &kv[k], 1);
+  }
   {
     int list[MAXUSED], n = 0, k;
     if (has_used && s->font)

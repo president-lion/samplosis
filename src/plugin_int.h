@@ -21,6 +21,7 @@ typedef struct Plug {
   int active;                        /* between activate and deactivate (main thread): process may run */
   int sf_missing;                    /* the state's SoundFont couldn't be loaded: silent; its lines are kept */
   char *sf_line, *sf_used;           /* then its soundfont and sf_used lines, written back on save */
+  char *sf_knobs;                    /* and its sf_knob lines (one or more, joined by newlines), or NULL */
   char sf_err[1400];                 /* then "Missing: <path>" or why it didn't load */
   double rate;
   char *text;                        /* the state as last accepted */
