@@ -50,11 +50,24 @@
      player has one group and one off_by per region;
    - silencingMode fast or normal: off_mode;
    - loCCn and hiCCn: loccN and hiccN (-1, the default, is no range).
+   - output1Target MAIN_OUTPUT: where everything plays anyway (another output is counted).
    Counted as ignored (smp_sf_ignored): every other attribute of <groups>, <group> and <sample> (glide, loop
-   crossfades, curves, outputs, slices and so on), and every element beside <groups> under <DecentSampler> (<ui>,
-   <effects>, <modulators>, <midi>, <tags>, <keyswitches> ...), as "<name>". The UI's knobs then stay at their
-   defaults: a library whose release or tone is only set by a knob's binding plays without it. name, enabled and
-   the root's own attributes are read past. Decent Sampler plays a centred voice 5.3 dB below its source (its
+   crossfades, curves, slices and so on; names as written, so rootnote isn't rootNote, as in Decent Sampler), and
+   every element beside <groups>, <ui>, <effects> and <midi> under <DecentSampler> (<modulators>, <tags>,
+   <keyswitches> ...), as "<name>". name, enabled and the root's own attributes are read past.
+
+   Knobs (read_knobs, sfknob.h). <ui>'s <control>s and <labeled-knob>s (in its <tab>s), with their <binding>s, the
+   <effects> in order, and <midi>'s <cc> bindings to a knob's VALUE become the preset's SfKnobs, handed to the
+   builder (sfz_set_knobs) with the font owning it; a preset with neither a knob nor an effect gets none and is
+   built as before. Each enabled <group> is a layer (1, 2 ... in file order, the region's cond.layer). A group's or
+   <groups>' volume or tuning that some knob binds is left out of the regions and kept in the layer instead, so the
+   player can set it (a binding replaces the attribute, as Decent Sampler's does); what no knob binds stays baked
+   in. CCs bound to a knob lose their default modulators (samplosis_unbind_cc), and a preset with a reverb effect
+   sends nothing to the shared reverb (samplosis_no_reverb_send). Buttons, menus, XY pads, drawbars, multi_state
+   knobs, bindings to anything else, effect types other than filters, reverb and delay, and CC bindings that aren't
+   to a knob are counted by name; the picture (images, the keyboard's colours, positions, styles) is read past.
+   Attributes with no space between them (name="a"next="b"), which Decent Sampler reads, are given one first
+   (ds_fix_attr_spaces). Decent Sampler plays a centred voice 5.3 dB below its source (its
    limiter's headroom); that isn't copied, so presets may sound louder here. A cap reached while reading (too many
    elements, attributes or silencing tags) is counted too, so a partly loaded preset says so. */
 #include <ctype.h>
@@ -82,14 +95,14 @@ enum {
   A_ATTACK, A_DECAY, A_SUSTAIN, A_RELEASE, A_ENVATTACK, A_ENVDECAY, A_ENVSUSTAIN, A_ENVRELEASE, A_ENVDELAY,
   A_ENVHOLD, A_VOLUME, A_GLOBALVOLUME, A_GROUPVOLUME, A_PAN, A_GROUPPAN, A_GLOBALPAN, A_TUNING, A_GROUPTUNING,
   A_GLOBALTUNING, A_PITCHKEYTRACK, A_AMPVELTRACK, A_SEQMODE, A_SEQLENGTH, A_SEQPOSITION, A_TRIGGER, A_TAGS,
-  A_SILENCEDBY, A_SILENCINGMODE, A_RTDECAY, A_AMPENVENABLED, A_ENABLED, A_NAME, NA
+  A_SILENCEDBY, A_SILENCINGMODE, A_RTDECAY, A_AMPENVENABLED, A_ENABLED, A_NAME, A_OUTPUT1, NA
 };
 static const char *const anames[NA] = {
   "path", "rootNote", "loNote", "hiNote", "loVel", "hiVel", "start", "end", "loopStart", "loopEnd", "loopEnabled",
   "attack", "decay", "sustain", "release", "ampEnvAttack", "ampEnvDecay", "ampEnvSustain", "ampEnvRelease",
   "ampEnvDelay", "ampEnvHold", "volume", "globalVolume", "groupVolume", "pan", "groupPan", "globalPan", "tuning",
   "groupTuning", "globalTuning", "pitchKeyTrack", "ampVelTrack", "seqMode", "seqLength", "seqPosition", "trigger",
-  "tags", "silencedByTags", "silencingMode", "releaseTriggerDecay", "ampEnvEnabled", "enabled", "name"
+  "tags", "silencedByTags", "silencingMode", "releaseTriggerDecay", "ampEnvEnabled", "enabled", "name", "output1Target"
 };
 
 #define MAX_CC 4
@@ -572,6 +585,10 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
       else if (word(v, "normal")) op(d, "off_mode", "normal");
       else { char w[64]; snprintf(w, sizeof w, "silencingMode=%.40s", v); ignored(d, w); }
     }
+  }
+  /* the output: everything plays on the main one here, which is where MAIN_OUTPUT (the usual value) sends it */
+  if ((v = inh(s, g, gs, A_OUTPUT1)) != NULL && !word(v, "MAIN_OUTPUT")) {
+    char w[64]; snprintf(w, sizeof w, "output1Target=%.40s", v); ignored(d, w);
   }
   /* CC ranges: the sample's own, else its group's, else <groups>' */
   {

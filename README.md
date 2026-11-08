@@ -105,7 +105,7 @@ The first control on both main pages is a tab control named Player, with two tab
   Switching during playback fades the old player's notes out over 5 ms (its reverb and chorus over 10 ms), so it
   doesn't click. While the Sampler plays, the SoundFont player lets go of its presets' samples (the font stays open,
   so switching back is quick; the presets load again then).
-- Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset or .exs) loads
+- Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset, .dslibrary or .exs) loads
   into the SoundFont player and switches to it; any other audio file loads into the Sampler and switches to it.
 - Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
   stays; on the Sampler page a .sf2 does the same.
@@ -116,7 +116,7 @@ The first control on both main pages is a tab control named Player, with two tab
 File replaces the old Previous file and Next file buttons, on both main pages. It comes right after Browse.
 
 - It lists the files in the loaded file's folder of that page's kind (audio files on the Sampler page, every
-  instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset and .exs): names
+  instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset, .dslibrary and .exs): names
   only, alphabetical, ignoring case. The loaded one is selected. Browse on the SoundFont page offers the same kinds
   ("SoundFonts and instruments"), and All files.
 - Choosing a file loads it at once. Up and Down on the closed box step through the folder and load each file as you
@@ -171,9 +171,11 @@ The SoundFont page, in Tab order:
    - The output combo is Output 1 to Output 16.
 8. SoundFont volume (minus 60 to plus 12 dB), SoundFont voices (16 to 1024, default 256) and SoundFont transpose
    (minus 24 to 24 semitones): sliders, with the same keys as the Sampler's.
-9. Reverb and chorus: On or Off.
-10. Status.
-11. Settings button.
+9. The knobs of a Decent Sampler preset that has them (see "A Decent Sampler preset's knobs"): one slider each, named
+   by the preset. A font without knobs has none, and Tab goes straight on.
+10. Reverb and chorus: On or Off.
+11. Status.
+12. Settings button.
 
 The controls of the mode you are not in are hidden, and Tab skips them. Every choice applies at once.
 
@@ -198,7 +200,8 @@ A pinned or chosen preset the font lacks shows in the lists as "Bank b program p
 ### Outputs
 
 The plugin has 16 stereo audio outputs. Each channel goes to the output you gave it; the default is Output 1, the main
-one. Channels on outputs other than 1 are dry: reverb and chorus apply only to Output 1. If the host provides fewer
+one. Channels on outputs other than 1 are dry: reverb and chorus apply only to Output 1, and so do a Decent Sampler
+preset's own effects. If the host provides fewer
 outputs, those channels play on Output 1. In REAPER, turn on the extra outputs in the plugin's routing.
 
 ### Reverb and chorus
@@ -207,6 +210,43 @@ A built-in reverb and chorus, driven by the song's CC91 and CC93 sends as Genera
 switch turns both off. The power-on reverb send is 40 (General MIDI level 2). The reverb is a Freeverb design (not
 FluidSynth's, so its character differs) and the chorus depth is 8 ms. SoundFont volume applies to the effects too. REAPER's
 stop, seek and loop fade the tails out over 10 ms and clear them.
+
+### A Decent Sampler preset's knobs
+
+A Decent Sampler preset's knobs (its <ui> controls) play as in Decent Sampler, from the window and by MIDI CC:
+
+- Each knob is a slider on the SoundFont page after SoundFont transpose, named by its label, two to a row (Reverb and
+  chorus, Status and Settings move down below them). The window is tall enough for 16; a preset with more shows its
+  first 16. In One preset mode they are the chosen preset's; in All channels mode every preset's that has knobs
+  (named "<preset>: <label>" when a font has more than one such preset).
+- The keys are the other sliders' (arrows, Shift ten times as far, Control a tenth, Page Up and Down, Home and End,
+  Enter or a character to type a value). A knob of whole numbers steps by 1; the others by a hundredth of their
+  range. The words: a 0 to 1 knob in percent ("40 percent"), a knob that tunes in semitones ("plus 3 semitones",
+  "minus 12 semitones"), a musical-time knob as a note length ("1/4", "1/8 dotted", "1/4 triplet"), others as
+  numbers. Typing takes the same words, or a number in the knob's own units.
+- The preset's <midi> CC bindings move them: a CC on a channel that plays the preset sets the knob, through the
+  binding's translation, and the slider follows within a quarter second. A CC bound this way loses its General MIDI
+  meaning for that preset (Finnish Forest Percussion's CC11 is Force, not expression; CC1 is Pitch, not vibrato);
+  other CCs keep theirs. A knob has one value, shared by the window and its CCs: the last move wins.
+- What a knob sets (its bindings): a group's or every group's volume (AMP_VOLUME, by tags or groupIndex), the
+  tuning (GLOBAL_TUNING, GROUP_TUNING), and its effects' parameters (FX_FILTER_FREQUENCY, FX_FILTER_RESONANCE or
+  FX_FILTER_Q, FX_REVERB_WET_LEVEL, FX_REVERB_ROOM_SIZE, FX_REVERB_DAMPING, FX_WET_LEVEL, FX_MIX, FX_DELAY_TIME,
+  FX_FEEDBACK), with linear, table and fixed_value translations. A binding sets its parameter, as in Decent Sampler:
+  a group's volume knob replaces that group's volume attribute. Integer and musical-time knobs give whole numbers.
+  A layer whose volume is 0 when a note starts plays no voice for that note.
+- The preset's <effects> play on its own bus, in order: lowpass, highpass and bandpass (resonant, 12 dB an octave;
+  lowpass_1pl 6 dB), reverb (Freeverb, as JUCE's, which Decent Sampler uses, with the preset's room size and
+  damping) and delay (stereo, with its feedback, stereo offset and feedback cutoff; a musical time follows the host's
+  tempo, 120 BPM without one). Musical times are Decent Sampler's list of 21: 1/64 triplet, 1/64, 1/32 triplet, 1/64
+  dotted, 1/32, 1/16 triplet, 1/32 dotted, 1/16, 1/8 triplet, 1/16 dotted, 1/8, 1/4 triplet, 1/8 dotted, 1/4, 1/2
+  triplet, 1/4 dotted, 1/2, 1 triplet, 1/2 dotted, 1, 1 dotted. A preset with a reverb sends nothing to the shared
+  reverb. The Reverb and chorus switch also turns off a preset's reverbs and delays (its filters stay: they are its
+  tone). Stop, seek and loop clear their tails.
+- The positions are saved with the project (sf_knob lines) and come back with it. Loading a file (another, or the
+  same again) sets every knob to its preset's starting value.
+- Limits: 32 knobs, 8 bindings a knob, 8 effects and 64 CC bindings a preset; values for the font's first 8 presets
+  that have knobs or effects (the rest play at their starting values); a group's volume or tuning for its first 1024
+  groups.
 
 ### Loading ahead
 
@@ -232,6 +272,8 @@ play, and the ones it can't read are silent (the player keeps trying to load the
 - "Loading samples for 3 presets" ("1 preset" when it is one)
 - "Loading Piano.sfz": an instrument opening in the background from the window (an SFZ reads every sample file's
   header first). The window stays usable, and what played before plays until it is ready.
+- "Unpacking Kit.dslibrary: 120 of 345 files": a Decent Sampler bundle unpacking into the cache folder, the first
+  time it opens.
 - "No SoundFont loaded"
 - "Missing: <path>": the file in the project is gone. The state keeps its path and settings, so the project still
   saves and comes back right if the file returns.
@@ -263,6 +305,7 @@ REAPER saves these in the project, after the Sampler's lines, one per line:
     sf_channel_preset 3 0 25
     sf_output 3 2
     sf_used 0:0 0:25 128:0
+    sf_knob 1 4 0.4
     sf_volume 0.0 dB
     sf_voices 256
     sf_effects on
@@ -274,6 +317,9 @@ REAPER saves these in the project, after the Sampler's lines, one per line:
 - sf_channel_preset N bank program: pins channel N. No line means "from the song". Bank 128 is the drum bank.
 - sf_output N M: channel N goes to output M. No line means output 1.
 - sf_used: the presets in use when saved, as bank:program.
+- sf_knob P K V: a Decent Sampler preset's knob away from its starting value: preset P (from 1, in the font's order),
+  knob K (from 1, in the preset's order), value V in the knob's own units. A preset or knob the font no longer has is
+  passed over. With the font missing, the lines are kept and saved again.
 - The last four are the four SoundFont parameters, which REAPER can automate.
 
 A line that doesn't read refuses the whole state ("line N: ...") and nothing changes. Program numbers in the state are
@@ -371,7 +417,15 @@ The file's first bytes choose the reader, then its name.
   the cache. Round robins, random layers, keyswitches, CC ranges, crossfades, release triggers (with rt_decay),
   groups and off_by, polyphony, envelopes, filters, LFOs and bend ranges play.
 - Decent Sampler (.dspreset, XML): read by Samplosis (yxml checks the XML) into the same player as SFZ, with
-  inheritance from groups, round robins, tags and silencing, release triggers and CC ranges.
+  inheritance from groups, round robins, tags and silencing, release triggers, CC ranges, and the preset's knobs,
+  CC bindings and effects (see "A Decent Sampler preset's knobs"). Two attributes with no space between them
+  (name="a"next="b") read as Decent Sampler reads them.
+- Decent Sampler bundles (.dslibrary, a zip): unpacked once into the cache folder (Settings), in a folder of their
+  own, then read as .dspreset files, one preset each (by their names in the zip). Only the presets and the audio
+  files are unpacked (not the pictures, __MACOSX or peak files); the bundle's own folder is never written to.
+  Opening it again unpacks nothing; a changed bundle unpacks again. The unpacked folders count toward the cache
+  limit and are trimmed oldest first, never while open. A bundle that isn't a zip, is damaged, holds a path outside
+  its folder, or uses encryption, doesn't open, with the reason.
 - Logic EXS24 and Sampler (.exs, both the little-endian and the older big-endian layout): read by Samplosis into the
   same player as SFZ. Zones and groups (key and velocity ranges, volume, pan, tuning, start and end, loops, one-shot,
   pitch tracking off, mute), round robins, random select, keyswitch groups (enable by note), CC-range groups,
@@ -400,12 +454,15 @@ doesn't support (first: lfo01_freq)"). The rest of the instrument plays without 
   past without counting. Approximations: LFOs are triangles (SFZ's default is a sine); when a region has both a
   filter and a pitch envelope, the filter envelope's times serve both; release_key plays as a release trigger and
   off_mode=time as normal.
-- Decent Sampler: glide, loop crossfades, loopDuringRelease, curves, playbackMode, slices, output routing,
-  legato, onLoCC and onHiCC, delay, silencingDecay and the other attributes not listed above; the <ui>, <effects>,
-  <modulators>, <midi>, <tags> and <keyswitches> elements (counted once each, with their contents read past);
-  trigger=continuous (plays as attack); a second silencing tag. Knob values set through <ui> are not applied (the
-  preset plays at the bound parameters' defaults), Decent Sampler's own limiter headroom isn't copied (a preset may
-  play louder than in Decent Sampler), and .dslibrary bundles (zips) aren't read: unzip them and open the .dspreset.
+- Decent Sampler: glide, loop crossfades, loopDuringRelease, curves, playbackMode, slices, output routing other
+  than MAIN_OUTPUT, legato, onLoCC and onHiCC, delay, silencingDecay and the other attributes not listed above
+  (names are read as written: rootnote isn't rootNote, as in Decent Sampler); the <modulators>, <tags>,
+  <keyswitches> and <noteSequences> elements (counted once each, with their contents read past); buttons, menus, XY
+  pads and drawbars, multi_state knobs, bindings to other parameters (named, like "binding ENV_RELEASE"), effect
+  types other than the filters, reverb and delay (named, like "effect chorus"), CC bindings that aren't to a knob's
+  value; trigger=continuous (plays as attack); a second silencing tag. The pictures (background, knob skins, keyboard
+  colours) are read past. Decent Sampler's own limiter headroom isn't copied (a preset may play louder than in
+  Decent Sampler). The knobs are not host parameters: REAPER can't automate them (send their CCs instead).
 - EXS: reversed zones, backward and alternating loops, loop crossfades and loop tuning, zone outputs, Flex, group
   polyphony, release trigger decay, velocity and key crossfades, groups enabled by pitch bend, MIDI channel,
   articulation or tempo (they play as if always on), the filter, mono legato, glide and volume key scaling. The

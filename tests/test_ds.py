@@ -375,3 +375,17 @@ def test_ds_attr_without_space(lib, tmp_path):
     rs = regions(lib, f, 0)
     assert len(rs) == 1 and (rs[0].lokey, rs[0].hikey) == (60, 60)
     lib.smp_sf_close(f)
+
+
+def test_ds_main_output_not_counted(lib, tmp_path):
+    """output1Target="MAIN_OUTPUT" is where every sound goes anyway (Finnish Forest Percussion names it on each
+    group): not counted; another output is, since everything plays on the main output here."""
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    for target, counted in (("MAIN_OUTPUT", 0), ("AUX_STEREO_OUTPUT_1", 1)):
+        path = write_ds(tmp_path / ("o%d.dspreset" % counted), """<DecentSampler><groups>
+  <group output1Target="%s"><sample path="a.wav" rootNote="60" loNote="60" hiNote="60"/></group>
+</groups></DecentSampler>""" % target)
+        f = opened(lib, path)
+        n, first = ignored(lib, f)
+        assert n == counted and (not counted or first.startswith("output1Target")), (target, n, first)
+        lib.smp_sf_close(f)
