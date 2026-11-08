@@ -134,6 +134,8 @@ typedef struct {
      knobs or effects (built as before); and the layer of the group being walked */
   SfKnobs *k;
   int layer;
+  int *gmap, ngroups, capg;               /* every <group> by its index (groupIndex counts disabled ones too, as
+                                            Decent Sampler does): its layer, or 0 for a disabled one */
   int live[4];                           /* by SF_KT_*: some knob sets it, so it plays through the layer instead of
                                             being baked into the regions */
   /* several presets in one font (sf_parse_ds_many): this preset's folder as UTF-8 with a trailing backslash, put
@@ -705,18 +707,22 @@ static void read_trans(const D *d, int e, SfTrans *t, float lo, float hi) {
 
 typedef struct { const char *tags; float vol, tune; } Layer;
 
-/* the layers (enabled <group>s in order) with their tags, volume and tuning; and <groups>' own */
+/* the layers (enabled <group>s in order) with their tags, volume and tuning; and <groups>' own; and d->gmap */
 static int read_layers(D *d, Layer **out, float *gvol, float *gtune) {
   int c, grp, n = 0, cap = 0;
   double x;
   *out = NULL; *gvol = 1; *gtune = 0;
+  d->ngroups = 0;
   for (c = d->el[0].first_child; c >= 0; c = d->el[c].next) {
     if (strcmp(el_name(d, c), "groups")) continue;
     if (level_db(attr(d, c, "globalVolume") ? attr(d, c, "globalVolume") : attr(d, c, "volume"), &x)) *gvol = (float)pow(10, x / 20);
     if (num(attr(d, c, "globalTuning"), &x)) *gtune = (float)x;
     for (grp = d->el[c].first_child; grp >= 0; grp = d->el[grp].next) {
       Layer *L;
-      if (strcmp(el_name(d, grp), "group") || is_false(attr(d, grp, "enabled"))) continue;
+      if (strcmp(el_name(d, grp), "group")) continue;
+      if (!grow((void **)&d->gmap, &d->capg, d->ngroups + 1, sizeof *d->gmap)) return -1;
+      d->gmap[d->ngroups++] = is_false(attr(d, grp, "enabled")) ? 0 : n + 1;
+      if (is_false(attr(d, grp, "enabled"))) continue;
       if (!grow((void **)out, &cap, n + 1, sizeof **out)) return -1;
       L = &(*out)[n++];
       L->tags = attr(d, grp, "tags");
@@ -753,8 +759,8 @@ static void read_binding(D *d, int e, SfKnobs *k, SfKnob *n, const Layer *layers
       b.first_layer = (uint16_t)k->nlayer_list;
       if (tags) {
         for (i = 0; i < nlayer; i++) if (tags_meet(tags, layers[i].tags) && !add_layer(k, lcap, i + 1)) return;
-      } else if (num(gi, &x) && x >= 0 && x < nlayer) {
-        if (!add_layer(k, lcap, (int)x + 1)) return;
+      } else if (num(gi, &x) && x >= 0 && x < d->ngroups) {
+        if (d->gmap[(int)x] && !add_layer(k, lcap, d->gmap[(int)x])) return;   /* a disabled group: nothing to set */
       } else { ignored(d, "binding to a group that isn't there"); return; }
       b.nlayers = (uint16_t)(k->nlayer_list - b.first_layer);
     }
@@ -947,7 +953,7 @@ int sf_is_ds(const char *path, const uint8_t *head, size_t n) {
 
 static void free_d(D *d) {
   if (!d) return;
-  free(d->pool); free(d->el); free(d->at);
+  free(d->pool); free(d->el); free(d->at); free(d->gmap);
   map_free(&d->silencers);
   free(d);
 }

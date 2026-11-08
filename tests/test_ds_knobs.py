@@ -470,3 +470,23 @@ def test_ds_chain_font_switch(lib, tmp_path):
         assert np.max(np.abs(x)) < 1e-6                                  # the old font's delay went with it
     finally:
         p.free()
+
+
+def test_ds_knob_group_index_counts_disabled_groups(lib, tmp_path):
+    """groupIndex counts every <group>, disabled ones too, as Decent Sampler does (a button may enable them)."""
+    write_layers(tmp_path)
+    text = """<DecentSampler>
+  <ui><tab><control label="Third" minValue="0" maxValue="1" value="0">
+    <binding type="amp" level="group" groupIndex="2" parameter="AMP_VOLUME"/></control></tab></ui>
+  <groups>
+    <group><sample path="natural.wav" rootNote="60" loNote="60" hiNote="60"/></group>
+    <group enabled="false"><sample path="force.wav" rootNote="60" loNote="60" hiNote="60"/></group>
+    <group><sample path="texture.wav" rootNote="60" loNote="60" hiNote="60"/></group>
+  </groups>
+</DecentSampler>"""
+    p = Player(lib, tmp_path, write_ds(tmp_path / "dis.dspreset", text))
+    try:
+        nat, _, tex = amps(hit(p))
+        assert nat > 0.05 and tex < nat * 1e-3, (nat, tex)      # group 2 (the third, Texture) is at 0
+    finally:
+        p.free()
