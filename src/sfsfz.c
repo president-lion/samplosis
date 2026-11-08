@@ -222,6 +222,8 @@ typedef struct SfzBuild {
   float *curves; int nc, capc;
   int swdef;                         /* the instrument's sw_default (the last given), -1 none */
   int oom;
+  /* presets (sfz_preset): where each starts in regs and its name; none given is one preset named after the file */
+  struct { int start; char name[21]; } *pre; int npre, cappre;
 } P;
 
 /* ---- small helpers ---- */
@@ -1912,7 +1914,7 @@ static void free_parser(P *p) {
   for (i = 0; i < p->ncache; i++) free(p->cache[i].lw);
   free(p->cache); free(p->cslot);
   if (p->paths) for (i = 0; i < p->npaths; i++) free(p->paths[i]);
-  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves);
+  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->pre);
 }
 
 /* ---- the builder other formats share (sfds.c, sfexs.c): they feed headers and opcodes as SFZ names and values ---- */
@@ -1923,6 +1925,22 @@ void sfz_ignored(SfzBuild *p, const char *name) { ignored(p, name); }
 int sfz_cancelled(SfzBuild *p) { return cancelled(p); }
 void sfz_loop_whole(SfzBuild *p) { if (p->level == LV_REGION) p->region.loop_whole = 1; }
 
+/* a new preset from here on (its regions are the ones fed after this call): the levels start again from SFZ's
+   defaults; the files, the defines and the instrument-wide set_cc stay. Called the same way in both passes. */
+void sfz_preset(SfzBuild *p, const char *name) {
+  size_t L = strlen(name);
+  if (p->level == LV_REGION) finish_region(p);
+  opts_default(&p->global); p->master = p->group = p->region = p->global;
+  p->level = LV_NONE;
+  p->default_path[0] = 0; p->note_offset = p->octave_offset = 0;
+  if (p->collect) return;
+  if (!grow((void **)&p->pre, &p->cappre, p->npre + 1, sizeof *p->pre)) { p->oom = 1; return; }
+  if (L > 20) L = 20;
+  p->pre[p->npre].start = p->nr;
+  memcpy(p->pre[p->npre].name, name, L); p->pre[p->npre].name[L] = 0;
+  p->npre++;
+}
+
 /* an SFZ file's feed: its text, with its includes */
 static int feed_sfz(SfzBuild *p, void *ctx, const wchar_t *full, char *why, int wcap) {
   (void)ctx;
@@ -1932,6 +1950,7 @@ static int feed_sfz(SfzBuild *p, void *ctx, const wchar_t *full, char *why, int 
 /* the calling thread's open progress for the next sfz_build (smp_sf_parse_detached_ex), or NULL */
 static __declspec(thread) volatile LONG *t_open_progress;
 void sf_set_open_progress(volatile LONG *prog) { t_open_progress = prog; }
+volatile LONG *sf_get_open_progress(void) { return t_open_progress; }
 
 int sf_parse_sfz(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   return sfz_build(f, path, feed_sfz, NULL, cancel, carg, why, wcap);
@@ -2017,29 +2036,36 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
     goto done;
   }
 
-  /* the model: one preset owning every region, the samples, and the one block of regions, preset starts,
+  /* the model: the presets (one unless the feed called sfz_preset) owning the regions in order, the samples, and
+     the one block of regions, preset starts,
      modulator lists and velocity curves */
   if (p->swdef >= 0) for (i = 0; i < p->nr; i++) p->regs[i].r.cond.sw_default = (int8_t)p->swdef;
   for (i = 0; i < 128; i++) { f->cc_init[i] = p->cc_init[i]; if (p->cc_init[i] >= 0) f->has_cc_init = 1; }
   f->version = 2;
-  f->phdr = calloc(2, sizeof *f->phdr);
-  f->order = calloc(1, sizeof *f->order);
+  if (!p->npre) {                               /* one preset, named after the file */
+    const char *b = p->root_name, *dot = strrchr(b, '.');
+    size_t L = dot && dot > b ? (size_t)(dot - b) : strlen(b);
+    if (!grow((void **)&p->pre, &p->cappre, 1, sizeof *p->pre)) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
+    if (L > 20) L = 20;
+    p->pre[0].start = 0; memcpy(p->pre[0].name, b, L); p->pre[0].name[L] = 0;
+    p->npre = 1;
+  }
+  f->phdr = calloc((size_t)p->npre + 1, sizeof *f->phdr);
+  f->order = calloc((size_t)p->npre, sizeof *f->order);
   f->shdr = calloc((size_t)p->ns + 1, sizeof *f->shdr);
   f->src = calloc((size_t)p->ns, sizeof *f->src);
   if (!f->phdr || !f->order || !f->shdr || !f->src) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
-  {
-    const char *b = p->root_name, *dot = strrchr(b, '.');
-    size_t L = dot && dot > b ? (size_t)(dot - b) : strlen(b);
-    if (L > 20) L = 20;
-    memcpy(f->phdr[0].name, b, L); f->phdr[0].name[L] = 0;
+  for (i = 0; i < p->npre; i++) {               /* bank 0, programs in the order given */
+    memcpy(f->phdr[i].name, p->pre[i].name, sizeof f->phdr[i].name);
+    f->phdr[i].program = (uint16_t)i;
   }
-  f->nphdr = 1;
+  f->nphdr = p->npre;
   memcpy(f->shdr, p->shdr, (size_t)p->ns * sizeof *f->shdr);
   memcpy(f->src, p->src, (size_t)p->ns * sizeof *f->src);
   f->nshdr = p->ns;
   f->paths = p->paths; f->npaths = p->npaths; p->paths = NULL; p->npaths = 0;
   {
-    size_t sreg = (size_t)p->nr * sizeof(SmpSfRegion), sst = 2 * sizeof(int);
+    size_t sreg = (size_t)p->nr * sizeof(SmpSfRegion), sst = ((size_t)p->npre + 1) * sizeof(int);
     size_t smod = (size_t)p->nm * sizeof(SmpSfMod), mod_at = (sreg + sst + 7) & ~(size_t)7;
     size_t cur_at = (mod_at + smod + 7) & ~(size_t)7, total = cur_at + (size_t)p->nc * 128 * sizeof(float);
     char *block = calloc(1, total ? total : 1);
@@ -2058,7 +2084,8 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
       r->pmod = NULL; r->npmod = 0;
       r->cond.amp_velcurve = p->regs[i].curve >= 0 ? curves + (size_t)p->regs[i].curve * 128 : NULL;
     }
-    f->rstart[0] = 0; f->rstart[1] = p->nr;
+    for (i = 0; i < p->npre; i++) f->rstart[i] = p->pre[i].start;
+    f->rstart[p->npre] = p->nr;
     f->nregions = p->nr;
   }
   if (!sf_build_order(f)) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }

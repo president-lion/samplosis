@@ -934,21 +934,25 @@ static SmpFont *parse_any(const char *path, int (*cancel)(void *), void *carg, c
 
   {
     /* SFZ: text, told by its name or by a header in its first bytes; sfsfz.c reads it (and its sample files). A
-       Decent Sampler preset (XML with <DecentSampler>, or .dspreset) is read by sfds.c into the same builder, and a
+       Decent Sampler preset (XML with <DecentSampler>, or .dspreset) is read by sfds.c into the same builder, a
+       Decent Sampler bundle (.dslibrary, or a zip: told first, since a stored preset in it would look like XML) is
+       unpacked by sfdslib.c and read the same way, and a
        Logic .exs (told by its name or its first block's header) by sfexs.c. */
     uint8_t head[4096];
     uint32_t n = s.size < sizeof head ? (uint32_t)s.size : (uint32_t)sizeof head;
-    int ds = 0, exs = 0;
+    int ds = 0, exs = 0, dl = 0;
     if (!(n >= 4 && rd(&s, 0, head, 4) && !memcmp(head, "RIFF", 4)) && (n == 0 || rd(&s, 0, head, n)) &&
-        ((exs = sf_is_exs(path, head, n)) != 0 || (ds = sf_is_ds(path, head, n)) != 0 || sf_is_sfz(path, head, n))) {
+        ((dl = sf_is_dslib(path, head, n)) != 0 || (exs = sf_is_exs(path, head, n)) != 0 ||
+         (ds = sf_is_ds(path, head, n)) != 0 || sf_is_sfz(path, head, n))) {
       CloseHandle(s.h);
       f->is_sfz = 1;
-      f->is_ds = ds;
+      f->is_ds = ds || dl;
       f->is_exs = exs;
       f->path = _strdup(path);
       if (!f->path) snprintf(why, sizeof why, "out of memory");
       else {
-        int r = exs ? sf_parse_exs(f, path, cancel, carg, why, sizeof why) :
+        int r = dl ? sf_parse_dslib(f, path, cancel, carg, why, sizeof why) :
+                exs ? sf_parse_exs(f, path, cancel, carg, why, sizeof why) :
                 ds ? sf_parse_ds(f, path, cancel, carg, why, sizeof why) : sf_parse_sfz(f, path, cancel, carg, why, sizeof why);
         if (r > 0) return f;
         if (r < 0) {                         /* why is the whole reason (every sample missing, say) */
@@ -958,7 +962,8 @@ static SmpFont *parse_any(const char *path, int (*cancel)(void *), void *carg, c
         }
       }
       if (err && cap > 0) snprintf(err, cap, "%s isn't %s this can play (%s)", base_name(path),
-                                   exs ? "an EXS instrument" : ds ? "a Decent Sampler preset" : "an SFZ file", why);
+                                   dl ? "a Decent Sampler bundle" : exs ? "an EXS instrument" :
+                                   ds ? "a Decent Sampler preset" : "an SFZ file", why);
       sf_free(f);
       return NULL;
     }
@@ -1105,6 +1110,7 @@ void sf_free(SmpFont *f) {
   free(f->ibag); free(f->imod); free(f->igen); free(f->shdr); free(f->order);
   free(f->regions);   /* the one block that also holds rstart and the modulator lists */
   free(f->swmask); free(f->pflags); free(f->kix_off); free(f->kix);
+  if (f->dslib_pinned) smp_cache_unpin(f->dslib_key);   /* its unpacked folder may be trimmed from now on */
   free(f);
 }
 

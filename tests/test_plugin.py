@@ -836,7 +836,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     os.replace(tmp_path / "s.wav", k / "s.wav")
     (k / "kit.sfz").write_text("<region> sample=s.wav key=60 eq1_freq=100\n<region> sample=gone.wav key=62\n")
     make_dls(k / "bank.dls")
-    for n in ("g.gig", "h.dspreset", "i.sf4", "j.sf2pack", "k.exs", "l.sbk", "m.sf2", "n.sf3", "notes.txt", "o.wav"):
+    for n in ("g.gig", "h.dspreset", "hh.dslibrary", "i.sf4", "j.sf2pack", "k.exs", "l.sbk", "m.sf2", "n.sf3", "notes.txt", "o.wav"):
         (k / n).write_bytes(b"x")
     text = P.script(P.sample())
     out = gui(P, tmp_path, text, ["key right", "read SoundFont", "read File", "dialog pick %s" % (d / "a.sf2"),
@@ -880,7 +880,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     assert st[4] == "plays sampler" and c[2] == "beeps 2"
     assert f[-3] == ["Tab", "Player", "SoundFont"], out              # a dropped .sfz: the SoundFont tab
     assert r[12] == "kit.sfz, SFZ, 1 preset", out
-    assert got(out, "list")[1] == ["File", "bank.dls", "g.gig", "h.dspreset", "i.sf4", "j.sf2pack", "k.exs",
+    assert got(out, "list")[1] == ["File", "bank.dls", "g.gig", "h.dspreset", "hh.dslibrary", "i.sf4", "j.sf2pack", "k.exs",
                                    "kit.sfz", "l.sbk", "m.sf2", "n.sf3"], out    # every kind; notes.txt and o.wav aren't
     assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples")
     assert r[13].endswith(". Missing 1 sample (first: gone.wav). "

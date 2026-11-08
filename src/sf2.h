@@ -81,6 +81,8 @@ struct SmpFont {
   int is_sfz;                           /* SFZ (sfsfz.c): paths, src, shdr, phdr, order and regions are filled */
   int is_ds;                            /* Decent Sampler (sfds.c, through sfsfz.c's builder): is_sfz is set too */
   int is_exs;                           /* Logic EXS (sfexs.c, through sfsfz.c's builder): is_sfz is set too */
+  uint64_t dslib_key; int dslib_pinned; /* a Decent Sampler bundle: its unpacked folder's cache key, pinned while
+                                           the font lives (sf_free unpins it) */
   int is_gig;                           /* GigaStudio (gigshim.cpp, through libgig): filled as DLS is */
   void *gig;                            /* GigaStudio: the loader's libgig file for decoding compressed waves, opened
                                            when the first is needed (sf_gig_decode), freed by sf_free; or NULL */
@@ -199,6 +201,7 @@ void sf_source_keys(SmpFont *f);
 /* sffont.c, for the player's offline renders: a pending voice's sample is loaded first (any thread); and the wait
    for it (sample) or for everything the presets in use need (-1), with no fixed cap while the loader keeps making
    progress (0 done, 1 gave up after a minute without any) */
+volatile LONG *sf_get_open_progress(void);       /* sfsfz.c: that progress (NULL when none), for sfdslib.c */
 void sf_set_open_progress(volatile LONG *prog);   /* sfsfz.c: this thread's next SFZ open counts its sample files into prog[0] of prog[1] */
 int smp_sf_wait_loaded(SmpFont *f, int sample);
 void sf_free(SmpFont *f);
@@ -269,10 +272,29 @@ void sfz_opcode(SfzBuild *b, const char *name, const char *value);
 void sfz_ignored(SfzBuild *b, const char *name);
 int sfz_cancelled(SfzBuild *b);
 void sfz_loop_whole(SfzBuild *b);
+/* sfz_preset starts a new preset (bank 0, programs 0, 1, 2 ... in call order; name cut to 20 characters): the
+   regions fed after it are its own. Called at the same places in both passes. A feed that never calls it makes one
+   preset named after the file. */
+void sfz_preset(SfzBuild *b, const char *name);
 /* sfds.c: Decent Sampler. sf_is_ds: the name ends .dspreset, or the first bytes have a <DecentSampler element.
    sf_parse_ds: as sf_parse_sfz, for a .dspreset */
 int sf_is_ds(const char *path, const uint8_t *head, size_t n);
 int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
+/* sf_parse_ds_many: one font (under font_path) of n presets, one per .dspreset in presets[], each named after its
+   file and reading its samples from beside it. Same return values. */
+int sf_parse_ds_many(SmpFont *f, const char *font_path, const char *const *presets, int n, int (*cancel)(void *),
+                     void *carg, char *why, int wcap);
+/* sfdslib.c: Decent Sampler bundles. sf_is_dslib: the name ends .dslibrary, or the file starts as a zip does.
+   sf_parse_dslib: unpacks the bundle into the cache folder once (<cache>\dslib\<key>\) and reads its presets with
+   sf_parse_ds_many. Same return values as sf_parse_sfz. */
+/* cache.c, for sfdslib.c: an unpacked bundle's folder for key; a key pinned (never trimmed) until unpinned, once
+   per pin; a folder deleted with everything under it (1 when it is gone) */
+int smp_cache_dslib_path(uint64_t key, wchar_t *out, int cap);
+void smp_cache_pin(uint64_t key);
+void smp_cache_unpin(uint64_t key);
+int smp_cache_delete_tree(const wchar_t *d);
+int sf_is_dslib(const char *path, const uint8_t *head, size_t n);
+int sf_parse_dslib(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap);
 /* sfexs.c: Logic's EXS24 and Sampler instruments. sf_is_exs: the name ends .exs, or the first bytes are an EXS
    block header. sf_parse_exs: as sf_parse_sfz, for an .exs (its samples are looked for near it) */
 int sf_is_exs(const char *path, const uint8_t *head, size_t n);

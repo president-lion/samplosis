@@ -308,7 +308,8 @@ int smp_entry_bps(const SmpEntry *e) { return e->bps ? e->bps : 4; }
 uint64_t smp_entry_data_offset(const SmpEntry *e, uint64_t frame) { return HDR + frame * (uint64_t)(e->bps ? e->bps : 4); }
 
 typedef struct { uint64_t key, size, time; int sfzp; } Item;   /* sfzp: 1 an SFZ probe cache file (sfsfz.c), 2 a
-                                                                  GigaStudio parse cache file (gigshim.cpp) */
+                                                                  GigaStudio parse cache file (gigshim.cpp), 3 an
+                                                                  unpacked Decent Sampler bundle's folder (sfdslib.c) */
 static const wchar_t *const kinds[3] = {L".smpc", L".sfzp", L".gigp"};
 static int by_time(const void *a, const void *b) {
   const Item *x = a, *y = b;
@@ -333,6 +334,97 @@ static void trim_parts(const wchar_t *dir) {
     DeleteFileW(fn);
   } while (FindNextFileW(f, &fd));
   FindClose(f);
+}
+
+/* ---- unpacked Decent Sampler bundles: <cache>\dslib\<016llx key>\, whole folders ---- */
+
+int smp_cache_dslib_path(uint64_t key, wchar_t *out, int cap) {
+  size_t n;
+  if (!dir_w(out, cap - 40)) return 0;
+  n = wcslen(out);
+  swprintf(out + n, (size_t)cap - n, L"\\dslib\\%016llx", (unsigned long long)key);
+  return 1;
+}
+
+void smp_cache_pin(uint64_t key) { lock(); pin_locked(key); LeaveCriticalSection(&cs); }
+
+void smp_cache_unpin(uint64_t key) {
+  int i;
+  lock();
+  for (i = 0; i < open_n; i++) if (open_keys[i] == key) { open_keys[i] = open_keys[--open_n]; break; }
+  LeaveCriticalSection(&cs);
+}
+
+/* the bytes of every file under folder d (links are not followed) */
+static uint64_t dir_bytes(const wchar_t *d) {
+  wchar_t pat[1300], sub[1300];
+  WIN32_FIND_DATAW fd;
+  uint64_t total = 0;
+  HANDLE f;
+  swprintf(pat, 1300, L"%s\\*", d);
+  if ((f = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 0;
+  do {
+    if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+      swprintf(sub, 1300, L"%s\\%s", d, fd.cFileName);
+      total += dir_bytes(sub);
+    } else total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+  } while (FindNextFileW(f, &fd));
+  FindClose(f);
+  return total;
+}
+
+/* deletes folder d and everything under it (a link is removed, never followed): 1 when it is gone */
+int smp_cache_delete_tree(const wchar_t *d) {
+  wchar_t pat[1300], sub[1300];
+  WIN32_FIND_DATAW fd;
+  HANDLE f;
+  swprintf(pat, 1300, L"%s\\*", d);
+  if ((f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+    do {
+      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+      swprintf(sub, 1300, L"%s\\%s", d, fd.cFileName);
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        smp_cache_delete_tree(sub);
+      else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(sub);
+      else { SetFileAttributesW(sub, FILE_ATTRIBUTE_NORMAL); DeleteFileW(sub); }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+  }
+  return RemoveDirectoryW(d) || GetFileAttributesW(d) == INVALID_FILE_ATTRIBUTES;
+}
+
+/* the unpacked bundles' folders as items (kind 3); .part folders over an hour old (a crash's) are deleted */
+static int dslib_items(const wchar_t *dir, Item **items, size_t *n, size_t *cap, uint64_t *total) {
+  wchar_t pat[1200], d[1300];
+  WIN32_FIND_DATAW fd;
+  FILETIME now; uint64_t t, hour = 3600ULL * 10000000ULL;
+  HANDLE f;
+  swprintf(pat, 1200, L"%s\\dslib\\*", dir);
+  if ((f = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 1;
+  GetSystemTimeAsFileTime(&now);
+  t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+  do {
+    uint64_t w = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+    size_t L = wcslen(fd.cFileName);
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+    swprintf(d, 1300, L"%s\\dslib\\%s", dir, fd.cFileName);
+    if (L > 5 && !_wcsicmp(fd.cFileName + L - 5, L".part")) { if (w + hour <= t) smp_cache_delete_tree(d); continue; }
+    if (L != 16) continue;
+    if (*n == *cap) {
+      Item *ni; *cap = *cap ? *cap * 2 : 256;
+      if (!(ni = realloc(*items, *cap * sizeof **items))) { FindClose(f); return 0; }
+      *items = ni;
+    }
+    (*items)[*n].key = wcstoull(fd.cFileName, NULL, 16);
+    (*items)[*n].size = dir_bytes(d);
+    (*items)[*n].time = w;
+    (*items)[*n].sfzp = 3;
+    *total += (*items)[*n].size; (*n)++;
+  } while (FindNextFileW(f, &fd));
+  FindClose(f);
+  return 1;
 }
 
 /* The cache's files, oldest first: the .smpc sample files, the .sfzp SFZ probe caches and the .gigp GigaStudio parse
@@ -364,13 +456,18 @@ uint64_t smp_cache_trim(uint64_t limit) {
     } while (FindNextFileW(f, &fd));
     FindClose(f);
   }
+  if (!dslib_items(dir, &items, &n, &cap, &total)) { free(items); return 0; }
   qsort(items, n, sizeof *items, by_time);
   lock();
   for (size_t i = 0; i < n; i++)
-    if (!items[i].sfzp && is_open_locked(items[i].key)) { pinned += items[i].size; total -= items[i].size; items[i].size = 0; items[i].time = 0; }
+    if ((!items[i].sfzp || items[i].sfzp == 3) && is_open_locked(items[i].key)) { pinned += items[i].size; total -= items[i].size; items[i].size = 0; items[i].time = 0; }
   for (size_t i = 0; i < n && total > limit; i++) {
     if (!items[i].size) continue;
     wchar_t fn[1200];
+    if (items[i].sfzp == 3) {             /* a bundle's folder: gone whole, or (a file in use) left for next time */
+      if (smp_cache_dslib_path(items[i].key, fn, 1200) && smp_cache_delete_tree(fn)) total -= items[i].size;
+      continue;
+    }
     file_w(items[i].key, kinds[items[i].sfzp], fn, 1200);
     if (DeleteFileW(fn)) total -= items[i].size;
   }
@@ -402,10 +499,21 @@ uint64_t smp_cache_used_bytes(void) {
   if (!dir_w(dir, 1100)) return 0;
   swprintf(pat, 1200, L"%s\\*.smpc", dir);
   HANDLE f = FindFirstFileW(pat, &fd);
-  if (f == INVALID_HANDLE_VALUE) return 0;
-  do {
-    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-  } while (FindNextFileW(f, &fd));
-  FindClose(f);
+  if (f != INVALID_HANDLE_VALUE) {
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+  }
+  swprintf(pat, 1200, L"%s\\dslib\\*", dir);         /* unpacked bundles (not their .part folders) */
+  if ((f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+    wchar_t d[1300];
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || wcslen(fd.cFileName) != 16) continue;
+      swprintf(d, 1300, L"%s\\dslib\\%s", dir, fd.cFileName);
+      total += dir_bytes(d);
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+  }
   return total;
 }

@@ -27,8 +27,8 @@
    Files. Each main page has Browse and a File combo box: the files of its kind in the loaded file's folder, the
    loaded one selected; choosing one (Up and Down too) loads it at once. Both load only their own page's kind (a file
    of the other kind gives that player's error). A dropped file goes by its extension: an instrument (.sf2 .sf3 .sf4
-   .sf2pack .sbk .dls .gig .sfz .dspreset .exs) loads into the SoundFont player, an audio file into the sampler, and the
-   tab follows.
+   .sf2pack .sbk .dls .gig .sfz .dspreset .dslibrary .exs) loads into the SoundFont player, an audio file into the
+   sampler, and the tab follows.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
 #include <commctrl.h>
@@ -664,7 +664,7 @@ static void refresh(Gui *g) {
 /* the SoundFont page's kinds: every instrument format the SoundFont player opens, for the File combo box and drops
    (Browse's filter below lists the same) */
 static const wchar_t *const font_exts[] = {L".sf2", L".sf3", L".sf4", L".sf2pack", L".sbk", L".dls", L".gig", L".sfz",
-                                           L".dspreset", L".exs"};
+                                           L".dspreset", L".dslibrary", L".exs"};
 static bool font_name(const wchar_t *n) {
   const wchar_t *dot = wcsrchr(n, L'.'); size_t i;
   if (!dot) return false;
@@ -722,7 +722,7 @@ typedef struct {
 } FileKind;
 static const FileKind kinds[2] = {
   {smp_plug_sample_path, audio_name, NULL, L"Load a sample"},             /* filter: audio_filter() */
-  {smp_plug_font_path, font_name, L"SoundFonts and instruments\0*.sf2;*.sf3;*.sf4;*.sf2pack;*.sbk;*.dls;*.gig;*.sfz;*.dspreset;*.exs\0All files\0*.*\0",
+  {smp_plug_font_path, font_name, L"SoundFonts and instruments\0*.sf2;*.sf3;*.sf4;*.sf2pack;*.sbk;*.dls;*.gig;*.sfz;*.dspreset;*.dslibrary;*.exs\0All files\0*.*\0",
    L"Load a SoundFont"},
 };
 

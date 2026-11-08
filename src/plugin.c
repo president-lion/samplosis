@@ -874,7 +874,8 @@ struct Loader {
   Job *want, *busy, *done;               /* the next job, the one decoding, a finished one not yet taken */
   long serial;                           /* the newest job's (main thread writes it, under the lock) */
   volatile LONG ffmpeg;                  /* the serial of a job that got to FFmpeg */
-  volatile LONG prog[3];                 /* an SFZ's sample files read so far, of how many, and for which serial */
+  volatile LONG prog[3];                 /* an SFZ's sample files read so far, of how many (negative: a bundle's
+                                            files unpacking), and for which serial */
   const clap_host_t *host;
   volatile LONG refs;
   HMODULE self;
@@ -892,6 +893,12 @@ static int loading_text(Plug *P, char *out, int cap) {
        about ten times rather than thousands */
     long n = P->loader->prog[1], d = P->loader->prog[0], step = n >= 100 ? n / 10 : 1;
     snprintf(out, (size_t)cap, "Loading %s: %ld of %ld samples", P->loading_name, d >= n ? n : d / step * step, n);
+    return 1;
+  }
+  if (!ff && P->loading_font && P->loader->prog[2] == P->loader->serial && P->loader->prog[1] < 0) {
+    /* a Decent Sampler bundle unpacking into the cache: files, the total given negative (sfdslib.c) */
+    long n = -P->loader->prog[1], d = P->loader->prog[0], step = n >= 100 ? n / 10 : 1;
+    snprintf(out, (size_t)cap, "Unpacking %s: %ld of %ld files", P->loading_name, d >= n ? n : d / step * step, n);
     return 1;
   }
   snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);

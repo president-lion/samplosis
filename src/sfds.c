@@ -116,6 +116,10 @@ typedef struct {
   /* caps reached while reading: told in the ignored count */
   int elems_capped, attrs_capped, tags_capped;
   char num[64];
+  /* several presets in one font (sf_parse_ds_many): this preset's folder as UTF-8 with a trailing backslash, put
+     before its relative sample paths (the builder's own folder is the font's); empty for a lone preset */
+  char dir[1024];
+  char pathbuf[2100];
 } D;
 
 /* ---- small helpers ---- */
@@ -434,7 +438,10 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   }
   if (!path || !path[0]) return;                     /* no sample to play */
   sfz_header(d->b, "region");
-  op(d, "sample", path);
+  if (d->dir[0] && !(path[0] == '/' || path[0] == '\\' || (path[0] && path[1] == ':'))) {
+    snprintf(d->pathbuf, sizeof d->pathbuf, "%s%s", d->dir, path);
+    op(d, "sample", d->pathbuf);
+  } else op(d, "sample", path);
   opn(d, "pitch_keycenter", note_num(inh(s, g, gs, A_ROOT), 60));
   opn(d, "lokey", lokey); opn(d, "hikey", hikey); opn(d, "lovel", lovel); opn(d, "hivel", hivel);
   /* volume, tuning and pan: the levels combined */
@@ -586,7 +593,16 @@ int sf_is_ds(const char *path, const uint8_t *head, size_t n) {
   return 0;
 }
 
-int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+static void free_d(D *d) {
+  if (!d) return;
+  free(d->pool); free(d->el); free(d->at);
+  map_free(&d->silencers);
+  free(d);
+}
+
+/* one preset's file into a new D, its tree walked once (round-robin lengths, silencing tags): the D, or NULL with
+   why */
+static D *load_ds(const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
   D *d = calloc(1, sizeof *d);
   wchar_t *full = sf_full_path(path);
   HANDLE h = INVALID_HANDLE_VALUE;
@@ -608,16 +624,72 @@ int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg,
   free(t); t = NULL;
   d->pass = 0;
   d->cancel = cancel; d->carg = carg;
-  if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }   /* round-robin lengths, silencing tags */
-  ok = sfz_build(f, path, feed_ds, d, cancel, carg, why, wcap);
-  if (ok == 0 && !strcmp(why, "it has no regions with samples")) snprintf(why, (size_t)wcap, "it has no samples to play");
+  if (!walk(d)) { snprintf(why, (size_t)wcap, "cancelled"); goto done; }
+  ok = 1;
 done:
   if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
   free(t); free(full);
-  if (d) {
-    free(d->pool); free(d->el); free(d->at);
-    map_free(&d->silencers);
-    free(d);
+  if (!ok) { free_d(d); d = NULL; }
+  return d;
+}
+
+int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+  D *d = load_ds(path, cancel, carg, why, wcap);
+  int ok;
+  if (!d) return 0;
+  ok = sfz_build(f, path, feed_ds, d, cancel, carg, why, wcap);
+  if (ok == 0 && !strcmp(why, "it has no regions with samples")) snprintf(why, (size_t)wcap, "it has no samples to play");
+  free_d(d);
+  return ok;
+}
+
+/* several presets: each one's file name (without its extension) names it */
+typedef struct { D **d; const char *const *paths; int n; } Many;
+
+static int feed_many(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int wcap) {
+  Many *m = ctx;
+  int k;
+  for (k = 0; k < m->n; k++) {
+    const char *p = m->paths[k], *base = p, *c, *dot;
+    char name[64];
+    size_t L;
+    for (c = p; *c; c++) if (*c == '\\' || *c == '/') base = c + 1;
+    dot = strrchr(base, '.');
+    L = dot && dot > base ? (size_t)(dot - base) : strlen(base);
+    if (L >= sizeof name) L = sizeof name - 1;
+    memcpy(name, base, L); name[L] = 0;
+    sfz_preset(b, name);
+    if (!feed_ds(b, m->d[k], full, why, wcap)) return 0;
   }
+  return 1;
+}
+
+int sf_parse_ds_many(SmpFont *f, const char *font_path, const char *const *presets, int n, int (*cancel)(void *),
+                     void *carg, char *why, int wcap) {
+  Many m;
+  int ok = 0, k;
+  m.d = calloc((size_t)(n > 0 ? n : 1), sizeof *m.d); m.paths = presets; m.n = n;
+  if (!m.d) { snprintf(why, (size_t)wcap, "out of memory"); return 0; }
+  for (k = 0; k < n; k++) {
+    const char *c, *slash = NULL;
+    char w[300];
+    if (!(m.d[k] = load_ds(presets[k], cancel, carg, w, sizeof w))) {
+      const char *base = presets[k];
+      for (c = presets[k]; *c; c++) if (*c == '\\' || *c == '/') base = c + 1;
+      snprintf(why, (size_t)wcap, "%s: %s", base, w);
+      ok = -1;
+      goto done;
+    }
+    for (c = presets[k]; *c; c++) if (*c == '\\' || *c == '/') slash = c;
+    if (slash && (size_t)(slash - presets[k] + 1) < sizeof m.d[k]->dir) {
+      memcpy(m.d[k]->dir, presets[k], (size_t)(slash - presets[k] + 1));
+      m.d[k]->dir[slash - presets[k] + 1] = 0;
+    }
+  }
+  ok = sfz_build(f, font_path, feed_many, &m, cancel, carg, why, wcap);
+  if (ok == 0 && !strcmp(why, "it has no regions with samples")) snprintf(why, (size_t)wcap, "it has no samples to play");
+done:
+  for (k = 0; k < n; k++) free_d(m.d[k]);
+  free(m.d);
   return ok;
 }
