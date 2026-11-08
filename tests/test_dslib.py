@@ -191,3 +191,25 @@ def test_dslib_two_opens_at_once(lib, tmp_path):
     dirs = unpack_dirs(tmp_path)
     assert len(dirs) == 1 and len(files_under(dirs[0])) == 402, (dirs, len(files_under(dirs[0])) if dirs else 0)
     assert not [d for d in glob.glob(str(tmp_path / "cache" / "dslib" / "*")) if d.endswith(".part")]
+
+
+def test_dslib_trim_never_leaves_half_a_folder(lib, tmp_path):
+    """A trim that can't delete a file in an unpacked folder (another program has it open) leaves the folder whole;
+    one it can delete goes whole. A folder that is there is always complete."""
+    point_cache(lib, tmp_path / "cache")
+    path = make_bundle(tmp_path / "Two.dslibrary", {"Kit.dspreset": KIT % ("a.wav", 60, 60),
+                                                    "Samples/a.wav": wav_bytes(tmp_path, 440.0),
+                                                    "Samples/b.wav": wav_bytes(tmp_path, 660.0, "b.wav")})
+    f, err = sf_open(lib, path)
+    assert f, err
+    lib.smp_sf_close(f)
+    d = unpack_dirs(tmp_path)[0]
+    held = open(os.path.join(d, "Samples", "b.wav"), "rb")    # Python's open shares read and write, not delete
+    try:
+        lib.smp_cache_trim(1)
+        assert files_under(d) == ["Kit.dspreset", os.path.join("Samples", "a.wav"), os.path.join("Samples", "b.wav")], files_under(d)
+    finally:
+        held.close()
+    lib.smp_cache_trim(1)
+    assert unpack_dirs(tmp_path) == []
+    assert not glob.glob(str(tmp_path / "cache" / "dslib" / "*"))   # nothing left behind either

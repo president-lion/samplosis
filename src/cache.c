@@ -461,17 +461,27 @@ uint64_t smp_cache_trim(uint64_t limit) {
   lock();
   for (size_t i = 0; i < n; i++)
     if ((!items[i].sfzp || items[i].sfzp == 3) && is_open_locked(items[i].key)) { pinned += items[i].size; total -= items[i].size; items[i].size = 0; items[i].time = 0; }
+  wchar_t (*trash)[1300] = NULL; size_t ntrash = 0;
   for (size_t i = 0; i < n && total > limit; i++) {
     if (!items[i].size) continue;
     wchar_t fn[1200];
-    if (items[i].sfzp == 3) {             /* a bundle's folder: gone whole, or (a file in use) left for next time */
-      if (smp_cache_dslib_path(items[i].key, fn, 1200) && smp_cache_delete_tree(fn)) total -= items[i].size;
+    if (items[i].sfzp == 3) {
+      /* A bundle's folder goes whole or not at all: renamed out of the way first (which fails while a file in it is
+         open, say by another process using it, and then it stays, whole), and deleted after the lock, so a folder
+         that is there is always complete and a big one doesn't hold the lock while it goes */
+      static volatile LONG tn;
+      if (!trash && !(trash = malloc(n * sizeof *trash))) continue;
+      if (!smp_cache_dslib_path(items[i].key, fn, 1200)) continue;
+      swprintf(trash[ntrash], 1300, L"%s.%lu.%lu.%ld.part", fn, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&tn));
+      if (MoveFileExW(fn, trash[ntrash], 0)) { ntrash++; total -= items[i].size; }
       continue;
     }
     file_w(items[i].key, kinds[items[i].sfzp], fn, 1200);
     if (DeleteFileW(fn)) total -= items[i].size;
   }
   LeaveCriticalSection(&cs);
+  for (size_t i = 0; i < ntrash; i++) smp_cache_delete_tree(trash[i]);   /* what can't go now goes in an hour */
+  free(trash);
   free(items);
   return total + pinned;
 }
