@@ -558,6 +558,8 @@ static void process_synth(Plug *P, const clap_process_t *pr) {
     outs[0] = P->scratch + P->maxf; outs[1] = P->scratch;
     if (b && b->data32 && b->channel_count == 1) mono = b->data32[0];
   }
+  if (pr->transport && (pr->transport->flags & CLAP_TRANSPORT_HAS_TEMPO))
+    smp_synth_set_tempo(P->s, pr->transport->tempo);   /* Decent Sampler's tempo-synced delays */
   for (i = 0; i < ne; i++) {
     const clap_event_header_t *h = pr->in_events->get(pr->in_events, i);
     uint32_t t = h->time >= n ? (n ? n - 1 : 0) : h->time;   /* a time past the block: its last frame */

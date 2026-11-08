@@ -373,3 +373,100 @@ def test_ds_knob_plain_preset_unchanged(lib, tmp_path):
         assert np.array_equal(a.render(ev, 0.6), b.render(ev, 0.6))
     finally:
         a.free(); b.free()
+
+
+# ---- Task 6: the chain in the player, driven by knobs and the host's tempo ----
+
+def noise_wave(fq):
+    return np.random.default_rng(int(fq)).standard_normal(RATE) * 0.1
+
+
+def click_wave(fq):
+    x = np.zeros(RATE // 2)
+    x[:200] = np.sin(2 * np.pi * fq * np.arange(200) / RATE) * 0.5
+    return x
+
+
+def chain_player(lib, tmp_path, wave, name="c.dspreset", **kw):
+    write_layers(tmp_path, wave)
+    p = Player(lib, tmp_path, write_ds(tmp_path / name, kit_text(**kw)))
+    lib.smp_synth_set_param(p.s, 33, 1)                                  # effects on
+    lib.smp_synth_set_tempo.argtypes, lib.smp_synth_set_tempo.restype = [ctypes.c_void_p, ctypes.c_double], None
+    return p
+
+
+def spectrum_db(x, lo, hi):
+    s = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+    f = np.fft.rfftfreq(len(x), 1 / OUT)
+    return 10 * np.log10(np.sum(s[(f >= lo) & (f < hi)]) + 1e-30)
+
+
+def test_ds_chain_tone_knob(lib, tmp_path):
+    bind_knobs(lib)
+    p = chain_player(lib, tmp_path, noise_wave)
+    q = chain_player(lib, tmp_path, noise_wave, name="plain.dspreset", effects="")   # no chain at all
+    try:
+        flat, ref = hit(p), hit(q)
+        for lo, hi in ((150, 250), (7000, 9000)):
+            assert abs(spectrum_db(flat, lo, hi) - spectrum_db(ref, lo, hi)) < 1, (lo, hi)
+        tone_k = knob_index(lib, p.s, "Tone")
+        lib.smp_synth_knob_set(p.s, tone_k, 0.0)                         # lowpass 250 Hz
+        dark = hit(p)
+        assert spectrum_db(ref, 7000, 9000) - spectrum_db(dark, 7000, 9000) > 30
+        lib.smp_synth_knob_set(p.s, tone_k, 1.0)                         # highpass 850 Hz
+        thin = hit(p)
+        assert spectrum_db(ref, 60, 140) - spectrum_db(thin, 60, 140) > 12
+    finally:
+        p.free(); q.free()
+
+
+def onset_after(x, t0, thresh):
+    i = np.nonzero(np.abs(x[int(t0 * OUT):]) > thresh)[0]
+    return (int(t0 * OUT) + i[0]) / OUT if len(i) else None
+
+
+def test_ds_chain_delay_knob_and_tempo(lib, tmp_path):
+    bind_knobs(lib)
+    p = chain_player(lib, tmp_path, click_wave)
+    try:
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Delay Mix"), 1.0)
+        lib.smp_synth_set_tempo(p.s, 120)
+        x = p.render([on(60, 127, 0.0)], 1.0)
+        assert abs(onset_after(x, 0.1, 0.05) - 0.5) < 0.005             # 1/4 at 120 BPM
+        lib.smp_synth_set_tempo(p.s, 60)
+        x = p.render([on(60, 127, 0.0)], 1.5)
+        assert abs(onset_after(x, 0.1, 0.05) - 1.0) < 0.005
+        lib.smp_synth_set_param(p.s, 33, 0)                             # Reverb and chorus off: no echo
+        x = p.render([on(60, 127, 0.0)], 1.5)
+        assert onset_after(x, 0.1, 0.01) is None
+    finally:
+        p.free()
+
+
+def test_ds_chain_reverb_cc(lib, tmp_path):
+    p = chain_player(lib, tmp_path, click_wave)
+    try:
+        x = p.render([cc(91, 127), on(60, 127, 0.0)], 1.0)
+        tail = x[int(0.5 * OUT):int(0.6 * OUT)]
+        assert 20 * np.log10(np.sqrt(np.mean(tail ** 2)) + 1e-30) > -50
+        x = p.render([cc(91, 0), on(60, 127, 0.0)], 1.0)
+        tail = x[int(0.5 * OUT):int(0.6 * OUT)]
+        assert 20 * np.log10(np.sqrt(np.mean(tail ** 2)) + 1e-30) < -90
+    finally:
+        p.free()
+
+
+def test_ds_chain_font_switch(lib, tmp_path):
+    bind_knobs(lib)
+    p = chain_player(lib, tmp_path, click_wave)
+    other = write_ds(tmp_path / "other.dspreset", kit_text(ui="", effects="", midi=""))
+    try:
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Delay Mix"), 1.0)
+        lib.smp_synth_set_tempo(p.s, 120)
+        p.render([on(60, 127, 0.0)], 0.3)                               # its echo would come at 0.5 s
+        err = ctypes.create_string_buffer(512)
+        assert lib.smp_synth_load(p.s, other.encode(), err, 512) == 1, err.value
+        x = p.render([], 0.6)
+        assert np.max(np.abs(x)) < 1e-6                                  # the old font's delay went with it
+    finally:
+        p.free()

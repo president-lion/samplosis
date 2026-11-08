@@ -354,6 +354,8 @@ SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v);   /* ids SMP_P_
    lines (public preset index and knob number, 0-based; set 1 writes *v, 0 reads it; 0 when there is no such
    knob). value in SmpKnobInfo is the knob's default. */
 typedef struct { char label[96]; int preset, knob, vtype, words; double lo, hi, value; } SmpKnobInfo;
+SMP_API void smp_synth_set_tempo(SmpSynth *s, double bpm);   /* the host's tempo, for Decent Sampler's tempo-synced
+                                    delays (120 until set; 20..999); any thread */
 SMP_API int smp_synth_knob_count(SmpSynth *s);
 SMP_API int smp_synth_knob_info(SmpSynth *s, int i, SmpKnobInfo *out);   /* 1 ok */
 SMP_API double smp_synth_knob_get(SmpSynth *s, int i);

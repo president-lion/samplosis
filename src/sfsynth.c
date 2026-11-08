@@ -75,6 +75,7 @@
 #include "sfvoice.h"
 #include "sffx.h"
 #include "sfstream.h"
+#include "sfdsfx.h"
 
 #define NCH 16
 #define NOUT 16
@@ -157,6 +158,11 @@ typedef struct {
 
 typedef struct { SmpFont *f; LONG64 a0; } Retired;
 
+/* Decent Sampler's effects chains for one load of a font: one per knobbed preset slot that has <effects> (NULL for
+   the others). Made on the main thread with the load, taken by the audio thread with the font (only when made for
+   the font it plays), retired by the next load and freed once the audio thread has let go of it. */
+typedef struct { const SmpFont *f; SfDsChain *c[KSLOTS]; LONG64 a0; } Chains;
+
 struct SmpSynth {
   double rate; int max_block;
   volatile LONG64 p[NPAR];        /* parameters 31..34, any thread */
@@ -221,6 +227,12 @@ struct SmpSynth {
   int nks; int kpub[KSLOTS]; const SfKnobs *kk[KSLOTS];
   LONG kseen;
   float lgain[KSLOTS][KLAYERS + 1], lcents[KSLOTS][KLAYERS + 1];
+  /* their effects chains: the newest load's (main thread writes), the one the audio thread plays (it writes), the
+     retired ones (main thread), each slot's stereo bus (max_block frames) and the host's tempo (any thread) */
+  Chains *volatile chs_want, *volatile chs;
+  Chains **chret; int nchret, cchret;
+  float *bus[KSLOTS][2];
+  volatile LONG64 bpm;
 };
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -234,6 +246,11 @@ SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v) {
   if (!s || id < SMP_NPARAMS || id >= SMP_NALLPARAMS || v != v) return;
   pi = smp_param_info(id);
   InterlockedExchange64(&s->p[id - SMP_NPARAMS], bits_of(clampd(v, pi->lo, pi->hi)));
+}
+
+SMP_API void smp_synth_set_tempo(SmpSynth *s, double bpm) {
+  if (!s || bpm != bpm) return;
+  InterlockedExchange64(&s->bpm, bits_of(clampd(bpm, 20, 999)));
 }
 
 SMP_API double smp_synth_get_param(const SmpSynth *s, int id) {
@@ -253,7 +270,7 @@ static int knob_slots(const SmpFont *f, int *pub, const SfKnobs **kk) {
   if (!f || !f->knobs) return 0;
   for (i = 0; i < np && n < KSLOTS; i++) {
     const SfKnobs *k = f->knobs[f->order[i]];
-    if (!k || !k->nknob) continue;
+    if (!k || (!k->nknob && !k->nfx)) continue;
     pub[n] = i; kk[n] = k; n++;
   }
   return n;
@@ -299,7 +316,9 @@ static void knob_apply(SmpSynth *s) {
               if (b->target == SF_KT_GROUP_VOL) lv[L] = out; else lt[L] = out;
             }
             break;
-          default: break;                       /* effects: the chain's (sfsynth.c's knob_fx) */
+          default:                              /* an effect's parameter: its chain's */
+            if (s->chs && s->chs->c[sl]) sf_chain_set(s->chs->c[sl], b->fx, b->param, out);
+            break;
         }
       }
     }
@@ -920,9 +939,19 @@ SMP_API SmpSynth *smp_synth_new(double rate, int max_block) {
   s->rev = (float *)calloc((size_t)max_block, sizeof(float));
   s->cho = (float *)calloc((size_t)max_block, sizeof(float));
   s->fx = smp_sffx_new(rate);
-  if (!s->v || !s->sl || !s->rev || !s->cho || !s->fx) {
-    free(s->v); free(s->sl); free(s->rev); free(s->cho); smp_sffx_free(s->fx); free(s); return NULL;
+  {
+    int bad = !s->v || !s->sl || !s->rev || !s->cho || !s->fx;
+    for (i = 0; i < KSLOTS; i++) {
+      s->bus[i][0] = (float *)calloc((size_t)max_block, sizeof(float));
+      s->bus[i][1] = (float *)calloc((size_t)max_block, sizeof(float));
+      bad |= !s->bus[i][0] || !s->bus[i][1];
+    }
+    if (bad) {
+      for (i = 0; i < KSLOTS; i++) { free(s->bus[i][0]); free(s->bus[i][1]); }
+      free(s->v); free(s->sl); free(s->rev); free(s->cho); smp_sffx_free(s->fx); free(s); return NULL;
+    }
   }
+  s->bpm = bits_of(120.0);
   for (i = SMP_NPARAMS; i < SMP_NALLPARAMS; i++) s->p[i - SMP_NPARAMS] = bits_of(smp_param_info(i)->def);
   s->rng = 0x9E3779B9u;                        /* the same draws in every new synth */
   for (i = 0; i < NCH; i++) { s->ch[i].preset = -1; chan_defaults(&s->ch[i]); s->chan_preset[i] = -1; }
@@ -930,6 +959,36 @@ SMP_API SmpSynth *smp_synth_new(double rate, int max_block) {
   cfg_publish(s); s->cfg_seen = s->cfg_seq;
   s->gain = 1; s->test_wait = 1;
   return s;
+}
+
+static void chains_free(Chains *c) {
+  int i;
+  if (!c) return;
+  for (i = 0; i < KSLOTS; i++) sf_chain_free(c->c[i]);
+  free(c);
+}
+
+/* main thread: font f's chains (NULL when none of its knobbed presets has effects); *oom set when memory ran out */
+static Chains *chains_new(const SmpSynth *s, const SmpFont *f, int *oom) {
+  int pub[KSLOTS], n, sl, any = 0;
+  const SfKnobs *kk[KSLOTS];
+  Chains *c;
+  *oom = 0;
+  n = knob_slots(f, pub, kk);
+  for (sl = 0; sl < n; sl++) any |= kk[sl]->nfx > 0;
+  if (!any) return NULL;
+  if (!(c = (Chains *)calloc(1, sizeof *c))) { *oom = 1; return NULL; }
+  c->f = f;
+  for (sl = 0; sl < n; sl++)
+    if (kk[sl]->nfx > 0 && !(c->c[sl] = sf_chain_new(kk[sl]->fx, kk[sl]->nfx, s->rate, s->max_block))) {
+      chains_free(c); *oom = 1; return NULL;
+    }
+  return c;
+}
+
+static void chains_clear(SmpSynth *s) {
+  int i;
+  if (s->chs) for (i = 0; i < KSLOTS; i++) sf_chain_clear(s->chs->c[i]);
 }
 
 /* the audio side lets go of its font: every voice ends at once and every use count is dropped */
@@ -955,6 +1014,10 @@ SMP_API void smp_synth_free(SmpSynth *s) {
   for (i = 0; i < s->nret; i++) smp_sf_close(s->ret[i].f);
   for (i = 0; i < s->nsq; i++) free(s->sq_all[i]);
   free(s->sq_all);
+  for (i = 0; i < s->nchret; i++) if (s->chret[i] != s->chs_want) chains_free(s->chret[i]);
+  chains_free(s->chs_want);
+  free(s->chret);
+  for (i = 0; i < KSLOTS; i++) { free(s->bus[i][0]); free(s->bus[i][1]); }
   free(s->ret); free(s->v); free(s->sl); free(s->rev); free(s->cho);
   smp_sffx_free(s->fx);
   free(s);
@@ -963,6 +1026,15 @@ SMP_API void smp_synth_free(SmpSynth *s) {
 SMP_API int smp_synth_collect(SmpSynth *s) {
   int i = 0, synced = 0;
   if (!s) return 0;
+  while (i < s->nchret) {                      /* chains the audio thread has let go of (it takes the newest) */
+    if (s->epoch >= s->chret[i]->a0 + 2 && s->chs != s->chret[i]) {
+      chains_free(s->chret[i]);
+      s->chret[i] = s->chret[--s->nchret];
+      continue;
+    }
+    i++;
+  }
+  i = 0;
   while (i < s->nret) {
     SmpFont *f = s->ret[i].f;
     if (s->epoch >= s->ret[i].a0 + 2 && (s->cur != f || f == s->font)) {
@@ -994,6 +1066,14 @@ SMP_API int smp_synth_load(SmpSynth *s, const char *path, char *err, int cap) {
   return smp_synth_load_font(s, f, path, err, cap);
 }
 
+static int grow_chret(SmpSynth *s) {
+  int c = s->cchret ? s->cchret * 2 : 4;
+  Chains **n = (Chains **)realloc(s->chret, sizeof *n * (size_t)c);
+  if (!n) return 0;
+  s->chret = n; s->cchret = c;
+  return 1;
+}
+
 SMP_API int smp_synth_load_font(SmpSynth *s, SmpFont *f, const char *path, char *err, int cap) {
   SmpFont *old;
   if (!s || !f) { if (f) smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "no player or no font"); return 0; }
@@ -1019,6 +1099,15 @@ SMP_API int smp_synth_load_font(SmpSynth *s, SmpFont *f, const char *path, char 
     q->n = f->max_sets; q->stamp = q->seq + nn * NCH;
     s->sq_all[s->nsq++] = q;
     InterlockedExchangePointer((PVOID volatile *)&s->sq_want, q);   /* before the font, which it must fit */
+  }
+  {                                             /* its effects chains, and room to retire the ones before */
+    int oom;
+    Chains *nc = chains_new(s, f, &oom), *oc = s->chs_want;
+    if (oom || (oc && s->nchret == s->cchret && !grow_chret(s))) {
+      chains_free(nc); smp_sf_close(f); if (err && cap > 0) snprintf(err, (size_t)cap, "out of memory"); return 0;
+    }
+    InterlockedExchangePointer((PVOID volatile *)&s->chs_want, nc);   /* before the font, which takes it */
+    if (oc) { oc->a0 = s->epoch; s->chret[s->nchret++] = oc; }
   }
   if (s->used_font != f) used_drop_main(s);    /* the old font's sf_used presets mean nothing now */
   old = s->font;
@@ -1170,6 +1259,7 @@ static void flush_now(SmpSynth *s, int now) {
     memset(s->ch[c].ksost, 0, sizeof s->ch[c].ksost);
   }
   if (now) smp_sffx_clear(s->fx); else smp_sffx_fade_out(s->fx);
+  chains_clear(s);                             /* a preset's own delay and reverb tails go too */
 }
 
 /* the flush, and the sf_used presets let go */
@@ -1186,9 +1276,13 @@ static void render_voices(SmpSynth *s, float *const *outs, int a, int b, int bas
     if (s->sl[i].st != V_LIVE) continue;
     o = out_of(s, s->sl[i].chan);
     if (!outs[2 * o] || !outs[2 * o + 1]) o = 0;
-    l = outs[2 * o]; r = outs[2 * o + 1];
+    l = outs[2 * o] + a; r = outs[2 * o + 1] + a;
+    /* a Decent Sampler preset with effects plays into its own bus, which its chain then adds to output 1 */
+    if (o == 0 && s->chs && s->sl[i].kslot >= 0 && s->chs->c[s->sl[i].kslot]) {
+      l = s->bus[s->sl[i].kslot][0] + (a - base); r = s->bus[s->sl[i].kslot][1] + (a - base);
+    }
     /* effect sends only from output 1: separated channels stay dry */
-    if (!smp_sfv_render(&s->v[i], l + a, r + a, o == 0 ? s->rev + (a - base) : NULL,
+    if (!smp_sfv_render(&s->v[i], l, r, o == 0 ? s->rev + (a - base) : NULL,
                         o == 0 ? s->cho + (a - base) : NULL, b - a))
       slot_free(s, i);
   }
@@ -1249,6 +1343,13 @@ static void block_start(SmpSynth *s, int n) {
     s->kseen = s->kgen - 1;                     /* the new font's knobs are worked out below */
     changed = 1;
   }
+  {                                             /* the chains made for the font playing (a reload makes new ones) */
+    Chains *c = s->chs_want;
+    if (c != s->chs && (!c || c->f == s->cur)) {
+      InterlockedExchangePointer((PVOID volatile *)&s->chs, c);
+      s->kseen = s->kgen - 1;                   /* their effects take the knobs' values below */
+    } else if (s->chs && s->chs->f != s->cur) InterlockedExchangePointer((PVOID volatile *)&s->chs, NULL);
+  }
   if (s->nks && s->kseen != s->kgen) { s->kseen = s->kgen; knob_apply(s); }   /* the window or the state moved one */
   if (s->dormant) {                             /* only what the channels would play, without using it */
     if (changed) for (i = 0; i < NCH; i++) InterlockedExchange(&s->chan_preset[i], want_preset(s, i));
@@ -1295,6 +1396,10 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
     int end = n - base < s->max_block ? n : base + s->max_block, pos = base;
     memset(s->rev, 0, sizeof(float) * (size_t)(end - base));
     memset(s->cho, 0, sizeof(float) * (size_t)(end - base));
+    if (s->chs) for (i = 0; i < KSLOTS; i++) if (s->chs->c[i]) {
+      memset(s->bus[i][0], 0, sizeof(float) * (size_t)(end - base));
+      memset(s->bus[i][1], 0, sizeof(float) * (size_t)(end - base));
+    }
     for (; k < s->nev; k++) {
       int at = s->ev[k].at >= n ? n - 1 : s->ev[k].at;
       if (at >= end) break;
@@ -1303,6 +1408,16 @@ SMP_API void smp_synth_process(SmpSynth *s, float *const *outs, int n) {
       handle(s, &s->ev[k]);
     }
     render(s, outs, pos, end, base);
+    if (s->chs) {                               /* the presets' chains, each on its bus, into output 1 */
+      LONG64 bb = s->bpm; double bpm; int on = param(s, SMP_P_SF_EFFECTS) >= 0.5;
+      memcpy(&bpm, &bb, 8);
+      for (i = 0; i < KSLOTS; i++) {
+        float *bl = s->bus[i][0], *br = s->bus[i][1], *ol = outs[0] + base, *orr = outs[1] + base;
+        if (!s->chs->c[i]) continue;
+        sf_chain_process(s->chs->c[i], bl, br, end - base, bpm, on);
+        for (j = 0; j < end - base; j++) { ol[j] += bl[j]; orr[j] += br[j]; }
+      }
+    }
     /* the effects add to output 1 here, before sf_volume below, so their return gets the same gain and ramp */
     smp_sffx_enable(s->fx, param(s, SMP_P_SF_EFFECTS) >= 0.5);
     smp_sffx_process(s->fx, s->rev, s->cho, outs[0] + base, outs[1] + base, end - base);
@@ -1718,6 +1833,7 @@ SMP_API int smp_synth_render_test(SmpSynth *s, const char *events, long frames, 
   resolve_all(s);
   s->nev = 0; s->peak = 0;
   smp_sffx_clear(s->fx);
+  chains_clear(s);
   s->offline = s->test_wait;
   QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0);
   for (b = 0; b < frames; b += block) {
