@@ -93,8 +93,8 @@
                                      looks at the rings (fewer at high pitches: see render) */
 #define COLLECT_WAIT_MS 200       /* collect waits this long for the streamer, else tries again on its next call */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
-#define KSLOTS 8                  /* knobbed presets of a font that keep values (Decent Sampler) */
-#define KLAYERS 1024              /* layers of a knobbed preset the knobs reach (more play at their own level) */
+#define KSLOTS SF_KNOB_PRESETS     /* knobbed presets of a font that keep values (Decent Sampler) */
+#define KLAYERS SF_KNOB_LAYERS    /* layers of a knobbed preset the knobs reach (sfds.c bakes the rest) */
 #define KSHOWN 16                 /* knobs the window shows */
 #define G_MODES 54                /* sampleModes */
 
@@ -283,46 +283,25 @@ static int kslot_of(const SmpSynth *s, int pub) {
   return -1;
 }
 
-/* a knob's value as its bindings read it: whole numbers for integer and musical-time knobs */
-static double kvalue(const SfKnob *n, double v) {
-  if (v < n->lo) v = n->lo;
-  if (v > n->hi) v = n->hi;
-  return n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5);
-}
+static double kvalue(const SfKnob *n, double v) { return sf_knob_value(n, v); }
 
-/* audio thread: every slot's layer gains and tunings from the values now (each binding sets its target, in knob
-   order then binding order, over the preset's own levels), and the voices that point at them told */
+/* audio thread: every slot's layer gains and tunings from the values now (sf_knobs_levels), its effects' bound
+   parameters set in its chain, and the voices that point at them told */
 static void knob_apply(SmpSynth *s) {
-  int sl, i;
+  int sl, i, j;
   for (sl = 0; sl < s->nks; sl++) {
     const SfKnobs *k = s->kk[sl];
-    int nl = k->nlayer < KLAYERS ? k->nlayer : KLAYERS, j, l;
-    float gv = k->global_vol, gt = k->global_tune, *lv = s->lgain[sl], *lt = s->lcents[sl];
-    for (l = 1; l <= nl; l++) { lv[l] = k->layer_vol[l]; lt[l] = k->layer_tune[l]; }
-    for (i = 0; i < k->nknob; i++) {
+    double vals[SF_KNOB_MAX];
+    for (i = 0; i < k->nknob; i++) vals[i] = kget(s, sl, i);
+    sf_knobs_levels(k, vals, k->nlayer < KLAYERS ? k->nlayer : KLAYERS, s->lgain[sl], s->lcents[sl]);
+    if (!s->chs || !s->chs->c[sl]) continue;
+    for (i = 0; i < k->nknob; i++) {           /* an effect's parameter: its chain's */
       const SfKnob *n = &k->knob[i];
-      float v = (float)kvalue(n, kget(s, sl, i));
-      for (j = 0; j < n->nb; j++) {
-        const SfKBind *b = &n->b[j];
-        float out = sf_trans(&b->tr, v, n->lo, n->hi);
-        int m;
-        switch (b->target) {
-          case SF_KT_GLOBAL_VOL: gv = out; break;
-          case SF_KT_GLOBAL_TUNE: gt = out; break;
-          case SF_KT_GROUP_VOL: case SF_KT_GROUP_TUNE:
-            for (m = 0; m < b->nlayers; m++) {
-              int L = k->layer_list[b->first_layer + m];
-              if (L < 1 || L > nl) continue;
-              if (b->target == SF_KT_GROUP_VOL) lv[L] = out; else lt[L] = out;
-            }
-            break;
-          default:                              /* an effect's parameter: its chain's */
-            if (s->chs && s->chs->c[sl]) sf_chain_set(s->chs->c[sl], b->fx, b->param, out);
-            break;
-        }
-      }
+      float v = (float)kvalue(n, vals[i]);
+      for (j = 0; j < n->nb; j++)
+        if (n->b[j].target == SF_KT_FX)
+          sf_chain_set(s->chs->c[sl], n->b[j].fx, n->b[j].param, sf_trans(&n->b[j].tr, v, n->lo, n->hi));
     }
-    for (l = 1; l <= nl; l++) { lv[l] = lv[l] * gv; lt[l] = 100.0f * (lt[l] + gt); }
   }
   for (i = 0; i < MAXV; i++)
     if (s->sl[i].st == V_LIVE && s->v[i].lgain) smp_sfv_update(&s->v[i], &s->ch[s->sl[i].chan].c);

@@ -11,6 +11,9 @@
 #define SF_FX_MAX 8                      /* effects a chain keeps */
 #define SF_KCC_MAX 64                    /* CC bindings a preset keeps */
 #define SF_TABLE_MAX 16                  /* points of a translation table */
+#define SF_KNOB_PRESETS 8                /* a font's knobbed presets whose knobs a player keeps values for; the rest
+                                            have their knobs' starting values baked into their regions */
+#define SF_KNOB_LAYERS 1024              /* a preset's layers a player reaches; later ones are baked likewise */
 
 enum { SF_KV_FLOAT, SF_KV_INT, SF_KV_MTIME };                        /* valueType */
 enum { SF_KW_NUMBER, SF_KW_PERCENT, SF_KW_SEMITONES, SF_KW_MTIME, SF_KW_INT };   /* how the window reads it */
@@ -50,6 +53,12 @@ typedef struct SfKnobs {
 void sf_knobs_free(SfKnobs *k);
 /* a translation of knob value v (whose range is lo..hi) */
 float sf_trans(const SfTrans *t, float v, float lo, float hi);
+/* the layers' gains (linear) and tunings (cents), lgain[1..nl] and lcents[1..nl], for knob values values[i]
+   (NULL: each knob's starting value): every binding sets its target over the preset's own levels, in knob order
+   then binding order; effect bindings are left to the caller */
+void sf_knobs_levels(const SfKnobs *k, const double *values, int nl, float *lgain, float *lcents);
+/* a knob's value as its bindings read it: clamped, and whole for integer and musical-time knobs */
+double sf_knob_value(const SfKnob *n, double v);
 /* a musical-time index's length in beats (a quarter note is one): Decent Sampler's list of 21, index clamped */
 double sf_mtime_beats(int index);
 /* its words: "1/4", "1/8 dotted", "1/4 triplet" */

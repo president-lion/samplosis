@@ -134,6 +134,11 @@ typedef struct {
      knobs or effects (built as before); and the layer of the group being walked */
   SfKnobs *k;
   int layer;
+  /* a preset whose knobs no player keeps values for (past the font's SF_KNOB_PRESETS knobbed presets; knobbed
+     counts them, shared by a bundle's presets, NULL for a lone one), or a layer past SF_KNOB_LAYERS: its knobs'
+     starting levels (bgain, bcents per layer) baked into its regions instead */
+  int *knobbed, bake_all;
+  float *bgain, *bcents;
   int *gmap, ngroups, capg;               /* every <group> by its index (groupIndex counts disabled ones too, as
                                             Decent Sampler does): its layer, or 0 for a disabled one */
   int live[4];                           /* by SF_KT_*: some knob sets it, so it plays through the layer instead of
@@ -490,7 +495,7 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   const char *v, *path = s->a[A_PATH];
   int lokey = note_num(inh(s, g, gs, A_LONOTE), 0), hikey = note_num(inh(s, g, gs, A_HINOTE), 127);
   int lovel = note_num(inh(s, g, gs, A_LOVEL), 0), hivel = note_num(inh(s, g, gs, A_HIVEL), 127);
-  int mode = seq_mode(inh(s, g, gs, A_SEQMODE)), pos = 1, len = 0, k;
+  int mode = seq_mode(inh(s, g, gs, A_SEQMODE)), pos = 1, len = 0, k, baked;
   double x, total;
   if ((v = inh(s, g, gs, A_SEQPOSITION)) != NULL && num(v, &x)) pos = x < 1 ? 1 : x > 65535 ? 65535 : (int)floor(x + 0.5);
   if ((v = inh(s, g, gs, A_SEQLENGTH)) != NULL && num(v, &x)) len = x < 0 ? 0 : x > 65535 ? 65535 : (int)floor(x + 0.5);
@@ -507,14 +512,19 @@ static void sample(D *d, const Look *s, const Look *g, const Look *gs) {
   opn(d, "pitch_keycenter", note_num(inh(s, g, gs, A_ROOT), 60));
   opn(d, "lokey", lokey); opn(d, "hikey", hikey); opn(d, "lovel", lovel); opn(d, "hivel", hivel);
   /* volume, tuning and pan: the levels combined */
-  /* with knobs, a group's or <groups>' volume or tuning that some knob sets plays through the layer instead */
-  if (d->k) opn(d, "samplosis_layer", d->layer);
+  /* with knobs, a group's or <groups>' volume or tuning that some knob sets plays through the layer instead (or,
+     where no player can reach it, at the knobs' starting levels, baked in) */
+  baked = d->k && d->bgain && (d->bake_all || d->layer > SF_KNOB_LAYERS);
+  if (d->k && !baked) opn(d, "samplosis_layer", d->layer);
+  if (baked && d->layer > SF_KNOB_LAYERS && !d->bake_all) ignored(d, "layers past the 1024th (at their knobs' starting levels)");
   total = 0;
+  if (baked) total += d->bgain[d->layer] > 0 ? 20 * log10(d->bgain[d->layer]) : -144;
   if (!d->live[SF_KT_GLOBAL_VOL] && level_db(gs->a[A_GLOBALVOLUME] ? gs->a[A_GLOBALVOLUME] : gs->a[A_VOLUME], &x)) total += x;
   if (!d->live[SF_KT_GROUP_VOL] && level_db(g->a[A_GROUPVOLUME] ? g->a[A_GROUPVOLUME] : g->a[A_VOLUME], &x)) total += x;
   if (level_db(s->a[A_VOLUME], &x)) total += x;
   opn(d, "volume", total < -144 ? -144 : total > 24 ? 24 : total);   /* the builder's range */
   total = 0;
+  if (baked) total += d->bcents[d->layer] / 100.0;
   if (!d->live[SF_KT_GLOBAL_TUNE] && num(gs->a[A_GLOBALTUNING], &x)) total += x;
   if (!d->live[SF_KT_GROUP_TUNE] && num(g->a[A_GROUPTUNING], &x)) total += x;
   if (num(inh(s, g, gs, A_TUNING), &x)) total += x;
@@ -931,13 +941,23 @@ static int feed_ds(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int w
   if (d->attrs_capped) sfz_ignored(b, "too many attributes (some left out)");
   if (d->tags_capped) sfz_ignored(b, "too many silencing tags (some left out)");
   if ((d->k = read_knobs(d)) != NULL) {
-    for (i = 0; i < 128; i++) if ((d->k->bound[i >> 3] >> (i & 7)) & 1) opn(d, "samplosis_unbind_cc", i);
-    if (d->k->has_reverb) op(d, "samplosis_no_reverb_send", "1");
-    taken = sfz_set_knobs(b, d->k);
+    int nl = d->k->nlayer;
+    d->bgain = (float *)malloc(((size_t)nl + 1) * sizeof(float));
+    d->bcents = (float *)malloc(((size_t)nl + 1) * sizeof(float));
+    if (d->bgain && d->bcents) sf_knobs_levels(d->k, NULL, nl, d->bgain, d->bcents);
+    else { free(d->bgain); free(d->bcents); d->bgain = d->bcents = NULL; }
+    d->bake_all = d->knobbed && ++*d->knobbed > SF_KNOB_PRESETS && d->bgain;
+    if (d->bake_all) ignored(d, "knobs of presets past the 8th (at their starting values)");
+    else {
+      for (i = 0; i < 128; i++) if ((d->k->bound[i >> 3] >> (i & 7)) & 1) opn(d, "samplosis_unbind_cc", i);
+      if (d->k->has_reverb) op(d, "samplosis_no_reverb_send", "1");
+      taken = sfz_set_knobs(b, d->k);
+    }
   }
   ok = walk(d);
   if (!taken) sf_knobs_free(d->k);
   d->k = NULL;
+  free(d->bgain); free(d->bcents); d->bgain = d->bcents = NULL; d->bake_all = 0;
   memset(d->live, 0, sizeof d->live);
   if (!ok) { snprintf(why, (size_t)wcap, "cancelled"); return 0; }
   return 1;
@@ -1009,11 +1029,12 @@ int sf_parse_ds(SmpFont *f, const char *path, int (*cancel)(void *), void *carg,
 }
 
 /* several presets: each one's file name (without its extension) names it */
-typedef struct { D **d; const char *const *paths; int n; } Many;
+typedef struct { D **d; const char *const *paths; int n; int knobbed; } Many;
 
 static int feed_many(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int wcap) {
   Many *m = ctx;
   int k;
+  m->knobbed = 0;                                    /* each pass counts the knobbed presets afresh */
   for (k = 0; k < m->n; k++) {
     const char *p = m->paths[k], *base = p, *c, *dot;
     char name[64];
@@ -1024,6 +1045,7 @@ static int feed_many(SfzBuild *b, void *ctx, const wchar_t *full, char *why, int
     if (L >= sizeof name) L = sizeof name - 1;
     memcpy(name, base, L); name[L] = 0;
     sfz_preset(b, name);
+    m->d[k]->knobbed = &m->knobbed;
     if (!feed_ds(b, m->d[k], full, why, wcap)) return 0;
   }
   return 1;

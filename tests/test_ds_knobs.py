@@ -490,3 +490,27 @@ def test_ds_knob_group_index_counts_disabled_groups(lib, tmp_path):
         assert nat > 0.05 and tex < nat * 1e-3, (nat, tex)      # group 2 (the third, Texture) is at 0
     finally:
         p.free()
+
+
+def test_ds_knobs_past_eight_presets_keep_their_levels(lib, tmp_path):
+    """A bundle's ninth knobbed preset has no knob values of its own (8 keep them): it plays at its knobs' starting
+    values, baked in, so its Force layer (starting at 0) stays silent; and that is counted."""
+    from test_dslib import make_bundle
+    files = {}
+    for tag, fq in LAYERS:
+        write_wav(tmp_path / ("%s.wav" % tag.lower()), sine(RATE, fq))
+        files["%s.wav" % tag.lower()] = (tmp_path / ("%s.wav" % tag.lower())).read_bytes()
+    for i in range(9):
+        files["p%d.dspreset" % (i + 1)] = kit_text()
+    p = Player(lib, tmp_path, make_bundle(tmp_path / "Nine.dslibrary", files))
+    try:
+        for pc in (0, 8):                                      # the first and the ninth preset
+            x = p.render(["midi 192 %d 0" % pc, on(60, 127, 0.05), off(60, 0.5)], 0.6)[int(0.1 * OUT):int(0.45 * OUT)]
+            nat, frc, tex = amps(x)
+            assert nat > 0.05 and frc < nat * 1e-3 and tex < nat * 1e-3, (pc, nat, frc, tex)
+    finally:
+        p.free()
+    f = opened(lib, str(tmp_path / "Nine.dslibrary"))
+    n, first = ignored(lib, f)
+    assert n >= 1, (n, first)
+    lib.smp_sf_close(f)

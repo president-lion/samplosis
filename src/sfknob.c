@@ -35,6 +35,40 @@ float sf_trans(const SfTrans *t, float v, float lo, float hi) {
   }
 }
 
+double sf_knob_value(const SfKnob *n, double v) {
+  if (v < n->lo) v = n->lo;
+  if (v > n->hi) v = n->hi;
+  return n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5);
+}
+
+void sf_knobs_levels(const SfKnobs *k, const double *values, int nl, float *lgain, float *lcents) {
+  float gv = k->global_vol, gt = k->global_tune;
+  int i, j, l, m;
+  if (nl > k->nlayer) nl = k->nlayer;
+  for (l = 1; l <= nl; l++) { lgain[l] = k->layer_vol[l]; lcents[l] = k->layer_tune[l]; }
+  for (i = 0; i < k->nknob; i++) {
+    const SfKnob *n = &k->knob[i];
+    float v = (float)sf_knob_value(n, values ? values[i] : n->value);
+    for (j = 0; j < n->nb; j++) {
+      const SfKBind *b = &n->b[j];
+      float out = sf_trans(&b->tr, v, n->lo, n->hi);
+      switch (b->target) {
+        case SF_KT_GLOBAL_VOL: gv = out; break;
+        case SF_KT_GLOBAL_TUNE: gt = out; break;
+        case SF_KT_GROUP_VOL: case SF_KT_GROUP_TUNE:
+          for (m = 0; m < b->nlayers; m++) {
+            int L = k->layer_list[b->first_layer + m];
+            if (L < 1 || L > nl) continue;
+            if (b->target == SF_KT_GROUP_VOL) lgain[L] = out; else lcents[L] = out;
+          }
+          break;
+        default: break;
+      }
+    }
+  }
+  for (l = 1; l <= nl; l++) { lgain[l] *= gv; lcents[l] = 100.0f * (lcents[l] + gt); }
+}
+
 /* Decent Sampler's musical_time list (decentsamples.com, "How to add tempo-synced delay", 2024): each a note value
    (1/n of a whole note, a whole note being 4 beats), plain, dotted (x 3/2) or triplet (x 2/3) */
 static const struct { int n; char kind; } MT[21] = {
