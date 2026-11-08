@@ -145,11 +145,12 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
      the channel's bend range). RPN fine and coarse tuning are added directly. */
   v->chan_tune = c->fine_cents + 100.0 * c->coarse_semis;
   v->cents0 = (v->pkey - v->root) * g[G_SCALE] + 100.0 * g[G_COARSE] + g[G_FINE] + v->correction +
-              g[G_PITCH] + v->chan_tune + 100.0 * v->transpose + v->rnd_cents;
+              g[G_PITCH] + v->chan_tune + 100.0 * v->transpose + v->rnd_cents + (v->lcents ? *v->lcents : 0);
   v->ratio_k = v->srate / rate;
 
   /* gain: initialAttenuation times the EMU factor, plus the modulators' attenuation (velocity, CC7, CC11) */
   v->atten_gain = pow(10.0, -clampd(ATTEN_FACTOR * r->gen[G_ATTEN] + v->mod[G_ATTEN], 0, 1440) / 200.0) * v->cond_gain;
+  if (v->lgain) v->atten_gain *= *v->lgain > 0 ? *v->lgain : 0;    /* a Decent Sampler knob's layer gain */
   {
     double th = (clampd(g[G_PAN], -500, 500) + 500) / 1000.0 * (PI / 2);   /* constant power, -3 dB each at 0 */
     v->pan_l = cos(th); v->pan_r = sin(th);

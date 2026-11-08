@@ -78,6 +78,9 @@ typedef struct SmpSfVoice {
   int64_t fed0; int fed;                 /* fed: the ring has had frames past path frame fed0 (the first read came) */
   int64_t wait;                          /* output frames before it starts (SFZ's delay and delay_random) */
   double rnd_cents;                      /* SFZ's pitch_random draw for this note */
+  /* Decent Sampler's knobs: the region's layer gain (linear) and tuning (cents) as the player keeps them now, or
+     NULL; set after the start (then smp_sfv_update), read at every derive */
+  const float *lgain, *lcents;
 } SmpSfVoice;
 
 /* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. st and slot:

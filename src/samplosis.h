@@ -346,6 +346,23 @@ SMP_API void smp_synth_flush(SmpSynth *s, int now);   /* audio thread, or main w
                                     cleared (now: at once, else faded out over 10 ms); the sf_used presets stay held (their countdown or the next state lets
                                     them go). For a host's reset, which comes on stop, seek and loop */
 SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v);   /* ids SMP_P_SF_*, any thread */
+/* A Decent Sampler preset's knobs (sfknob.h). The knobs shown: One preset mode, the chosen preset's; All channels,
+   every knobbed preset's (labelled "<preset>: <label>" when the font has more than one), at most 16 (the font's
+   first 8 knobbed presets keep values; the rest play at their presets' defaults). Values are in the knob's own
+   units (its minValue..maxValue), one per knob, shared by the window and the CCs bound to it; a load resets them
+   to the presets' values. count, info, get and set: main thread (set: any thread); by_preset is for the state
+   lines (public preset index and knob number, 0-based; set 1 writes *v, 0 reads it; 0 when there is no such
+   knob). value in SmpKnobInfo is the knob's default. */
+typedef struct { char label[96]; int preset, knob, vtype, words; double lo, hi, value; } SmpKnobInfo;
+SMP_API int smp_synth_knob_count(SmpSynth *s);
+SMP_API int smp_synth_knob_info(SmpSynth *s, int i, SmpKnobInfo *out);   /* 1 ok */
+SMP_API double smp_synth_knob_get(SmpSynth *s, int i);
+SMP_API void smp_synth_knob_set(SmpSynth *s, int i, double v);
+SMP_API int smp_synth_knob_by_preset(SmpSynth *s, int preset, int knob, double *v, int set);
+/* sfknob.c: a knob value in words ("40 percent", "plus 3 semitones", "1/8 dotted", "0.25") and back (the same
+   words, or a bare number in the knob's units; 0 when the text isn't one) */
+SMP_API void smp_knob_text(const SmpKnobInfo *k, double v, char *out, int cap);
+SMP_API int smp_knob_parse(const SmpKnobInfo *k, const char *text, double *v);
 SMP_API double smp_synth_get_param(const SmpSynth *s, int id);
 SMP_API int smp_synth_script_write(const SmpSynth *s, char *out, int cap);     /* like snprintf; main thread */
 SMP_API int smp_synth_script_apply(SmpSynth *s, const char *text, char *err, int cap);  /* 0 ok; nothing changes

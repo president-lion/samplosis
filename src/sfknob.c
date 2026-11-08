@@ -1,5 +1,6 @@
 /* sfknob.c: the small pieces of a Decent Sampler preset's knob description (sfknob.h) the reader, the player and
    the window share: translations, musical time, freeing, and the tests' text dump. */
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,4 +118,78 @@ int smp_sf_test_knobs_text(const SmpFont *f, int preset, char *out, int cap) {
   }
   at = put(out, c, at, "layers %d\n", k->nlayer);
   return (int)(at < c ? at : c - 1);
+}
+
+/* ---- a knob's value in words, and back ---- */
+
+void smp_knob_text(const SmpKnobInfo *k, double v, char *out, int cap) {
+  if (!out || cap <= 0) return;
+  out[0] = 0;
+  if (!k) return;
+  switch (k->words) {
+    case SF_KW_PERCENT: snprintf(out, (size_t)cap, "%.0f percent", v * 100 + 0.0); break;
+    case SF_KW_SEMITONES: {
+      double r = k->vtype == SF_KV_FLOAT ? v : floor(v + 0.5), a = fabs(r);
+      char n[32];
+      if (k->vtype == SF_KV_FLOAT) snprintf(n, sizeof n, "%.2f", a); else snprintf(n, sizeof n, "%.0f", a);
+      if (k->vtype == SF_KV_FLOAT) { size_t L = strlen(n); while (L && n[L - 1] == '0') n[--L] = 0; if (L && n[L - 1] == '.') n[--L] = 0; }
+      if (r == 0) snprintf(out, (size_t)cap, "0 semitones");
+      else snprintf(out, (size_t)cap, "%s %s semitone%s", r > 0 ? "plus" : "minus", n, a == 1 ? "" : "s");
+      break;
+    }
+    case SF_KW_MTIME: snprintf(out, (size_t)cap, "%s", sf_mtime_name((int)floor(v + 0.5))); break;
+    case SF_KW_INT: snprintf(out, (size_t)cap, "%.0f", floor(v + 0.5)); break;
+    default: {
+      size_t L;
+      snprintf(out, (size_t)cap, "%.2f", v);
+      L = strlen(out);
+      while (L && out[L - 1] == '0') out[--L] = 0;
+      if (L && out[L - 1] == '.') out[--L] = 0;
+      if (!strcmp(out, "-0")) snprintf(out, (size_t)cap, "0");
+    }
+  }
+}
+
+/* text without leading and trailing spaces, lower case, in t (cap bytes) */
+static void tidy(const char *in, char *t, size_t cap) {
+  size_t n = 0;
+  while (*in == ' ' || *in == '\t') in++;
+  while (*in && n + 1 < cap) { char c = *in++; t[n++] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c); }
+  while (n && (t[n - 1] == ' ' || t[n - 1] == '\t')) n--;
+  t[n] = 0;
+}
+
+int smp_knob_parse(const SmpKnobInfo *k, const char *text, double *v) {
+  char t[96], *e;
+  double x;
+  int i, sign = 1;
+  if (!k || !text || !v) return 0;
+  tidy(text, t, sizeof t);
+  if (!t[0]) return 0;
+  if (k->words == SF_KW_MTIME) {
+    for (i = 0; i <= 20; i++) if (!_stricmp(t, sf_mtime_name(i))) { *v = i; return 1; }
+    if (!strcmp(t, "1/1")) { *v = 19; return 1; }
+    if (!strcmp(t, "1/1 dotted")) { *v = 20; return 1; }
+    if (!strcmp(t, "1/1 triplet")) { *v = 17; return 1; }
+  }
+  {
+    char *p = t;
+    if (!strncmp(p, "plus ", 5)) p += 5;
+    else if (!strncmp(p, "minus ", 6)) { p += 6; sign = -1; }
+    x = strtod(p, &e);
+    if (e == p || !isfinite(x)) return 0;
+    while (*e == ' ') e++;
+    if (k->words == SF_KW_PERCENT) {
+      if (*e == '%') e++;
+      else if (!strncmp(e, "percent", 7)) e += 7;
+      x /= 100;
+    } else if (k->words == SF_KW_SEMITONES) {
+      if (!strncmp(e, "semitones", 9)) e += 9;
+      else if (!strncmp(e, "semitone", 8)) e += 8;
+    }
+    while (*e == ' ') e++;
+    if (*e) return 0;
+    *v = sign * x;
+    return 1;
+  }
 }

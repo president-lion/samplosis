@@ -92,6 +92,9 @@
                                      looks at the rings (fewer at high pitches: see render) */
 #define COLLECT_WAIT_MS 200       /* collect waits this long for the streamer, else tries again on its next call */
 #define NPAR (SMP_NALLPARAMS - SMP_NPARAMS)
+#define KSLOTS 8                  /* knobbed presets of a font that keep values (Decent Sampler) */
+#define KLAYERS 1024              /* layers of a knobbed preset the knobs reach (more play at their own level) */
+#define KSHOWN 16                 /* knobs the window shows */
 #define G_MODES 54                /* sampleModes */
 
 enum { V_FREE, V_PENDING, V_LIVE };
@@ -149,6 +152,7 @@ typedef struct {
   uint64_t vid;                   /* this start's own number, so a partner link can be checked */
   int partner; uint64_t partner_vid;   /* the other half of a stereo pair (SmpSfCond.pair), -1 none */
   uint32_t ev;                    /* the note event (serial) that started it */
+  int kslot;                      /* its channel's knobbed preset (Decent Sampler) when it started, or -1 */
 } Slot;
 
 typedef struct { SmpFont *f; LONG64 a0; } Retired;
@@ -206,6 +210,17 @@ struct SmpSynth {
   SfStream *volatile st;
   volatile LONG underruns;
   volatile LONG underruns_onset;  /* of those, the ones of voices whose first streamed read hadn't come yet */
+  /* Decent Sampler's knobs (sfknob.h). The values, for the font's first KSLOTS knobbed presets in public order:
+     doubles any thread writes (the window, the state, the audio thread for a bound CC), each write counted in
+     kgen. smp_synth_load_font writes the new font's values after publishing it, and the audio thread writes a CC's
+     only while the font it plays is the one wanted, so a load's values are never overwritten by the font before. */
+  volatile LONG64 kval[KSLOTS][SF_KNOB_MAX];
+  volatile LONG kgen;
+  /* audio thread: the playing font's knobbed presets (public index and description), the kgen last applied, and
+     what the values work out to: each layer's gain (linear) and tuning (cents), which voices point at */
+  int nks; int kpub[KSLOTS]; const SfKnobs *kk[KSLOTS];
+  LONG kseen;
+  float lgain[KSLOTS][KLAYERS + 1], lcents[KSLOTS][KLAYERS + 1];
 };
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -224,6 +239,93 @@ SMP_API void smp_synth_set_param(SmpSynth *s, int id, double v) {
 SMP_API double smp_synth_get_param(const SmpSynth *s, int id) {
   if (id < SMP_NPARAMS || id >= SMP_NALLPARAMS) return 0;
   return s ? param(s, id) : smp_param_info(id)->def;
+}
+
+/* ---- Decent Sampler's knobs ---- */
+
+static double kget(const SmpSynth *s, int slot, int k) { LONG64 b = s->kval[slot][k]; double v; memcpy(&v, &b, 8); return v; }
+static void kput(SmpSynth *s, int slot, int k, double v) { InterlockedExchange64(&s->kval[slot][k], bits_of(v)); InterlockedIncrement(&s->kgen); }
+
+/* font f's knobbed presets that keep values: their public indices and descriptions, at most KSLOTS (either thread:
+   the font's description never changes) */
+static int knob_slots(const SmpFont *f, int *pub, const SfKnobs **kk) {
+  int i, n = 0, np = f ? smp_sf_preset_count(f) : 0;
+  if (!f || !f->knobs) return 0;
+  for (i = 0; i < np && n < KSLOTS; i++) {
+    const SfKnobs *k = f->knobs[f->order[i]];
+    if (!k || !k->nknob) continue;
+    pub[n] = i; kk[n] = k; n++;
+  }
+  return n;
+}
+
+/* audio thread: the slot of public preset pub in the playing font, or -1 */
+static int kslot_of(const SmpSynth *s, int pub) {
+  int i;
+  for (i = 0; i < s->nks; i++) if (s->kpub[i] == pub) return i;
+  return -1;
+}
+
+/* a knob's value as its bindings read it: whole numbers for integer and musical-time knobs */
+static float kvalue(const SfKnob *n, double v) {
+  if (v < n->lo) v = n->lo;
+  if (v > n->hi) v = n->hi;
+  return (float)(n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5));
+}
+
+/* audio thread: every slot's layer gains and tunings from the values now (each binding sets its target, in knob
+   order then binding order, over the preset's own levels), and the voices that point at them told */
+static void knob_apply(SmpSynth *s) {
+  int sl, i;
+  for (sl = 0; sl < s->nks; sl++) {
+    const SfKnobs *k = s->kk[sl];
+    int nl = k->nlayer < KLAYERS ? k->nlayer : KLAYERS, j, l;
+    float gv = k->global_vol, gt = k->global_tune, *lv = s->lgain[sl], *lt = s->lcents[sl];
+    for (l = 1; l <= nl; l++) { lv[l] = k->layer_vol[l]; lt[l] = k->layer_tune[l]; }
+    for (i = 0; i < k->nknob; i++) {
+      const SfKnob *n = &k->knob[i];
+      float v = kvalue(n, kget(s, sl, i));
+      for (j = 0; j < n->nb; j++) {
+        const SfKBind *b = &n->b[j];
+        float out = sf_trans(&b->tr, v, n->lo, n->hi);
+        int m;
+        switch (b->target) {
+          case SF_KT_GLOBAL_VOL: gv = out; break;
+          case SF_KT_GLOBAL_TUNE: gt = out; break;
+          case SF_KT_GROUP_VOL: case SF_KT_GROUP_TUNE:
+            for (m = 0; m < b->nlayers; m++) {
+              int L = k->layer_list[b->first_layer + m];
+              if (L < 1 || L > nl) continue;
+              if (b->target == SF_KT_GROUP_VOL) lv[L] = out; else lt[L] = out;
+            }
+            break;
+          default: break;                       /* effects: the chain's (sfsynth.c's knob_fx) */
+        }
+      }
+    }
+    for (l = 1; l <= nl; l++) { lv[l] = lv[l] * gv; lt[l] = 100.0f * (lt[l] + gt); }
+  }
+  for (i = 0; i < MAXV; i++)
+    if (s->sl[i].st == V_LIVE && s->v[i].lgain) smp_sfv_update(&s->v[i], &s->ch[s->sl[i].chan].c);
+}
+
+/* audio thread: a CC on channel c (whose preset is pub) moves the knobs it is bound to; 1 when it moved any */
+static int knob_cc(SmpSynth *s, int pub, int n, int v) {
+  int sl = kslot_of(s, pub), i, any = 0;
+  const SfKnobs *k;
+  if (sl < 0 || s->want != s->cur) return 0;
+  k = s->kk[sl];
+  if (!((k->bound[n >> 3] >> (n & 7)) & 1)) return 0;
+  for (i = 0; i < k->ncc; i++) {
+    const SfKnob *kn;
+    float x;
+    if (k->cc[i].cc != n) continue;
+    kn = &k->knob[k->cc[i].knob];
+    x = sf_trans(&k->cc[i].tr, v / 127.0f, 0, 1);
+    kput(s, sl, k->cc[i].knob, kvalue(kn, x));
+    any = 1;
+  }
+  return any;
 }
 
 /* ---- configuration hand-off (seqlock) ---- */
@@ -447,6 +549,11 @@ static int try_start(SmpSynth *s, int i) {
   if (!smp_sfv_start(&s->v[i], s->cur, t->reg, t->key, t->vel, &s->ch[t->chan].c, s->rate,
                      floor(param(s, SMP_P_SF_TRANSPOSE) + 0.5), s->st, i, t->held))
     return 0;
+  if (t->kslot >= 0 && t->kslot < s->nks && t->reg->cond.layer && t->reg->cond.layer <= KLAYERS) {
+    s->v[i].lgain = &s->lgain[t->kslot][t->reg->cond.layer];   /* its knobbed layer's gain and tuning, live */
+    s->v[i].lcents = &s->lcents[t->kslot][t->reg->cond.layer];
+    smp_sfv_update(&s->v[i], &s->ch[t->chan].c);
+  }
   if (t->rt && ((t->reg->gen[G_MODES] & 3) == 1 || (t->reg->gen[G_MODES] & 3) == 3))
     smp_sfv_release(&s->v[i]);                /* a looping release trigger would never end: released at once */
   /* an offline render waits for the streamer when the note's first frames are past its head */
@@ -506,6 +613,7 @@ static void start_region(SmpSynth *s, int c, int key, int vel, const SmpSfRegion
   t->chan = c; t->key = key; t->vel = vel; t->keydown = held < 0; t->reg = r; t->excl = r->gen[G_EXCL];
   t->rt = held >= 0; t->held = held;
   t->vid = ++s->vid; t->ev = s->serial; t->partner = -1;
+  t->kslot = s->nks ? kslot_of(s, s->ch[c].preset) : -1;
   /* a stereo pair's follower links with its leader, the region just before it, started by this same event */
   if (r->cond.pair && s->last_reg == r - 1 && s->last_slot >= 0 && s->last_slot != i && s->sl[s->last_slot].vid == s->last_vid &&
       s->sl[s->last_slot].st != V_FREE) {
@@ -603,10 +711,15 @@ static void start_event(SmpSynth *s, int c, int key, int vel, int release, float
       if (cond_ok(s, c, r, key, vel, release, rnd, others)) make_room(s, c, r);
     }
   s->protect = s->age + 1;                      /* the voices this event starts are never its victims */
-  for (k = 0; k < n; k++) {
-    const SmpSfRegion *r = &regs[idx ? idx[k] : k];
-    if (cond_ok(s, c, r, key, vel, release, rnd, others) && !smp_sfv_xf_silent(r, key, vel))
+  {
+    int ks = s->nks ? kslot_of(s, s->ch[c].preset) : -1;
+    for (k = 0; k < n; k++) {
+      const SmpSfRegion *r = &regs[idx ? idx[k] : k];
+      if (!cond_ok(s, c, r, key, vel, release, rnd, others) || smp_sfv_xf_silent(r, key, vel)) continue;
+      /* a layer a knob has at 0 (Decent Sampler) starts no voice either; raising it later doesn't add one */
+      if (ks >= 0 && r->cond.layer && r->cond.layer <= KLAYERS && s->lgain[ks][r->cond.layer] <= 0) continue;
       start_region(s, c, key, vel, r, held);
+    }
   }
   s->protect = 0;
 }
@@ -730,6 +843,7 @@ static void control(SmpSynth *s, int c, int n, int v) {
     return;
   }
   h->c.cc[n] = (uint8_t)v;
+  if (s->nks && knob_cc(s, h->preset, n, v)) { s->kseen = s->kgen; knob_apply(s); }   /* a knob's CC: at once */
   switch (n) {
     case 0: h->msb = v; break;
     case 32: h->lsb = v; break;
@@ -911,9 +1025,83 @@ SMP_API int smp_synth_load_font(SmpSynth *s, SmpFont *f, const char *path, char 
   s->font = f;
   snprintf(s->path, sizeof s->path, "%s", path);
   InterlockedExchangePointer((PVOID volatile *)&s->want, f);
+  {                                             /* the knobs start at the new font's values (after want: see kval) */
+    int pub[KSLOTS], n, sl, k;
+    const SfKnobs *kk[KSLOTS];
+    n = knob_slots(f, pub, kk);
+    for (sl = 0; sl < n; sl++) for (k = 0; k < kk[sl]->nknob; k++) kput(s, sl, k, kk[sl]->knob[k].value);
+    InterlockedIncrement(&s->kgen);
+  }
   if (old) { s->ret[s->nret].f = old; s->ret[s->nret].a0 = s->epoch; s->nret++; }
   smp_synth_collect(s);
   return 1;
+}
+
+/* ---- the knobs, for the window and the state (main thread) ---- */
+
+typedef struct { int slot, knob, pub; const SfKnob *n; } Shown;
+
+/* the knobs shown, in order: One preset mode the chosen preset's, All channels every knobbed preset's */
+static int knobs_shown(const SmpSynth *s, Shown *out) {
+  int pub[KSLOTS], n, sl, k, m = 0, one = -1;
+  const SfKnobs *kk[KSLOTS];
+  if (!s->font) return 0;
+  n = knob_slots(s->font, pub, kk);
+  if (s->mcfg.mode == MODE_ONE) one = lookup(s->font, s->mcfg.bank, s->mcfg.program, s->mcfg.bank >= 128);
+  for (sl = 0; sl < n; sl++) {
+    if (one >= 0 && pub[sl] != one) continue;
+    for (k = 0; k < kk[sl]->nknob && m < KSHOWN; k++) {
+      out[m].slot = sl; out[m].knob = k; out[m].pub = pub[sl]; out[m].n = &kk[sl]->knob[k];
+      m++;
+    }
+  }
+  return m;
+}
+
+SMP_API int smp_synth_knob_count(SmpSynth *s) { Shown sh[KSHOWN]; return s ? knobs_shown(s, sh) : 0; }
+
+SMP_API int smp_synth_knob_info(SmpSynth *s, int i, SmpKnobInfo *out) {
+  Shown sh[KSHOWN];
+  int n, pub[KSLOTS];
+  const SfKnobs *kk[KSLOTS];
+  if (!s || !out || i < 0 || i >= (n = knobs_shown(s, sh))) return 0;
+  memset(out, 0, sizeof *out);
+  if (s->mcfg.mode == MODE_ALL && knob_slots(s->font, pub, kk) > 1) {
+    char pn[32];
+    smp_sf_preset_info(s->font, sh[i].pub, NULL, NULL, pn, sizeof pn);
+    snprintf(out->label, sizeof out->label, "%s: %s", pn, sh[i].n->label);
+  } else snprintf(out->label, sizeof out->label, "%s", sh[i].n->label);
+  out->preset = sh[i].pub; out->knob = sh[i].knob;
+  out->vtype = sh[i].n->vtype; out->words = sh[i].n->words;
+  out->lo = sh[i].n->lo; out->hi = sh[i].n->hi; out->value = sh[i].n->value;
+  return 1;
+}
+
+SMP_API double smp_synth_knob_get(SmpSynth *s, int i) {
+  Shown sh[KSHOWN];
+  if (!s || i < 0 || i >= knobs_shown(s, sh)) return 0;
+  return kget(s, sh[i].slot, sh[i].knob);
+}
+
+SMP_API void smp_synth_knob_set(SmpSynth *s, int i, double v) {
+  Shown sh[KSHOWN];
+  if (!s || v != v || i < 0 || i >= knobs_shown(s, sh)) return;
+  kput(s, sh[i].slot, sh[i].knob, kvalue(sh[i].n, v));
+}
+
+SMP_API int smp_synth_knob_by_preset(SmpSynth *s, int preset, int knob, double *v, int set) {
+  int pub[KSLOTS], n, sl;
+  const SfKnobs *kk[KSLOTS];
+  if (!s || !v || !s->font) return 0;
+  n = knob_slots(s->font, pub, kk);
+  for (sl = 0; sl < n; sl++) {
+    if (pub[sl] != preset) continue;
+    if (knob < 0 || knob >= kk[sl]->nknob) return 0;
+    if (set) { if (*v != *v) return 0; kput(s, sl, knob, kvalue(&kk[sl]->knob[knob], *v)); }
+    else *v = kget(s, sl, knob);
+    return 1;
+  }
+  return 0;
 }
 
 /* ---- events ---- */
@@ -1057,8 +1245,11 @@ static void block_start(SmpSynth *s, int n) {
     seq_clear(s, -1);
     InterlockedExchangePointer((PVOID volatile *)&s->cur, w);
     for (i = 0; i < NCH; i++) font_ccs(s, &s->ch[i]);
+    s->nks = knob_slots(w, s->kpub, s->kk);
+    s->kseen = s->kgen - 1;                     /* the new font's knobs are worked out below */
     changed = 1;
   }
+  if (s->nks && s->kseen != s->kgen) { s->kseen = s->kgen; knob_apply(s); }   /* the window or the state moved one */
   if (s->dormant) {                             /* only what the channels would play, without using it */
     if (changed) for (i = 0; i < NCH; i++) InterlockedExchange(&s->chan_preset[i], want_preset(s, i));
   } else if (changed) resolve_all(s);

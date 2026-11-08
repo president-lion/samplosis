@@ -211,3 +211,165 @@ def test_ds_knob_default_mods(lib, tmp_path):
     f = opened(lib, write_ds(tmp_path / "plain.dspreset", kit_text(ui="", effects="", midi="")))
     assert {7, 10, 11, 91, 93} <= cc_sources(regions(lib, f, 0)[0])
     lib.smp_sf_close(f)
+
+
+# ---- Task 4: knob values play (layer gains, tuning, CCs) ----
+
+from test_sf2 import peak_hz
+from test_sfz import OUT, Player, off, on, tone
+
+
+class SmpKnobInfo(ctypes.Structure):
+    _fields_ = [("label", ctypes.c_char * 96), ("preset", ctypes.c_int), ("knob", ctypes.c_int),
+                ("vtype", ctypes.c_int), ("words", ctypes.c_int), ("lo", ctypes.c_double), ("hi", ctypes.c_double),
+                ("value", ctypes.c_double)]
+
+
+def bind_knobs(lib):
+    vp, ci, cd = ctypes.c_void_p, ctypes.c_int, ctypes.c_double
+    lib.smp_synth_knob_count.argtypes, lib.smp_synth_knob_count.restype = [vp], ci
+    lib.smp_synth_knob_info.argtypes, lib.smp_synth_knob_info.restype = [vp, ci, ctypes.POINTER(SmpKnobInfo)], ci
+    lib.smp_synth_knob_get.argtypes, lib.smp_synth_knob_get.restype = [vp, ci], cd
+    lib.smp_synth_knob_set.argtypes, lib.smp_synth_knob_set.restype = [vp, ci, cd], None
+    lib.smp_knob_text.argtypes, lib.smp_knob_text.restype = [ctypes.POINTER(SmpKnobInfo), cd, ctypes.c_char_p, ci], None
+    lib.smp_knob_parse.argtypes = [ctypes.POINTER(SmpKnobInfo), ctypes.c_char_p, ctypes.POINTER(cd)]
+    lib.smp_knob_parse.restype = ci
+
+
+def cc(n, v, t=0.0):
+    return "midi %d %d %d %d" % (0xB0, n, v, int(round(t * OUT)))
+
+
+def knob_index(lib, s, label):
+    for i in range(lib.smp_synth_knob_count(s)):
+        k = SmpKnobInfo()
+        assert lib.smp_synth_knob_info(s, i, ctypes.byref(k))
+        if k.label.decode() == label:
+            return i
+    raise KeyError(label)
+
+
+def hit(p, extra=(), key=60, secs=0.6):
+    x = p.render(list(extra) + [on(key, 127, 0.05), off(key, 0.5)], secs)
+    return x[int(0.1 * OUT):int(0.45 * OUT)]
+
+
+def amps(x):
+    return [tone(x, fq) for _, fq in LAYERS]
+
+
+def test_ds_knob_layers_default_and_force(lib, tmp_path):
+    bind_knobs(lib)
+    p = Player(lib, tmp_path, make_kit(tmp_path))
+    try:
+        assert lib.smp_synth_knob_count(p.s) == 7
+        nat, frc, tex = amps(hit(p))
+        assert nat > 0.05 and frc < nat * 1e-3 and tex < nat * 1e-3, (nat, frc, tex)   # defaults: Natural alone
+        force = knob_index(lib, p.s, "Force")
+        lib.smp_synth_knob_set(p.s, force, 1.0)
+        n1, f1, t1 = amps(hit(p))
+        assert f1 > 0.05 and n1 < f1 * 1e-3 and t1 < f1 * 1e-3
+        lib.smp_synth_knob_set(p.s, force, 0.5)
+        n5, f5, _ = amps(hit(p))
+        assert abs(20 * np.log10(n5 / nat) + 6.02) < 0.2 and abs(20 * np.log10(f5 / f1) + 6.02) < 0.2, (n5, f5)
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Texture"), 1.0)
+        assert amps(hit(p))[2] > 0.05
+    finally:
+        p.free()
+
+
+def test_ds_knob_cc_moves_knob(lib, tmp_path):
+    bind_knobs(lib)
+    p = Player(lib, tmp_path, make_kit(tmp_path))
+    try:
+        nat, frc, _ = amps(hit(p, [cc(11, 127)]))
+        assert frc > 0.05 and nat < frc * 1e-3, (nat, frc)
+        assert abs(lib.smp_synth_knob_get(p.s, knob_index(lib, p.s, "Force")) - 1.0) < 1e-9
+        nat, frc, _ = amps(hit(p, [cc(11, 0)]))
+        assert nat > 0.05 and frc < nat * 1e-3                         # CC11 at 0 isn't expression here: no mute
+    finally:
+        p.free()
+
+
+def test_ds_knob_unbound_cc_keeps_gm(lib, tmp_path):
+    only17 = '\n  <midi>%s</midi>' % MIDI.split("<cc number=")[4].join(['<cc number=', ''])
+    p = Player(lib, tmp_path, make_kit(tmp_path, midi=only17))
+    try:
+        x = hit(p, [cc(11, 0)])
+        assert np.max(np.abs(x)) < 1e-3                                  # CC11 is expression as ever: silent
+    finally:
+        p.free()
+
+
+def test_ds_knob_pitch_semitones(lib, tmp_path):
+    bind_knobs(lib)
+    p = Player(lib, tmp_path, make_kit(tmp_path))
+    try:
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Pitch"), 3)
+        assert abs(peak_hz(hit(p), OUT) - 300 * 2 ** (3 / 12)) < 1
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Pitch"), 0)
+        assert abs(peak_hz(hit(p, [cc(1, 85)]), OUT) - 300) < 0.5     # -24 + 36 x 85/127 = 0.09: rounds to 0
+        assert abs(peak_hz(hit(p, [cc(1, 0)]), OUT) - 75) < 0.5        # -24 semitones
+    finally:
+        p.free()
+
+
+def test_ds_knob_replaces_group_volume(lib, tmp_path):
+    bind_knobs(lib)
+    write_layers(tmp_path)
+    p = Player(lib, tmp_path, write_ds(tmp_path / "v.dspreset", kit_text(group_attrs=('volume="0.5"', "", ""))))
+    q = Player(lib, tmp_path, make_kit(tmp_path, name="full.dspreset"))
+    try:
+        full = amps(hit(q))[0]
+        at0 = amps(hit(p))[0]
+        assert abs(20 * np.log10(at0 / full)) < 0.1                     # Force 0 sets Natural to 1: the 0.5 replaced
+        lib.smp_synth_knob_set(p.s, knob_index(lib, p.s, "Force"), 0.5)
+        assert abs(20 * np.log10(amps(hit(p))[0] / at0) + 6.02) < 0.2
+    finally:
+        p.free(); q.free()
+
+
+def test_ds_knob_text(lib, tmp_path):
+    bind_knobs(lib)
+    p = Player(lib, tmp_path, make_kit(tmp_path))
+    try:
+        def info(label):
+            k = SmpKnobInfo()
+            assert lib.smp_synth_knob_info(p.s, knob_index(lib, p.s, label), ctypes.byref(k))
+            return k
+
+        def text(k, v):
+            b = ctypes.create_string_buffer(64)
+            lib.smp_knob_text(ctypes.byref(k), v, b, 64)
+            return b.value.decode()
+
+        def parse(k, t):
+            v = ctypes.c_double()
+            assert lib.smp_knob_parse(ctypes.byref(k), t.encode(), ctypes.byref(v)), t
+            return v.value
+
+        f, pt, dt = info("Force"), info("Pitch"), info("Delay Time")
+        assert (f.lo, f.hi, f.value) == (0, 1, 0) and (dt.lo, dt.hi, dt.value) == (6, 16, 13)
+        assert text(f, 0.4) == "40 percent" and abs(parse(f, "40 percent") - 0.4) < 1e-9 and abs(parse(f, "40") - 0.4) < 1e-9
+        assert text(pt, 3) == "plus 3 semitones" and text(pt, -12) == "minus 12 semitones" and text(pt, 0) == "0 semitones"
+        assert parse(pt, "minus 12 semitones") == -12 and parse(pt, "-3") == -3
+        assert text(dt, 13) == "1/4" and text(dt, 12) == "1/8 dotted" and text(dt, 11) == "1/4 triplet"
+        assert parse(dt, "1/8 dotted") == 12 and parse(dt, "1/4") == 13
+    finally:
+        p.free()
+
+
+def test_ds_knob_plain_preset_unchanged(lib, tmp_path):
+    """A knob that binds nothing makes a preset "knobbed" without changing its sound: it renders exactly as the same
+    preset without the knob."""
+    write_layers(tmp_path)
+    nothing = '\n  <ui><tab><control label="Nothing" minValue="0" maxValue="1" value="0.5"/></tab></ui>'
+    a = Player(lib, tmp_path, write_ds(tmp_path / "a.dspreset", kit_text(ui=nothing, effects="", midi="",
+                                                                          group_attrs=('volume="0.5" groupTuning="1"', "", ""))))
+    b = Player(lib, tmp_path, write_ds(tmp_path / "b.dspreset", kit_text(ui="", effects="", midi="",
+                                                                          group_attrs=('volume="0.5" groupTuning="1"', "", ""))))
+    try:
+        ev = [cc(11, 90), on(60, 100, 0.01), cc(11, 40, 0.2), off(60, 0.4)]
+        assert np.array_equal(a.render(ev, 0.6), b.render(ev, 0.6))
+    finally:
+        a.free(); b.free()
