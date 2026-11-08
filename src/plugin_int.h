@@ -76,6 +76,11 @@ int smp_plug_load_font(Plug *P, const char *path, char *err, int cap);  /* 1 loa
    started, 0 and a plain reason; the status says "Loading x.sfz" until smp_plug_poll_load swaps it in on the main
    thread (then it plays). A newer load, or a project's state, cancels it. */
 int smp_plug_load_font_start(Plug *P, const char *path, char *err, int cap);
+int smp_plug_knob_count(Plug *P);                  /* a Decent Sampler preset's knobs (main thread): as
+                                                      smp_synth_knob_*; a set marks the project changed */
+int smp_plug_knob_info(Plug *P, int i, SmpKnobInfo *k);
+double smp_plug_knob_get(Plug *P, int i);
+void smp_plug_knob_set(Plug *P, int i, double v);
 SmpSynth *smp_plug_synth(Plug *P);                 /* ask each time: activate at a new rate replaces the player,
                                                       so a pointer kept from before may have been freed */
 void smp_plug_font_text(Plug *P, char *out, int cap);   /* "GM.sf2, 412 presets", "Piano.sfz, SFZ, 1 preset",

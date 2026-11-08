@@ -44,6 +44,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include "plugin_int.h"
+#include "sfknob.h"
 #include "decode.h"
 
 #define W_WIDTH 760
@@ -61,18 +62,21 @@ enum { ID_VAL = 100,                          /* + parameter id: its slider or c
        ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
        ID_EDIT = 300,                        /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
-       ID_OUT = 420 };                        /* + channel - 1: its output combo box */
+       ID_OUT = 420,                          /* + channel - 1: its output combo box */
+       ID_KNOB = 440 };                       /* + knob: its slider */
 enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, NPAGES = 3 };
 #define PAGE_CTLS 128
 #define PAGE_STOPS 64
 #define SL_LIMIT (-1)                         /* the slider that isn't a parameter: the cache size limit */
+#define SL_KNOB0 (-2)                         /* SL_KNOB0 - i: the sliders of a Decent Sampler preset's knobs */
+#define NKNOB 16                              /* knob sliders on the SoundFont page */
 enum { T_REFRESH = 1, T_OPEN = 2 };
 #define WM_DROPPED (WM_APP + 1)
 
 typedef struct { IDropTarget t; struct Gui *g; int ok; } Drop;
 
 /* a value's slider and the edit box that stands in for it while typing */
-typedef struct { HWND tb, ed; int what; char said[64]; bool editing; } Slider;
+typedef struct { HWND tb, ed; int what; char said[64]; bool editing; const struct Gui *gui; } Slider;
 
 typedef struct Gui {
   Plug *P;
@@ -82,7 +86,7 @@ typedef struct Gui {
   bool setting_tab;                           /* the window moves the tab itself: not the user's choice */
   HWND sample, browse, status, settings;
   HWND val[SMP_NALLPARAMS];                   /* each parameter's slider or combo box */
-  Slider sl[SMP_NALLPARAMS + 1]; int nsl;
+  Slider sl[SMP_NALLPARAMS + 1 + NKNOB]; int nsl;
   Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
   IAccPropServices *aps;                      /* the words a screen reader reads for a slider; NULL: numbers */
   HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
@@ -96,6 +100,10 @@ typedef struct Gui {
   HWND mode_one[4], mode_all[4 * NCH];        /* each mode's own controls with their labels: shown in that mode only */
   int nmode_one, nmode_all;
   bool sf_one;                                /* the mode the page shows: One preset */
+  /* a Decent Sampler preset's knobs: NKNOB sliders made once, the first nknobs shown (with the preset's labels),
+     after SoundFont transpose; Reverb and chorus, Status and Settings move down below them */
+  Slider *knob[NKNOB]; HWND knob_lab[NKNOB]; int nknobs; char knob_key[2200];
+  HWND fx_lab, sfstatus_lab; int transpose_y;
   const void *list_font; char list_key[1200]; /* the font the preset lists were built for (and its text) */
   char from_song[NCH][300];                   /* each channel's first entry as it reads now */
   HWND file[2];                               /* each main page's File combo box: the sampler's, the SoundFont's */
@@ -180,23 +188,40 @@ static void set_limit(Gui *g, double gb);
 static void say_note(Gui *g, const char *msg);
 
 /* ---- sliders ---- */
+/* a knob slider's knob (as the player has it now); 0 when there is none */
+static int knob_of(const Slider *s, SmpKnobInfo *k) {
+  const Gui *g = s->gui;
+  memset(k, 0, sizeof *k);
+  return g && g->P && smp_plug_knob_info(g->P, SL_KNOB0 - s->what, k);
+}
+static bool knob_whole(const SmpKnobInfo *k) { return k->vtype != SF_KV_FLOAT; }
+
 static void sl_range(const Slider *s, double *lo, double *hi, double *step) {
   const SmpParamInfo *pi;
   if (s->what == SL_LIMIT) { *lo = LIMIT_LO; *hi = LIMIT_HI; *step = 1; return; }
+  if (s->what <= SL_KNOB0) {                    /* a knob: whole numbers step by 1, the rest by a hundredth */
+    SmpKnobInfo k;
+    if (!knob_of(s, &k) || !(k.hi > k.lo)) { *lo = 0; *hi = 1; *step = 0.01; return; }
+    *lo = k.lo; *hi = k.hi; *step = knob_whole(&k) ? 1 : (k.hi - k.lo) / 100;
+    return;
+  }
   pi = smp_param_info(s->what);
   *lo = pi->lo; *hi = pi->hi; *step = pi->kind == SMP_K_MS ? 10 : 1;
 }
 static double sl_get(Gui *g, const Slider *s) {
   SmpSettings st;
+  if (s->what <= SL_KNOB0) return smp_plug_knob_get(g->P, SL_KNOB0 - s->what);
   if (s->what != SL_LIMIT) return smp_plug_get_param(g->P, s->what);
   smp_settings_get(&st);
   return st.cache_limit_gb;
 }
 static void sl_text(const Slider *s, double v, char *out, int cap) {
-  if (s->what == SL_LIMIT) gb_text(v, out, cap); else param_text(s->what, v, out, cap);
+  if (s->what <= SL_KNOB0) { SmpKnobInfo k; if (knob_of(s, &k)) smp_knob_text(&k, v, out, cap); else if (cap > 0) out[0] = 0; }
+  else if (s->what == SL_LIMIT) gb_text(v, out, cap); else param_text(s->what, v, out, cap);
 }
 static int sl_parse(const Slider *s, const char *t, double *v) {
   char *e;
+  if (s->what <= SL_KNOB0) { SmpKnobInfo k; return knob_of(s, &k) && smp_knob_parse(&k, t, v); }
   if (s->what != SL_LIMIT) return smp_value_parse(s->what, t, v);
   *v = strtod(t, &e);
   while (*e == ' ') e++;
@@ -225,15 +250,17 @@ static void sl_set(Gui *g, Slider *s, double v) {
   sl_range(s, &lo, &hi, &step);
   if (v < lo) v = lo;                            /* past either end it stays at the end */
   if (v > hi) v = hi;
-  if (s->what == SL_LIMIT) set_limit(g, v); else smp_plug_set_param(g->P, s->what, v);
+  if (s->what <= SL_KNOB0) smp_plug_knob_set(g->P, SL_KNOB0 - s->what, v);
+  else if (s->what == SL_LIMIT) set_limit(g, v); else smp_plug_set_param(g->P, s->what, v);
   sl_show(g, s, true);
 }
 /* Up and Down: a semitone, a cent, a dB, 10 ms, 1 %, 1 GB (by: 1, 10 or 0.1, and the sign); whole-number values
    never step less than 1 */
 static void sl_nudge(Gui *g, Slider *s, double by) {
   double lo, hi, step, v;
-  int kind = s->what == SL_LIMIT ? -1 : smp_param_info(s->what)->kind;
+  int kind = s->what <= SL_LIMIT ? -1 : smp_param_info(s->what)->kind;
   bool whole = kind == SMP_K_NOTE || kind == SMP_K_SEMI || kind == SMP_K_CENT || kind == SMP_K_COUNT || kind == SMP_K_PAN;
+  if (s->what <= SL_KNOB0) { SmpKnobInfo k; whole = knob_of(s, &k) && knob_whole(&k); }
   sl_range(s, &lo, &hi, &step);
   step *= fabs(by);
   if (whole && step < 1) step = 1;
@@ -246,7 +273,7 @@ static void sl_dragged(Gui *g, Slider *s) {
   double lo, hi, step, n = (double)SendMessageW(s->tb, TBM_GETRANGEMAX, 0, 0), v;
   sl_range(s, &lo, &hi, &step);
   v = lo + (double)SendMessageW(s->tb, TBM_GETPOS, 0, 0) / (n > 0 ? n : 1) * (hi - lo);
-  v = s->what == SL_LIMIT ? floor(v * 10 + 0.5) / 10 : floor(v / step + 0.5) * step;
+  v = s->what == SL_LIMIT ? floor(v * 10 + 0.5) / 10 : lo + floor((v - lo) / step + 0.5) * step;
   sl_set(g, s, v);
 }
 
@@ -567,6 +594,8 @@ static int sf_index(Gui *g, int bank, int program) {   /* the preset's place in 
 static bool in_list(HWND *list, int n, HWND h) { int i; for (i = 0; i < n; i++) if (list[i] == h) return true; return false; }
 /* a window of the SoundFont page that its mode hides */
 static bool mode_hides(Gui *g, HWND h) {
+  int i;
+  for (i = g->nknobs; i < NKNOB; i++) if (g->knob[i] && (h == g->knob[i]->tb || h == g->knob_lab[i])) return true;
   return g->sf_one ? in_list(g->mode_all, g->nmode_all, h) : in_list(g->mode_one, g->nmode_one, h);
 }
 /* the SoundFont page shows its mode's controls; the focus never stays on one that hides */
@@ -576,6 +605,78 @@ static void sf_layout(Gui *g) {
   if (f && mode_hides(g, f)) focus(g->sfmode);
   for (i = 0; i < g->nmode_one; i++) ShowWindow(g->mode_one[i], g->sf_one ? SW_SHOW : SW_HIDE);
   for (i = 0; i < g->nmode_all; i++) ShowWindow(g->mode_all[i], g->sf_one ? SW_HIDE : SW_SHOW);
+  for (i = 0; i < NKNOB; i++) if (g->knob[i]) {
+    int sh = i < g->nknobs ? SW_SHOW : SW_HIDE;
+    ShowWindow(g->knob_lab[i], sh);
+    if (!g->knob[i]->editing) ShowWindow(g->knob[i]->tb, sh);
+  }
+}
+
+/* a label at x, y and its control (and a slider's edit box) after it, their sizes kept */
+static void move_labelled(HWND lab, HWND c, HWND ed, int x, int y) {
+  RECT r; int lw;
+  GetWindowRect(lab, &r); lw = r.right - r.left;
+  SetWindowPos(lab, NULL, x, y + 4, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  SetWindowPos(c, NULL, x + lw + 4, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  if (ed) SetWindowPos(ed, NULL, x + lw + 4, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* The knobs take the places after SoundFont transpose, two to a row: the first beside it, then the next rows, left
+   and right; Reverb and chorus takes the place after the last (beside SoundFont transpose when there is none, as
+   before), and Status and Settings the rows below. */
+static void knob_place(int slot, int ty, int *x, int *y) {
+  *x = slot % 2 == 0 ? 384 : 8;
+  *y = ty + ((slot + 1) / 2) * ROW;
+}
+static void knob_layout(Gui *g) {
+  int i, x, y;
+  for (i = 0; i < g->nknobs; i++) {
+    knob_place(i, g->transpose_y, &x, &y);
+    move_labelled(g->knob_lab[i], g->knob[i]->tb, g->knob[i]->ed, x, y);
+  }
+  knob_place(g->nknobs, g->transpose_y, &x, &y);
+  move_labelled(g->fx_lab, g->val[SMP_P_SF_EFFECTS], NULL, x, y);
+  y += ROW;
+  move_labelled(g->sfstatus_lab, g->sfstatus, NULL, 8, y);
+  SetWindowPos(g->sfsettings, NULL, 132, y + ROW, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  InvalidateRect(g->win, NULL, TRUE);
+}
+
+/* the knobs the player has now: labels, ranges and places when they change (a new font, mode or preset), then each
+   one's value (the timer's: a CC moves a knob) */
+static void sf_knobs(Gui *g) {
+  char key[2200]; int n = smp_plug_knob_count(g->P), i, at;
+  SmpKnobInfo k[NKNOB];
+  if (n > NKNOB) n = NKNOB;
+  at = snprintf(key, sizeof key, "%p|%d", (void *)sf_font(g), n);
+  for (i = 0; i < n; i++) {
+    if (!smp_plug_knob_info(g->P, i, &k[i])) memset(&k[i], 0, sizeof k[i]);
+    if (at < (int)sizeof key) at += snprintf(key + at, sizeof key - (size_t)at, "|%s %g %g %d", k[i].label, k[i].lo, k[i].hi, k[i].vtype);
+  }
+  if (strcmp(key, g->knob_key)) {
+    HWND f = GetFocus(); bool lost = false;
+    snprintf(g->knob_key, sizeof g->knob_key, "%s", key);
+    for (i = n; i < NKNOB; i++) {
+      if (g->knob[i]->editing) edit_end(g, g->knob[i], false, false);
+      if (f && (f == g->knob[i]->tb || f == g->knob[i]->ed)) lost = true;
+    }
+    g->nknobs = n;
+    for (i = 0; i < n; i++) {
+      Slider *s = g->knob[i];
+      double steps = knob_whole(&k[i]) ? k[i].hi - k[i].lo : 100;
+      wchar_t w[96];
+      MultiByteToWideChar(CP_UTF8, 0, k[i].label, -1, w, 96);
+      SetWindowTextW(g->knob_lab[i], w);
+      annotate(g, s->tb, PROPID_ACC_NAME, k[i].label);
+      annotate(g, s->ed, PROPID_ACC_NAME, k[i].label);
+      SendMessageW(s->tb, TBM_SETRANGEMAX, TRUE, (LPARAM)(steps > 1000 ? 1000 : steps < 1 ? 1 : (LONG)floor(steps + 0.5)));
+      s->said[0] = 0;
+    }
+    knob_layout(g);
+    if (g->page == PG_FONT) sf_layout(g);
+    if (lost) focus(g->val[SMP_P_SF_TRANSPOSE]);   /* its knob went: the focus to the slider before the knobs */
+  }
+  for (i = 0; i < n; i++) if (!g->knob[i]->editing) sl_show(g, g->knob[i], false);
 }
 
 static void sf_show(Gui *g) {
@@ -586,6 +687,7 @@ static void sf_show(Gui *g) {
   f = sf_font(g);
   n = f ? smp_sf_preset_count(f) : 0;
   if ((bool)c.one != g->sf_one) { g->sf_one = c.one != 0; sf_layout(g); }
+  sf_knobs(g);
   cb_select(g->sfmode, c.one ? 1 : 0);
   k = sf_index(g, c.bank, c.program);
   snprintf(lacks, sizeof lacks, "Bank %d program %d (not in this font)", c.bank, c.program + 1);
@@ -1087,7 +1189,7 @@ static Slider *slider(Gui *g, int page, const char *label, int what, int x, int 
   Slider *s = &g->sl[g->nsl]; wchar_t lab[96]; double lo, hi, step, n;
   int i = g->nsl++;
   MultiByteToWideChar(CP_UTF8, 0, label, -1, lab, 96);
-  s->what = what;
+  s->what = what; s->gui = g;
   ctl(g, page, L"STATIC", lab, SS_LEFT, x, y + 4, lw, 20, -1);
   s->ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, x + lw + 4, y, cw, 24, g->win,
                           (HMENU)(INT_PTR)(ID_EDIT + i), module(), NULL);
@@ -1128,8 +1230,10 @@ static HWND param_box(Gui *g, int page, int id, int x, int y, int lw, int cw) {
 
 #define N_REST (SMP_NPARAMS - 2)
 #define REST_ROWS ((N_REST + 1) / 2)
-#define W_HEIGHT (8 + (4 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page, the taller: the tabs, 3 rows, the
-                                                           rest in two columns, Status and Settings */
+#define W_HEIGHT_S (8 + (4 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page: the tabs, 3 rows, the rest in two
+                                                             columns, Status and Settings */
+#define W_HEIGHT_F (8 + 23 * ROW + 26 + 8)   /* the SoundFont page with every knob: Settings 23 rows down */
+#define W_HEIGHT (W_HEIGHT_S > W_HEIGHT_F ? W_HEIGHT_S : W_HEIGHT_F)
 
 static bool build(Gui *g, HWND parent) {
   HINSTANCE hi = module();
@@ -1217,9 +1321,19 @@ static bool build(Gui *g, HWND parent) {
   param_box(g, PG_FONT, SMP_P_SF_VOICES, 384, y, 160, 200);
   y += ROW;
   param_box(g, PG_FONT, SMP_P_SF_TRANSPOSE, 8, y, 120, 236);
+  g->transpose_y = y;
+  for (id = 0; id < NKNOB; id++) {             /* the knobs, in Tab order after SoundFont transpose (sf_knobs) */
+    char t[32]; int x, yy;
+    snprintf(t, sizeof t, "Knob %d", id + 1);
+    knob_place(id, y, &x, &yy);
+    g->knob[id] = slider(g, PG_FONT, t, SL_KNOB0 - id, x, yy, 120, 236, ID_KNOB + id);
+    g->knob_lab[id] = g->all[PG_FONT][g->nall[PG_FONT] - 2];
+  }
   param_box(g, PG_FONT, SMP_P_SF_EFFECTS, 384, y, 160, 200);
+  g->fx_lab = g->all[PG_FONT][g->nall[PG_FONT] - 2];
   y += ROW;
   g->sfstatus = labelled(g, PG_FONT, "Status", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_SFSTATUS);
+  g->sfstatus_lab = g->all[PG_FONT][g->nall[PG_FONT] - 2];
   y += ROW;
   g->sfsettings = ctl(g, PG_FONT, L"BUTTON", L"Settings", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_SFSETTINGS);
 

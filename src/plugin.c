@@ -1152,6 +1152,12 @@ void smp_plug_set_plays(Plug *P, int which) {
 
 SmpSynth *smp_plug_synth(Plug *P) { return P->s; }
 
+/* a Decent Sampler preset's knobs, for the window (sfsynth.c's smp_synth_knob_*); a move marks the project changed */
+int smp_plug_knob_count(Plug *P) { return P->s ? smp_synth_knob_count(P->s) : 0; }
+int smp_plug_knob_info(Plug *P, int i, SmpKnobInfo *k) { return P->s ? smp_synth_knob_info(P->s, i, k) : 0; }
+double smp_plug_knob_get(Plug *P, int i) { return P->s ? smp_synth_knob_get(P->s, i) : 0; }
+void smp_plug_knob_set(Plug *P, int i, double v) { if (P->s) { smp_synth_knob_set(P->s, i, v); mark_dirty(P); } }
+
 /* the font's format in words, or NULL for SoundFont 2 and 3 (their text is as it was before other formats came) */
 static const char *font_kind(const SmpFont *f) {
   if (f->is_gig) return "GigaStudio";

@@ -1078,3 +1078,56 @@ def _running(pid):
         return k32.WaitForSingleObject(h, 0) == 0x102
     finally:
         k32.CloseHandle(h)
+
+
+# ---- a Decent Sampler preset's knobs on the SoundFont page ----
+
+KNOBS = ["Tone", "Pitch", "Texture", "Force", "Reverb", "Delay Mix", "Delay Time"]
+
+
+def knob_kit(tmp_path):
+    from test_ds_knobs import make_kit
+    d = tmp_path / "kit"
+    d.mkdir(exist_ok=True)
+    return make_kit(d)
+
+
+def test_gui_knobs_shown(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    out = gui(P, tmp_path, P.script(P.sample()), ["drop %s" % kit, "say", "read Force", "read Pitch", "read Delay Time",
+                                                  "read Tone", "focus SoundFont transpose"] + ["key tab"] * 8)
+    r = {x[0]: x[1] for x in got(out, "read")}
+    assert r["Force"] == "0 percent" and r["Pitch"] == "0 semitones" and r["Delay Time"] == "1/4", out
+    assert r["Tone"] == "50 percent"
+    names = [x[1] for x in got(out, "focus")][-8:]
+    assert names == KNOBS + ["Reverb and chorus"], out
+
+
+def test_gui_knob_keys_and_edit(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    out = gui(P, tmp_path, P.script(P.sample()), ["drop %s" % kit, "say", "focus Force", "key right", "key end",
+                                                  "key enter", "type 40", "key enter", "focus Pitch", "key enter",
+                                                  "type -3", "key enter", "key up", "focus Delay Time", "key down",
+                                                  "key enter", "type 1/4 triplet", "key enter", "counts"])
+    v = [x[2] for x in got(out, "focus")]
+    assert v[-10:] == ["1 percent", "100 percent", "100 percent", "40 percent", "0 semitones", "minus 3 semitones",
+                       "minus 2 semitones", "1/8 dotted", "1/8 dotted", "1/4 triplet"], out   # Down from 1/4
+    assert got(out, "counts")[0][0] == "beeps 0", out
+
+
+def test_gui_knobs_hidden_without(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    (tmp_path / "plain.sfz").write_text("<region> sample=%s key=60\n" % (tmp_path / "kit" / "natural.wav"))
+    out = gui(P, tmp_path, P.script(P.sample()), ["drop %s" % kit, "say", "drop %s" % (tmp_path / "plain.sfz"), "say",
+                                                  "read Force", "focus SoundFont transpose", "key tab"])
+    r = {x[0]: x[1] for x in got(out, "read")}
+    assert r["Force"] == "(none)", out
+    assert got(out, "focus")[-1][1] == "Reverb and chorus", out
+
+
+def test_gui_knob_follows_cc(P, tmp_path):
+    kit = knob_kit(tmp_path)
+    out = gui(P, tmp_path, P.script(P.sample()), ["drop %s" % kit, "say", "midi 176 11 127", "pump 400", "read Force",
+                                                  "midi 176 1 0", "pump 400", "read Pitch"])
+    r = {x[0]: x[1] for x in got(out, "read")}
+    assert r["Force"] == "100 percent" and r["Pitch"] == "minus 24 semitones", out
