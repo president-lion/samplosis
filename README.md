@@ -627,6 +627,12 @@ these keys:
   either end they go round to the other end of the page (the DAW's own window isn't reached with Tab).
 - A file that won't load beeps, and its reason is said by VoiceOver as well as shown in Status.
 - Drop a file on the window, as on Windows. Browse opens the Mac's file panel.
+- The window takes the keyboard focus when the host shows it (on the control used last), and again after a file
+  panel closes.
+- Ableton Live tells VoiceOver that the focus is on a control of its own main window whatever window is in front, so
+  VoiceOver couldn't follow the focus into a plugin's window or the file panel. While Samplosis's window (or a file
+  panel it opened) is in front, Samplosis gives VoiceOver the real focus instead; with any other window in front,
+  Live's answer is left as it is. (Only a host that answers this question itself is affected.)
 
 ### What else is different
 

@@ -50,6 +50,9 @@ SMP_API long smp_test_gui_beeps(void) { return beeps; }
 SMP_API void smp_test_gui_quiet(int q) { quiet = q; }
 static void beep(void) { InterlockedIncrement(&beeps); if (!quiet) NSBeep(); }
 
+static NSHashTable *g_views;                   /* (see "VoiceOver's focus" below) */
+static int g_panels;
+
 static NSString *ns(const char *s) { NSString *r = s ? [NSString stringWithUTF8String:s] : nil; return r ? r : @""; }
 
 /* ================================================================ controls */
@@ -143,6 +146,7 @@ typedef struct { int one, bank, program, channel, pin[NCH], out[NCH]; } SfCfg;
 - (void)fileList:(int)kind rescan:(BOOL)rescan;
 - (void)editEnd:(SmpSlider *)s apply:(BOOL)apply toSlider:(BOOL)toSlider;
 - (void)nextTab:(BOOL)back;
+- (void)takeFocus;
 @end
 
 /* ---- control classes: keys go to the controller first ---- */
@@ -527,8 +531,11 @@ static void sel(NSPopUpButton *p, NSInteger k) { if (p.indexOfSelectedItem != k 
   op.allowsMultipleSelection = NO; op.message = title; op.title = title;
   if (start.length) op.directoryURL = [NSURL fileURLWithPath:start isDirectory:YES];
   [self modalBegin];
+  g_panels++;
   NSModalResponse r = [op runModal];
+  g_panels--;
   if ([self modalEnd]) return nil;
+  [self.view.window makeKeyAndOrderFront:nil];   /* back to the plugin's window (a host may give the focus elsewhere) */
   return r == NSModalResponseOK ? op.URL.path : nil;
 }
 - (void)browseFolder {
@@ -1127,7 +1134,19 @@ static BOOL audio_name(NSString *n) {
   for (id = 0; id < SMP_NALLPARAMS; id++) [self showParam:id force:YES];
   [self showPage:smp_plug_plays(P) ? PG_FONT : PG_SAMPLER to:nil];
 }
+/* the window comes to the front with the focus on a control (the last used, else the page's first), and VoiceOver is
+   told: a host may open its plugin window without making it the key window */
+- (void)takeFocus {
+  NSWindow *w = self.view.window;
+  if (closing || !w || self.view.hiddenOrHasHiddenAncestor) return;
+  [w makeKeyAndOrderFront:nil];
+  NSView *to = self.last && [self shows:self.last] && [self.last isDescendantOf:self.view] ? self.last : [self orderOf:page].firstObject;
+  NSView *fr = owner_of(w.firstResponder);
+  if (!fr || ![fr isDescendantOf:self.view]) [self focus:to]; else to = fr;
+  NSAccessibilityPostNotification(to, NSAccessibilityFocusedUIElementChangedNotification);
+}
 - (void)attached {                                /* in the host's window: the timer, and the focus on the first control */
+  [g_views addObject:self.view];
   if (self.timer) return;
   self.timer = [NSTimer timerWithTimeInterval:0.25 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
   [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSDefaultRunLoopMode];
@@ -1146,7 +1165,7 @@ static BOOL audio_name(NSString *n) {
   __weak SmpGui *w = self;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
     SmpGui *g = w;
-    if (g && !g->closing && g.view.window) [g focus:[g orderOf:g->page].firstObject];
+    if (g && !g->closing && g.view.window) [g takeFocus];
   });
 }
 - (void)close {
@@ -1191,6 +1210,56 @@ static BOOL audio_name(NSString *n) {
 }
 @end
 
+/* ================================================================ VoiceOver's focus in hosts that answer for it
+   VoiceOver follows the keyboard by asking the application which element has the focus. Some hosts answer that
+   themselves, with their own window's element, whatever window is in front: in Ableton Live the answer is always a
+   control of Live's main window, so VoiceOver can't follow the focus into a plugin's window or into the file panel
+   it opens, and reads nothing as one moves there. So, once, the host's own answer is wrapped: while the key window is
+   one of Samplosis's windows (or a file panel Samplosis has open) the answer is the one AppKit itself gives (the
+   element that has the keyboard focus in that window); in every other case it is the host's, unchanged. Only a host
+   that answers for itself (its application class overrides the question) is touched. */
+#import <objc/runtime.h>
+/* g_views: Samplosis's views now in windows (weak); g_panels: file panels Samplosis has open */
+static IMP g_host_focus, g_base_focus, g_host_attr, g_base_attr;
+
+static BOOL ours_in_front(void) {
+  NSWindow *kw = NSApp.keyWindow;
+  if (!kw) return NO;
+  if (g_panels > 0 && [kw isKindOfClass:[NSSavePanel class]]) return YES;
+  for (NSView *v in g_views) if (v.window == kw) return YES;
+  return NO;
+}
+static id smp_focused(id self, SEL cmd) {
+  if (ours_in_front()) return ((id (*)(id, SEL))g_base_focus)(self, cmd);
+  return ((id (*)(id, SEL))g_host_focus)(self, cmd);
+}
+static id smp_attr(id self, SEL cmd, NSString *a) {
+  if ([a isEqualToString:NSAccessibilityFocusedUIElementAttribute] && ours_in_front())
+    return ((id (*)(id, SEL, NSString *))g_base_attr)(self, cmd, a);
+  return ((id (*)(id, SEL, NSString *))g_host_attr)(self, cmd, a);
+}
+static void focus_fix_install(void) {
+  static BOOL done;
+  if (done) return;
+  done = YES;
+  g_views = [NSHashTable weakObjectsHashTable];
+  Class app = [NSApp class], base = [NSApplication class];
+  if (!app || app == base) return;              /* a plain application: AppKit answers already */
+  SEL f = @selector(accessibilityFocusedUIElement), a = @selector(accessibilityAttributeValue:);
+  Method hf = class_getInstanceMethod(app, f), bf = class_getInstanceMethod(base, f);
+  if (hf && bf && method_getImplementation(hf) != method_getImplementation(bf)) {
+    g_base_focus = method_getImplementation(bf);
+    g_host_focus = class_replaceMethod(app, f, (IMP)smp_focused, method_getTypeEncoding(hf));
+    if (!g_host_focus) g_host_focus = method_getImplementation(hf);
+  }
+  Method ha = class_getInstanceMethod(app, a), ba = class_getInstanceMethod(base, a);
+  if (ha && ba && method_getImplementation(ha) != method_getImplementation(ba)) {
+    g_base_attr = method_getImplementation(ba);
+    g_host_attr = class_replaceMethod(app, a, (IMP)smp_attr, method_getTypeEncoding(ha));
+    if (!g_host_attr) g_host_attr = method_getImplementation(ha);
+  }
+}
+
 /* ================================================================ the CLAP gui extension: embedded, Cocoa */
 static SmpGui *ctl_of(Plug *P) { return P && P->gui ? (__bridge SmpGui *)P->gui->ctl : nil; }
 
@@ -1213,6 +1282,7 @@ static bool g_preferred(const clap_plugin_t *p, const char **api, bool *floating
 static bool g_create(const clap_plugin_t *p, const char *api, bool floating) {
   Plug *P = plug(p);
   if (!g_supported(p, api, floating)) return false;
+  focus_fix_install();
   if (P->gui) return true;
   struct Gui *gs = calloc(1, sizeof *gs);
   if (!gs) return false;
@@ -1244,7 +1314,16 @@ static bool g_parent(const clap_plugin_t *p, const clap_window_t *win) {
 }
 static bool g_transient(const clap_plugin_t *p, const clap_window_t *w) { (void)p; (void)w; return false; }
 static void g_title(const clap_plugin_t *p, const char *t) { (void)p; (void)t; }
-static bool g_show(const clap_plugin_t *p) { SmpGui *g = ctl_of(plug(p)); if (g) g.view.hidden = NO; return true; }
+static bool g_show(const clap_plugin_t *p) {
+  SmpGui *g = ctl_of(plug(p));
+  if (!g) return true;
+  g.view.hidden = NO;
+  __weak SmpGui *w = g;                        /* once the host has its window on screen */
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    SmpGui *gg = w; if (gg && !gg->closing) [gg takeFocus];
+  });
+  return true;
+}
 static bool g_hide(const clap_plugin_t *p) { SmpGui *g = ctl_of(plug(p)); if (g) g.view.hidden = YES; return true; }
 
 const clap_plugin_gui_t smp_gui_ext = {g_supported, g_preferred, g_create, g_destroy, g_scale, g_size, g_can_resize,
