@@ -66,7 +66,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sf2.h"
 #include "decode.h"
 
@@ -1180,7 +1180,7 @@ static void pcache_write(P *p, const wchar_t *sfz) {
   }
   memcpy(b, "SFZP", 4);
   { uint32_t v = PCACHE_VERSION; memcpy(b + 4, &v, 4); memcpy(b + 8, &n, 4); }
-  _snwprintf(part, WPATH + 39, L"%s.%lu.part", path, GetCurrentThreadId());
+  _snwprintf(part, WPATH + 39, L"%ls.%lu.part", path, GetCurrentThreadId());
   part[WPATH + 39] = 0;
   h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h != INVALID_HANDLE_VALUE) {
@@ -1262,7 +1262,7 @@ static int sample_file(P *p, const char *name) {
   if (absolute || (rel[0] && rel[1] == L':') || rel[0] == L'\\') {
     if (wcslen(rel) >= WPATH) goto bad_path;
     wcscpy(w, rel);
-  } else if (_snwprintf(w, WPATH - 1, L"%s%s", p->root_dir, rel) < 0) goto bad_path;   /* too long: never cut short */
+  } else if (_snwprintf(w, WPATH - 1, L"%ls%ls", p->root_dir, rel) < 0) goto bad_path;   /* too long: never cut short */
   w[WPATH - 1] = 0;
   { DWORD n = GetFullPathNameW(w, WPATH, full, NULL); if (!n || n >= WPATH) goto bad_path; }
   wcscpy(lw, full);
@@ -1780,7 +1780,7 @@ static void include(P *p, const char *s, size_t n, const wchar_t *dir, int depth
   if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, rel, WPATH) &&
       !MultiByteToWideChar(CP_ACP, 0, name, -1, rel, WPATH)) return;
   if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') { if (wcslen(rel) >= WPATH) return; wcscpy(w, rel); }
-  else if (_snwprintf(w, WPATH - 1, L"%s%s", dir, rel) < 0) return;   /* too long: never cut short */
+  else if (_snwprintf(w, WPATH - 1, L"%ls%ls", dir, rel) < 0) return;   /* too long: never cut short */
   w[WPATH - 1] = 0;
   fn = GetFullPathNameW(w, WPATH, full, NULL);
   if (!fn || fn >= WPATH) return;

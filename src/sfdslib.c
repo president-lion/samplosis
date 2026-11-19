@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #define MINIZ_NO_STDIO
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #define MINIZ_NO_ARCHIVE_WRITING_APIS
@@ -242,7 +242,7 @@ int sf_parse_dslib(SmpFont *f, const char *path, int (*cancel)(void *), void *ca
   if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) {
     /* not unpacked yet: into <key>.part, then renamed (a .part left by a crash or a cancel is started again) */
     /* a .part of this thread's own: two opens of the bundle at once (two instances, two hosts) never share one */
-    swprintf(part, 1300, L"%s.%lu.%lu.part", dir, GetCurrentProcessId(), GetCurrentThreadId());
+    swprintf(part, 1300, L"%ls.%lu.%lu.part", dir, GetCurrentProcessId(), GetCurrentThreadId());
     {
       wchar_t parent[1200], *bs;
       wcscpy(parent, dir);

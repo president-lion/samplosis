@@ -20,7 +20,7 @@
    names with spaces and in any language work.
 
    Called from the main thread or worker threads (the sampler's loader), never from the audio thread. */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +28,20 @@
 #include "decode.h"
 #include "ffdecode.h"
 
+#ifdef _WIN32
+#define SMP_FFPROBE_NAME L"ffprobe.exe"
+#define SMP_FFPROBE_NAME8 "ffprobe.exe"
+#define SMP_FFMPEG_NAME8 "ffmpeg.exe"
+#else
+#define SMP_FFPROBE_NAME L"ffprobe"
+#define SMP_FFPROBE_NAME8 "ffprobe"
+#define SMP_FFMPEG_NAME8 "ffmpeg"
+#endif
+
 static volatile LONG test_flags;               /* TESTS ONLY: SMP_FF_TEST_* */
 void smp_ff_set_test_flags(long f) { InterlockedExchange(&test_flags, (LONG)f); }
 
+#ifdef _WIN32
 /* one argument onto a command line, quoted the way the C runtime reads it back: backslashes are doubled before a
    quote (the closing one too), and a quote is escaped. 0 when it doesn't fit. */
 static int put_arg(wchar_t *cmd, size_t cap, size_t *at, const wchar_t *a) {
@@ -49,6 +60,19 @@ static int put_arg(wchar_t *cmd, size_t cap, size_t *at, const wchar_t *a) {
   cmd[*at] = 0;
   return 1;
 }
+#else
+/* POSIX: no command line to quote; the arguments are kept one after another, each ended by a 0, and the list ends
+   with an empty one (run_tool splits them back into argv) */
+static int put_arg(wchar_t *cmd, size_t cap, size_t *at, const wchar_t *a) {
+  size_t n = wcslen(a);
+  if (*at + n + 2 >= cap) return 0;
+  wmemcpy(cmd + *at, a, n);
+  *at += n;
+  cmd[(*at)++] = 0;
+  cmd[*at] = 0;
+  return 1;
+}
+#endif
 static int put_args(wchar_t *cmd, size_t cap, size_t *at, const wchar_t *const *a) {
   for (; *a; a++) if (!put_arg(cmd, cap, at, *a)) return 0;
   return 1;
@@ -75,6 +99,7 @@ static int out_put(Out *o, const char *b, DWORD k) {
   return 1;
 }
 
+#ifdef _WIN32
 /* one of the child's output pipes, read with overlapped I/O */
 #define RD_SIZE 65536
 typedef struct { HANDLE h; OVERLAPPED ov; int pending, open; char b[RD_SIZE]; } Reader;
@@ -109,7 +134,11 @@ static int make_pipe(HANDLE *rd, HANDLE *wr) {
 }
 static void close_h(HANDLE *h) { if (*h && *h != INVALID_HANDLE_VALUE) CloseHandle(*h); *h = INVALID_HANDLE_VALUE; }
 
+#endif
+
 enum { RUN_DONE, RUN_CANCELLED, RUN_STALLED, RUN_REFUSED, RUN_NO_START };
+
+#ifdef _WIN32
 
 /* Runs exe with the command line cmd until it ends, or until cancel says so, it writes nothing to stdout for stall
    ms, or out refuses its output (then it is killed). Either way it has ended (and been waited for) on return. */
@@ -215,6 +244,106 @@ out:
   return res;
 }
 
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <unistd.h>
+extern char **environ;
+
+/* POSIX: the same contract as on Windows. The child gets /dev/null on stdin and two pipes, and nothing else (on macOS
+   POSIX_SPAWN_CLOEXEC_DEFAULT closes every other descriptor); it runs in a process group of its own at a lower
+   priority, so stopping it kills whatever it started too. The output is read with poll, every 50 ms asking cancel
+   and checking the stall timer. */
+static int run_tool(const wchar_t *exe, wchar_t *cmd, Out *o, int (*cancel)(void *), void *arg, ULONGLONG stall) {
+  char *argv[64], exe8[4096];
+  int nargs = 0, res = RUN_NO_START, i, outp[2] = {-1, -1}, errp[2] = {-1, -1}, status = 0;
+  pid_t pid = -1;
+  posix_spawn_file_actions_t fa; posix_spawnattr_t at;
+  int have_fa = 0, have_at = 0;
+  char *buf = NULL;
+  ULONGLONG last, exited = 0;
+  if (!smp_path_utf8(exe, exe8, sizeof exe8)) return RUN_NO_START;
+  for (wchar_t *a = cmd; *a && nargs < 63; a += wcslen(a) + 1) {
+    size_t cap = wcslen(a) * 4 + 1;
+    if (!(argv[nargs] = malloc(cap)) || WideCharToMultiByte(CP_UTF8, 0, a, -1, argv[nargs], (int)cap, NULL, NULL) <= 0) goto out;
+    nargs++;
+  }
+  argv[nargs] = NULL;
+  if (!nargs || !(buf = malloc(65536)) || pipe(outp) || pipe(errp)) goto out;
+  for (i = 0; i < 2; i++) { fcntl(i ? errp[0] : outp[0], F_SETFL, O_NONBLOCK); fcntl(i ? errp[0] : outp[0], F_SETFD, FD_CLOEXEC); }
+  if (posix_spawn_file_actions_init(&fa)) goto out;
+  have_fa = 1;
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, outp[1], 1);
+  posix_spawn_file_actions_adddup2(&fa, errp[1], 2);
+  if (posix_spawnattr_init(&at)) goto out;
+  have_at = 1;
+  short fl = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  fl |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+  posix_spawnattr_setflags(&at, fl);
+  posix_spawnattr_setpgroup(&at, 0);
+  { sigset_t none, def; sigemptyset(&none); sigemptyset(&def); sigaddset(&def, SIGPIPE);
+    posix_spawnattr_setsigmask(&at, &none); posix_spawnattr_setsigdefault(&at, &def); }
+  argv[0] = exe8;                                /* (the list's first is the program, as on Windows) */
+  if (posix_spawn(&pid, exe8, &fa, &at, argv, environ)) { pid = -1; argv[0] = NULL; goto out; }
+  argv[0] = NULL;
+  setpriority(PRIO_PROCESS, (id_t)pid, 10);      /* below normal, as on Windows */
+  close(outp[1]); outp[1] = -1; close(errp[1]); errp[1] = -1;
+  res = RUN_DONE;
+  last = GetTickCount64();
+  for (;;) {
+    struct pollfd pf[2]; int np = 0;
+    if (outp[0] >= 0) { pf[np].fd = outp[0]; pf[np].events = POLLIN; np++; }
+    if (errp[0] >= 0) { pf[np].fd = errp[0]; pf[np].events = POLLIN; np++; }
+    if (!np) break;                              /* both pipes closed: the child is ending */
+    if (!exited && waitpid(pid, &status, WNOHANG) == pid) { exited = GetTickCount64(); pid = -pid - 1; }
+    if (exited && GetTickCount64() - exited > 200) break;
+    poll(pf, (nfds_t)np, exited ? 20 : 50);
+    for (i = 0; i < np && res == RUN_DONE; i++) {
+      if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+      int is_out = pf[i].fd == outp[0];
+      ssize_t got = read(pf[i].fd, buf, 65536);
+      if (got > 0 && is_out) {
+        last = GetTickCount64();
+        if (!out_put(o, buf, (DWORD)got)) res = RUN_REFUSED;
+      } else if (got > 0) {                      /* stderr: its start is kept, the rest drained */
+        size_t k = (size_t)got < sizeof o->errs - 1 - o->en ? (size_t)got : sizeof o->errs - 1 - o->en;
+        memcpy(o->errs + o->en, buf, k); o->en += k; o->errs[o->en] = 0;
+      } else if (got == 0 || (errno != EAGAIN && errno != EINTR)) {
+        if (is_out) { close(outp[0]); outp[0] = -1; } else { close(errp[0]); errp[0] = -1; }
+      }
+    }
+    if (res != RUN_DONE) break;
+    if (cancel && cancel(arg)) { res = RUN_CANCELLED; break; }
+    if (GetTickCount64() - last > stall) { res = RUN_STALLED; break; }
+  }
+  if (pid > 0) {
+    if (res != RUN_DONE) kill(-pid, SIGKILL);    /* stopped: the child and its group go now */
+    ULONGLONG t0 = GetTickCount64();
+    while (waitpid(pid, &status, WNOHANG) == 0) {
+      if (GetTickCount64() - t0 > 10000) { kill(-pid, SIGKILL); waitpid(pid, &status, 0); break; }   /* won't end */
+      Sleep(10);
+    }
+  }
+  o->code = WIFEXITED(status) ? (DWORD)WEXITSTATUS(status) : 1;
+out:
+  if (pid == -1 && res == RUN_DONE) res = RUN_NO_START;
+  if (have_fa) posix_spawn_file_actions_destroy(&fa);
+  if (have_at) posix_spawnattr_destroy(&at);
+  for (i = 0; i < 2; i++) { if (outp[i] >= 0) close(outp[i]); if (errp[i] >= 0) close(errp[i]); }
+  for (i = 1; i < nargs; i++) free(argv[i]);
+  free(buf);
+  return res;
+}
+#endif
+
 /* FFmpeg's reason: the last line it wrote to stderr, without "[decoder @ 0x...] " prefixes, or fallback */
 static void ff_reason(const Out *o, const char *fallback, char *err, int cap) {
   char t[4096], *line = NULL, *p, *e;
@@ -267,10 +396,11 @@ int smp_ff_decode(const char *path, size_t max_floats, float **x, size_t *floats
   if ((flags & SMP_FF_TEST_MISSING) || !smp_ffmpeg_find_w(ff, 1100)) return SMP_FF_MISSING;
   wcscpy(probe, ff);
   slash = wcsrchr(probe, L'\\');
+  { wchar_t *s2 = wcsrchr(probe, L'/'); if (s2 && (!slash || s2 > slash)) slash = s2; }
   if (!slash || (size_t)(slash - probe) + 13 > 1100) return SMP_FF_MISSING;
-  wcscpy(slash + 1, L"ffprobe.exe");
+  wcscpy(slash + 1, SMP_FFPROBE_NAME);
   if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) {
-    snprintf(err, (size_t)cap, "FFmpeg's ffprobe.exe isn't beside ffmpeg.exe, and it's needed");
+    snprintf(err, (size_t)cap, "FFmpeg's " SMP_FFPROBE_NAME8 " isn't beside " SMP_FFMPEG_NAME8 ", and it's needed");
     return SMP_FF_FAILED;
   }
   n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);

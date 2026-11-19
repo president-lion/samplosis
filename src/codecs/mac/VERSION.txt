@@ -3,4 +3,6 @@ https://monkeysaudio.com/files/MAC_1343_SDK.zip (page https://www.monkeysaudio.c
 SHA-256 3fd1c60f994daba536902f30b1bebc2235099c8b8a039d8b37d9d27d4827e0ca (no checksum is published; this is the file used)
 Kept: the decoder side of Source/MACLib (with Old/ for files before 3.98), Source/Shared, and the five compress files
 that MACLib.cpp refers to (APECompress, APECompressCore, APECompressCreate, MACProgressHelper, WAVInputSource).
+Source/MACLib/NNFilterNeon.cpp is kept too: the macOS build (CMakeLists.txt) needs it on Apple silicon; build.bat
+doesn't compile it.
 Unchanged; used only through ../mac_shim.cpp. Licence: 3-clause BSD, see License.txt.

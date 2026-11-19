@@ -3,7 +3,7 @@
    the top of sfstream.c for the handoffs. */
 #ifndef SFSTREAM_H
 #define SFSTREAM_H
-#include <windows.h>
+#include "plat.h"
 #include <stdint.h>
 #include "samplosis.h"
 

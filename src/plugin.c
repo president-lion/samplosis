@@ -179,9 +179,14 @@ static void keep_text(Plug *P, const char *text) {
   free(P->text); P->text = t;
 }
 
+#ifdef _WIN32
+#define SMP_OS_DECODER_TAG " (decoded by Windows)"
+#else
+#define SMP_OS_DECODER_TAG " (decoded by macOS)"
+#endif
 /* "Ready: x.wav", and what decoded it when that wasn't built in: "Ready: x.m4a (decoded by Windows)" */
 static void ready_status(Plug *P, const SmpSample *s) {
-  const char *by = s->by == SMP_DEC_WINDOWS ? " (decoded by Windows)" : s->by == SMP_DEC_FFMPEG ? " (decoded by FFmpeg)" : "";
+  const char *by = s->by == SMP_DEC_WINDOWS ? SMP_OS_DECODER_TAG : s->by == SMP_DEC_FFMPEG ? " (decoded by FFmpeg)" : "";
   snprintf(P->status, sizeof P->status, "Ready: %s%s", s->name, by);
 }
 
@@ -1390,7 +1395,15 @@ static uint32_t f_count(const clap_plugin_factory_t *f) { (void)f; return 1; }
 static const clap_plugin_descriptor_t *f_desc(const clap_plugin_factory_t *f, uint32_t i) { (void)f; return i ? NULL : &desc; }
 static const clap_plugin_factory_t factory = {f_count, f_desc, f_create};
 
+#ifdef SMP_CLAP_FIRST
+/* the macOS build (CMakeLists.txt): this code is a static library that clap-wrapper turns into the CLAP, VST3 and
+   Audio Unit, and mac/entry.c exports clap_entry from these */
+bool smp_entry_init(const char *path) { (void)path; return true; }
+void smp_entry_deinit(void) {}
+const void *smp_entry_factory(const char *id) { return strcmp(id, CLAP_PLUGIN_FACTORY_ID) ? NULL : &factory; }
+#else
 static bool e_init(const char *path) { (void)path; return true; }
 static void e_deinit(void) {}
 static const void *e_factory(const char *id) { return strcmp(id, CLAP_PLUGIN_FACTORY_ID) ? NULL : &factory; }
 CLAP_EXPORT const clap_plugin_entry_t clap_entry = {CLAP_VERSION_INIT, e_init, e_deinit, e_factory};
+#endif

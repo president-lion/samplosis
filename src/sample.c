@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #include "samplosis.h"
 #include "decode.h"
 
@@ -40,7 +40,7 @@ static void sidecar_path(uint64_t key, wchar_t *out, int cap) {
   SmpSettings s; wchar_t dir[1100];
   smp_settings_get(&s);
   w_path(s.cache_dir, dir, 1100);
-  swprintf(out, cap, L"%s\\%016llx.txt", dir, (unsigned long long)key);
+  swprintf(out, cap, L"%ls\\%016llx.txt", dir, (unsigned long long)key);
 }
 
 /* the sidecar: "root r from f by b" (by, what decoded the file, came later: 0 when it isn't there) */

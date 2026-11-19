@@ -30,7 +30,7 @@
    .sf2pack .sbk .dls .gig .sfz .dspreset .dslibrary .exs) loads into the SoundFont player, an audio file into the
    sampler, and the tab follows.
    Everything here runs on the main thread (the window's). */
-#include <windows.h>
+#include "plat.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>

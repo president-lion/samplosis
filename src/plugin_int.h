@@ -2,7 +2,7 @@
    Everything here is main thread only, except where it says. */
 #ifndef SMP_PLUGIN_INT_H
 #define SMP_PLUGIN_INT_H
-#include <windows.h>
+#include "plat.h"
 #include <clap/clap.h>
 #include "samplosis.h"
 

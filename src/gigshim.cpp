@@ -52,7 +52,7 @@
    the project and restart), since the heap can't be trusted after it.
 
    Paths are UTF-8 throughout: libgig's RIFF.cpp is patched to open them with CreateFileW. */
-#include <windows.h>
+#include "plat.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +70,16 @@ extern "C" {
 }
 
 namespace {
+
+/* the path libgig opens: on Windows as given; elsewhere the shared code's backslashes become slashes */
+std::string os_path(const char *p) {
+  std::string s(p ? p : "");
+#ifndef _WIN32
+  for (char &c : s) if (c == '\\') c = '/';
+#endif
+  return s;
+}
+
 
 SRWLOCK g_lock = SRWLOCK_INIT;   /* taken and let go explicitly, so a guard that catches a crash can let go of it */
 volatile LONG g_guards;          /* crashes the guards caught (tests: smp_sf_test_gig_guards) */
@@ -665,7 +675,7 @@ int parse(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char 
   gp = new Gig;
   Gig &g = *gp;
   if (g_fault == 1) { g_fault = 0; *(volatile int *)nullptr = 0; }   /* tests: a crash inside the guard */
-  g.riff = new RIFF::File(path);
+  g.riff = new RIFF::File(os_path(path));
   if (g.riff->GetListType() != RIFF_TYPE_DLS) { say(why, wcap, "it isn't a DLS or GigaStudio file"); return 0; }
   g.file = new gig::File(g.riff);
 
@@ -850,6 +860,7 @@ void reason_of(const std::string &m, char *why, int wcap) { say(why, wcap, m.emp
    is trusted: libgig's objects from that call are leaked rather than destroyed, and g_crashed refuses every later
    GigaStudio open and decode in this process, with CRASHED as the reason, since the crash may have damaged the
    heap and only a restart is safe. */
+#ifdef _WIN32
 int seh_filter(unsigned long code) {
   switch (code) {
     case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_INT_DIVIDE_BY_ZERO:
@@ -859,6 +870,8 @@ int seh_filter(unsigned long code) {
       return EXCEPTION_CONTINUE_SEARCH;
   }
 }
+
+#endif
 
 void tripped(char *why, int wcap) {
   InterlockedIncrement(&g_guards);
@@ -872,7 +885,11 @@ SRWLOCK g_pending_lock = SRWLOCK_INIT;
 std::vector<Gig *> *g_pending;
 void free_caught(Gig *g) { try { delete g; } catch (...) {} }
 void free_guarded(Gig *g) {
+#ifdef _WIN32
   __try { free_caught(g); } __except (seh_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); InterlockedExchange(&g_crashed, 1); }
+#else
+  free_caught(g);       /* no structured exceptions here: a crash inside libgig would end the process */
+#endif
 }
 void drain_pending(void) {   /* g_lock held */
   for (;;) {
@@ -923,12 +940,16 @@ int parse_caught(SmpFont *f, const char *path, int (*cancel)(void *), void *carg
 }
 
 int parse_guarded(SmpFont *f, const char *path, int (*cancel)(void *), void *carg, char *why, int wcap) {
+#ifdef _WIN32
   __try {
     return parse_caught(f, path, cancel, carg, why, wcap);
   } __except (seh_filter(GetExceptionCode())) {
     tripped(why, wcap);
     return -1;
   }
+#else
+  return parse_caught(f, path, cancel, carg, why, wcap);
+#endif
 }
 
 /* one decode: its arguments, and what it holds, so the guard can let go of it all */
@@ -955,7 +976,7 @@ float *decode(Decode &d) {
     g = new Gig;
     try {
       if (g_fault == 2) { g_fault = 0; *(volatile int *)nullptr = 0; }   /* tests: a crash inside the guard */
-      g->riff = new RIFF::File(d.f->path);
+      g->riff = new RIFF::File(os_path(d.f->path));
       g->file = new gig::File(g->riff);
       g->file->GetSample(0, &prog);
     } catch (...) { free_caught(g); throw; }
@@ -1027,6 +1048,7 @@ float *decode_caught(Decode &d) {
 }
 
 float *decode_guarded(Decode *d) {
+#ifdef _WIN32
   __try {
     return decode_caught(*d);
   } __except (seh_filter(GetExceptionCode())) {
@@ -1037,6 +1059,9 @@ float *decode_guarded(Decode *d) {
     if (d->locked) { d->locked = false; ReleaseSRWLockExclusive(&g_lock); }
     return nullptr;
   }
+#else
+  return decode_caught(*d);
+#endif
 }
 
 } /* namespace */
@@ -1167,7 +1192,7 @@ void gpc_save(const SmpFont *f, const char *path) {
     }
   }
   wchar_t part[2100];
-  swprintf(part, 2100, L"%s.%lu.part", file, GetCurrentThreadId());
+  swprintf(part, 2100, L"%ls.%lu.part", file, GetCurrentThreadId());
   HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return;
   DWORD put = 0;

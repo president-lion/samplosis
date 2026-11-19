@@ -8,4 +8,7 @@
 #define NO_THREADING 1
 #define _HAS_STD_BYTE 0
 #define NOMINMAX 1
+#ifdef __APPLE__
+#define HAVE_VDSP 1                 /* Accelerate's vector functions (macOS has no sincosf) */
+#endif
 #include "rubberband/single/RubberBandSingle.cpp"

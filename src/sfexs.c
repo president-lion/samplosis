@@ -60,7 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <windows.h>
+#include "plat.h"
 #include "sf2.h"
 
 #define EXS_MAX_FILE (64u << 20)
@@ -363,7 +363,7 @@ static void search(X *x, const Keys *t, const wchar_t *dir, const wchar_t *skip,
   folder[0] = 0;
   for (e = dir + L - 1; e > dir && e[-1] != L'\\'; e--) {}
   if (L > 1) { size_t k = (size_t)(dir + L - 1 - e); if (k < MAX_PATH) { wmemcpy(folder, e, k); folder[k] = 0; } }
-  _snwprintf(pat, WP - 1, L"%s*", dir); pat[WP - 1] = 0;
+  _snwprintf(pat, WP - 1, L"%ls*", dir); pat[WP - 1] = 0;
   h = FindFirstFileExW(pat, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
   if (h == INVALID_HANDLE_VALUE) return;
   /* the files first, so a folder's own samples count before its subfolders' */
@@ -382,7 +382,7 @@ static void search(X *x, const Keys *t, const wchar_t *dir, const wchar_t *skip,
         if ((pass == 1 && !t->k[k].noext) || wcscmp(t->k[k].k, lw)) continue;
         if (!s->path || (s->depth == level && !s->hinted)) {
           wchar_t full[WP];
-          if (_snwprintf(full, WP - 1, L"%s%s", dir, fd.cFileName) < 0) continue;
+          if (_snwprintf(full, WP - 1, L"%ls%ls", dir, fd.cFileName) < 0) continue;
           full[WP - 1] = 0;
           found(x, s, full, folder, level);
         }
@@ -396,7 +396,7 @@ static void search(X *x, const Keys *t, const wchar_t *dir, const wchar_t *skip,
     wchar_t sub[WP];
     if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
     if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-    if (_snwprintf(sub, WP - 1, L"%s%s\\", dir, fd.cFileName) < 0) continue;
+    if (_snwprintf(sub, WP - 1, L"%ls%ls\\", dir, fd.cFileName) < 0) continue;
     sub[WP - 1] = 0;
     if (skip && ieq_w(sub, skip)) continue;
     search(x, t, sub, NULL, level, depth + 1);
@@ -436,7 +436,7 @@ static void find_samples(X *x) {
     if (!n[0]) continue;
     dirs[0] = prev; dirs[1] = x->dir;
     for (k = 0; k < 2 && !s->path; k++) {
-      if (!dirs[k][0] || _snwprintf(full, WP - 1, L"%s%s", dirs[k], n) < 0) continue;
+      if (!dirs[k][0] || _snwprintf(full, WP - 1, L"%ls%ls", dirs[k], n) < 0) continue;
       full[WP - 1] = 0;
       if (exists_file(full)) {
         wchar_t *sl;

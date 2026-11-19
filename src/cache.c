@@ -2,7 +2,7 @@
    engine's decoded samples: the header says how many channels). Version 2 files hold int16 mono instead: a decoded
    SF2Pack's sample data, and a SoundFont engine's decoded sample whose values are all exact 16-bit ones (a 16-bit
    source), which halves its size. */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +64,7 @@ static int dir_w(wchar_t *out, int cap) {
 static int file_w(uint64_t key, const wchar_t *ext, wchar_t *out, int cap) {
   if (!dir_w(out, cap)) return 0;
   size_t n = wcslen(out);
-  swprintf(out + n, cap - n, L"\\%016llx%s", (unsigned long long)key, ext);
+  swprintf(out + n, cap - n, L"\\%016llx%ls", (unsigned long long)key, ext);
   return 1;
 }
 
@@ -322,7 +322,7 @@ static void trim_parts(const wchar_t *dir) {
   WIN32_FIND_DATAW fd;
   FILETIME now; uint64_t t, hour = 3600ULL * 10000000ULL;
   HANDLE f;
-  swprintf(pat, 1200, L"%s\\*.part", dir);
+  swprintf(pat, 1200, L"%ls\\*.part", dir);
   f = FindFirstFileW(pat, &fd);
   if (f == INVALID_HANDLE_VALUE) return;
   GetSystemTimeAsFileTime(&now);
@@ -330,7 +330,7 @@ static void trim_parts(const wchar_t *dir) {
   do {
     uint64_t w = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
     if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || w + hour > t) continue;
-    swprintf(fn, 1200, L"%s\\%s", dir, fd.cFileName);
+    swprintf(fn, 1200, L"%ls\\%ls", dir, fd.cFileName);
     DeleteFileW(fn);
   } while (FindNextFileW(f, &fd));
   FindClose(f);
@@ -361,13 +361,13 @@ static uint64_t dir_bytes(const wchar_t *d) {
   WIN32_FIND_DATAW fd;
   uint64_t total = 0;
   HANDLE f;
-  swprintf(pat, 1300, L"%s\\*", d);
+  swprintf(pat, 1300, L"%ls\\*", d);
   if ((f = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 0;
   do {
     if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-      swprintf(sub, 1300, L"%s\\%s", d, fd.cFileName);
+      swprintf(sub, 1300, L"%ls\\%ls", d, fd.cFileName);
       total += dir_bytes(sub);
     } else total += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
   } while (FindNextFileW(f, &fd));
@@ -380,11 +380,11 @@ int smp_cache_delete_tree(const wchar_t *d) {
   wchar_t pat[1300], sub[1300];
   WIN32_FIND_DATAW fd;
   HANDLE f;
-  swprintf(pat, 1300, L"%s\\*", d);
+  swprintf(pat, 1300, L"%ls\\*", d);
   if ((f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
     do {
       if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-      swprintf(sub, 1300, L"%s\\%s", d, fd.cFileName);
+      swprintf(sub, 1300, L"%ls\\%ls", d, fd.cFileName);
       if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         smp_cache_delete_tree(sub);
       else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(sub);
@@ -401,7 +401,7 @@ static int dslib_items(const wchar_t *dir, Item **items, size_t *n, size_t *cap,
   WIN32_FIND_DATAW fd;
   FILETIME now; uint64_t t, hour = 3600ULL * 10000000ULL;
   HANDLE f;
-  swprintf(pat, 1200, L"%s\\dslib\\*", dir);
+  swprintf(pat, 1200, L"%ls\\dslib\\*", dir);
   if ((f = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 1;
   GetSystemTimeAsFileTime(&now);
   t = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
@@ -409,7 +409,7 @@ static int dslib_items(const wchar_t *dir, Item **items, size_t *n, size_t *cap,
     uint64_t w = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
     size_t L = wcslen(fd.cFileName);
     if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
-    swprintf(d, 1300, L"%s\\dslib\\%s", dir, fd.cFileName);
+    swprintf(d, 1300, L"%ls\\dslib\\%ls", dir, fd.cFileName);
     if (L > 5 && !_wcsicmp(fd.cFileName + L - 5, L".part")) { if (w + hour <= t) smp_cache_delete_tree(d); continue; }
     if (L != 16) continue;
     if (*n == *cap) {
@@ -438,7 +438,7 @@ uint64_t smp_cache_trim(uint64_t limit) {
   uint64_t total = 0, pinned = 0; /* open files are never deleted and do not count against the limit */
   WIN32_FIND_DATAW fd;
   for (pass = 0; pass < 3; pass++) {
-    swprintf(pat, 1200, L"%s\\*%s", dir, kinds[pass]);
+    swprintf(pat, 1200, L"%ls\\*%ls", dir, kinds[pass]);
     HANDLE f = FindFirstFileW(pat, &fd);
     if (f == INVALID_HANDLE_VALUE) continue;
     do {
@@ -472,7 +472,7 @@ uint64_t smp_cache_trim(uint64_t limit) {
       static volatile LONG tn;
       if (!trash && !(trash = malloc(n * sizeof *trash))) continue;
       if (!smp_cache_dslib_path(items[i].key, fn, 1200)) continue;
-      swprintf(trash[ntrash], 1300, L"%s.%lu.%lu.%ld.part", fn, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&tn));
+      swprintf(trash[ntrash], 1300, L"%ls.%lu.%lu.%ld.part", fn, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&tn));
       if (MoveFileExW(fn, trash[ntrash], 0)) { ntrash++; total -= items[i].size; }
       continue;
     }
@@ -493,7 +493,7 @@ int smp_cache_ok(char *why, int cap) {
   smp_settings_get(&s);
   if (dir_w(dir, 1100)) {
     make_dirs(dir);   /* a probe name of its own: instances checking at once never collide */
-    swprintf(probe, 1200, L"%s\\.probe.%lu.%lu.%ld", dir, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
+    swprintf(probe, 1200, L"%ls\\.probe.%lu.%lu.%ld", dir, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
     HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return 1; }
     DWORD a = GetFileAttributesW(dir);
@@ -507,7 +507,7 @@ uint64_t smp_cache_used_bytes(void) {
   WIN32_FIND_DATAW fd;
   uint64_t total = 0;
   if (!dir_w(dir, 1100)) return 0;
-  swprintf(pat, 1200, L"%s\\*.smpc", dir);
+  swprintf(pat, 1200, L"%ls\\*.smpc", dir);
   HANDLE f = FindFirstFileW(pat, &fd);
   if (f != INVALID_HANDLE_VALUE) {
     do {
@@ -515,12 +515,12 @@ uint64_t smp_cache_used_bytes(void) {
     } while (FindNextFileW(f, &fd));
     FindClose(f);
   }
-  swprintf(pat, 1200, L"%s\\dslib\\*", dir);         /* unpacked bundles (not their .part folders) */
+  swprintf(pat, 1200, L"%ls\\dslib\\*", dir);         /* unpacked bundles (not their .part folders) */
   if ((f = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
     wchar_t d[1300];
     do {
       if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || wcslen(fd.cFileName) != 16) continue;
-      swprintf(d, 1300, L"%s\\dslib\\%s", dir, fd.cFileName);
+      swprintf(d, 1300, L"%ls\\dslib\\%ls", dir, fd.cFileName);
       total += dir_bytes(d);
     } while (FindNextFileW(f, &fd));
     FindClose(f);

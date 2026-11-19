@@ -2,7 +2,7 @@
    keep_tone on|off, ffmpeg_path, raw_rate, raw_channels 1|2, raw_format s16|s24|s32|f32|u8, raw_endian little|big).
    Reloaded when the file's last-write time changes. Words read in any case; a value that doesn't read keeps the
    default. */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +18,15 @@ static BOOL CALLBACK init_cs(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p
 
 static void defaults(SmpSettings *s) {
   memset(s, 0, sizeof *s);
+#ifdef _WIN32
   strcpy(s->cache_dir, "D:\\samplosis\\cache");
+#else
+  {   /* the Mac's place for files an app can make again */
+    const char *h = getenv("HOME");
+    if (h && strlen(h) + 40 < sizeof s->cache_dir) snprintf(s->cache_dir, sizeof s->cache_dir, "%s/Library/Caches/Samplosis", h);
+    else strcpy(s->cache_dir, "/tmp/Samplosis");
+  }
+#endif
   s->cache_limit_gb = 10;
   s->raw_rate = 44100; s->raw_channels = 2; s->raw_format = SMP_RAW_S16; s->raw_endian = SMP_RAW_LITTLE;
 }

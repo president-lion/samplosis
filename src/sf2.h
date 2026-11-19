@@ -3,7 +3,7 @@
 #ifndef SF2_H
 #define SF2_H
 #include <stdint.h>
-#include <windows.h>
+#include "plat.h"
 #include "samplosis.h"
 #include "sfknob.h"
 

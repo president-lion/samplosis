@@ -28,12 +28,16 @@
 
    Called from the main thread or worker threads (the sampler's loader), never from the audio thread: it allocates,
    reads the disk and waits. Files only, never bytes in memory (decode_memory doesn't come here). */
-#define COBJMACROS
-#include <windows.h>
+#define COBJMACROS                 /* before windows.h, as it always was */
+#include "plat.h"
+#ifdef _WIN32
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#else
+#include <AudioToolbox/AudioToolbox.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +51,7 @@ void smp_mf_set_test_flags(long f) { InterlockedExchange(&test_flags, (LONG)f); 
 static volatile LONG helpers;                      /* helper threads still running, for the tests */
 SMP_API long smp_test_only_mf_helpers(void) { return InterlockedCompareExchange(&helpers, 0, 0); }
 
+#ifdef _WIN32
 /* Media Foundation, started once per process when it can be; a failure is tried again next time. mf_state: 0 not
    started (or failed), 1 a helper is starting it, 2 started. */
 enum { MF_IDLE, MF_STARTING, MF_STARTED };
@@ -256,6 +261,8 @@ static DWORD WINAPI helper(void *arg) {
   FreeLibraryAndExitThread(st.self, 0);            /* drops this helper's hold on the DLL; never returns */
 }
 
+#endif  /* _WIN32 */
+
 /* MPEG-4 boxes, for the edit list: big-endian sizes, a box is size (4), type (4), then its payload; size 1 means a
    64-bit size follows, size 0 means to the end */
 static uint32_t rd32(const unsigned char *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -315,6 +322,7 @@ SMP_API int smp_test_only_mp4_edit(const unsigned char *b, size_t len, double *s
   return smp_mp4_edit(b, len, start, dur);
 }
 
+#ifdef _WIN32
 int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats, unsigned *ch, unsigned *sr,
                   int *trimmed, int (*cancel)(void *), void *arg, char *err, int cap) {
   Job *j; Start *st = NULL; HANDLE t = NULL; HMODULE self = NULL; int n, res; LONG seen = 0;
@@ -377,3 +385,70 @@ int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats
   job_free(j);
   return res;
 }
+
+#else  /* macOS: Core Audio's ExtAudioFile */
+
+/* The Mac's own decoders read AAC, Apple Lossless, CAF and the other formats Core Audio knows. Core Audio applies an
+   MPEG-4 file's start delay and edit list itself, so a decode reports trimmed and the caller doesn't apply them again.
+   The file is local, so this runs on the calling thread, asking cancel between pieces. */
+int smp_mf_decode(const char *path, size_t max_floats, float **x, size_t *floats, unsigned *ch, unsigned *sr,
+                  int *trimmed, int (*cancel)(void *), void *arg, char *err, int cap) {
+  CFURLRef url;
+  ExtAudioFileRef af = NULL;
+  AudioStreamBasicDescription in, out;
+  UInt32 sz = sizeof in;
+  float *buf = NULL; size_t n = 0, have = 0;
+  int res = SMP_MF_OK;
+  *x = NULL; *floats = 0; *ch = 0; *sr = 0; *trimmed = 0;
+  url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+  if (!url) return SMP_MF_NOT_MINE;
+  OSStatus st = ExtAudioFileOpenURL(url, &af);
+  CFRelease(url);
+  if (st != noErr || !af) return SMP_MF_NOT_MINE;
+  if (ExtAudioFileGetProperty(af, kExtAudioFileProperty_FileDataFormat, &sz, &in) != noErr ||
+      in.mChannelsPerFrame < 1 || in.mSampleRate < 1) {
+    ExtAudioFileDispose(af);
+    return SMP_MF_NOT_MINE;
+  }
+  memset(&out, 0, sizeof out);
+  out.mSampleRate = in.mSampleRate;
+  out.mFormatID = kAudioFormatLinearPCM;
+  out.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+  out.mChannelsPerFrame = in.mChannelsPerFrame;
+  out.mBitsPerChannel = 32;
+  out.mBytesPerFrame = out.mBytesPerPacket = 4 * out.mChannelsPerFrame;
+  out.mFramesPerPacket = 1;
+  if (ExtAudioFileSetProperty(af, kExtAudioFileProperty_ClientDataFormat, sizeof out, &out) != noErr) {
+    ExtAudioFileDispose(af);
+    snprintf(err, (size_t)cap, "macOS has no decoder for its sound");
+    return SMP_MF_FAILED;
+  }
+  for (;;) {
+    enum { PIECE = 32768 };
+    size_t want = (size_t)PIECE * out.mChannelsPerFrame;
+    if (cancel && cancel(arg)) { snprintf(err, (size_t)cap, "cancelled"); res = SMP_MF_STOPPED; break; }
+    if (n + want > have) {
+      size_t nh = have ? have * 2 : want * 4;
+      while (nh < n + want) nh *= 2;
+      float *nb = realloc(buf, nh * sizeof(float));
+      if (!nb) { snprintf(err, (size_t)cap, "out of memory"); res = SMP_MF_FAILED; break; }
+      buf = nb; have = nh;
+    }
+    AudioBufferList bl;
+    bl.mNumberBuffers = 1;
+    bl.mBuffers[0].mNumberChannels = out.mChannelsPerFrame;
+    bl.mBuffers[0].mDataByteSize = (UInt32)(want * sizeof(float));
+    bl.mBuffers[0].mData = buf + n;
+    UInt32 frames = PIECE;
+    if (ExtAudioFileRead(af, &frames, &bl) != noErr) { snprintf(err, (size_t)cap, "macOS couldn't decode it (it may be damaged)"); res = SMP_MF_FAILED; break; }
+    if (!frames) break;
+    n += (size_t)frames * out.mChannelsPerFrame;
+    if (n > max_floats) { res = SMP_MF_TOO_LONG; break; }
+  }
+  ExtAudioFileDispose(af);
+  if (res == SMP_MF_OK && !n) { snprintf(err, (size_t)cap, "it has no sound"); res = SMP_MF_FAILED; }
+  if (res != SMP_MF_OK) { free(buf); return res; }
+  *x = buf; *floats = n; *ch = out.mChannelsPerFrame; *sr = (unsigned)(out.mSampleRate + 0.5); *trimmed = 1;
+  return SMP_MF_OK;
+}
+#endif

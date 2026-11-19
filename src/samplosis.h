@@ -4,7 +4,14 @@
 #ifdef _WIN32
 #define SMP_API __declspec(dllexport)
 #else
-#define SMP_API
+#define SMP_API __attribute__((visibility("default")))
+/* MSVC's __declspec(thread) and __declspec(dllexport), as clang and GCC spell them */
+#ifndef __declspec
+#define __declspec(x) SMP_DECLSPEC_##x
+#define SMP_DECLSPEC_thread __thread
+#define SMP_DECLSPEC_dllexport __attribute__((visibility("default")))
+#define SMP_DECLSPEC_noinline __attribute__((noinline))
+#endif
 #endif
 #ifdef __cplusplus
 extern "C" {

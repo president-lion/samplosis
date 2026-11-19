@@ -24,9 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "plat.h"
 #define DR_WAV_IMPLEMENTATION
 #define DR_FLAC_IMPLEMENTATION
 #define DR_MP3_IMPLEMENTATION
@@ -101,7 +99,13 @@ static unsigned char *slurp(const char *path, size_t *len) {
   wchar_t w[2048];
   if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048)) fp = _wfopen(w, L"rb");
 #else
-  fp = fopen(path, "rb");
+  {   /* paths the shared code built Windows-style ("dir\\name") */
+    char *q = strdup(path);
+    if (!q) return NULL;
+    for (char *c = q; *c; c++) if (*c == '\\') *c = '/';
+    fp = fopen(q, "rb");
+    free(q);
+  }
 #endif
   if (!fp) return NULL;
   _fseeki64(fp, 0, SEEK_END); n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET);

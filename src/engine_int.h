@@ -1,7 +1,7 @@
 /* Shared by engine.c and stream.c: the engine and voice structs and the play path. Not part of the API. */
 #ifndef SMP_ENGINE_INT_H
 #define SMP_ENGINE_INT_H
-#include <windows.h>
+#include "plat.h"
 #include <stdint.h>
 #include "samplosis.h"
 

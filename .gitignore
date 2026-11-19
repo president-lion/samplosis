@@ -11,3 +11,7 @@ __pycache__/
 *.dll
 *.log
 tests/host.exe
+
+# macOS build
+build/
+.DS_Store
