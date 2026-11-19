@@ -1294,3 +1294,31 @@ def test_ffmpeg_ends_while_pipe_held(lib, tmp_path):
     lib.smp_sample_free(s)
     assert secs < 5, secs
     assert pids_running(d) == (0, 3)                              # ffprobe, ffmpeg, and its orphan (killed)
+
+
+@need_ffmpeg
+def test_foreign_formats_skip_the_built_in_decoders(lib, tmp_path):
+    # An AU file (or DTS, AC-3, Matroska and others the built-in decoders don't read) whose audio happens to hold
+    # MPEG frame syncs: before, dr_mp3 skipped the header and "read" a few frames, a sample of noise a fraction of
+    # a second long, and the system decoder or FFmpeg never saw the file. Now the first bytes send it straight
+    # there: the AU loads at its full length (16-bit mono PCM), or, on a machine where nothing reads it, not at all.
+    point_cache(lib, tmp_path / "cache")
+    w = tmp_path / "src.wav"
+    write_wav(w, two_tones(44100), 44100)
+    m = tmp_path / "x.mp3"
+    ffmpeg("-i", w, "-c:a", "libmp3lame", "-id3v2_version", "0", "-write_xing", "0", m)
+    body = m.read_bytes()
+    body = body[:len(body) & ~1]
+    au = tmp_path / "x.au"
+    au.write_bytes(struct.pack(">4sIIIII", b".snd", 24, len(body), 3, 44100, 1) + body)
+    s, err = load(lib, au)
+    if s:
+        assert s.contents.by != 0, "a built-in decoder took the AU file"
+        assert s.contents.frames == len(body) // 2, (s.contents.frames, len(body) // 2)
+        lib.smp_sample_free(s)
+    dts = tmp_path / "x.dts"
+    dts.write_bytes(b"\x7f\xfe\x80\x01" + body)
+    s, err = load(lib, dts)
+    if s:
+        assert s.contents.by != 0, "a built-in decoder took the DTS file"
+        lib.smp_sample_free(s)

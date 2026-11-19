@@ -4,8 +4,9 @@
 
    The text. Comments (// to the line's end and block comments) are blanked first. #define $NAME value is a textual
    replacement on every later line (a value may use earlier defines, expanded when it is defined); #include "file"
-   reads another file in place, relative to the including file, at most 16 deep, never one already being read (so a
-   cycle stops), at most 4096 includes and 64 MB of text in all. Headers are <control>, <global>, <master>,
+   reads another file in place, relative to the root .sfz's folder (as sfizz and ARIA read it) or, when it isn't
+   there, to the including file's, at most 16 deep, never one already being read (so a cycle stops), at most 4096
+   includes and 64 MB of text in all. Headers are <control>, <global>, <master>,
    <group> and <region>, inheriting in that order (a <global> starts the master and group again from it, a
    <master> the group, and each <region> starts from the group); <curve>, <effect> and <midi> are read past (their
    opcodes do nothing here). An opcode is name=value, and a value runs to the next name= or header or the line's
@@ -445,6 +446,10 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
     double d; if (num(v, &d)) p->cc_init[cc] = (int16_t)clampi((int)floor(d + 0.5), 0, 127);
     return 1;
   }
+  if ((cc = cc_suffix(nm, "set_hdcc")) >= 0) {  /* the same as a fraction, 0 to 1 (SFZ v2, ARIA) */
+    double d; if (num(v, &d)) p->cc_init[cc] = (int16_t)clampi((int)floor(d * 127 + 0.5), 0, 127);
+    return 1;
+  }
   for (i = 0; i < (int)(sizeof T / sizeof *T); i++)
     if ((cc = cc_suffix(nm, T[i].prefix)) >= 0) { add_ccm(p, o, nm, cc, T[i].target, v); return 1; }
   return 0;
@@ -637,7 +642,7 @@ static void control_opcode(P *p, const char *nm, const char *v) {
     int k; if (inum(v, &k)) p->note_offset = clampi(k, -127, 127);
   } else if (!strcmp(nm, "octave_offset")) {
     int k; if (inum(v, &k)) p->octave_offset = clampi(k, -10, 10);
-  } else if (cc_suffix(nm, "set_cc") >= 0) {
+  } else if (cc_suffix(nm, "set_cc") >= 0 || cc_suffix(nm, "set_hdcc") >= 0) {
     cc_opcode(p, NULL, nm, v);
   } else if (!label(nm)) {
     ignored(p, nm);
@@ -1779,28 +1784,30 @@ static void include(P *p, const char *s, size_t n, const wchar_t *dir, int depth
   for (k = 0; name[k]; k++) if (name[k] == '/') name[k] = '\\';
   if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, rel, WPATH) &&
       !MultiByteToWideChar(CP_ACP, 0, name, -1, rel, WPATH)) return;
-  if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') { if (wcslen(rel) >= WPATH) return; wcscpy(w, rel); }
-  else if (_snwprintf(w, WPATH - 1, L"%ls%ls", dir, rel) < 0) return;   /* too long: never cut short */
-  w[WPATH - 1] = 0;
-  fn = GetFullPathNameW(w, WPATH, full, NULL);
-  if (!fn || fn >= WPATH) return;
+  if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') {
+    if (wcslen(rel) >= WPATH) return;
+    wcscpy(w, rel);
+    fn = GetFullPathNameW(w, WPATH, full, NULL);
+    if (!fn || fn >= WPATH) return;
+  } else {                       /* relative: from the root .sfz's folder (as sfizz and ARIA read it), else from the
+                                    including file's */
+    const wchar_t *from[2] = {p->root_dir, dir};
+    for (k = 0; k < 2; k++) {
+      if (k == 1 && !wcscmp(dir, p->root_dir)) return;   /* the same folder: already tried */
+      if (_snwprintf(w, WPATH - 1, L"%ls%ls", from[k], rel) < 0) continue;   /* too long: never cut short */
+      w[WPATH - 1] = 0;
+      fn = GetFullPathNameW(w, WPATH, full, NULL);
+      if (!fn || fn >= WPATH) continue;
+      if (GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) break;
+    }
+    if (k == 2) return;          /* in neither: a missing include is skipped */
+  }
   process_file(p, full, depth + 1, why, (int)sizeof why);   /* a missing or bad include is skipped */
 }
 
-/* one line (n bytes, no newline): a directive, or headers and opcodes */
-static void do_line(P *p, const char *s, size_t n, const wchar_t *dir, int depth) {
+/* the headers and opcodes of a line, or of a part of one between #include directives (expanded already) */
+static void opcodes(P *p, const char *s, size_t n) {
   size_t i = 0;
-  while (i < n && ws(s[i])) i++;
-  if (i < n && s[i] == '#') {
-    if (n - i >= 7 && !memcmp(s + i, "#define", 7)) { define(p, s + i + 7, n - i - 7); return; }
-    if (n - i >= 8 && !memcmp(s + i, "#include", 8)) {
-      size_t m = p->ndef ? expand(p, s + i + 8, n - i - 8, p->line, MAX_LINE) : n - i - 8;
-      include(p, p->ndef ? p->line : s + i + 8, m, dir, depth);
-      return;
-    }
-  }
-  if (p->ndef && memchr(s, '$', n)) { n = expand(p, s, n, p->line, MAX_LINE); s = p->line; }
-  i = 0;
   while (i < n && !p->oom) {
     size_t a, nn, vs, ve;
     while (i < n && ws(s[i])) i++;
@@ -1833,6 +1840,50 @@ static void do_line(P *p, const char *s, size_t n, const wchar_t *dir, int depth
     for (ve = i; ve > vs && ws(s[ve - 1]); ve--) {}
     if (nn) opcode_at(p, s + a, nn, s + vs, ve - vs);
   }
+}
+
+/* where the next #define or #include starts (at the line's start or after a space or a header's '>'), or n */
+static size_t next_directive(const char *s, size_t n, size_t from) {
+  size_t k;
+  for (k = from; k + 7 <= n; k++)
+    if (s[k] == '#' && (k == 0 || ws(s[k - 1]) || s[k - 1] == '>') &&
+        (!memcmp(s + k, "#define", 7) || (k + 8 <= n && !memcmp(s + k, "#include", 8)))) return k;
+  return n;
+}
+
+/* one line (n bytes, no newline): headers, opcodes, #define and #include in any mix, read left to right as sfizz
+   reads them: "<group> #include "x.txt" lovel=1", or "#define $a 1  #define $b 2". A #define's value runs to the
+   next directive or the line's end; an #include's name is "quoted" or runs to the next space. Each part is expanded
+   with the defines made before it. */
+static void do_line(P *p, const char *s, size_t n, const wchar_t *dir, int depth) {
+  size_t a, q, e, m; char *c;
+  if (next_directive(s, n, 0) == n) {               /* the usual line: no directives */
+    if (p->ndef && memchr(s, '$', n)) { n = expand(p, s, n, p->line, MAX_LINE); s = p->line; }
+    opcodes(p, s, n);
+    return;
+  }
+  if (!(c = malloc(n))) { p->oom = 1; return; }   /* a copy: expanding and an include's own lines use p->line */
+  memcpy(c, s, n);
+  for (a = 0; a < n && !p->oom && !cancelled(p); a = e) {
+    q = next_directive(c, n, a);
+    if (q > a) {                                    /* headers and opcodes before it */
+      if (p->ndef && memchr(c + a, '$', q - a)) { m = expand(p, c + a, q - a, p->line, MAX_LINE); opcodes(p, p->line, m); }
+      else opcodes(p, c + a, q - a);
+    }
+    if (q == n) break;
+    if (c[q + 1] == 'd') {                          /* #define: to the next directive */
+      e = next_directive(c, n, q + 7);
+      define(p, c + q + 7, e - q - 7);
+      continue;
+    }
+    e = q + 8;                                      /* #include: past the name */
+    while (e < n && ws(c[e])) e++;
+    if (e < n && c[e] == '"') { e++; while (e < n && c[e] != '"') e++; if (e < n) e++; }
+    else while (e < n && !ws(c[e])) e++;
+    if (p->ndef && memchr(c + q + 8, '$', e - q - 8)) { m = expand(p, c + q + 8, e - q - 8, p->line, MAX_LINE); include(p, p->line, m, dir, depth); }
+    else include(p, c + q + 8, e - q - 8, dir, depth);
+  }
+  free(c);
 }
 
 /* comments blanked in place (// to the line's end, block comments), newlines kept */

@@ -438,7 +438,8 @@ static float *vorbis_read(const unsigned char *b, size_t len, unsigned *ch, unsi
   return g.x;
 }
 
-/* the built-in decoders, then the library ones; D_WINDOWS is a container only Windows reads (from a file) */
+/* the built-in decoders, then the library ones; D_WINDOWS is a format only the system decoder (Windows' or the
+   Mac's) or FFmpeg reads, from a file */
 enum { D_NONE, D_WAV, D_FLAC, D_VORBIS, D_MP3, D_CAF, D_OPUS, D_WAVPACK, D_APE, D_WINDOWS };
 #define D_IS_LIBRARY(d) ((d) >= D_OPUS && (d) <= D_APE)
 
@@ -452,6 +453,27 @@ static int is_ogg_opus(const unsigned char *b, size_t len) {
 
 /* which decoder the first bytes ask for, or D_NONE. strict: container magics only (a raw file's first bytes can
    look like an MPEG frame sync or "ID3" by chance) */
+/* The first bytes of formats only the system decoder or FFmpeg read. Without this the built-in decoders are tried on
+   them in turn, and dr_mp3, which skips to the first thing that looks like an MPEG frame, "reads" a few frames of
+   noise from an AU or DTS file's audio: a sample a fraction of a second long, and the right decoder never tried. */
+static int foreign(const unsigned char *b, size_t len) {
+  static const struct { const char *m; unsigned char n, at; } k[] = {
+    {".snd", 4, 0},                                        /* AU */
+    {"\x7F\xFE\x80\x01", 4, 0}, {"\xFE\x7F\x01\x80", 4, 0},       /* DTS, 16-bit words either byte order */
+    {"\x1F\xFF\xE8\x00", 4, 0}, {"\xFF\x1F\x00\xE8", 4, 0},       /* DTS, 14-bit words */
+    {"\x64\x58\x20\x25", 4, 0},                             /* DTS-HD substream */
+    {"\x0B\x77", 2, 0}, {"\x77\x0B", 2, 0},                  /* AC-3 and E-AC-3 */
+    {"\xF8\x72\x6F\xBA", 4, 4}, {"\xF8\x72\x6F\xBB", 4, 4},   /* TrueHD, MLP */
+    {"Creative Voice File", 19, 0}, {"TTA1", 4, 0}, {"MPCK", 4, 0}, {"MP+", 3, 0},
+    {"\x1A\x45\xDF\xA3", 4, 0},                             /* Matroska and WebM */
+    {"DSD ", 4, 0}, {"FRM8", 4, 0},                         /* DSF, DFF */
+    {"ajkg", 4, 0},                                         /* Shorten */
+  };
+  for (unsigned i = 0; i < sizeof k / sizeof *k; i++)
+    if (len >= (size_t)k[i].at + k[i].n && !memcmp(b + k[i].at, k[i].m, k[i].n)) return 1;
+  return 0;
+}
+
 static int sniff(const unsigned char *b, size_t len, int strict) {
   static const unsigned char w64[16] = {'r', 'i', 'f', 'f', 0x2E, 0x91, 0xCF, 0x11, 0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00};
   static const unsigned char asf[16] = {0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
@@ -467,6 +489,7 @@ static int sniff(const unsigned char *b, size_t len, int strict) {
   if ((len >= 12 && !memcmp(b + 4, "ftyp", 4)) || (len >= 16 && !memcmp(b, asf, 16)) || (len >= 6 && !memcmp(b, "#!AMR", 5)))
     return D_WINDOWS;                                       /* MPEG-4 and 3GP, ASF (WMA), AMR */
   if (strict) return D_NONE;
+  if (foreign(b, len)) return D_WINDOWS;                   /* a format the built-in decoders don't read */
   if (len >= 10 && !memcmp(b, "ID3", 3)) {                 /* an ID3 tag first: FLAC, Monkey's Audio or MP3 after it */
     size_t skip = 10 + ((size_t)(b[6] & 127) << 21 | (size_t)(b[7] & 127) << 14 | (size_t)(b[8] & 127) << 7 | (b[9] & 127));
     if (b[5] & 0x10) skip += 10;

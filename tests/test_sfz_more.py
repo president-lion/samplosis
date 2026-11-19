@@ -210,3 +210,54 @@ def test_sfz_hinted_sample_jumps_the_queue(lib, tmp_path):
     finally:
         lib.smp_sf_test_pause(0)
         lib.smp_sf_close(f)
+
+
+def test_sfz_directives_anywhere_and_root_relative_includes(lib, tmp_path):
+    """As sfizz reads them (DrumGizmo's and Salamander's SFZ conversions are laid out this way): #include and
+    #define anywhere on a line and more than one to a line ("<group> #include "x.txt" lovel=1", "#define $a 1
+    #define $b 2"), each part expanded with the defines made before it; an include's path is from the root .sfz's
+    folder, and from the including file's when it isn't there."""
+    kit = tmp_path / "kit"
+    for d in ("Stereo", "Data/multi", "Data/inc", "Samples"):
+        (kit / d).mkdir(parents=True)
+    write_wav(kit / "Samples" / "a.wav", sine(RATE // 2, 440.0))
+    (kit / "Data" / "macro.txt").write_text("#define $lo 1        #define $hi 64\n#define $k 62\n")
+    (kit / "Data" / "region.txt").write_text("<region> sample=../Samples/a.wav key=$k\n")
+    # from the root's folder (Stereo/..): Data/multi/../Data/region.txt wouldn't exist
+    (kit / "Data" / "multi" / "group.txt").write_text('<group> #include "../Data/region.txt" lovel=$lo hivel=$hi\n')
+    # from the including file's folder: Stereo/near.txt doesn't exist, Data/inc/near.txt does
+    (kit / "Data" / "inc" / "far.txt").write_text('#include "near.txt"\n')
+    (kit / "Data" / "inc" / "near.txt").write_text("<region> sample=../Samples/a.wav key=70\n")
+    path = write_sfz(kit / "Stereo" / "kit.sfz",
+                     '#include "../Data/macro.txt" #include "../Data/multi/group.txt"\n'
+                     '<group> #include "../Data/inc/far.txt"\n')
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.lokey, x.hikey, x.lovel, x.hivel) for x in r] == [(62, 62, 1, 64), (70, 70, 0, 127)]
+        assert lib.smp_sf_problem(f) == b""
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_set_hdcc(lib, tmp_path):
+    """set_hdccN is set_ccN as a fraction (0 to 1, of 127): 0.5 is 64, so a region gated on 60..70 plays; 0.2 is 25,
+    and it doesn't."""
+    write_wav(tmp_path / "a.wav", sine(RATE, 440.0))
+    lvl = []
+    for v in ("0.5", "0.2"):
+        path = write_sfz(tmp_path / ("h%s.sfz" % v), """
+<control> set_hdcc24=%s
+<region> sample=a.wav key=60 pitch_keycenter=60 locc24=60 hicc24=70 amp_veltrack=0
+""" % v)
+        f = opened(lib, path)
+        try:
+            assert ignored(lib, f)[0] == 0
+        finally:
+            lib.smp_sf_close(f)
+        p = Player(lib, tmp_path, path)
+        try:
+            lvl.append(rms(p.render([on(60, 100, 0)], 0.3)[4800:]))
+        finally:
+            p.free()
+    assert lvl[0] > 0.1 and lvl[1] < 1e-6, lvl

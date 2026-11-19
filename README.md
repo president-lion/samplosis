@@ -392,6 +392,9 @@ not its name, so a misnamed file still loads.
    still be read by FFmpeg. FFmpeg runs hidden at below-normal priority; if it sends nothing for 60 seconds it is
    stopped and the status says "FFmpeg took too long to decode it". Without FFmpeg, a file only it could read says
    "FFmpeg isn't installed; this format needs it".
+   The formats of this stage and the last that the first bytes tell apart (AU, DTS, AC-3 and E-AC-3, MLP and TrueHD,
+   VOC, TTA, Musepack, Matroska and WebM, DSF, DFF and Shorten) skip the built-in decoders, so the MP3 decoder can't
+   mistake a few bytes of their audio for MPEG frames and load a fraction of a second of noise.
 
 Browse and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
 .rf64 .caf .raw .pcm .opus .wv .ape .m4a .aac .mp4 .wma .ac3 .amr .3gp .alac .dsf .dff .tta .mka .webm .au .snd
@@ -415,7 +418,9 @@ The file's first bytes choose the reader, then its name.
   libgig. Uncompressed waves stream from the file; compressed ones are decoded once into the cache. Velocity,
   layer, keyswitch, round robin, random, release trigger, stereo and controller dimensions are mapped, with EG1,
   EG2, the filter and the three LFOs.
-- SFZ (.sfz, text): read by Samplosis, with #include and #define, default_path, note_offset and octave_offset. Each
+- SFZ (.sfz, text): read by Samplosis, with #include and #define (anywhere on a line and several to a line, as
+  sfizz reads them; an included file's path is from the main .sfz's folder, or from the including file's when it
+  isn't there), set_cc and set_hdcc, default_path, note_offset and octave_offset. Each
   sample file is a sound file of any format above: WAV and AIFF stream from the file, others are decoded once into
   the cache. Round robins, random layers, keyswitches, CC ranges, crossfades, release triggers (with rt_decay),
   groups and off_by, polyphony, envelopes, filters, LFOs and bend ranges play.
