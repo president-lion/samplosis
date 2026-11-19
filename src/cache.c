@@ -94,7 +94,7 @@ static int write_file(uint64_t key, const void *data, uint64_t bytes, uint64_t f
   wchar_t dir[1100], part[1200], fin[1200];
   static volatile LONG counter;
   wchar_t ext[64];
-  swprintf(ext, 64, L".%lu.%lu.%ld.part", GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
+  swprintf(ext, 64, L".%lu.%lu.%ld.part", (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), InterlockedIncrement(&counter));
   if (!dir_w(dir, 1100) || !file_w(key, L".smpc", fin, 1200) || !file_w(key, ext, part, 1200)) return 1;
   make_dirs(dir);
   HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -472,7 +472,7 @@ uint64_t smp_cache_trim(uint64_t limit) {
       static volatile LONG tn;
       if (!trash && !(trash = malloc(n * sizeof *trash))) continue;
       if (!smp_cache_dslib_path(items[i].key, fn, 1200)) continue;
-      swprintf(trash[ntrash], 1300, L"%ls.%lu.%lu.%ld.part", fn, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&tn));
+      swprintf(trash[ntrash], 1300, L"%ls.%lu.%lu.%ld.part", fn, (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), InterlockedIncrement(&tn));
       if (MoveFileExW(fn, trash[ntrash], 0)) { ntrash++; total -= items[i].size; }
       continue;
     }
@@ -493,7 +493,7 @@ int smp_cache_ok(char *why, int cap) {
   smp_settings_get(&s);
   if (dir_w(dir, 1100)) {
     make_dirs(dir);   /* a probe name of its own: instances checking at once never collide */
-    swprintf(probe, 1200, L"%ls\\.probe.%lu.%lu.%ld", dir, GetCurrentProcessId(), GetCurrentThreadId(), InterlockedIncrement(&counter));
+    swprintf(probe, 1200, L"%ls\\.probe.%lu.%lu.%ld", dir, (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), InterlockedIncrement(&counter));
     HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return 1; }
     DWORD a = GetFileAttributesW(dir);

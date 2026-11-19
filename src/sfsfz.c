@@ -206,7 +206,7 @@ typedef struct SfzBuild {
   int missing, unreadable; char first_missing[160], first_unreadable[160];
   /* probing: the probe cache read back, share roots given up on */
   Cached *cache; int ncache; int *cslot; int capcslot;
-  int probed;                        /* files probed now (not from the cache) */
+  volatile LONG probed;              /* files probed now (not from the cache) */
   SRWLOCK dead_lock; wchar_t dead[MAX_DEAD][WPATH / 4]; int ndead;
   volatile LONG next_probe;
   int *porder;                       /* the files in probe order: by path, so a cold disk reads them folder by folder */
@@ -1021,7 +1021,7 @@ static void probe(P *p, File *fl) {
     fl->status = F_UNREADABLE;                                  /* empty, or it can't be read */
   }
   CloseHandle(h);
-  if (fl->status == F_OK) InterlockedIncrement((volatile LONG *)&p->probed);
+  if (fl->status == F_OK) InterlockedIncrement(&p->probed);
 }
 
 static DWORD WINAPI probe_worker(void *arg) {
@@ -1180,7 +1180,7 @@ static void pcache_write(P *p, const wchar_t *sfz) {
   }
   memcpy(b, "SFZP", 4);
   { uint32_t v = PCACHE_VERSION; memcpy(b + 4, &v, 4); memcpy(b + 8, &n, 4); }
-  _snwprintf(part, WPATH + 39, L"%ls.%lu.part", path, GetCurrentThreadId());
+  _snwprintf(part, WPATH + 39, L"%ls.%lu.part", path, (unsigned long)GetCurrentThreadId());
   part[WPATH + 39] = 0;
   h = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
   if (h != INVALID_HANDLE_VALUE) {

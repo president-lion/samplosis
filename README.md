@@ -1,7 +1,8 @@
 # Samplosis
 
 An accessible sampler for REAPER, written in C as a CLAP instrument for Windows. The window is made of plain Windows
-controls that NVDA reads as they are.
+controls that NVDA reads as they are. It also runs on macOS, as a CLAP, VST3 and Audio Unit, with a window of native
+Mac controls that VoiceOver reads as they are (see "macOS").
 
 Licence: GPL version 2 (see COPYING). It includes these libraries, each under its own licence:
 
@@ -14,6 +15,8 @@ Licence: GPL version 2 (see COPYING). It includes these libraries, each under it
   BSD); the Monkey's Audio SDK 13.43 (Matthew T. Ashland, 3-clause BSD); yxml (Yoran Heling, MIT), which reads
   Decent Sampler presets; and libgig 4.6.0 (Christian Schoenebeck, GPL version 2 or later, with four small read
   fixes listed in its VERSION.txt), which reads GigaStudio files.
+- On macOS only, fetched when it builds: clap-wrapper (MIT), which makes the VST3 and the Audio Unit from the CLAP,
+  with Steinberg's VST3 SDK (MIT) and Apple's AudioUnitSDK (Apache 2.0).
 
 ## What it does
 
@@ -581,6 +584,67 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
   and deletes it (MEASURE_STREAM_NOTES, _RUNS, _PURGE, _REF, _KEEP and _FEATURES change what it plays; the top of
   measure.py says how); the gig part writes a 2 GB compressed .gig and deletes it; MEASURE_SFZ names a real .sfz to
   try; MEASURE_DLL measures another build (for before-and-after numbers).
+
+## macOS
+
+The same plugin, built for the Mac (Apple silicon and Intel, macOS 11 or later) in three formats from one build:
+Samplosis.clap (REAPER and other CLAP hosts), Samplosis.vst3 (Ableton Live, Cubase, Studio One, REAPER and most
+others) and Samplosis.component (an Audio Unit, for Logic and GarageBand). Pro Tools isn't possible: AAX needs Avid's
+own SDK. Everything in the sampler and the SoundFont player works as it does on Windows; the differences are below.
+
+### Building and installing
+
+It needs the Command Line Tools (`xcode-select --install`) and CMake and Ninja (`brew install cmake ninja`).
+Double-click `build.command` in Finder, or run it in Terminal: it builds the three plugins into build/samplosis_assets,
+signs them for this Mac and copies them to ~/Library/Audio/Plug-Ins (CLAP, VST3 and Components). Close the DAW first,
+or rescan its plugins after. By hand:
+
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
+
+The first build downloads clap-wrapper, the CLAP headers, the VST3 SDK and the AudioUnitSDK. `build/smp_smoke` checks
+the engine (a sample loads, notes play at the right pitch, a keep-length copy renders, an SFZ plays), and
+`build/smp_gui_host build/samplosis_assets/Samplosis.clap [state.txt]` opens the window on its own, without a DAW.
+Validated: Apple's `auval -v aumu Smps AuSk` passes; Steinberg's VST3 validator passes 46 of 47 tests (the one left
+asks the plugin to start at 1234.5678 Hz, which the SoundFont player's reverb and chorus refuse, on Windows too).
+
+### The window on the Mac
+
+The pages, controls, Tab order and words are those of "The window, in Tab order" and the sections after it, with
+these keys:
+
+- Every control has its name for VoiceOver (the label before it); the labels themselves aren't read again.
+- On a slider, VoiceOver reads the value in words, and VoiceOver's own increment and decrement (VO-Up and VO-Down,
+  or a swipe on a trackpad) step it as Up and Down do. Up or Right and Down or Left step it; Shift ten times as far;
+  Option (or Control) a tenth, since Control with the arrows switches desktops on the Mac. Page Up and Page Down
+  (fn-Up and fn-Down on a laptop) step ten times as far; Home and End (fn-Left and fn-Right) go to the limits.
+  Return, or typing a character, puts the edit box in its place, as on Windows.
+- Choices are pop-up buttons. Up and Down change the choice without opening the menu (each step applies, so on File
+  each one loads), stopping at the ends; Space or Return opens the menu. Home and End go to the first and last.
+- Player is a two-part button (Sampler, SoundFont). Left and Right switch, and Ctrl+Tab or Ctrl+Shift+Tab switch from
+  any control on a main page.
+- Tab and Shift+Tab go through the page's controls in order whatever the Mac's keyboard navigation setting is; past
+  either end they go round to the other end of the page (the DAW's own window isn't reached with Tab).
+- A file that won't load beeps, and its reason is said by VoiceOver as well as shown in Status.
+- Drop a file on the window, as on Windows. Browse opens the Mac's file panel.
+
+### What else is different
+
+- Settings are in ~/Library/Application Support/Samplosis/settings.txt (or $SAMPLOSIS_SETTINGS), and the cache
+  folder starts as ~/Library/Caches/Samplosis.
+- The Windows stage of the decode chain is the Mac's own Core Audio: it reads AAC and Apple Lossless (.m4a), CAF and
+  the other formats macOS knows, and applies an MPEG-4 file's start delay itself. Status says "(decoded by macOS)".
+- FFmpeg is ffmpeg (and ffprobe beside it), found in Settings, on PATH, or in Homebrew's and MacPorts' folders
+  (/opt/homebrew/bin, /usr/local/bin, /opt/local/bin); `brew install ffmpeg` puts it there. It runs as a process
+  group of its own and is stopped with it.
+- GigaStudio: the last-resort guard against a crash inside libgig is Windows-only (it uses Windows' structured
+  exceptions); the crashes the damage tests found are fixed in libgig itself.
+- Paths may be written either way in SFZ and the other instrument files: "samples\kick.wav" works as
+  "samples/kick.wav" does.
+
+How it is built: src/plat.h is windows.h on Windows; on the Mac, src/plat_posix.h and plat_posix.c give the Win32
+calls the shared code uses (threads, events, locks, a thread pool, files, folders and wide-character paths) on POSIX,
+so the engine compiles unchanged. The window is src/mac/gui_mac.m (Cocoa); src/mac/entry.c exports the CLAP entry.
 
 ## Measured numbers
 

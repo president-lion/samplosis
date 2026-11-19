@@ -73,8 +73,6 @@ set_source_files_properties(${S}/rb.cpp ${S}/stretch.cpp PROPERTIES COMPILE_OPTI
 set_source_files_properties(${S}/gigshim.cpp PROPERTIES COMPILE_DEFINITIONS "PACKAGE=\"libgig\";VERSION=\"4.6.0\"")
 set_source_files_properties(${CO}/mac_shim.cpp PROPERTIES COMPILE_DEFINITIONS "PLATFORM_APPLE"
                                                           INCLUDE_DIRECTORIES "${CO}/mac/Source/Shared;${CO}/mac/Source/MACLib")
-set_source_files_properties(${S}/sfds.c ${S}/sfdslib.c PROPERTIES
-  COMPILE_DEFINITIONS "MINIZ_NO_STDIO;MINIZ_NO_ZLIB_COMPATIBLE_NAMES;MINIZ_NO_ARCHIVE_WRITING_APIS")
 
 # ---- the plugin: CLAP glue and the Cocoa window, made into CLAP, VST3 and AU by clap-wrapper
 add_library(samplosis_impl STATIC ${S}/plugin.c ${S}/mac/gui_mac.m)
@@ -101,3 +99,8 @@ make_clapfirst_plugins(
 # ---- a command-line check of the engine on the Mac (tests/mac_smoke.c)
 add_executable(smp_smoke ${CMAKE_SOURCE_DIR}/tests/mac_smoke.c)
 target_link_libraries(smp_smoke PRIVATE smp_core)
+
+# ---- a small CLAP host that opens the window without a DAW (tests/mac_gui_host.m)
+add_executable(smp_gui_host tests/mac_gui_host.m)
+target_link_libraries(smp_gui_host PRIVATE clap "-framework Cocoa")
+set_source_files_properties(tests/mac_gui_host.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

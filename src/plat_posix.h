@@ -30,7 +30,9 @@ typedef unsigned long ULONG;
 typedef uint32_t DWORD, UINT;
 typedef int64_t LONG64, LONGLONG, INT64;
 typedef uint64_t ULONG64, ULONGLONG, DWORD64, UINT64, DWORDLONG;
-typedef int BOOL;
+#ifndef __OBJC__
+typedef int BOOL;              /* (Objective-C has its own BOOL; the window code passes none to these calls) */
+#endif
 typedef uint8_t BYTE, BOOLEAN;
 typedef uint16_t WORD;
 typedef int16_t SHORT;
@@ -224,6 +226,7 @@ BOOL CloseHandle(HANDLE h);
 HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags, LPDWORD id);
 DWORD ResumeThread(HANDLE h);
 BOOL GetExitCodeThread(HANDLE h, LPDWORD code);
+#define GetCurrentThread smp_GetCurrentThread   /* the Carbon headers have a GetCurrentThread of their own */
 HANDLE GetCurrentThread(void);
 #define THREAD_PRIORITY_LOWEST -2
 #define THREAD_PRIORITY_BELOW_NORMAL -1

@@ -1192,7 +1192,7 @@ void gpc_save(const SmpFont *f, const char *path) {
     }
   }
   wchar_t part[2100];
-  swprintf(part, 2100, L"%ls.%lu.part", file, GetCurrentThreadId());
+  swprintf(part, 2100, L"%ls.%lu.part", file, (unsigned long)GetCurrentThreadId());
   HANDLE h = CreateFileW(part, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return;
   DWORD put = 0;
