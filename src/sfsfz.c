@@ -102,15 +102,17 @@ enum {
 };
 
 enum { LOOP_NONE, LOOP_ONESHOT, LOOP_CONT, LOOP_SUSTAIN };   /* SFZ loop_mode */
-enum { LV_NONE, LV_CONTROL, LV_GLOBAL, LV_MASTER, LV_GROUP, LV_REGION, LV_OTHER };
+enum { LV_NONE, LV_CONTROL, LV_GLOBAL, LV_MASTER, LV_GROUP, LV_REGION, LV_OTHER, LV_CURVE };
 enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
 
 #define MAX_CCM 16                       /* controller modulations a region keeps */
 /* what a controller modulates (Opts.ccm): level (dB), pitch (cents), cutoff (cents), pan (percent), the amplitude
    envelope's stages (seconds, sustain percent), the vibrato's depth (cents) and rate (Hz), and amplitude (percent,
-   a factor: amplitude_onccN=X scales the level by X / 100 times the controller over 127, so CC 0 is silent) */
+   a factor: amplitude_onccN=X scales the level by X / 100 times the controller over 127, so CC 0 is silent),
+   amp_veltrack (percent) and width (percent), the last two set once from the controller's starting value.
+   CM_FOLDED marks one folded into the region's own values (a curve no modulator can draw). */
 enum { CM_GAIN, CM_PITCH, CM_CUTOFF, CM_PAN, CM_AMPEG0 /* delay; +1 attack ... +5 release */, CM_VIBDEPTH = CM_AMPEG0 + 6,
-       CM_VIBFREQ, CM_AMP };
+       CM_VIBFREQ, CM_AMP, CM_VELTRACK, CM_WIDTH, CM_FOLDED = 255 };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -150,7 +152,9 @@ typedef struct {
   int amp_keycenter;
   /* controllers modulating the region (gain_ccN, pitch_onccN, ampeg_decayccN...): the last one given per CC and
      target wins */
-  int nccm; struct { uint8_t cc, target; double amount; } ccm[MAX_CCM];
+  /* curve: the controller's curve (X_curveccN), 0 linear; SFZ's built-ins 1 bipolar, 2 and 3 their inverses, 4 x^2,
+     5 sqrt x, 6 sqrt (1 - x); others (and any a <curve> redefines) the file's own */
+  int nccm; struct { uint8_t cc, target, curve; double amount; } ccm[MAX_CCM];
   int layer;                                   /* samplosis_layer (Decent Sampler's knobs): cond.layer */
 } Opts;
 
@@ -239,7 +243,13 @@ typedef struct SfzBuild {
   /* CCs the file's own opcodes use (onccN, loccN, xfin_hiccN...; not set_ccN or labels), from the first pass, so
      every region of the second knows: CC91 and CC93 used that way are the instrument's, not GM's effect sends */
   uint8_t own_cc[16];
+  /* the file's <curve>s (curve_index, vNNN), from the first pass, since a <curve> may come after the regions that
+     use it; cur_curve is the one being read (-1 none) */
+  struct UCurve { int idx; float v[128]; uint8_t set[128]; } *ucv; int nucv, capucv, cur_curve;
 } P;
+
+static double curve_val(const P *p, int k, double x);
+static int custom_curve(const P *p, int k);
 
 /* ---- small helpers ---- */
 
@@ -432,8 +442,20 @@ static void add_ccm(P *p, Opts *o, const char *nm, int cc, int target, const cha
   double d; int i;
   if (!num(v, &d)) return;
   for (i = 0; i < o->nccm && !(o->ccm[i].cc == cc && o->ccm[i].target == target); i++) {}
-  if (i == o->nccm) { if (o->nccm >= MAX_CCM) { ignored(p, nm); return; } o->nccm++; }
+  if (i == o->nccm) { if (o->nccm >= MAX_CCM) { ignored(p, nm); return; } o->nccm++; o->ccm[i].curve = 0; }
   o->ccm[i].cc = (uint8_t)cc; o->ccm[i].target = (uint8_t)target; o->ccm[i].amount = d;
+}
+
+/* X_curveccN=K: the curve of X's modulation by CC N; given first, the modulation starts with no amount */
+static void set_ccm_curve(P *p, Opts *o, const char *nm, int cc, int target, const char *v) {
+  int i, k;
+  if (!inum(v, &k) || k < 0 || k > 255) { ignored(p, nm); return; }
+  for (i = 0; i < o->nccm && !(o->ccm[i].cc == cc && o->ccm[i].target == target); i++) {}
+  if (i == o->nccm) {
+    if (o->nccm >= MAX_CCM) { ignored(p, nm); return; }
+    o->nccm++; o->ccm[i].cc = (uint8_t)cc; o->ccm[i].target = (uint8_t)target; o->ccm[i].amount = 0;
+  }
+  o->ccm[i].curve = (uint8_t)k;
 }
 
 /* SFZ's controller opcodes, SFZ 1 and 2 spellings: 1 when nm was one */
@@ -448,11 +470,27 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
     {"ampeg_sustain_oncc", CM_AMPEG0 + 4}, {"ampeg_releasecc", CM_AMPEG0 + 5}, {"ampeg_release_oncc", CM_AMPEG0 + 5},
     {"pitchlfo_depthcc", CM_VIBDEPTH}, {"pitchlfo_depth_oncc", CM_VIBDEPTH}, {"pitchlfo_freqcc", CM_VIBFREQ},
     {"pitchlfo_freq_oncc", CM_VIBFREQ}, {"amplitude_cc", CM_AMP}, {"amplitude_oncc", CM_AMP},
+    {"amp_veltrack_cc", CM_VELTRACK}, {"amp_veltrack_oncc", CM_VELTRACK}, {"width_cc", CM_WIDTH}, {"width_oncc", CM_WIDTH},
   };
   int i, cc;
+  const char *cv;
   if ((cc = cc_suffix(nm, "set_cc")) >= 0) {   /* a level's set_cc (<control> is where it belongs): the same */
     double d; if (num(v, &d)) p->cc_init[cc] = (int16_t)clampi((int)floor(d + 0.5), 0, 127);
     return 1;
+  }
+  if ((cc = cc_suffix(nm, "set_hdcc")) >= 0) {   /* the same as a fraction, 0..1 (ARIA's high-resolution CC) */
+    double d; if (num(v, &d)) p->cc_init[cc] = (int16_t)clampi((int)floor(clampd(d, 0, 1) * 127 + 0.5), 0, 127);
+    return 1;
+  }
+  if ((cv = strstr(nm, "_curvecc")) != NULL && o) {   /* X_curveccN: X's modulation by CC N, as X_onccN names it */
+    char base[64]; size_t L = (size_t)(cv - nm);
+    if (L + 6 < sizeof base && (cc = cc_suffix(cv + 1, "curvecc")) >= 0) {
+      memcpy(base, nm, L); memcpy(base + L, "_oncc", 6);
+      for (i = 0; i < (int)(sizeof T / sizeof *T); i++)
+        if (!strcmp(T[i].prefix, base)) { set_ccm_curve(p, o, nm, cc, T[i].target, v); return 1; }
+      if (!strcmp(base, "volume_oncc") || !strcmp(base, "gain_oncc")) { set_ccm_curve(p, o, nm, cc, CM_GAIN, v); return 1; }
+    }
+    return 0;
   }
   for (i = 0; i < (int)(sizeof T / sizeof *T); i++)
     if ((cc = cc_suffix(nm, T[i].prefix)) >= 0) { add_ccm(p, o, nm, cc, T[i].target, v); return 1; }
@@ -464,7 +502,7 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   double d; int k, i;
   char w[64];
 #define IS(s) (!strcmp(nm, s))
-  if (p->collect && strncmp(nm, "set_cc", 6) && strncmp(nm, "label_cc", 8)) {   /* a CC of the file's own */
+  if (p->collect && strncmp(nm, "set_cc", 6) && strncmp(nm, "set_hdcc", 8) && strncmp(nm, "label_cc", 8)) {   /* a CC of the file's own */
     size_t n = strlen(nm), j = n;
     while (j > 0 && nm[j - 1] >= '0' && nm[j - 1] <= '9') j--;
     if (j < n && n - j <= 3 && j >= 2 && nm[j - 2] == 'c' && nm[j - 1] == 'c') {
@@ -681,7 +719,7 @@ static void control_opcode(P *p, const char *nm, const char *v) {
     int k; if (inum(v, &k)) p->note_offset = clampi(k, -127, 127);
   } else if (!strcmp(nm, "octave_offset")) {
     int k; if (inum(v, &k)) p->octave_offset = clampi(k, -10, 10);
-  } else if (cc_suffix(nm, "set_cc") >= 0) {
+  } else if (cc_suffix(nm, "set_cc") >= 0 || cc_suffix(nm, "set_hdcc") >= 0) {
     cc_opcode(p, NULL, nm, v);
   } else if (!label(nm)) {
     ignored(p, nm);
@@ -1438,6 +1476,57 @@ static int add_curve(P *p, const Opts *o) {
   return p->nc++;
 }
 
+/* a controller's value before any MIDI: set_ccN's, else what a reset gives it (CC7 100, CC10 64, CC11 127, else 0) */
+static int cc_start(const P *p, int cc) {
+  if (p->cc_init[cc] >= 0) return p->cc_init[cc];
+  return cc == 7 ? 100 : cc == 10 ? 64 : cc == 11 ? 127 : 0;
+}
+
+/* the SF2 source a controller modulation's curve becomes (0x80 | cc with the polarity and direction bits), or -1
+   when no modulator source draws it: linear, bipolar and their inverses do; the rest are the region's own values */
+static int ccm_source(const P *p, int cc, int curve, int target) {
+  if (custom_curve(p, curve)) return -1;
+  if (target == CM_AMP) return curve == 0 || curve == 2 || curve == 4 || curve == 5 || curve == 6 ? 0x80 | cc : -1;
+  switch (curve) {
+    case 0: return 0x0080 | cc;
+    case 1: return 0x0280 | cc;                 /* bipolar */
+    case 2: return 0x0180 | cc;                 /* negative */
+    case 3: return 0x0380 | cc;
+    default: return -1;
+  }
+}
+
+/* Controller modulations a modulator can't draw (a <curve> of the file's, x^2 or sqrt on anything but amplitude),
+   and amp_veltrack_ccN and width_ccN, which have no SF2 generator a modulator could reach: their value at the
+   controller's starting position goes into the region's own (volume, tune, pan, cutoff, the envelope, amplitude,
+   amp_veltrack, width), and the modulation is dropped. The knob then doesn't move them; the instrument starts as
+   the file means it to. */
+static void fold_static(P *p, Opts *o) {
+  int k;
+  for (k = 0; k < o->nccm; k++) {
+    int cc = o->ccm[k].cc, tg = o->ccm[k].target, cv = o->ccm[k].curve;
+    double a = o->ccm[k].amount, c;
+    if (tg == CM_FOLDED || tg == CM_VIBFREQ) continue;   /* the vibrato's rate is set once already (see below) */
+    if (tg != CM_VELTRACK && tg != CM_WIDTH && ccm_source(p, cc, cv, tg) >= 0) continue;
+    c = curve_val(p, cv, cc_start(p, cc));
+    if (tg == CM_GAIN) o->volume += a * c;
+    else if (tg == CM_PITCH) o->tune += a * c;
+    else if (tg == CM_PAN) o->pan += a * c;
+    else if (tg == CM_CUTOFF) { if (o->cutoff > 0) o->cutoff *= pow(2.0, a * c / 1200.0); }
+    else if (tg >= CM_AMPEG0 && tg < CM_AMPEG0 + 6) {
+      int st = tg - CM_AMPEG0;
+      o->ampeg[st] += a * c;
+      if (o->ampeg[st] < 0) o->ampeg[st] = 0;
+      if (st == 4 && o->ampeg[st] > 100) o->ampeg[st] = 100;
+    }
+    else if (tg == CM_AMP) o->amplitude *= a / 100.0 * (c > 0 ? c : 0);
+    else if (tg == CM_VELTRACK) o->veltrack += a * c;
+    else if (tg == CM_WIDTH) o->width += a * c;
+    else continue;                              /* the vibrato's depth: left as a linear modulator */
+    o->ccm[k].target = CM_FOLDED;
+  }
+}
+
 /* The region now complete in p->region: its sample, its generators (SF2 units; each conversion below) and
    conditions, as one region, or two for a stereo sample. The first pass only notes its sample file. */
 static void finish_region(P *p) {
@@ -1450,6 +1539,7 @@ static void finish_region(P *p) {
   SmpSfMod m[12 + MAX_CCM];
   double db, fc_raw;
   if (p->collect) { if (o->sample[0]) sample_file(p, o->sample); return; }
+  fold_static(p, &p->region);
   if (o->sw_default >= 0) p->swdef = o->sw_default;
   if (!o->sample[0] || p->too_many || p->oom) return;
   if (o->hikey < 0 || o->lokey > 127 || o->hivel < 0 || o->lovel > 127) return;   /* never plays */
@@ -1570,7 +1660,7 @@ static void finish_region(P *p) {
     for (k = 0; k < o->nccm; k++) {
       /* pitchlfo_freqccN: the rate at the controller's set_cc value (SF2's rate is in cents, so a controller can't
          move it in Hz; the instrument's starting value counts) */
-      if (o->ccm[k].target == CM_VIBFREQ) bf += o->ccm[k].amount * (p->cc_init[o->ccm[k].cc] > 0 ? p->cc_init[o->ccm[k].cc] : 0) / 127.0;
+      if (o->ccm[k].target == CM_VIBFREQ) bf += o->ccm[k].amount * curve_val(p, o->ccm[k].curve, cc_start(p, o->ccm[k].cc));
       if (o->ccm[k].target == CM_VIBDEPTH && o->ccm[k].amount != 0) depth_cc = 1;
     }
     if (bf > 0 && (b->pitch != 0 || depth_cc)) {
@@ -1598,6 +1688,11 @@ static void finish_region(P *p) {
         if ((p->unbound[cc >> 3] >> (cc & 7)) & 1) continue;
         if (cc == 91 && p->no_rev_send) continue;
         if ((cc == 91 || cc == 93) && ((p->own_cc[cc >> 3] >> (cc & 7)) & 1)) continue;   /* the instrument's own control */
+        if (cc == 10) {                         /* pan_oncc10 replaces the default pan, as in sfizz */
+          int j, own = 0;
+          for (j = 0; j < o->nccm; j++) if (o->ccm[j].cc == 10 && o->ccm[j].target == CM_PAN) own = 1;
+          if (own) continue;
+        }
         m[nmod++] = base[k];
       }
     }
@@ -1638,8 +1733,13 @@ static void finish_region(P *p) {
           /* the level times v / 127: the concave, negative curve's 480 cB make exactly that amplitude (960 make its
              square, SF2's CC7 default), down to -48 dB at 0. CC7 and CC11 keep that default (sfizz's amplitude_oncc7
              default is squared too), so only the X / 100 above changes them; a Decent Sampler knob's CC is unbound. */
+          /* amplitude_curveccN: 4 (x^2) is the concave curve's 960, 5 (sqrt x) its 240; 2 and 6, the inverses,
+             the concave curve rising (the positive direction) at 480 and 240 */
+          int cv = o->ccm[k].curve;
           if (a > 0 && !((cc == 7 || cc == 11) && !((p->unbound[cc >> 3] >> (cc & 7)) & 1))) {
-            SmpSfMod w = {(uint16_t)(0x0580 | cc), G_ATTEN, 480, 0, 0}; m[nmod++] = w;
+            uint16_t src = (uint16_t)((cv == 2 || cv == 6 ? 0x0480 : 0x0580) | cc);
+            int16_t amtc = (int16_t)(cv == 4 ? 960 : cv == 5 || cv == 6 ? 240 : 480);
+            SmpSfMod w = {src, G_ATTEN, amtc, 0, 0}; m[nmod++] = w;
           }
           continue;
         }
@@ -1655,7 +1755,11 @@ static void finish_region(P *p) {
           }
         }
         if (dest < 0 || amt == 0) continue;
-        { SmpSfMod w = {(uint16_t)(0x0080 | cc), (uint16_t)dest, (int16_t)clampi((int)floor(amt + 0.5), -32768, 32767), 0, 0}; m[nmod++] = w; }
+        {                                       /* the curve's source: linear, bipolar, inverted (ccm_source) */
+          int src = ccm_source(p, cc, o->ccm[k].curve, tg);
+          SmpSfMod w = {(uint16_t)(src >= 0 ? src : 0x0080 | cc), (uint16_t)dest, (int16_t)clampi((int)floor(amt + 0.5), -32768, 32767), 0, 0};
+          m[nmod++] = w;
+        }
       }
     }
     if ((moff = add_mods(p, m, nmod)) < 0) return;
@@ -1744,6 +1848,55 @@ static void finish_region(P *p) {
 
 /* ---- the text ---- */
 
+/* an opcode of a <curve> (first pass): curve_index=K, vNNN=value */
+static void curve_opcode(P *p, const char *nm, const char *v) {
+  struct UCurve *u; double d; int k;
+  if (p->cur_curve < 0 || p->cur_curve >= p->nucv) return;
+  u = &p->ucv[p->cur_curve];
+  if (!strcmp(nm, "curve_index")) { if (inum(v, &k) && k >= 0 && k <= 255) u->idx = k; return; }
+  if (nm[0] == 'v' && nm[1] >= '0' && nm[1] <= '9') {
+    char *e; long n = strtol(nm + 1, &e, 10);
+    if (!*e && n >= 0 && n <= 127 && num(v, &d)) { u->v[n] = (float)d; u->set[n] = 1; }
+  }
+}
+
+/* curve K at controller value x (0..127): the file's <curve> of that index when it has one (linear between its
+   points; 0 at 0 and 1 at 127 unless given), else SFZ's built-ins, else linear */
+static double curve_val(const P *p, int k, double x) {
+  int i;
+  double t = clampd(x, 0, 127) / 127.0;
+  for (i = p->nucv - 1; i >= 0; i--) {
+    const struct UCurve *u = &p->ucv[i];
+    if (u->idx == k) {                          /* the 128 points, as add_curve fills amp_velcurve_N's */
+      double c[128], lv = u->set[0] ? u->v[0] : 0, f;
+      int j, last = 0, xi;
+      c[0] = lv;
+      for (j = 1; j < 128; j++) {
+        if (u->set[j] || j == 127) {
+          double nv = u->set[j] ? u->v[j] : 1; int q;
+          for (q = last; q <= j; q++) c[q] = lv + (nv - lv) * (q - last) / (j - last);
+          last = j; lv = nv;
+        }
+      }
+      xi = (int)floor(clampd(x, 0, 127)); f = clampd(x, 0, 127) - xi;
+      return xi >= 127 ? c[127] : c[xi] + (c[xi + 1] - c[xi]) * f;
+    }
+  }
+  switch (k) {
+    case 1: return 2 * t - 1;
+    case 2: return 1 - t;
+    case 3: return 1 - 2 * t;
+    case 4: return t * t;
+    case 5: return sqrt(t);
+    case 6: return sqrt(1 - t);
+    default: return t;
+  }
+}
+static int custom_curve(const P *p, int k) {
+  int i; for (i = 0; i < p->nucv; i++) if (p->ucv[i].idx == k) return 1;
+  return 0;
+}
+
 static void header(P *p, const char *s, size_t n) {
   char h[40]; size_t i;
   while (n && ws(*s)) { s++; n--; }
@@ -1757,7 +1910,15 @@ static void header(P *p, const char *s, size_t n) {
   else if (!strcmp(h, "master")) { p->master = p->global; p->group = p->master; p->level = LV_MASTER; }
   else if (!strcmp(h, "group")) { p->group = p->master; p->level = LV_GROUP; }
   else if (!strcmp(h, "region")) { p->region = p->group; p->level = LV_REGION; }
-  else if (!strcmp(h, "curve") || !strcmp(h, "effect") || !strcmp(h, "midi")) p->level = LV_OTHER;
+  else if (!strcmp(h, "curve")) {                /* read in the first pass (curve_opcode), passed over in the second */
+    p->level = LV_OTHER; p->cur_curve = -1;
+    if (p->collect) {
+      if (!grow((void **)&p->ucv, &p->capucv, p->nucv + 1, sizeof *p->ucv)) { p->oom = 1; return; }
+      memset(&p->ucv[p->nucv], 0, sizeof *p->ucv); p->ucv[p->nucv].idx = -1;
+      p->cur_curve = p->nucv++; p->level = LV_CURVE;
+    }
+  }
+  else if (!strcmp(h, "effect") || !strcmp(h, "midi")) p->level = LV_OTHER;
   else { char t[48]; snprintf(t, sizeof t, "<%s>", h); ignored(p, t); p->level = LV_OTHER; }
 }
 
@@ -1777,7 +1938,8 @@ static void opcode_at(P *p, const char *name, size_t nn, const char *v, size_t v
     case LV_MASTER: opcode(p, &p->master, nm, p->val); p->group = p->master; break;
     case LV_GROUP: opcode(p, &p->group, nm, p->val); break;
     case LV_REGION: opcode(p, &p->region, nm, p->val); break;
-    default: break;                  /* before any header, or in <curve>, <effect>, <midi>: nothing to do */
+    case LV_CURVE: curve_opcode(p, nm, p->val); break;
+    default: break;                 /* before any header, or in <curve>, <effect>, <midi>: nothing to do */
   }
 }
 
@@ -2049,6 +2211,7 @@ static void free_parser(P *p) {
   free(p->def_name); free(p->def_val); free(p->def_slot);
   free(p->line); free(p->val); free(p->tmp);
   strset_free(&p->ign); strset_free(&p->badpath);
+  free(p->ucv); p->ucv = NULL;
   for (i = 0; i < p->nfiles; i++) {
     Head *h = p->files[i].heads;
     while (h) { Head *nx = h->next; free(h); h = nx; }
@@ -2146,6 +2309,7 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
 
   /* the first pass collects the files, which are probed (the probe cache first) before the second builds */
   memset(p->own_cc, 0, sizeof p->own_cc);
+  p->nucv = 0; p->cur_curve = -1;
   p->collect = 1;
   if (!feed(p, ctx, full, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
