@@ -212,7 +212,28 @@ typedef struct {
   uint8_t xfcc_n;               /* how many of xfcc are set */
   struct { uint8_t cc, lo, hi, out; } xfcc[4];   /* out 0 fades in over lo..hi, 1 fades out */
   uint8_t xf_cccurve;           /* 0 power, 1 gain (xf_cccurve) */
+  /* added for SFZ's second filter and EQ (SmpSfxDsp below); NULL when the region has neither. Lives in the font. */
+  const struct SmpSfxDsp *xdsp;
 } SmpSfCond;
+
+/* SFZ's second filter (fil2_type, cutoff2, resonance2) and three EQ bands (eqN_freq, eqN_bw, eqN_gain), run in that
+   order after the first filter, each a biquad. Their controllers (cutoff2_onccN, eqN_gain_onccN...) move them live:
+   a value is its base plus, for each modulation, amount x curve[cc], with curve the controller's 128 points through
+   its curve (X_curveccN, the file's <curve>s too). */
+enum { SMP_XM_CUTOFF2, SMP_XM_RESO2, SMP_XM_EQFREQ /* +band */, SMP_XM_EQBW = SMP_XM_EQFREQ + 3,
+       SMP_XM_EQGAIN = SMP_XM_EQBW + 3 };
+#define SMP_XDSP_MODS 24
+#define SMP_XDSP_CURVES 4
+typedef struct SmpSfxDsp {
+  uint8_t fil2_on, fil2_type;   /* fil2_type: SMP_FIL_* */
+  float cutoff2, resonance2;    /* Hz, dB */
+  float fil2_keytrack, fil2_veltrack; uint8_t fil2_keycenter;   /* cents per key from the centre; cents at velocity 127 */
+  uint8_t eq_on[3];             /* the bands that can be heard (a gain, or a controller or velocity on it) */
+  struct { float freq, bw, gain, vel2freq, vel2gain; } eq[3];   /* Hz, octaves, dB; Hz and dB at velocity 127 */
+  uint8_t nmod;
+  struct { uint8_t cc, target; int8_t curve; float amount; } mod[SMP_XDSP_MODS];   /* curve: a slot below, -1 linear */
+  float curves[SMP_XDSP_CURVES][128];
+} SmpSfxDsp;
 enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3,      /* 2-pole lowpass, highpass, bandpass, notch */
        SMP_FIL_LP1 = 4, SMP_FIL_HP1 = 5 };                                  /* 1-pole lowpass and highpass (6 dB an octave) */
 typedef struct {

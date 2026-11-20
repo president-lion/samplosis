@@ -1146,7 +1146,7 @@ void gpc_save(const SmpFont *f, const char *path) {
     SmpSfRegion r = f->regions[i];
     int64_t mi = r.imod ? (int64_t)(r.imod - (const SmpSfMod *)(block + mod_at)) : -1;
     int64_t ci = r.cond.amp_velcurve ? (int64_t)(r.cond.amp_velcurve - (const float *)(block + cur_at)) : -1;
-    r.imod = nullptr; r.pmod = nullptr; r.cond.amp_velcurve = nullptr;
+    r.imod = nullptr; r.pmod = nullptr; r.cond.amp_velcurve = nullptr; r.cond.xdsp = nullptr;   /* GigaStudio has none */
     o.raw(&r, sizeof r); o.u64((uint64_t)mi); o.u64((uint64_t)ci);
   }
   o.raw(block + mod_at, nmods * sizeof(SmpSfMod));
@@ -1294,7 +1294,7 @@ int gpc_load(SmpFont *f, const char *path) {
       if (mi + (uint64_t)(regs[i].nimod < 0 ? 0 : regs[i].nimod) > nmods) { ok = false; break; }
       regs[i].imod = (const SmpSfMod *)(block + mod_at) + mi;
     } else regs[i].nimod = 0;
-    regs[i].pmod = nullptr; regs[i].npmod = 0;
+    regs[i].pmod = nullptr; regs[i].npmod = 0; regs[i].cond.xdsp = nullptr;
     if ((int64_t)ci >= 0) {
       if (ci + 128 > ncurve) { ok = false; break; }
       regs[i].cond.amp_velcurve = (const float *)(block + cur_at) + ci;

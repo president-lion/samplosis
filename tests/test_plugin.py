@@ -834,7 +834,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     k.mkdir()
     P.sample("s.wav")
     os.replace(tmp_path / "s.wav", k / "s.wav")
-    (k / "kit.sfz").write_text("<region> sample=s.wav key=60 eq1_freq=100\n<region> sample=gone.wav key=62\n")
+    (k / "kit.sfz").write_text("<region> sample=s.wav key=60 foo_bar=100\n<region> sample=gone.wav key=62\n")
     make_dls(k / "bank.dls")
     for n in ("g.gig", "h.dspreset", "hh.dslibrary", "i.sf4", "j.sf2pack", "k.exs", "l.sbk", "m.sf2", "n.sf3", "notes.txt", "o.wav"):
         (k / n).write_bytes(b"x")
@@ -884,7 +884,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
                                    "kit.sfz", "l.sbk", "m.sf2", "n.sf3"], out    # every kind; notes.txt and o.wav aren't
     assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples")
     assert r[13].endswith(". Missing 1 sample (first: gone.wav). "
-                          "Ignored 1 SFZ setting it doesn't support (first: eq1_freq)"), out
+                          "Ignored 1 SFZ setting it doesn't support (first: foo_bar)"), out
     assert f[-2] == ["Tab", "Player", "Sampler"]
     assert f[-1] == ["Tab", "Player", "SoundFont"], out              # a dropped .dls: the SoundFont tab
     assert r[14] == "bank.dls, DLS, 5 presets", out

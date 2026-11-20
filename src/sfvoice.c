@@ -132,6 +132,68 @@ static double xf_in(int x, int lo, int hi);
 static double xf_out(int x, int lo, int hi);
 
 /* the modulators of both lists, then what the generators work out to */
+/* A biquad of the second filter's kinds (SMP_FIL_*) at hz with q_db of resonance, from RBJ's cookbook as the
+   first filter's: SFZ's reading, so the passband stays at unity and the peak is q_db above it. */
+static void x_filter(int kind, double hz, double q_db, double rate, double *c) {
+  double w, cs, alpha, a0, peak, q;
+  hz = clampd(hz, 5, 0.45 * rate);
+  w = 2 * PI * hz / rate;
+  if (kind == SMP_FIL_LP1 || kind == SMP_FIL_HP1) {
+    double k = tan(w / 2), n = 1 / (1 + k);
+    if (kind == SMP_FIL_LP1) { c[0] = k * n; c[1] = k * n; } else { c[0] = n; c[1] = -n; }
+    c[2] = 0; c[3] = (k - 1) * n; c[4] = 0;
+    return;
+  }
+  peak = pow(10.0, clampd(q_db, 0, 96) / 20.0);
+  q = sqrt((peak * peak + peak * sqrt(peak * peak - 1)) / 2);
+  cs = cos(w); alpha = sin(w) / (2 * q); a0 = 1 + alpha;
+  switch (kind) {
+    case SMP_FIL_HP: c[0] = (1 + cs) / 2 / a0; c[1] = -(1 + cs) / a0; c[2] = c[0]; break;
+    case SMP_FIL_BP: c[0] = alpha / a0; c[1] = 0; c[2] = -alpha / a0; break;
+    case SMP_FIL_BR: c[0] = 1 / a0; c[1] = -2 * cs / a0; c[2] = c[0]; break;
+    default: c[0] = (1 - cs) / 2 / a0; c[1] = (1 - cs) / a0; c[2] = c[0]; break;
+  }
+  c[3] = -2 * cs / a0; c[4] = (1 - alpha) / a0;
+}
+
+/* An EQ band: RBJ's peaking EQ, gain dB at hz over bw octaves (0 dB is a straight wire) */
+static void x_peak(double hz, double bw, double gain, double rate, double *c) {
+  double A, w, sn, cs, alpha, a0;
+  if (gain == 0) { c[0] = 1; c[1] = c[2] = c[3] = c[4] = 0; return; }
+  hz = clampd(hz, 5, 0.45 * rate); bw = clampd(bw, 0.001, 4); gain = clampd(gain, -96, 24);
+  A = pow(10.0, gain / 40); w = 2 * PI * hz / rate; sn = sin(w); cs = cos(w);
+  alpha = sn * sinh(log(2.0) / 2 * bw * w / sn);
+  a0 = 1 + alpha / A;
+  c[0] = (1 + alpha * A) / a0; c[1] = -2 * cs / a0; c[2] = (1 - alpha * A) / a0;
+  c[3] = -2 * cs / a0; c[4] = (1 - alpha / A) / a0;
+}
+
+/* the second filter's and the EQ's targets at the controllers' values now (see SmpSfxDsp) */
+static void x_targets(SmpSfVoice *v, const SmpSfChan *c) {
+  const SmpSfxDsp *x = v->reg->cond.xdsp;
+  double val[SMP_XM_EQGAIN + 3], vel = v->vel / 127.0;
+  int i, b, n = 0;
+  memset(val, 0, sizeof val);
+  val[SMP_XM_RESO2] = x->resonance2;
+  for (b = 0; b < 3; b++) {
+    val[SMP_XM_EQFREQ + b] = x->eq[b].freq + x->eq[b].vel2freq * vel;
+    val[SMP_XM_EQBW + b] = x->eq[b].bw;
+    val[SMP_XM_EQGAIN + b] = x->eq[b].gain + x->eq[b].vel2gain * vel;
+  }
+  for (i = 0; i < x->nmod; i++) {
+    int cv = c->cc[x->mod[i].cc & 127];
+    double f = x->mod[i].curve >= 0 ? x->curves[x->mod[i].curve][cv] : cv / 127.0;
+    val[x->mod[i].target] += x->mod[i].amount * f;
+  }
+  if (x->fil2_on) {
+    double cents = val[SMP_XM_CUTOFF2] + x->fil2_keytrack * (v->pkey - x->fil2_keycenter) + x->fil2_veltrack * vel;
+    x_filter(x->fil2_type, x->cutoff2 * pow(2.0, cents / 1200.0), val[SMP_XM_RESO2], v->rate, v->xt[n++]);
+  }
+  for (b = 0; b < 3; b++)
+    if (x->eq_on[b]) x_peak(val[SMP_XM_EQFREQ + b], val[SMP_XM_EQBW + b], val[SMP_XM_EQGAIN + b], v->rate, v->xt[n++]);
+  v->xn = n;
+}
+
 static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   const SmpSfRegion *r = v->reg;
   ModCtx m;
@@ -208,6 +270,7 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->m_decay = tc_samples(g[G_DECAY_MODENV] + k * g[G_KEY_MODENV_DECAY], -12000, 8000, rate);
   v->m_sus = 1 - clampd(g[G_SUSTAIN_MODENV], 0, 1000) / 1000.0;
   v->m_release = tc_samples(g[G_RELEASE_MODENV], -12000, 8000, rate);
+  if (r->cond.xdsp) x_targets(v, c);
 }
 
 /* ---- envelopes and LFOs, stepped n samples at a time ---- */
@@ -394,6 +457,14 @@ static void control(SmpSfVoice *v) {
     v->ratio = ratio;
     v->b0 = c[0]; v->b1 = c[1]; v->b2 = c[2]; v->a1 = c[3]; v->a2 = c[4];
     v->gl = v->gr = v->grev = v->gcho = 0;
+    memcpy(v->xc, v->xt, sizeof v->xc);
+  }
+  {                               /* the second filter and EQ: steps toward their targets; no denormals in their state */
+    int k, j;
+    for (k = 0; k < v->xn; k++) {
+      for (j = 0; j < 5; j++) v->xdc[k][j] = (v->xt[k][j] - v->xc[k][j]) * inv;
+      for (j = 0; j < 4; j++) if (fabs(v->xs[k][j]) < 1e-20) v->xs[k][j] = 0;
+    }
   }
   v->d_ratio = (ratio - v->ratio) * inv;
   v->d_gl = (gain * v->pan_l - v->gl) * inv;
@@ -700,6 +771,19 @@ static void read_avail(SmpSfVoice *v) {
   }
 }
 
+/* the second filter and EQ bands on one sample (after the first filter) */
+static __inline double x_run(SmpSfVoice *v, double y) {
+  int k;
+  for (k = 0; k < v->xn; k++) {
+    double *c = v->xc[k], *s = v->xs[k];
+    const double *d = v->xdc[k];
+    double o = c[0] * y + c[1] * s[0] + c[2] * s[1] - c[3] * s[2] - c[4] * s[3];
+    s[1] = s[0]; s[0] = y; s[3] = s[2]; s[2] = o; y = o;
+    c[0] += d[0]; c[1] += d[1]; c[2] += d[2]; c[3] += d[3]; c[4] += d[4];
+  }
+  return y;
+}
+
 /* m samples of the current stretch; 0 when the voice must end. FRAME(v, i) gives frame i. The int16 one is the
    stage 2 code exactly, so a sample held whole sounds bit for bit as it did. */
 #define RUN_BODY(FRAME)                                                                                          \
@@ -716,6 +800,7 @@ static void read_avail(SmpSfVoice *v) {
       y = o;                                                                                                     \
       v->b0 += v->d_b0; v->b1 += v->d_b1; v->b2 += v->d_b2; v->a1 += v->d_a1; v->a2 += v->d_a2;                  \
     }                                                                                                            \
+    if (v->xn) y = x_run(v, y);                                                                                  \
     l[i] += (float)(y * v->gl * f);                                                                              \
     r[i] += (float)(y * v->gr * f);                                                                              \
     if (rev) rev[i] += (float)(y * v->grev * f);                                                                 \
@@ -802,6 +887,7 @@ static int run_stream(SmpSfVoice *v, float *l, float *r, float *rev, float *cho,
         y = o;
         v->b0 += v->d_b0; v->b1 += v->d_b1; v->b2 += v->d_b2; v->a1 += v->d_a1; v->a2 += v->d_a2;
       }
+      if (v->xn) y = x_run(v, y);
       y *= v->ug;
       l[i] += (float)(y * v->gl * f);
       r[i] += (float)(y * v->gr * f);

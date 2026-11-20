@@ -112,7 +112,7 @@ enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
    amp_veltrack (percent) and width (percent), the last two set once from the controller's starting value.
    CM_FOLDED marks one folded into the region's own values (a curve no modulator can draw). */
 enum { CM_GAIN, CM_PITCH, CM_CUTOFF, CM_PAN, CM_AMPEG0 /* delay; +1 attack ... +5 release */, CM_VIBDEPTH = CM_AMPEG0 + 6,
-       CM_VIBFREQ, CM_AMP, CM_VELTRACK, CM_WIDTH, CM_FOLDED = 255 };
+       CM_VIBFREQ, CM_AMP, CM_VELTRACK, CM_WIDTH, CM_RESO /* the first filter's resonance, dB */, CM_FOLDED = 255 };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -131,6 +131,11 @@ typedef struct {
   int fileg_set, pitcheg_set;
   int fil_type;                                /* SMP_FIL_*, or -1: a kind the voice can't do */
   double cutoff, resonance, fil_veltrack, fil_keytrack, fil_keycenter;   /* Hz (-1 none), dB, cents, cents/key */
+  /* the second filter and the EQ bands (SmpSfxDsp): fil2_type SMP_FIL_* (-1 one the voice can't do), cutoff2 Hz
+     (-1 none); eqN_freq Hz, eqN_bw octaves, eqN_gain dB; and their controllers (target SMP_XM_*, curve SFZ's) */
+  int fil2_type; double cutoff2, resonance2, fil2_keytrack, fil2_veltrack, fil2_keycenter;
+  double eqf[3], eqbw[3], eqg[3], eqv2f[3], eqv2g[3];
+  int nxm; struct { uint8_t cc, target, curve; double amount; } xm[SMP_XDSP_MODS];
   Lfo amplfo, fillfo, pitchlfo, lfo1, lfo2;
   int lfo1_set, lfo2_set;
   double offset, end, loop_start, loop_end;    /* frames; end and the loop points -1 when not given */
@@ -191,7 +196,7 @@ typedef struct { char **s; int n, cap; } StrSet;
 typedef struct { wchar_t *lw; uint64_t size, mtime; Info in; } Cached;
 
 /* a region being built: its modulators (an offset into the pool) and its velocity curve (index, or -1) */
-typedef struct { SmpSfRegion r; int mod_off, nmod, curve; } Reg;
+typedef struct { SmpSfRegion r; int mod_off, nmod, curve, xd; } Reg;   /* xd: its SmpSfxDsp in P.xds, -1 none */
 
 typedef struct SfzBuild {
   SmpFont *f;
@@ -231,6 +236,7 @@ typedef struct SfzBuild {
   Reg *regs; int nr, capr; int too_many;
   SmpSfMod *mods; int nm, capm;
   float *curves; int nc, capc;
+  SmpSfxDsp *xds; int nxd, capxd;              /* the regions' second filters and EQs (add_xdsp) */
   int swdef;                         /* the instrument's sw_default (the last given), -1 none */
   int oom;
   /* presets (sfz_preset): where each starts in regs and its name; none given is one preset named after the file */
@@ -394,6 +400,8 @@ static void opts_default(Opts *o) {
   o->keytrack = 100; o->amplitude = 100; o->width = 100; o->veltrack = 100;
   o->ampeg[4] = 100;                           /* ampeg_sustain 100 %; fileg_ and pitcheg_sustain 0 */
   o->fil_type = SMP_FIL_LP; o->cutoff = -1; o->fil_keycenter = 60;
+  o->fil2_type = SMP_FIL_LP; o->cutoff2 = -1; o->fil2_keycenter = 60;
+  o->eqf[0] = 50; o->eqf[1] = 500; o->eqf[2] = 5000; o->eqbw[0] = o->eqbw[1] = o->eqbw[2] = 1;   /* sfizz's defaults */
   o->end = o->loop_start = o->loop_end = -1; o->loop_mode = -1;
   o->trigger = SMP_TRIG_ATTACK; o->hirand = 1;
   o->sw_lokey = o->sw_hikey = o->sw_last = o->sw_down = o->sw_up = o->sw_previous = o->sw_default = -1;
@@ -471,6 +479,7 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
     {"pitchlfo_depthcc", CM_VIBDEPTH}, {"pitchlfo_depth_oncc", CM_VIBDEPTH}, {"pitchlfo_freqcc", CM_VIBFREQ},
     {"pitchlfo_freq_oncc", CM_VIBFREQ}, {"amplitude_cc", CM_AMP}, {"amplitude_oncc", CM_AMP},
     {"amp_veltrack_cc", CM_VELTRACK}, {"amp_veltrack_oncc", CM_VELTRACK}, {"width_cc", CM_WIDTH}, {"width_oncc", CM_WIDTH},
+    {"resonance_cc", CM_RESO}, {"resonance_oncc", CM_RESO},
   };
   int i, cc;
   const char *cv;
@@ -494,6 +503,77 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
   }
   for (i = 0; i < (int)(sizeof T / sizeof *T); i++)
     if ((cc = cc_suffix(nm, T[i].prefix)) >= 0) { add_ccm(p, o, nm, cc, T[i].target, v); return 1; }
+  return 0;
+}
+
+/* a filter kind's name (fil_type, fil2_type): SMP_FIL_*, -1 for one the voice can't do */
+static int fil_kind(const char *v) {
+  if (ieq(v, "lpf_2p")) return SMP_FIL_LP;
+  if (ieq(v, "hpf_2p")) return SMP_FIL_HP;
+  if (ieq(v, "bpf_2p")) return SMP_FIL_BP;
+  if (ieq(v, "brf_2p")) return SMP_FIL_BR;
+  if (ieq(v, "lpf_1p")) return SMP_FIL_LP1;
+  if (ieq(v, "hpf_1p")) return SMP_FIL_HP1;
+  return -1;
+}
+
+#define IS_(s) (!strcmp(nm, s))
+/* The second filter's and the EQ's opcodes: 1 when nm was one. Each value X has its controllers in SFZ's two
+   spellings, X_onccN and X_ccN (the EQ's also XccN: eq1_freqcc80), and X_curveccN for their curve. */
+static int xdsp_opcode(P *p, Opts *o, const char *nm, const char *v) {
+  int tgt = -1, band = -1, cc, i, k;
+  const char *rest; double d; char w[64];
+  if (!strncmp(nm, "cutoff2", 7)) { tgt = SMP_XM_CUTOFF2; rest = nm + 7; }
+  else if (!strncmp(nm, "resonance2", 10)) { tgt = SMP_XM_RESO2; rest = nm + 10; }
+  else if (!strncmp(nm, "fil2_", 5)) {
+    if (IS_("fil2_type")) {
+      if ((o->fil2_type = fil_kind(v)) < 0) { snprintf(w, sizeof w, "fil2_type=%.40s", v); ignored(p, w); }
+    }
+    else if (IS_("fil2_keytrack")) num(v, &o->fil2_keytrack);
+    else if (IS_("fil2_keycenter")) { int kc; if (key(p, v, &kc) && kc >= 0) o->fil2_keycenter = kc; }
+    else if (IS_("fil2_veltrack")) num(v, &o->fil2_veltrack);
+    else return 0;
+    return 1;
+  }
+  else if (!strncmp(nm, "eq", 2) && nm[2] >= '1' && nm[2] <= '3' && nm[3] == '_') {
+    band = nm[2] - '1'; rest = nm + 4;
+    if (!strncmp(rest, "freq", 4)) { tgt = SMP_XM_EQFREQ + band; rest += 4; }
+    else if (!strncmp(rest, "bw", 2)) { tgt = SMP_XM_EQBW + band; rest += 2; }
+    else if (!strncmp(rest, "gain", 4)) { tgt = SMP_XM_EQGAIN + band; rest += 4; }
+    else if (!strcmp(rest, "vel2freq")) { num(v, &o->eqv2f[band]); return 1; }
+    else if (!strcmp(rest, "vel2gain")) { num(v, &o->eqv2g[band]); return 1; }
+    else return 0;                              /* eqN_type and the rest: ignored */
+  }
+  else return 0;
+  if (!*rest) {                                 /* the value itself */
+    if (!num(v, &d)) return 1;
+    if (tgt == SMP_XM_CUTOFF2) o->cutoff2 = d;
+    else if (tgt == SMP_XM_RESO2) o->resonance2 = d;
+    else if (tgt < SMP_XM_EQBW) o->eqf[band] = d;
+    else if (tgt < SMP_XM_EQGAIN) o->eqbw[band] = d;
+    else o->eqg[band] = d;
+    return 1;
+  }
+  if ((cc = cc_suffix(rest, "_curvecc")) >= 0) {
+    if (!inum(v, &k) || k < 0 || k > 255) { ignored(p, nm); return 1; }
+    for (i = 0; i < o->nxm && !(o->xm[i].cc == cc && o->xm[i].target == tgt); i++) {}
+    if (i == o->nxm) {
+      if (o->nxm >= SMP_XDSP_MODS) { ignored(p, nm); return 1; }
+      o->nxm++; o->xm[i].cc = (uint8_t)cc; o->xm[i].target = (uint8_t)tgt; o->xm[i].amount = 0;
+    }
+    o->xm[i].curve = (uint8_t)k;
+    return 1;
+  }
+  if ((cc = cc_suffix(rest, "_oncc")) >= 0 || (cc = cc_suffix(rest, "_cc")) >= 0 || (cc = cc_suffix(rest, "cc")) >= 0) {
+    if (!num(v, &d)) return 1;
+    for (i = 0; i < o->nxm && !(o->xm[i].cc == cc && o->xm[i].target == tgt); i++) {}
+    if (i == o->nxm) {
+      if (o->nxm >= SMP_XDSP_MODS) { ignored(p, nm); return 1; }
+      o->nxm++; o->xm[i].cc = (uint8_t)cc; o->xm[i].target = (uint8_t)tgt; o->xm[i].curve = 0;
+    }
+    o->xm[i].amount = d;
+    return 1;
+  }
   return 0;
 }
 
@@ -540,6 +620,7 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
     else { snprintf(w, sizeof w, "%s=%.40s", nm, v); ignored(p, w); }
     return;
   }
+  if (xdsp_opcode(p, o, nm, v)) return;           /* the second filter and the EQ (cutoff2_cc115 isn't cutoff_cc) */
   if (strstr(nm, "cc") && cc_opcode(p, o, nm, v)) return;   /* the controller opcodes first: pitchlfo_depthccN isn't an LFO field */
   /* the sample */
   if (IS("sample")) {
@@ -1522,16 +1603,58 @@ static void fold_static(P *p, Opts *o) {
     else if (tg == CM_AMP) o->amplitude *= a / 100.0 * (c > 0 ? c : 0);
     else if (tg == CM_VELTRACK) o->veltrack += a * c;
     else if (tg == CM_WIDTH) o->width += a * c;
+    else if (tg == CM_RESO) o->resonance += a * c;
     else continue;                              /* the vibrato's depth: left as a linear modulator */
     o->ccm[k].target = CM_FOLDED;
   }
+}
+
+/* The region's second filter and EQ, as an SmpSfxDsp in p->xds (the same as the last one is shared): its index, -1
+   when it has neither, -2 out of memory. The second filter needs a cutoff2 and a kind the voice can do; a band is
+   heard when it has a gain, a vel2gain or a controller on its gain. Each controller's curve becomes 128 points in
+   one of the struct's curve slots (linear needs none); past the slots, a curve plays linear. */
+static int add_xdsp(P *p, const Opts *o) {
+  SmpSfxDsp x; int b, i, j, any = 0, ncv = 0, cvk[SMP_XDSP_CURVES];
+  memset(&x, 0, sizeof x);
+  if (o->cutoff2 > 0 && o->fil2_type >= 0) {
+    x.fil2_on = 1; x.fil2_type = (uint8_t)o->fil2_type;
+    x.cutoff2 = (float)clampd(o->cutoff2, 1, 30000); x.resonance2 = (float)clampd(o->resonance2, 0, 40);
+    x.fil2_keytrack = (float)clampd(o->fil2_keytrack, -1200, 1200); x.fil2_veltrack = (float)clampd(o->fil2_veltrack, -9600, 9600);
+    x.fil2_keycenter = (uint8_t)clampi((int)o->fil2_keycenter, 0, 127);
+    any = 1;
+  }
+  for (b = 0; b < 3; b++) {
+    int m = 0;
+    for (i = 0; i < o->nxm; i++) if (o->xm[i].target == SMP_XM_EQGAIN + b && o->xm[i].amount != 0) m = 1;
+    x.eq[b].freq = (float)o->eqf[b]; x.eq[b].bw = (float)o->eqbw[b]; x.eq[b].gain = (float)o->eqg[b];
+    x.eq[b].vel2freq = (float)o->eqv2f[b]; x.eq[b].vel2gain = (float)o->eqv2g[b];
+    if (o->eqg[b] != 0 || o->eqv2g[b] != 0 || m) { x.eq_on[b] = 1; any = 1; }
+  }
+  if (!any) return -1;
+  for (i = 0; i < o->nxm && x.nmod < SMP_XDSP_MODS; i++) {
+    int tg = o->xm[i].target, cv = o->xm[i].curve, slot = -1;
+    if (o->xm[i].amount == 0) continue;
+    if (tg <= SMP_XM_RESO2 ? !x.fil2_on : !x.eq_on[(tg - SMP_XM_EQFREQ) % 3]) continue;
+    if (cv != 0 || custom_curve(p, cv)) {
+      for (j = 0; j < ncv && cvk[j] != cv; j++) {}
+      if (j == ncv && ncv < SMP_XDSP_CURVES) { cvk[ncv] = cv; for (b = 0; b < 128; b++) x.curves[ncv][b] = (float)curve_val(p, cv, b); ncv++; }
+      if (j < ncv) slot = j;
+    }
+    x.mod[x.nmod].cc = o->xm[i].cc; x.mod[x.nmod].target = (uint8_t)tg; x.mod[x.nmod].curve = (int8_t)slot;
+    x.mod[x.nmod].amount = (float)o->xm[i].amount;
+    x.nmod++;
+  }
+  if (p->nxd && !memcmp(&p->xds[p->nxd - 1], &x, sizeof x)) return p->nxd - 1;
+  if (!grow((void **)&p->xds, &p->capxd, p->nxd + 1, sizeof *p->xds)) { p->oom = 1; return -2; }
+  p->xds[p->nxd] = x;
+  return p->nxd++;
 }
 
 /* The region now complete in p->region: its sample, its generators (SF2 units; each conversion below) and
    conditions, as one region, or two for a stereo sample. The first pass only notes its sample file. */
 static void finish_region(P *p) {
   const Opts *o = &p->region;
-  File *fl; int fi, nch, ch, lm, uses_loop, nmod = 0, moff, curve = -1;
+  File *fl; int fi, nch, ch, lm, uses_loop, nmod = 0, moff, curve = -1, xd = -1;
   int lokey, hikey, lovel, hivel;
   int64_t start, endx, ls_abs, le_abs;
   uint32_t at = 0, hf, rate;
@@ -1729,6 +1852,7 @@ static void finish_region(P *p) {
         else if (tg == CM_CUTOFF) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 8; amt = a; } }
         else if (tg == CM_PAN) { dest = 17; amt = a * 5; }
         else if (tg == CM_VIBDEPTH) { dest = 6; amt = a; }
+        else if (tg == CM_RESO) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 9; amt = a * 10; } }   /* dB as cB */
         else if (tg == CM_AMP) {
           /* the level times v / 127: the concave, negative curve's 480 cB make exactly that amplitude (960 make its
              square, SF2's CC7 default), down to -48 dB at 0. CC7 and CC11 keep that default (sfizz's amplitude_oncc7
@@ -1819,6 +1943,8 @@ static void finish_region(P *p) {
     c->layer = (uint16_t)o->layer;
   }
 
+  if ((xd = add_xdsp(p, o)) < -1) return;
+
   /* one region a channel: the sample from frame `at`, the address offsets relative to that sample (fine plus
      coarse, as the voice reads them), and the channel's pan; the second is the pair's follower */
   for (ch = 0; ch < nch; ch++) {
@@ -1831,7 +1957,7 @@ static void finish_region(P *p) {
     if (!grow((void **)&p->regs, &p->capr, p->nr + 1, sizeof *p->regs)) { p->oom = 1; return; }
     sh = &p->shdr[sid];
     g = &p->regs[p->nr++];
-    g->r = r; g->mod_off = moff; g->nmod = nmod; g->curve = curve;
+    g->r = r; g->mod_off = moff; g->nmod = nmod; g->curve = curve; g->xd = xd;
     g->r.sample = sid;
     g->r.cond.pair = (uint8_t)(ch == 1);
     g->r.gen[53] = (int16_t)(sid < 32767 ? sid : 32767);
@@ -2221,7 +2347,7 @@ static void free_parser(P *p) {
   for (i = 0; i < p->ncache; i++) free(p->cache[i].lw);
   free(p->cache); free(p->cslot);
   if (p->paths) for (i = 0; i < p->npaths; i++) free(p->paths[i]);
-  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->pre);
+  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->xds); free(p->pre);
   if (p->pk) for (i = 0; i < p->cappk; i++) sf_knobs_free(p->pk[i]);
   free(p->pk);
 }
@@ -2394,14 +2520,17 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
   {
     size_t sreg = (size_t)p->nr * sizeof(SmpSfRegion), sst = ((size_t)p->npre + 1) * sizeof(int);
     size_t smod = (size_t)p->nm * sizeof(SmpSfMod), mod_at = (sreg + sst + 7) & ~(size_t)7;
-    size_t cur_at = (mod_at + smod + 7) & ~(size_t)7, total = cur_at + (size_t)p->nc * 128 * sizeof(float);
+    size_t cur_at = (mod_at + smod + 7) & ~(size_t)7, xd_at = (cur_at + (size_t)p->nc * 128 * sizeof(float) + 7) & ~(size_t)7;
+    size_t total = xd_at + (size_t)p->nxd * sizeof(SmpSfxDsp);
     char *block = calloc(1, total ? total : 1);
-    SmpSfMod *mods; float *curves;
+    SmpSfMod *mods; float *curves; SmpSfxDsp *xds;
     if (!block) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
     f->regions = (SmpSfRegion *)block;
     f->rstart = (int *)(block + sreg);
     mods = (SmpSfMod *)(block + mod_at);
     curves = (float *)(block + cur_at);
+    xds = (SmpSfxDsp *)(block + xd_at);
+    if (p->nxd) memcpy(xds, p->xds, (size_t)p->nxd * sizeof *xds);
     if (smod) memcpy(mods, p->mods, smod);
     if (p->nc) memcpy(curves, p->curves, (size_t)p->nc * 128 * sizeof(float));
     for (i = 0; i < p->nr; i++) {
@@ -2410,6 +2539,7 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
       r->imod = mods + p->regs[i].mod_off; r->nimod = p->regs[i].nmod;
       r->pmod = NULL; r->npmod = 0;
       r->cond.amp_velcurve = p->regs[i].curve >= 0 ? curves + (size_t)p->regs[i].curve * 128 : NULL;
+      r->cond.xdsp = p->regs[i].xd >= 0 ? xds + p->regs[i].xd : NULL;
     }
     for (i = 0; i < p->npre; i++) f->rstart[i] = p->pre[i].start;
     f->rstart[p->npre] = p->nr;

@@ -61,6 +61,10 @@ typedef struct SmpSfVoice {
   double b0, b1, b2, a1, a2, d_b0, d_b1, d_b2, d_a1, d_a2;
   int filt_on;                           /* 0 while the filter is a straight wire now and at the next update */
   double x1, x2, y1, y2;
+  /* SFZ's second filter and EQ bands (cond.xdsp): xn biquads after the first filter, in order. Their targets (xt)
+     are worked out at every derive (the start and each controller change); the coefficients (xc) step toward them
+     sample by sample (xdc) as the first filter's do; xs is each one's state (x1, x2, y1, y2). */
+  int xn; double xt[4][5], xc[4][5], xdc[4][5], xs[4][4];
   double level;                          /* the last envelope level times the attenuation, for stealing */
   /* kill: a linear fade */
   int killing; double fade, fade_step;

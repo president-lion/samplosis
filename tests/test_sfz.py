@@ -540,7 +540,7 @@ def test_sfz_unknown_opcodes_counted(lib, tmp_path):
     f = opened(lib, path)
     try:
         assert len(regions(lib, f, 0)) == 2
-        assert ignored(lib, f) == (5, "eq1_freq")      # eq1_freq, eq1_gain, foo_bar, bar_baz, <weird>
+        assert ignored(lib, f) == (3, "foo_bar")       # foo_bar, bar_baz, <weird> (the EQ is played since 2026-11-20)
     finally:
         lib.smp_sf_close(f)
 
