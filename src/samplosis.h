@@ -207,6 +207,11 @@ typedef struct {
   /* added for Decent Sampler's knobs */
   uint16_t layer;               /* the preset's layer (its <group>, 1-based) whose gain and tuning the knobs set at
                                    play time (SfKnobs, sfknob.h); 0: none, the region's own values are all there is */
+  /* added for SFZ's controller crossfades (xfin_loccN, xfin_hiccN, xfout_loccN, xfout_hiccN): worked out whenever
+     the voice's modulators are (at the start and at every controller change), so a held note follows the controller */
+  uint8_t xfcc_n;               /* how many of xfcc are set */
+  struct { uint8_t cc, lo, hi, out; } xfcc[4];   /* out 0 fades in over lo..hi, 1 fades out */
+  uint8_t xf_cccurve;           /* 0 power, 1 gain (xf_cccurve) */
 } SmpSfCond;
 enum { SMP_FIL_LP = 0, SMP_FIL_HP = 1, SMP_FIL_BP = 2, SMP_FIL_BR = 3,      /* 2-pole lowpass, highpass, bandpass, notch */
        SMP_FIL_LP1 = 4, SMP_FIL_HP1 = 5 };                                  /* 1-pole lowpass and highpass (6 dB an octave) */

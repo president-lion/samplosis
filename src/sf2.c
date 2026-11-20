@@ -827,9 +827,14 @@ int sf_finish_regions(SmpFont *f) {
     if (!f->swmask) return 0;
     for (p = 0; p < f->nphdr; p++) {
       uint8_t *m = f->swmask + 16 * (size_t)p;
+      int uses_last = 0;
+      /* A range is keyswitch keys only in a preset that switches on them (some region's sw_last): sfizz and
+         sforzando play a range with nothing switching on it (No Budget Band's harmonica_wahwah.sfz gives its release
+         group sw_lokey=0 sw_hikey=127, which would otherwise silence every key) */
+      for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) uses_last |= f->regions[i].cond.sw_last >= 0;
       for (i = f->rstart[p]; i < f->rstart[p + 1]; i++) {
         const SmpSfCond *c = &f->regions[i].cond; int k;
-        if (c->sw_lokey >= 0) for (k = c->sw_lokey; k <= c->sw_hikey && k < 128; k++) mask_set(m, k);
+        if (uses_last && c->sw_lokey >= 0) for (k = c->sw_lokey; k <= c->sw_hikey && k < 128; k++) mask_set(m, k);
         mask_set(m, c->sw_last);
       }
     }

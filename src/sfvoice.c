@@ -128,6 +128,9 @@ static void add_mods(double *sum, const SmpSfMod *list, int n, const ModCtx *m, 
   }
 }
 
+static double xf_in(int x, int lo, int hi);
+static double xf_out(int x, int lo, int hi);
+
 /* the modulators of both lists, then what the generators work out to */
 static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   const SmpSfRegion *r = v->reg;
@@ -148,8 +151,20 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
               g[G_PITCH] + v->chan_tune + 100.0 * v->transpose + v->rnd_cents + (v->lcents ? *v->lcents : 0);
   v->ratio_k = v->srate / rate;
 
-  /* gain: initialAttenuation times the EMU factor, plus the modulators' attenuation (velocity, CC7, CC11) */
-  v->atten_gain = pow(10.0, -clampd(ATTEN_FACTOR * r->gen[G_ATTEN] + v->mod[G_ATTEN], 0, 1440) / 200.0) * v->cond_gain;
+  /* gain: initialAttenuation times the EMU factor, plus the modulators' attenuation (velocity, CC7, CC11). SF2
+     stops at 0 (no boost); SFZ's gain_ccN may raise a voice above unity (gain_cc11=12 is +12 dB at CC11 127, as
+     sfizz plays it), up to 24 dB */
+  v->atten_gain = pow(10.0, -clampd(ATTEN_FACTOR * r->gen[G_ATTEN] + v->mod[G_ATTEN],
+                                    v->font && v->font->is_sfz ? -240 : 0, 1440) / 200.0) * v->cond_gain;
+  if (r->cond.xfcc_n) {                       /* SFZ's controller crossfades, at the controllers' values now */
+    double x = 1; int i2;
+    for (i2 = 0; i2 < r->cond.xfcc_n && i2 < 4; i2++) {
+      int val = c->cc[r->cond.xfcc[i2].cc & 127];
+      x *= r->cond.xfcc[i2].out ? xf_out(val, r->cond.xfcc[i2].lo, r->cond.xfcc[i2].hi)
+                                : xf_in(val, r->cond.xfcc[i2].lo, r->cond.xfcc[i2].hi);
+    }
+    v->atten_gain *= r->cond.xf_cccurve == 1 ? x : sqrt(x);
+  }
   if (v->lgain) v->atten_gain *= *v->lgain > 0 ? *v->lgain : 0;    /* a Decent Sampler knob's layer gain */
   {
     double th = (clampd(g[G_PAN], -500, 500) + 500) / 1000.0 * (PI / 2);   /* constant power, -3 dB each at 0 */

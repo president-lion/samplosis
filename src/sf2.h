@@ -111,7 +111,8 @@ struct SmpFont {
   int *rstart;
   /* Built by sf_finish_regions at open, immutable after:
      - swmask: per phdr preset, 16 bytes: a 128-bit mask of the keyswitch keys (the regions' sw_lokey..sw_hikey
-       ranges and sw_last keys), which set the last keyswitch and never sound. NULL when no region has one.
+       ranges, in a preset with some sw_last, and sw_last keys), which set the last keyswitch and never sound. NULL
+       when no region has one.
      - pflags: per phdr preset, SF_PF_*.
      - kix_off, kix: per phdr preset (unless SF_PF_NOINDEX), the regions that cover each key: for key k, kix entries
        [kix_off[129 p + k], kix_off[129 p + k + 1]) are region indices within the preset, in region order.

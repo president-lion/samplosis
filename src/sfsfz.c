@@ -134,6 +134,8 @@ typedef struct {
   int sw_lokey, sw_hikey, sw_last, sw_down, sw_up, sw_previous, sw_default;
   int ncc; uint8_t cc[4], cclo[4], cchi[4];
   int xfin_lokey, xfin_hikey, xfout_lokey, xfout_hikey, xfin_lovel, xfin_hivel, xfout_lovel, xfout_hivel, xf_curve;
+  /* controller crossfades: per controller and direction, lo and hi (-1 not given) */
+  int nxfcc; struct { uint8_t cc, out; int lo, hi; } xfcc[4]; int xf_cccurve;
   uint32_t group, off_by; int off_mode;
   double rt_decay; int polyphony, note_polyphony;
   double bend_up, bend_down; int bend_set;      /* cents */
@@ -459,6 +461,30 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
     if (IS("samplosis_layer") && num(v, &d)) o->layer = clampi((int)d, 0, 65535);
     else if (IS("samplosis_unbind_cc") && num(v, &d) && d >= 0 && d <= 127) p->unbound[(int)d >> 3] |= (uint8_t)(1 << ((int)d & 7));
     else if (IS("samplosis_no_reverb_send")) p->no_rev_send = 1;
+    return;
+  }
+  if (!strncmp(nm, "xfin_", 5) || !strncmp(nm, "xfout_", 6)) {   /* controller crossfades: xfin_locc67=64 */
+    int out = nm[2] == 'o', hi; const char *s = nm + (out ? 6 : 5);
+    if ((!strncmp(s, "locc", 4) || !strncmp(s, "hicc", 4)) && s[4] >= '0' && s[4] <= '9') {
+      char *e; long n = strtol(s + 4, &e, 10);
+      hi = s[0] == 'h';
+      if (!*e && n >= 0 && n <= 127 && inum(v, &k)) {
+        for (i = 0; i < o->nxfcc && (o->xfcc[i].cc != n || o->xfcc[i].out != out); i++) {}
+        if (i == o->nxfcc) {
+          if (o->nxfcc >= 4) { ignored(p, nm); return; }        /* four controller crossfades a region */
+          o->xfcc[i].cc = (uint8_t)n; o->xfcc[i].out = (uint8_t)out; o->xfcc[i].lo = o->xfcc[i].hi = -1; o->nxfcc++;
+        }
+        if (hi) o->xfcc[i].hi = clampi(k, 0, 127); else o->xfcc[i].lo = clampi(k, 0, 127);
+        return;
+      }
+      ignored(p, nm);
+      return;
+    }
+  }
+  if (IS("xf_cccurve")) {
+    if (ieq(v, "power")) o->xf_cccurve = 0;
+    else if (ieq(v, "gain")) o->xf_cccurve = 1;
+    else { snprintf(w, sizeof w, "%s=%.40s", nm, v); ignored(p, w); }
     return;
   }
   if (strstr(nm, "cc") && cc_opcode(p, o, nm, v)) return;   /* the controller opcodes first: pitchlfo_depthccN isn't an LFO field */
@@ -1633,6 +1659,17 @@ static void finish_region(P *p) {
     c->xfin_lovel = (uint8_t)clampi(o->xfin_lovel, 0, 127); c->xfin_hivel = (uint8_t)clampi(o->xfin_hivel, 0, 127);
     c->xfout_lovel = (uint8_t)clampi(o->xfout_lovel, 0, 127); c->xfout_hivel = (uint8_t)clampi(o->xfout_hivel, 0, 127);
     c->xf_curve = (uint8_t)o->xf_curve;
+    {                                           /* SFZ's defaults for an end not given: xfin_ 0, xfout_ 127 */
+      int i2;
+      for (i2 = 0; i2 < o->nxfcc && i2 < 4; i2++) {
+        int d0 = o->xfcc[i2].out ? 127 : 0;
+        c->xfcc[i2].cc = o->xfcc[i2].cc; c->xfcc[i2].out = o->xfcc[i2].out;
+        c->xfcc[i2].lo = (uint8_t)(o->xfcc[i2].lo >= 0 ? o->xfcc[i2].lo : d0);
+        c->xfcc[i2].hi = (uint8_t)(o->xfcc[i2].hi >= 0 ? o->xfcc[i2].hi : d0);
+      }
+      c->xfcc_n = (uint8_t)(o->nxfcc < 4 ? o->nxfcc : 4);
+      c->xf_cccurve = (uint8_t)o->xf_cccurve;
+    }
     c->group = o->group; c->off_by = o->off_by; c->off_mode = (uint8_t)o->off_mode;
     c->rt_decay = (float)clampd(o->rt_decay, 0, 200);
     c->polyphony = (uint16_t)clampi(o->polyphony, 0, 65535);
@@ -2078,6 +2115,9 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
      modulator lists and velocity curves */
   if (p->swdef >= 0) for (i = 0; i < p->nr; i++) p->regs[i].r.cond.sw_default = (int8_t)p->swdef;
   for (i = 0; i < 128; i++) { f->cc_init[i] = p->cc_init[i]; if (p->cc_init[i] >= 0) f->has_cc_init = 1; }
+  /* No send to the shared reverb until the music asks (CC91): SFZ players (sfizz, sforzando) have no reverb of
+     their own, so GM's default send of 40 put a reverb on every instrument that its author never heard */
+  if (f->cc_init[91] < 0) { f->cc_init[91] = 0; f->has_cc_init = 1; }
   f->version = 2;
   if (!p->npre) {                               /* one preset, named after the file */
     const char *b = p->root_name, *dot = strrchr(b, '.');

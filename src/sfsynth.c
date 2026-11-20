@@ -43,8 +43,8 @@
    - Random (lorand, hirand): one draw in [0, 1) per note-on (xorshift32, seeded the same in every new synth;
      smp_synth_test_seed), shared by every region of the note; a region plays when lorand <= draw < hirand (or
      hirand is 1 or more). A note's release triggers use its note-on's draw.
-   - Keyswitches: keys in a region's sw_lokey..sw_hikey, and its sw_last key, set the channel's last keyswitch;
-     those keys never sound (sf_preset_swmask). sw_last plays when the last keyswitch (or, before any since the
+   - Keyswitches: keys in a region's sw_lokey..sw_hikey (only in a preset where some region has sw_last), and its
+     sw_last key, set the channel's last keyswitch; those keys never sound (sf_preset_swmask). sw_last plays when the last keyswitch (or, before any since the
      channel's preset was chosen, the region's sw_default) is that key; sw_down and sw_up test whether that key is
      down now (any key, a keyswitch or not); sw_previous whether the channel's previous note-on (keyswitches too)
      was that key.
@@ -662,7 +662,7 @@ static int cond_ok(SmpSynth *s, int c, const SmpSfRegion *r, int key, int vel, i
     default: return 0;
   }
   if (rnd < d->lorand || (rnd >= d->hirand && d->hirand < 1)) return 0;
-  if (d->sw_lokey >= 0 && key >= d->sw_lokey && key <= d->sw_hikey) return 0;
+  if (d->sw_lokey >= 0 && key >= d->sw_lokey && key <= d->sw_hikey && bit(sf_preset_swmask(s->cur, h->preset), key)) return 0;
   if (d->sw_last >= 0 && (h->sw_last >= 0 ? h->sw_last : d->sw_default) != d->sw_last) return 0;
   if (d->sw_down >= 0 && !h->held[d->sw_down]) return 0;
   if (d->sw_up >= 0 && h->held[d->sw_up]) return 0;
