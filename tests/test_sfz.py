@@ -188,6 +188,59 @@ def test_sfz_inheritance_and_define_include(lib, tmp_path):
         lib.smp_sf_close(f)
 
 
+def test_sfz_directives_mid_line(lib, tmp_path):
+    """#define and #include may sit anywhere in a line, as sforzando and sfizz read them (the Headroom Piano and
+    Maestro Concert Grand write '<region> #define $KEY 60 lokey=59 #include "x.txt"'): a define's value ends where an
+    opcode's would (the next name=, header or directive), so it can still hold spaces, and what follows on the line
+    sees it; a # that starts no directive stays in a value."""
+    os.makedirs(tmp_path / "Data")
+    write_wav(tmp_path / "s60.wav", sine(RATE // 2, 261.63))
+    write_wav(tmp_path / "s64.wav", sine(RATE // 2, 329.63))
+    write_wav(tmp_path / "two words.wav", sine(RATE // 2, 440.0))
+    write_wav(tmp_path / "a #1.wav", sine(RATE // 2, 440.0))
+    write_sfz(tmp_path / "Data" / "smp.txt", "sample=s$KEY.$EXT\npitch_keycenter=$KEY\n")
+    path = write_sfz(tmp_path / "mid.sfz", """#define $EXT wav
+<group> #define $LO 1 lovel=$LO hivel=127
+<region> #define $KEY 60 lokey=59 hikey=61 #include "Data/smp.txt"
+<region> #define $KEY 64 lokey=62 hikey=66 #include "Data/smp.txt" volume=-6
+#define $FILE two words.wav
+<region> sample=$FILE key=70
+<region> sample=a #1.wav key=72
+""")
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.lokey, x.hikey) for x in r] == [(59, 61), (62, 66), (70, 70), (72, 72)]
+        assert [x.gen[58] for x in r] == [60, 64, 70, 72]
+        assert all((x.lovel, x.hivel) == (1, 127) for x in r)
+        assert r[1].gen[48] == 150                                      # the opcode after the #include still counts
+        assert len({x.sample for x in r}) == 4
+        lo, _ = note(lib, f, 60)
+        hi, _ = note(lib, f, 64)
+        assert abs(peak_hz(lo[2000:20000, 0], OUT) - 261.63) < 2
+        assert abs(peak_hz(hi[2000:20000, 0], OUT) - 329.63) < 2
+        assert lib.smp_sf_problem(f) == b""
+    finally:
+        lib.smp_sf_close(f)
+
+
+def test_sfz_include_relative_to_root(lib, tmp_path):
+    """An #include in an included file is looked for from the root .sfz's folder first, as sforzando and sfizz do
+    (Data/group.txt including "Data/region.txt"), then from the including file's own folder."""
+    os.makedirs(tmp_path / "Data")
+    write_wav(tmp_path / "a.wav", sine(RATE // 2, 440.0))
+    write_sfz(tmp_path / "Data" / "region.txt", "<region> key=60 sample=a.wav\n")
+    write_sfz(tmp_path / "Data" / "local.txt", "<region> key=62 sample=a.wav\n")
+    write_sfz(tmp_path / "Data" / "group.txt", '<group> lovel=1\n#include "Data/region.txt"\n#include "local.txt"\n')
+    path = write_sfz(tmp_path / "root.sfz", '#include "Data/group.txt"\n')
+    f = opened(lib, path)
+    try:
+        r = regions(lib, f, 0)
+        assert [(x.lokey, x.lovel) for x in r] == [(60, 1), (62, 1)]
+    finally:
+        lib.smp_sf_close(f)
+
+
 def envelope(x, win=480):
     a = np.abs(x)
     return np.array([a[i:i + win].max() for i in range(0, len(a) - win, win)])

@@ -3,9 +3,11 @@
    of samplosis.h for SFZ's logic. The player and voice then play it like any SoundFont.
 
    The text. Comments (// to the line's end and block comments) are blanked first. #define $NAME value is a textual
-   replacement on every later line (a value may use earlier defines, expanded when it is defined); #include "file"
-   reads another file in place, relative to the including file, at most 16 deep, never one already being read (so a
-   cycle stops), at most 4096 includes and 64 MB of text in all. Headers are <control>, <global>, <master>,
+   replacement on everything after it (a value may use earlier defines, expanded when it is defined, and ends where
+   an opcode's value would); #include "file" reads another file in place, looked for from the root .sfz's folder
+   and then the including file's, at most 16 deep, never one already being read (so a cycle stops), at most 4096
+   includes and 64 MB of text in all. Either directive may start any word of a line, not only the line, as
+   sforzando and sfizz read them. Headers are <control>, <global>, <master>,
    <group> and <region>, inheriting in that order (a <global> starts the master and group again from it, a
    <master> the group, and each <region> starts from the group); <curve>, <effect> and <midi> are read past (their
    opcodes do nothing here). An opcode is name=value, and a value runs to the next name= or header or the line's
@@ -1817,25 +1819,88 @@ static void include(P *p, const char *s, size_t n, const wchar_t *dir, int depth
   if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, rel, WPATH) &&
       !MultiByteToWideChar(CP_ACP, 0, name, -1, rel, WPATH)) return;
   if ((rel[0] && rel[1] == L':') || rel[0] == L'\\') { if (wcslen(rel) >= WPATH) return; wcscpy(w, rel); }
-  else if (_snwprintf(w, WPATH - 1, L"%s%s", dir, rel) < 0) return;   /* too long: never cut short */
+  else {
+    /* the root .sfz's folder first, as sforzando and sfizz look (Data\group.txt including "Data/region.txt"),
+       then the including file's own folder */
+    wchar_t root[WPATH], *sl; DWORD at;
+    wcsncpy(root, p->stack[0], WPATH - 1); root[WPATH - 1] = 0;
+    sl = wcsrchr(root, L'\\');
+    if (sl) sl[1] = 0; else root[0] = 0;
+    if (_snwprintf(w, WPATH - 1, L"%s%s", root, rel) < 0) return;   /* too long: never cut short */
+    w[WPATH - 1] = 0;
+    at = GetFileAttributesW(w);
+    if ((at == INVALID_FILE_ATTRIBUTES || (at & FILE_ATTRIBUTE_DIRECTORY)) &&
+        _snwprintf(w, WPATH - 1, L"%s%s", dir, rel) < 0) return;
+  }
   w[WPATH - 1] = 0;
   fn = GetFullPathNameW(w, WPATH, full, NULL);
   if (!fn || fn >= WPATH) return;
   process_file(p, full, depth + 1, why, (int)sizeof why);   /* a missing or bad include is skipped */
 }
 
-/* one line (n bytes, no newline): a directive, or headers and opcodes */
+/* 7 or 8 when a #define or #include starts s (n bytes), not followed by more of a name; else 0 */
+static size_t directive_at(const char *s, size_t n) {
+  if (n >= 7 && !memcmp(s, "#define", 7) && (n == 7 || !namech(s[7]))) return 7;
+  if (n >= 8 && !memcmp(s, "#include", 8) && (n == 8 || !namech(s[8]))) return 8;
+  return 0;
+}
+
+/* where a value starting at i ends: a header, or a space before the next name=, header or directive, or the line's
+   end (trailing spaces left for the caller to trim) */
+static size_t value_end(const char *s, size_t n, size_t i) {
+  while (i < n) {
+    if (s[i] == '<') break;
+    if (ws(s[i])) {
+      size_t j = i, k;
+      while (j < n && ws(s[j])) j++;
+      if (j >= n || s[j] == '<' || directive_at(s + j, n - j)) break;
+      for (k = j; k < n && namech(s[k]); k++) {}
+      if (k > j && k < n && s[k] == '=') break;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return i;
+}
+
+static void do_text(P *p, const char *s, size_t n);
+
+/* one line (n bytes, no newline). A #define or #include may start the line or any word in it (sforzando and sfizz
+   read '<region> #define $KEY 60 lokey=59 #include "x.txt"'), so the line is taken in order: the text before a
+   directive, the directive, then the rest, which sees what the directive defined or read. A define's value ends
+   where an opcode's would, so it may hold spaces; a # that starts no directive stays in a value (sample=a #1.wav). */
 static void do_line(P *p, const char *s, size_t n, const wchar_t *dir, int depth) {
   size_t i = 0;
-  while (i < n && ws(s[i])) i++;
-  if (i < n && s[i] == '#') {
-    if (n - i >= 7 && !memcmp(s + i, "#define", 7)) { define(p, s + i + 7, n - i - 7); return; }
-    if (n - i >= 8 && !memcmp(s + i, "#include", 8)) {
-      size_t m = p->ndef ? expand(p, s + i + 8, n - i - 8, p->line, MAX_LINE) : n - i - 8;
-      include(p, p->ndef ? p->line : s + i + 8, m, dir, depth);
-      return;
+  while (i < n && !p->oom) {
+    size_t d = i, L = 0;
+    for (; d < n; d++) if (s[d] == '#' && (d == 0 || ws(s[d - 1])) && (L = directive_at(s + d, n - d))) break;
+    if (d > i) do_text(p, s + i, d - i);
+    if (d >= n) break;
+    if (L == 7) {                                   /* #define $NAME value */
+      size_t a = d + 7, e;
+      while (a < n && ws(s[a])) a++;
+      if (a < n && s[a] == '$') for (a++; a < n && namech(s[a]) && s[a] != '$'; a++) {}
+      while (a < n && ws(s[a])) a++;
+      if (a < n && s[a] == '<') for (e = a; e < n && !ws(s[e]); e++) {}   /* a header as the value: one word */
+      else e = value_end(s, n, a);
+      define(p, s + d + 7, e - d - 7);
+      i = e;
+    } else {                                        /* #include "file" (or a bare name, to the next space) */
+      size_t a = d + 8, b;
+      while (a < n && ws(s[a])) a++;
+      if (a < n && s[a] == '"') { for (b = a + 1; b < n && s[b] != '"'; b++) {} if (b < n) b++; }
+      else for (b = a; b < n && !ws(s[b]); b++) {}
+      if (p->ndef) include(p, p->line, expand(p, s + a, b - a, p->line, MAX_LINE), dir, depth);
+      else include(p, s + a, b - a, dir, depth);
+      i = b;
     }
   }
+}
+
+/* text with no directive in it: headers and opcodes, after the defines are replaced */
+static void do_text(P *p, const char *s, size_t n) {
+  size_t i;
   if (p->ndef && memchr(s, '$', n)) { n = expand(p, s, n, p->line, MAX_LINE); s = p->line; }
   i = 0;
   while (i < n && !p->oom) {
@@ -1854,19 +1919,7 @@ static void do_line(P *p, const char *s, size_t n, const wchar_t *dir, int depth
     if (i >= n || s[i] != '=') continue;            /* not name=value: skipped */
     nn = i - a;
     vs = ++i;
-    while (i < n) {                                 /* the value runs to the next name= or header */
-      if (s[i] == '<') break;
-      if (ws(s[i])) {
-        size_t j = i, k;
-        while (j < n && ws(s[j])) j++;
-        if (j >= n || s[j] == '<') break;
-        for (k = j; k < n && namech(s[k]); k++) {}
-        if (k > j && k < n && s[k] == '=') break;
-        i = j;
-        continue;
-      }
-      i++;
-    }
+    i = value_end(s, n, i);                         /* the value runs to the next name= or header */
     for (ve = i; ve > vs && ws(s[ve - 1]); ve--) {}
     if (nn) opcode_at(p, s + a, nn, s + vs, ve - vs);
   }
