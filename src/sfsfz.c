@@ -107,9 +107,10 @@ enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
 
 #define MAX_CCM 16                       /* controller modulations a region keeps */
 /* what a controller modulates (Opts.ccm): level (dB), pitch (cents), cutoff (cents), pan (percent), the amplitude
-   envelope's stages (seconds, sustain percent), the vibrato's depth (cents) and rate (Hz) */
+   envelope's stages (seconds, sustain percent), the vibrato's depth (cents) and rate (Hz), and amplitude (percent,
+   a factor: amplitude_onccN=X scales the level by X / 100 times the controller over 127, so CC 0 is silent) */
 enum { CM_GAIN, CM_PITCH, CM_CUTOFF, CM_PAN, CM_AMPEG0 /* delay; +1 attack ... +5 release */, CM_VIBDEPTH = CM_AMPEG0 + 6,
-       CM_VIBFREQ };
+       CM_VIBFREQ, CM_AMP };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -121,6 +122,7 @@ typedef struct {
   int lokey, hikey, lovel, hivel, keycenter;   /* keycenter -2: pitch_keycenter=sample, the file's own root */
   double keytrack, tune, transpose;            /* cents per key, cents, semitones */
   double volume, amplitude, pan, width, veltrack;   /* dB, percent, -100..100, percent, percent */
+  double lv_volume[3];                  /* global_volume, master_volume, group_volume (dB): added to volume, not replaced by it */
   int velcurve_n; uint8_t velset[128]; float velcurve[128];   /* amp_velcurve_N points given */
   double ampeg[6], fileg[6], pitcheg[6];       /* delay, attack, hold, decay (seconds), sustain (percent), release */
   double fileg_depth, pitcheg_depth;           /* cents */
@@ -234,6 +236,9 @@ typedef struct SfzBuild {
      shared reverb */
   SfKnobs **pk; int cappk;
   uint8_t unbound[16]; int no_rev_send;
+  /* CCs the file's own opcodes use (onccN, loccN, xfin_hiccN...; not set_ccN or labels), from the first pass, so
+     every region of the second knows: CC91 and CC93 used that way are the instrument's, not GM's effect sends */
+  uint8_t own_cc[16];
 } P;
 
 /* ---- small helpers ---- */
@@ -442,7 +447,7 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
     {"ampeg_decaycc", CM_AMPEG0 + 3}, {"ampeg_decay_oncc", CM_AMPEG0 + 3}, {"ampeg_sustaincc", CM_AMPEG0 + 4},
     {"ampeg_sustain_oncc", CM_AMPEG0 + 4}, {"ampeg_releasecc", CM_AMPEG0 + 5}, {"ampeg_release_oncc", CM_AMPEG0 + 5},
     {"pitchlfo_depthcc", CM_VIBDEPTH}, {"pitchlfo_depth_oncc", CM_VIBDEPTH}, {"pitchlfo_freqcc", CM_VIBFREQ},
-    {"pitchlfo_freq_oncc", CM_VIBFREQ},
+    {"pitchlfo_freq_oncc", CM_VIBFREQ}, {"amplitude_cc", CM_AMP}, {"amplitude_oncc", CM_AMP},
   };
   int i, cc;
   if ((cc = cc_suffix(nm, "set_cc")) >= 0) {   /* a level's set_cc (<control> is where it belongs): the same */
@@ -459,6 +464,14 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   double d; int k, i;
   char w[64];
 #define IS(s) (!strcmp(nm, s))
+  if (p->collect && strncmp(nm, "set_cc", 6) && strncmp(nm, "label_cc", 8)) {   /* a CC of the file's own */
+    size_t n = strlen(nm), j = n;
+    while (j > 0 && nm[j - 1] >= '0' && nm[j - 1] <= '9') j--;
+    if (j < n && n - j <= 3 && j >= 2 && nm[j - 2] == 'c' && nm[j - 1] == 'c') {
+      int c = atoi(nm + j);
+      if (c >= 0 && c <= 127) p->own_cc[c >> 3] |= (uint8_t)(1 << (c & 7));
+    }
+  }
   if (!strncmp(nm, "samplosis_", 10)) {      /* the builder's own, fed by sfds.c for Decent Sampler's knobs */
     if (IS("samplosis_layer") && num(v, &d)) o->layer = clampi((int)d, 0, 65535);
     else if (IS("samplosis_unbind_cc") && num(v, &d) && d >= 0 && d <= 127) p->unbound[(int)d >> 3] |= (uint8_t)(1 << ((int)d & 7));
@@ -511,6 +524,9 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   if (IS("transpose")) { num(v, &o->transpose); return; }
   /* level and pan */
   if (IS("volume")) { num(v, &o->volume); return; }
+  if (IS("global_volume")) { num(v, &o->lv_volume[0]); return; }
+  if (IS("master_volume")) { num(v, &o->lv_volume[1]); return; }
+  if (IS("group_volume")) { num(v, &o->lv_volume[2]); return; }
   if (IS("amplitude")) { num(v, &o->amplitude); return; }
   if (IS("pan")) { num(v, &o->pan); return; }
   if (IS("width")) { num(v, &o->width); return; }
@@ -1494,8 +1510,14 @@ static void finish_region(P *p) {
      initialAttenuation, whose centibels the voice takes times 0.4 (the EMU factor), so dB x -25, up to 144 dB;
      above 0 dB, which attenuation can't say, it is the condition gain 10^(dB / 20). amp_veltrack (percent, 100 by
      default) and amp_velcurve_N go to the conditions, which replace SF2's velocity-to-attenuation modulator. */
-  db = o->volume + (o->amplitude >= 100 ? (o->amplitude == 100 ? 0 : 20 * log10(o->amplitude / 100)) :
+  db = o->volume + o->lv_volume[0] + o->lv_volume[1] + o->lv_volume[2] + (o->amplitude >= 100 ? (o->amplitude == 100 ? 0 : 20 * log10(o->amplitude / 100)) :
                     o->amplitude <= 0 ? -144 : 20 * log10(o->amplitude / 100));
+  {                                             /* amplitude_onccN=X: its X / 100 here, the controller's part a modulator */
+    int k;
+    for (k = 0; k < o->nccm; k++)
+      if (o->ccm[k].target == CM_AMP && o->ccm[k].amount != 100)
+        db += o->ccm[k].amount <= 0 ? -144 : 20 * log10(o->ccm[k].amount / 100);
+  }
   db = clampd(db, -144, 24);
   if (db <= 0) r.gen[G_ATTEN] = (int16_t)clampi((int)floor(-db * 25 + 0.5), 0, 3600);
   else r.cond.gain = (float)pow(10.0, db / 20);
@@ -1575,6 +1597,7 @@ static void finish_region(P *p) {
         int cc = base[k].src & 0x7F;
         if ((p->unbound[cc >> 3] >> (cc & 7)) & 1) continue;
         if (cc == 91 && p->no_rev_send) continue;
+        if ((cc == 91 || cc == 93) && ((p->own_cc[cc >> 3] >> (cc & 7)) & 1)) continue;   /* the instrument's own control */
         m[nmod++] = base[k];
       }
     }
@@ -1611,6 +1634,15 @@ static void finish_region(P *p) {
         else if (tg == CM_CUTOFF) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 8; amt = a; } }
         else if (tg == CM_PAN) { dest = 17; amt = a * 5; }
         else if (tg == CM_VIBDEPTH) { dest = 6; amt = a; }
+        else if (tg == CM_AMP) {
+          /* the level times v / 127: the concave, negative curve's 480 cB make exactly that amplitude (960 make its
+             square, SF2's CC7 default), down to -48 dB at 0. CC7 and CC11 keep that default (sfizz's amplitude_oncc7
+             default is squared too), so only the X / 100 above changes them; a Decent Sampler knob's CC is unbound. */
+          if (a > 0 && !((cc == 7 || cc == 11) && !((p->unbound[cc >> 3] >> (cc & 7)) & 1))) {
+            SmpSfMod w = {(uint16_t)(0x0580 | cc), G_ATTEN, 480, 0, 0}; m[nmod++] = w;
+          }
+          continue;
+        }
         else if (tg >= CM_AMPEG0 && tg < CM_AMPEG0 + 6) {
           int st = tg - CM_AMPEG0;
           dest = G_DELAY_VOLENV + st;
@@ -2113,6 +2145,7 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
   if (add_path(p, path) != 0) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }   /* paths[0]: the .sfz */
 
   /* the first pass collects the files, which are probed (the probe cache first) before the second builds */
+  memset(p->own_cc, 0, sizeof p->own_cc);
   p->collect = 1;
   if (!feed(p, ctx, full, why, wcap)) goto done;
   if (p->level == LV_REGION) finish_region(p);
