@@ -112,7 +112,10 @@ enum { F_PENDING, F_OK, F_MISSING, F_UNREADABLE };
    amp_veltrack (percent) and width (percent), the last two set once from the controller's starting value.
    CM_FOLDED marks one folded into the region's own values (a curve no modulator can draw). */
 enum { CM_GAIN, CM_PITCH, CM_CUTOFF, CM_PAN, CM_AMPEG0 /* delay; +1 attack ... +5 release */, CM_VIBDEPTH = CM_AMPEG0 + 6,
-       CM_VIBFREQ, CM_AMP, CM_VELTRACK, CM_WIDTH, CM_RESO /* the first filter's resonance, dB */, CM_FOLDED = 255 };
+       CM_VIBFREQ, CM_AMP, CM_VELTRACK, CM_WIDTH, CM_RESO /* the first filter's resonance, dB */,
+       CM_FILDEPTH, CM_PITCHDEPTH /* fileg_depth, pitcheg_depth (cents) */,
+       CM_MODENV0 /* the modulation envelope's stages, as CM_AMPEG0's: fileg_ when set, else pitcheg_ */,
+       CM_FOLDED = 255 };
 
 /* an LFO as SFZ gives it: Hz, seconds, and its depths (cents to pitch, dB to volume, cents to cutoff) */
 typedef struct { double freq, delay, pitch, volume, cutoff; } Lfo;
@@ -136,6 +139,15 @@ typedef struct {
   int fil2_type; double cutoff2, resonance2, fil2_keytrack, fil2_veltrack, fil2_keycenter;
   double eqf[3], eqbw[3], eqg[3], eqv2f[3], eqv2g[3];
   int nxm; struct { uint8_t cc, target, curve; double amount; } xm[SMP_XDSP_MODS];
+  /* flex envelopes by number (egN is flex[N - 1]; set: some opcode named it), as SmpSfFlexEg has them */
+  struct FlexO {
+    uint8_t set, npts, sustain, ntm, ndm;
+    double time[SMP_FLEX_PTS], level[SMP_FLEX_PTS]; uint8_t curve[SMP_FLEX_PTS];
+    double depth[4];
+    struct { uint8_t cc, pt; double amount; } tm[4];
+    struct { uint8_t cc, target; double amount; } dm[4];
+  } flex[SMP_FLEX_MAX];
+  double offset_random; int ndelay_cc; struct { uint8_t cc; double amount; } delay_cc[2];   /* frames; seconds */
   Lfo amplfo, fillfo, pitchlfo, lfo1, lfo2;
   int lfo1_set, lfo2_set;
   double offset, end, loop_start, loop_end;    /* frames; end and the loop points -1 when not given */
@@ -196,7 +208,8 @@ typedef struct { char **s; int n, cap; } StrSet;
 typedef struct { wchar_t *lw; uint64_t size, mtime; Info in; } Cached;
 
 /* a region being built: its modulators (an offset into the pool) and its velocity curve (index, or -1) */
-typedef struct { SmpSfRegion r; int mod_off, nmod, curve, xd; } Reg;   /* xd: its SmpSfxDsp in P.xds, -1 none */
+typedef struct { SmpSfRegion r; int mod_off, nmod, curve, xd, fx, nfx; } Reg;   /* xd: its SmpSfxDsp in P.xds, -1 none;
+                                                            fx, nfx: its flex envelopes in P.fxs */
 
 typedef struct SfzBuild {
   SmpFont *f;
@@ -237,6 +250,7 @@ typedef struct SfzBuild {
   SmpSfMod *mods; int nm, capm;
   float *curves; int nc, capc;
   SmpSfxDsp *xds; int nxd, capxd;              /* the regions' second filters and EQs (add_xdsp) */
+  SmpSfFlexEg *fxs; int nfx, capfx, last_fx, last_nfx;   /* their flex envelopes (add_flex); the last set added */
   int swdef;                         /* the instrument's sw_default (the last given), -1 none */
   int oom;
   /* presets (sfz_preset): where each starts in regs and its name; none given is one preset named after the file */
@@ -480,6 +494,20 @@ static int cc_opcode(P *p, Opts *o, const char *nm, const char *v) {
     {"pitchlfo_freq_oncc", CM_VIBFREQ}, {"amplitude_cc", CM_AMP}, {"amplitude_oncc", CM_AMP},
     {"amp_veltrack_cc", CM_VELTRACK}, {"amp_veltrack_oncc", CM_VELTRACK}, {"width_cc", CM_WIDTH}, {"width_oncc", CM_WIDTH},
     {"resonance_cc", CM_RESO}, {"resonance_oncc", CM_RESO},
+    {"fileg_depthcc", CM_FILDEPTH}, {"fileg_depth_oncc", CM_FILDEPTH}, {"pitcheg_depthcc", CM_PITCHDEPTH},
+    {"pitcheg_depth_oncc", CM_PITCHDEPTH},
+    {"fileg_delaycc", CM_MODENV0 + 0}, {"fileg_delay_oncc", CM_MODENV0 + 0},
+    {"fileg_attackcc", CM_MODENV0 + 1}, {"fileg_attack_oncc", CM_MODENV0 + 1},
+    {"fileg_holdcc", CM_MODENV0 + 2}, {"fileg_hold_oncc", CM_MODENV0 + 2},
+    {"fileg_decaycc", CM_MODENV0 + 3}, {"fileg_decay_oncc", CM_MODENV0 + 3},
+    {"fileg_sustaincc", CM_MODENV0 + 4}, {"fileg_sustain_oncc", CM_MODENV0 + 4},
+    {"fileg_releasecc", CM_MODENV0 + 5}, {"fileg_release_oncc", CM_MODENV0 + 5},
+    {"pitcheg_delaycc", CM_MODENV0 + 0}, {"pitcheg_delay_oncc", CM_MODENV0 + 0},
+    {"pitcheg_attackcc", CM_MODENV0 + 1}, {"pitcheg_attack_oncc", CM_MODENV0 + 1},
+    {"pitcheg_holdcc", CM_MODENV0 + 2}, {"pitcheg_hold_oncc", CM_MODENV0 + 2},
+    {"pitcheg_decaycc", CM_MODENV0 + 3}, {"pitcheg_decay_oncc", CM_MODENV0 + 3},
+    {"pitcheg_sustaincc", CM_MODENV0 + 4}, {"pitcheg_sustain_oncc", CM_MODENV0 + 4},
+    {"pitcheg_releasecc", CM_MODENV0 + 5}, {"pitcheg_release_oncc", CM_MODENV0 + 5},
   };
   int i, cc;
   const char *cv;
@@ -518,6 +546,57 @@ static int fil_kind(const char *v) {
 }
 
 #define IS_(s) (!strcmp(nm, s))
+/* a flex envelope's opcode, egN_...: 1 when nm was one this can play. egN_timeK, egN_levelK, egN_curveK (K a point,
+   0..SMP_FLEX_PTS-1), egN_sustain, egN_pitch / cutoff / volume / amplitude, and controllers on a point's time
+   (egN_timeK_onccN) or on a depth (egN_pitch_onccN). egN_shapeK, egN_dynamic, egN_loop and controllers past 127
+   (ARIA's extended ones) aren't. */
+static int flex_opcode(P *p, Opts *o, const char *nm, const char *v) {
+  static const char *const tgn[4] = {"pitch", "cutoff", "volume", "amplitude"};
+  char *e; long n = strtol(nm + 2, &e, 10), k;
+  struct FlexO *x;
+  double d; int i, cc;
+  (void)p;
+  if (e == nm + 2 || *e != '_' || n < 1 || n > SMP_FLEX_MAX) return 0;
+  x = &o->flex[n - 1]; e++;
+  if (!strcmp(e, "sustain")) { if (inum(v, &i)) { x->sustain = (uint8_t)clampi(i, 0, SMP_FLEX_PTS - 1); x->set = 1; } return 1; }
+  for (i = 0; i < 4; i++) {
+    size_t L = strlen(tgn[i]);
+    if (!strncmp(e, tgn[i], L)) {
+      if (!e[L]) { if (num(v, &d)) { x->depth[i] = d; x->set = 1; } return 1; }
+      if ((cc = cc_suffix(e + L, "_oncc")) >= 0 || (cc = cc_suffix(e + L, "_cc")) >= 0 ||
+          ((!strcmp(e + L, "_oncc140") || !strcmp(e + L, "_oncc141")) && (cc = atoi(e + L + 5)) > 0)) {   /* ARIA's key delta */
+        int j;
+        if (!num(v, &d)) return 1;
+        for (j = 0; j < x->ndm && !(x->dm[j].cc == cc && x->dm[j].target == i); j++) {}
+        if (j == x->ndm) { if (x->ndm >= 4) return 0; x->ndm++; x->dm[j].cc = (uint8_t)cc; x->dm[j].target = (uint8_t)i; }
+        x->dm[j].amount = d; x->set = 1;
+        return 1;
+      }
+      return 0;
+    }
+  }
+  if (!strncmp(e, "time", 4) || !strncmp(e, "level", 5) || !strncmp(e, "curve", 5)) {
+    int kind = e[0] == 't' ? 0 : e[0] == 'l' ? 1 : 2;
+    char *f;
+    k = strtol(e + (kind ? 5 : 4), &f, 10);
+    if (f == e + (kind ? 5 : 4) || k < 0 || k >= SMP_FLEX_PTS) return 0;
+    if (*f) {                                   /* egN_timeK_onccN */
+      int j;
+      if (kind != 0 || ((cc = cc_suffix(f, "_oncc")) < 0 && (cc = cc_suffix(f, "_cc")) < 0)) return 0;
+      if (!num(v, &d)) return 1;
+      for (j = 0; j < x->ntm && !(x->tm[j].cc == cc && x->tm[j].pt == k); j++) {}
+      if (j == x->ntm) { if (x->ntm >= 4) return 0; x->ntm++; x->tm[j].cc = (uint8_t)cc; x->tm[j].pt = (uint8_t)k; }
+      x->tm[j].amount = d; x->set = 1;
+      return 1;
+    }
+    if (kind == 2) { if (inum(v, &i)) x->curve[k] = (uint8_t)clampi(i, 0, 255); }
+    else if (num(v, &d)) { if (kind == 0) x->time[k] = d < 0 ? 0 : d; else x->level[k] = clampd(d, -1, 1); }
+    if (k + 1 > x->npts) x->npts = (uint8_t)(k + 1);
+    x->set = 1;
+    return 1;
+  }
+  return 0;
+}
 /* The second filter's and the EQ's opcodes: 1 when nm was one. Each value X has its controllers in SFZ's two
    spellings, X_onccN and X_ccN (the EQ's also XccN: eq1_freqcc80), and X_curveccN for their curve. */
 static int xdsp_opcode(P *p, Opts *o, const char *nm, const char *v) {
@@ -621,6 +700,16 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
     return;
   }
   if (xdsp_opcode(p, o, nm, v)) return;           /* the second filter and the EQ (cutoff2_cc115 isn't cutoff_cc) */
+  if (nm[0] == 'e' && nm[1] == 'g' && nm[2] >= '0' && nm[2] <= '9' && flex_opcode(p, o, nm, v)) return;
+  if (IS("offset_random")) { num(v, &o->offset_random); return; }
+  if ((k = cc_suffix(nm, "delay_cc")) >= 0 || (k = cc_suffix(nm, "delay_oncc")) >= 0) {   /* seconds at the CC's 127 */
+    if (num(v, &d)) {
+      for (i = 0; i < o->ndelay_cc && o->delay_cc[i].cc != k; i++) {}
+      if (i == o->ndelay_cc) { if (i >= 2) { ignored(p, nm); return; } o->ndelay_cc++; o->delay_cc[i].cc = (uint8_t)k; }
+      o->delay_cc[i].amount = d;
+    }
+    return;
+  }
   if (strstr(nm, "cc") && cc_opcode(p, o, nm, v)) return;   /* the controller opcodes first: pitchlfo_depthccN isn't an LFO field */
   /* the sample */
   if (IS("sample")) {
@@ -1604,6 +1693,14 @@ static void fold_static(P *p, Opts *o) {
     else if (tg == CM_VELTRACK) o->veltrack += a * c;
     else if (tg == CM_WIDTH) o->width += a * c;
     else if (tg == CM_RESO) o->resonance += a * c;
+    else if (tg == CM_FILDEPTH) { o->fileg_depth += a * c; o->fileg_set = 1; }
+    else if (tg == CM_PITCHDEPTH) { o->pitcheg_depth += a * c; o->pitcheg_set = 1; }
+    else if (tg >= CM_MODENV0 && tg < CM_MODENV0 + 6) {
+      double *e = o->fileg_set || !o->pitcheg_set ? o->fileg : o->pitcheg; int st = tg - CM_MODENV0;
+      e[st] += a * c;
+      if (e[st] < 0) e[st] = 0;
+      if (st == 4 && e[st] > 100) e[st] = 100;
+    }
     else continue;                              /* the vibrato's depth: left as a linear modulator */
     o->ccm[k].target = CM_FOLDED;
   }
@@ -1613,6 +1710,35 @@ static void fold_static(P *p, Opts *o) {
    when it has neither, -2 out of memory. The second filter needs a cutoff2 and a kind the voice can do; a band is
    heard when it has a gain, a vel2gain or a controller on its gain. Each controller's curve becomes 128 points in
    one of the struct's curve slots (linear needs none); past the slots, a curve plays linear. */
+/* The region's flex envelopes into p->fxs (the same set as the last one is shared): *n of them from the returned
+   index; -2 out of memory. One counts when it has points and a depth (or a controller on one). */
+static int add_flex(P *p, const Opts *o, int *n) {
+  SmpSfFlexEg set[SMP_FLEX_MAX]; int i, j, m = 0;
+  *n = 0;
+  for (i = 0; i < SMP_FLEX_MAX; i++) {
+    const struct FlexO *x = &o->flex[i];
+    SmpSfFlexEg *g = &set[m];
+    int deep = x->ndm > 0;
+    for (j = 0; j < 4; j++) if (x->depth[j] != 0) deep = 1;
+    if (!x->set || !x->npts || !deep) continue;
+    memset(g, 0, sizeof *g);
+    g->npts = x->npts; g->sustain = (uint8_t)(x->sustain < x->npts ? x->sustain : x->npts - 1);
+    for (j = 0; j < x->npts; j++) { g->time[j] = (float)x->time[j]; g->level[j] = (float)x->level[j]; g->curve[j] = x->curve[j]; }
+    for (j = 0; j < 4; j++) g->depth[j] = (float)x->depth[j];
+    g->ntm = x->ntm; g->ndm = x->ndm;
+    for (j = 0; j < x->ntm; j++) { g->tm[j].cc = x->tm[j].cc; g->tm[j].pt = x->tm[j].pt; g->tm[j].amount = (float)x->tm[j].amount; }
+    for (j = 0; j < x->ndm; j++) { g->dm[j].cc = x->dm[j].cc; g->dm[j].target = x->dm[j].target; g->dm[j].amount = (float)x->dm[j].amount; }
+    m++;
+  }
+  if (!m) return -1;
+  *n = m;
+  if (p->nfx && p->last_nfx == m && !memcmp(p->fxs + p->last_fx, set, (size_t)m * sizeof *set)) return p->last_fx;
+  if (!grow((void **)&p->fxs, &p->capfx, p->nfx + m, sizeof *p->fxs)) { p->oom = 1; return -2; }
+  memcpy(p->fxs + p->nfx, set, (size_t)m * sizeof *set);
+  p->last_fx = p->nfx; p->last_nfx = m; p->nfx += m;
+  return p->last_fx;
+}
+
 static int add_xdsp(P *p, const Opts *o) {
   SmpSfxDsp x; int b, i, j, any = 0, ncv = 0, cvk[SMP_XDSP_CURVES];
   memset(&x, 0, sizeof x);
@@ -1654,7 +1780,7 @@ static int add_xdsp(P *p, const Opts *o) {
    conditions, as one region, or two for a stereo sample. The first pass only notes its sample file. */
 static void finish_region(P *p) {
   const Opts *o = &p->region;
-  File *fl; int fi, nch, ch, lm, uses_loop, nmod = 0, moff, curve = -1, xd = -1;
+  File *fl; int fi, nch, ch, lm, uses_loop, nmod = 0, moff, curve = -1, xd = -1, fx = -1, nfx = 0;
   int lokey, hikey, lovel, hivel;
   int64_t start, endx, ls_abs, le_abs;
   uint32_t at = 0, hf, rate;
@@ -1853,6 +1979,19 @@ static void finish_region(P *p) {
         else if (tg == CM_PAN) { dest = 17; amt = a * 5; }
         else if (tg == CM_VIBDEPTH) { dest = 6; amt = a; }
         else if (tg == CM_RESO) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 9; amt = a * 10; } }   /* dB as cB */
+        else if (tg == CM_FILDEPTH) { if (o->cutoff > 0 && o->fil_type >= 0) { dest = 11; amt = a; } }
+        else if (tg == CM_PITCHDEPTH) { dest = 7; amt = a; }
+        else if (tg >= CM_MODENV0 && tg < CM_MODENV0 + 6) {
+          /* as the amplitude envelope's: timecents between the stage at the controller's 0 and at its 127; the
+             sustain is SF2's 0.1 % steps of decrease */
+          const double *e = o->fileg_set || !o->pitcheg_set ? o->fileg : o->pitcheg; int st = tg - CM_MODENV0;
+          dest = G_DELAY_MODENV + st;
+          if (st == 4) amt = -10 * (clampd(e[4] + a, 0, 100) - clampd(e[4], 0, 100));
+          else {
+            double t0 = e[st] > 0.001 ? e[st] : 0.001, t1 = e[st] + a > 0.001 ? e[st] + a : 0.001;
+            amt = 1200.0 * log2(t1 / t0);
+          }
+        }
         else if (tg == CM_AMP) {
           /* the level times v / 127: the concave, negative curve's 480 cB make exactly that amplitude (960 make its
              square, SF2's CC7 default), down to -48 dB at 0. CC7 and CC11 keep that default (sfizz's amplitude_oncc7
@@ -1941,9 +2080,13 @@ static void finish_region(P *p) {
     c->amp_random = (float)clampd(o->amp_random, -96, 96); c->pitch_random = (float)clampd(o->pitch_random, 0, 9600);
     c->amp_keytrack = (float)clampd(o->amp_keytrack, -96, 12); c->amp_keycenter = (uint8_t)clampi(o->amp_keycenter, 0, 127);
     c->layer = (uint16_t)o->layer;
+    c->offset_random = (uint32_t)clampd(o->offset_random, 0, 4e9);
+    c->ndelay_cc = (uint8_t)o->ndelay_cc;
+    for (i = 0; i < o->ndelay_cc && i < 2; i++) { c->delay_cc[i].cc = o->delay_cc[i].cc; c->delay_cc[i].amount = (float)clampd(o->delay_cc[i].amount, -100, 100); }
   }
 
   if ((xd = add_xdsp(p, o)) < -1) return;
+  if ((fx = add_flex(p, o, &nfx)) < -1) return;
 
   /* one region a channel: the sample from frame `at`, the address offsets relative to that sample (fine plus
      coarse, as the voice reads them), and the channel's pan; the second is the pair's follower */
@@ -1957,7 +2100,7 @@ static void finish_region(P *p) {
     if (!grow((void **)&p->regs, &p->capr, p->nr + 1, sizeof *p->regs)) { p->oom = 1; return; }
     sh = &p->shdr[sid];
     g = &p->regs[p->nr++];
-    g->r = r; g->mod_off = moff; g->nmod = nmod; g->curve = curve; g->xd = xd;
+    g->r = r; g->mod_off = moff; g->nmod = nmod; g->curve = curve; g->xd = xd; g->fx = fx; g->nfx = nfx;
     g->r.sample = sid;
     g->r.cond.pair = (uint8_t)(ch == 1);
     g->r.gen[53] = (int16_t)(sid < 32767 ? sid : 32767);
@@ -2347,7 +2490,7 @@ static void free_parser(P *p) {
   for (i = 0; i < p->ncache; i++) free(p->cache[i].lw);
   free(p->cache); free(p->cslot);
   if (p->paths) for (i = 0; i < p->npaths; i++) free(p->paths[i]);
-  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->xds); free(p->pre);
+  free(p->paths); free(p->shdr); free(p->src); free(p->regs); free(p->mods); free(p->curves); free(p->xds); free(p->fxs); free(p->pre);
   if (p->pk) for (i = 0; i < p->cappk; i++) sf_knobs_free(p->pk[i]);
   free(p->pk);
 }
@@ -2521,9 +2664,10 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
     size_t sreg = (size_t)p->nr * sizeof(SmpSfRegion), sst = ((size_t)p->npre + 1) * sizeof(int);
     size_t smod = (size_t)p->nm * sizeof(SmpSfMod), mod_at = (sreg + sst + 7) & ~(size_t)7;
     size_t cur_at = (mod_at + smod + 7) & ~(size_t)7, xd_at = (cur_at + (size_t)p->nc * 128 * sizeof(float) + 7) & ~(size_t)7;
-    size_t total = xd_at + (size_t)p->nxd * sizeof(SmpSfxDsp);
+    size_t fx_at = (xd_at + (size_t)p->nxd * sizeof(SmpSfxDsp) + 7) & ~(size_t)7;
+    size_t total = fx_at + (size_t)p->nfx * sizeof(SmpSfFlexEg);
     char *block = calloc(1, total ? total : 1);
-    SmpSfMod *mods; float *curves; SmpSfxDsp *xds;
+    SmpSfMod *mods; float *curves; SmpSfxDsp *xds; SmpSfFlexEg *fxs;
     if (!block) { snprintf(why, (size_t)wcap, "out of memory"); goto done; }
     f->regions = (SmpSfRegion *)block;
     f->rstart = (int *)(block + sreg);
@@ -2531,6 +2675,8 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
     curves = (float *)(block + cur_at);
     xds = (SmpSfxDsp *)(block + xd_at);
     if (p->nxd) memcpy(xds, p->xds, (size_t)p->nxd * sizeof *xds);
+    fxs = (SmpSfFlexEg *)(block + fx_at);
+    if (p->nfx) memcpy(fxs, p->fxs, (size_t)p->nfx * sizeof *fxs);
     if (smod) memcpy(mods, p->mods, smod);
     if (p->nc) memcpy(curves, p->curves, (size_t)p->nc * 128 * sizeof(float));
     for (i = 0; i < p->nr; i++) {
@@ -2540,6 +2686,8 @@ int sfz_build(SmpFont *f, const char *path, SfzFeed feed, void *ctx, int (*cance
       r->pmod = NULL; r->npmod = 0;
       r->cond.amp_velcurve = p->regs[i].curve >= 0 ? curves + (size_t)p->regs[i].curve * 128 : NULL;
       r->cond.xdsp = p->regs[i].xd >= 0 ? xds + p->regs[i].xd : NULL;
+      r->cond.flex = p->regs[i].fx >= 0 ? fxs + p->regs[i].fx : NULL;
+      r->cond.nflex = (uint8_t)(p->regs[i].fx >= 0 ? p->regs[i].nfx : 0);
     }
     for (i = 0; i < p->npre; i++) f->rstart[i] = p->pre[i].start;
     f->rstart[p->npre] = p->nr;

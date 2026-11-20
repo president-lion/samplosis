@@ -52,6 +52,10 @@ class SmpSfCcXf(ctypes.Structure):
     _fields_ = [("cc", ctypes.c_uint8), ("lo", ctypes.c_uint8), ("hi", ctypes.c_uint8), ("out", ctypes.c_uint8)]
 
 
+class SmpSfDelayCc(ctypes.Structure):
+    _fields_ = [("cc", ctypes.c_uint8), ("amount", ctypes.c_float)]
+
+
 class SmpSfCond(ctypes.Structure):
     i8, u8 = ctypes.c_int8, ctypes.c_uint8
     _fields_ = [("trigger", u8), ("seq_len", ctypes.c_uint16), ("seq_pos", ctypes.c_uint16),
@@ -71,7 +75,8 @@ class SmpSfCond(ctypes.Structure):
                 ("pitch_random", ctypes.c_float), ("amp_keytrack", ctypes.c_float), ("amp_keycenter", ctypes.c_uint8),
                 ("layer", ctypes.c_uint16),
                 ("xfcc_n", u8), ("xfcc", SmpSfCcXf * 4), ("xf_cccurve", u8),
-                ("xdsp", ctypes.c_void_p)]
+                ("xdsp", ctypes.c_void_p), ("flex", ctypes.c_void_p), ("nflex", u8),
+                ("offset_random", ctypes.c_uint32), ("ndelay_cc", u8), ("delay_cc", SmpSfDelayCc * 2)]
 
 
 class SmpSfRegion(ctypes.Structure):

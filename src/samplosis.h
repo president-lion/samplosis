@@ -214,6 +214,13 @@ typedef struct {
   uint8_t xf_cccurve;           /* 0 power, 1 gain (xf_cccurve) */
   /* added for SFZ's second filter and EQ (SmpSfxDsp below); NULL when the region has neither. Lives in the font. */
   const struct SmpSfxDsp *xdsp;
+  /* added for SFZ's flex envelopes (egN_timeX, egN_levelX, egN_pitch...): nflex of them (SmpSfFlexEg), or none.
+     Lives in the font. */
+  const struct SmpSfFlexEg *flex; uint8_t nflex;
+  /* added for SFZ's offset_random (frames: the start moves on by a random 0..offset_random) and delay_ccN (seconds
+     at the controller's 127, at note-on) */
+  uint32_t offset_random;
+  uint8_t ndelay_cc; struct { uint8_t cc; float amount; } delay_cc[2];
 } SmpSfCond;
 
 /* SFZ's second filter (fil2_type, cutoff2, resonance2) and three EQ bands (eqN_freq, eqN_bw, eqN_gain), run in that
@@ -224,6 +231,23 @@ enum { SMP_XM_CUTOFF2, SMP_XM_RESO2, SMP_XM_EQFREQ /* +band */, SMP_XM_EQBW = SM
        SMP_XM_EQGAIN = SMP_XM_EQBW + 3 };
 #define SMP_XDSP_MODS 24
 #define SMP_XDSP_CURVES 4
+/* An SFZ flex envelope: points 0..npts-1, each reached timeK seconds after the one before (point 0 from 0 at the
+   start) through its curve (0 linear, 4 x^2, 5 sqrt x; SFZ's curve numbers), with its level (-1..1). It holds at
+   point sustain until the note is released, then goes on through the rest; past the last point it holds there.
+   Its value times depth[] moves pitch (cents), cutoff (cents), volume (dB) and amplitude (percent, added to 100).
+   tm: a controller's seconds on a point's time (egN_timeK_onccN, at note-on); dm: a controller's on a depth
+   (egN_pitch_onccN, live). */
+#define SMP_FLEX_PTS 9
+#define SMP_FLEX_MAX 32
+enum { SMP_FX_PITCH, SMP_FX_CUTOFF, SMP_FX_VOLUME, SMP_FX_AMPLITUDE };
+typedef struct SmpSfFlexEg {
+  uint8_t npts, sustain, ntm, ndm;
+  float time[SMP_FLEX_PTS], level[SMP_FLEX_PTS]; uint8_t curve[SMP_FLEX_PTS];
+  float depth[4];
+  struct { uint8_t cc, pt; float amount; } tm[4];
+  struct { uint8_t cc, target; float amount; } dm[4];
+} SmpSfFlexEg;
+
 typedef struct SmpSfxDsp {
   uint8_t fil2_on, fil2_type;   /* fil2_type: SMP_FIL_* */
   float cutoff2, resonance2;    /* Hz, dB */

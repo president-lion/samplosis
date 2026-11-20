@@ -65,8 +65,9 @@ def test_sfz_gain_cc_boosts(lib, tmp_path):
 
 def test_sfz_keyswitch_range_needs_sw_last(lib, tmp_path):
     """A range with nothing switching on it (No Budget Band's harmonica gives its release group sw_lokey=0
-    sw_hikey=127) leaves the keys playing, as sfizz does; in a preset with an sw_last, the range's keys stay
-    keyswitches and never sound."""
+    sw_hikey=127) leaves the keys playing, as sfizz does. In a preset with an sw_last only that key is a switch
+    (2026-11-20, from Unreal Instruments' guitars, whose range is the whole keyboard): a played key inside the
+    range sounds and leaves the switch alone; the sw_last key itself is silent."""
     write_wav(tmp_path / "a.wav", sine(RATE, 440.0))
     write_wav(tmp_path / "b.wav", sine(RATE, 660.0))
     loose = write_sfz(tmp_path / "l.sfz", """
@@ -92,10 +93,14 @@ def test_sfz_keyswitch_range_needs_sw_last(lib, tmp_path):
     try:
         key_in_range = p.render([on(49, 100, 0)], 0.3)
         played = p.render([on(60, 100, 0)], 0.3)
+        other_switch = p.render([on(40, 100, 0), on(60, 100, 0.01)], 0.3)
+        switch_key = p.render([on(36, 100, 0)], 0.3)
     finally:
         p.free()
-    assert rms(key_in_range) < 1e-6
+    assert rms(key_in_range[int(0.05 * OUT):]) > 0.05
     assert rms(played[int(0.05 * OUT):]) > 0.05
+    assert rms(other_switch[int(0.06 * OUT):]) > 0.05         # 40 is in the range but no sw_last: not a switch
+    assert rms(switch_key) < 1e-6
 
 
 def test_sfz_controller_crossfades(lib, tmp_path):

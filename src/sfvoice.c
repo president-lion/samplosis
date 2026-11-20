@@ -194,6 +194,78 @@ static void x_targets(SmpSfVoice *v, const SmpSfChan *c) {
   v->xn = n;
 }
 
+/* ---- SFZ's flex envelopes (SmpSfFlexEg) ---- */
+
+/* a segment's shape at x (0..1) through its curve: SFZ's 4 (x^2) and 5 (sqrt x); anything else is a straight line */
+static double fx_shape(int curve, double x) { return curve == 4 ? x * x : curve == 5 ? sqrt(x) : x; }
+
+/* each envelope n samples on: along its segment toward point pt, from point to point; at the sustain point it holds
+   until the release (smp_sfv_off moves it past), and past the last point it stays at the last level */
+static void fx_step(SmpSfVoice *v, double n) {
+  int k;
+  for (k = 0; k < v->nfx; k++) {
+    const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+    double m = n;
+    while (m > 0 && v->fx[k].pt < g->npts && !v->fx[k].held) {
+      int pt = v->fx[k].pt;
+      double len = v->fx[k].len[pt], to = g->level[pt];
+      if (len > 0 && v->fx[k].t + m < len) {
+        v->fx[k].t += m; m = 0;
+        v->fx[k].val = v->fx[k].from + (to - v->fx[k].from) * fx_shape(g->curve[pt], v->fx[k].t / len);
+        break;
+      }
+      m -= len > v->fx[k].t ? len - v->fx[k].t : 0;
+      v->fx[k].val = v->fx[k].from = to; v->fx[k].t = 0;
+      if (pt == g->sustain && !v->released) v->fx[k].held = 1;   /* at the sustain point: wait for the release */
+      else v->fx[k].pt = pt + 1;
+    }
+  }
+}
+
+/* the depths at the controllers' values now (at every derive) */
+static void fx_depths(SmpSfVoice *v, const SmpSfChan *c) {
+  int k, j;
+  for (k = 0; k < v->nfx; k++) {
+    const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+    for (j = 0; j < 4; j++) v->fx[k].depth[j] = g->depth[j];
+    for (j = 0; j < g->ndm; j++) {          /* CC140 is ARIA's key delta (semitones from the last note), 141 its size */
+      int n = g->dm[j].cc;
+      double x = n < 128 ? c->cc[n] / 127.0 : n == 140 ? v->keydelta : abs(v->keydelta);
+      v->fx[k].depth[g->dm[j].target & 3] += g->dm[j].amount * x;
+    }
+  }
+}
+
+/* at note-on: every envelope at its start (point 0, from 0), each point's length from its time and the controllers on
+   it as they are now */
+static void fx_start(SmpSfVoice *v, const SmpSfChan *c) {
+  int k, j;
+  v->nfx = v->reg->cond.flex ? v->reg->cond.nflex : 0;
+  if (v->nfx > SMP_FLEX_MAX) v->nfx = SMP_FLEX_MAX;
+  for (k = 0; k < v->nfx; k++) {
+    const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+    for (j = 0; j < g->npts && j < SMP_FLEX_PTS; j++) v->fx[k].len[j] = g->time[j];
+    for (j = 0; j < g->ntm; j++)
+      if (g->tm[j].pt < SMP_FLEX_PTS) v->fx[k].len[g->tm[j].pt] += g->tm[j].amount * c->cc[g->tm[j].cc & 127] / 127.0;
+    for (j = 0; j < SMP_FLEX_PTS; j++) v->fx[k].len[j] = v->fx[k].len[j] > 0 ? v->fx[k].len[j] * v->rate : 0;
+  }
+}
+
+/* their sum on pitch (cents), cutoff (cents), volume (dB) and amplitude (a factor) */
+static void fx_sum(const SmpSfVoice *v, double *pitch, double *cutoff, double *gain) {
+  int k;
+  double db = 0, amp = 1;
+  *pitch = *cutoff = 0;
+  for (k = 0; k < v->nfx; k++) {
+    double x = v->fx[k].val;
+    *pitch += x * v->fx[k].depth[SMP_FX_PITCH];
+    *cutoff += x * v->fx[k].depth[SMP_FX_CUTOFF];
+    db += x * v->fx[k].depth[SMP_FX_VOLUME];
+    amp *= 1 + x * v->fx[k].depth[SMP_FX_AMPLITUDE] / 100;
+  }
+  *gain = (amp > 0 ? amp : 0) * (db != 0 ? pow(10.0, clampd(db, -144, 24) / 20) : 1);
+}
+
 static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   const SmpSfRegion *r = v->reg;
   ModCtx m;
@@ -271,6 +343,7 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->m_sus = 1 - clampd(g[G_SUSTAIN_MODENV], 0, 1000) / 1000.0;
   v->m_release = tc_samples(g[G_RELEASE_MODENV], -12000, 8000, rate);
   if (r->cond.xdsp) x_targets(v, c);
+  if (v->nfx) fx_depths(v, c);
 }
 
 /* ---- envelopes and LFOs, stepped n samples at a time ---- */
@@ -430,12 +503,13 @@ static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
 
 static void control(SmpSfVoice *v) {
   const double inv = 1.0 / SMP_SFV_CTL, *g = v->g;
-  double amp, cents, ratio, gain, c[5], me;
+  double amp, cents, ratio, gain, c[5], me, fx_cut = 0;
   int wire;
   venv_step(v, SMP_SFV_CTL);
   menv_step(v, SMP_SFV_CTL);
   lfo_step(&v->modlfo, SMP_SFV_CTL);
   lfo_step(&v->viblfo, SMP_SFV_CTL);
+  if (v->nfx) fx_step(v, SMP_SFV_CTL);
   if (v->venv.stage == E_DONE) v->ending = 1;    /* this stretch fades to 0, then the voice ends */
 
   me = menv_out(&v->menv);
@@ -444,8 +518,13 @@ static void control(SmpSfVoice *v) {
   ratio = pow(2.0, cents / 1200.0) * v->ratio_k;
   amp = venv_amp(&v->venv);
   gain = amp * v->atten_gain * pow(10.0, v->modlfo.val * g[G_MODLFO_VOL] / 200.0);
+  if (v->nfx) {                   /* the flex envelopes on pitch, cutoff and level */
+    double fp, fc, fg;
+    fx_sum(v, &fp, &fc, &fg);
+    ratio *= pow(2.0, fp / 1200.0); gain *= fg; fx_cut = fc;
+  }
   v->level = amp * v->atten_gain;
-  filter_target(v, g[G_FC] + me * g[G_MODENV_FC] + v->modlfo.val * g[G_MODLFO_FC], c);
+  filter_target(v, g[G_FC] + me * g[G_MODENV_FC] + v->modlfo.val * g[G_MODLFO_FC] + fx_cut, c);
   wire = c[0] == 1 && c[1] == 0 && c[2] == 0 && c[3] == 0 && c[4] == 0;
   if (wire && fabs(v->b0 - 1) < 1e-9 && fabs(v->b1) < 1e-9 && fabs(v->b2) < 1e-9 && fabs(v->a1) < 1e-9 &&
       fabs(v->a2) < 1e-9) {       /* stepped back to a wire: snap to it exactly, so the filter can switch off */
@@ -606,6 +685,7 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
   if (r->cond.end_frame) end = r->cond.end_frame;                /* SFZ's end, as a frame of the sample */
   lps = (int64_t)ls + gen[G_LOOPSTART] + 32768 * (int64_t)gen[G_LOOPSTARTCOARSE];
   lpe = (int64_t)le + gen[G_LOOPEND] + 32768 * (int64_t)gen[G_LOOPENDCOARSE];
+  if (r->cond.offset_random) start += (int64_t)(rnd01() * (r->cond.offset_random + 1.0));   /* SFZ's offset_random */
   if (start < 0) start = 0;
   if (start > (int64_t)frames - 1) start = (int64_t)frames - 1;
   if (end > (int64_t)frames) end = frames;
@@ -633,8 +713,14 @@ int smp_sfv_start(SmpSfVoice *v, SmpFont *f, const SmpSfRegion *r, int key, int 
     if (d->amp_random != 0) db += d->amp_random * rnd01();
     if (db != 0) v->cond_gain *= pow(10.0, db / 20);
     if (d->pitch_random > 0) v->rnd_cents = d->pitch_random * (2 * rnd01() - 1);
-    if (d->delay > 0 || d->delay_random > 0) v->wait = (int64_t)((d->delay + d->delay_random * rnd01()) * rate + 0.5);
+    {                                   /* delay_ccN: seconds at the controller's 127, at note-on */
+      double dl = d->delay; int j;
+      for (j = 0; j < d->ndelay_cc && j < 2; j++) dl += d->delay_cc[j].amount * c->cc[d->delay_cc[j].cc & 127] / 127.0;
+      if (dl < 0) dl = 0;
+      if (dl > 0 || d->delay_random > 0) v->wait = (int64_t)((dl + d->delay_random * rnd01()) * rate + 0.5);
+    }
   }
+  fx_start(v, c);
   derive(v, c);
   if (v->streaming && st) stream_start(v, st, slot, vw.stream);   /* after derive: its pitch gives the speed */
   v->venv.stage = E_DELAY; v->menv.stage = E_DELAY;
@@ -660,6 +746,13 @@ void smp_sfv_off(SmpSfVoice *v) {
   if (v->menv.stage != E_DONE) {
     if (v->menv.stage == E_DELAY) v->menv.val = 0;
     v->menv.stage = E_RELEASE;
+  }
+  {                                   /* the flex envelopes: on from their sustain point, from where they are */
+    int k;
+    for (k = 0; k < v->nfx; k++) {
+      int s = v->reg->cond.flex[k].sustain;
+      if (v->fx[k].held || v->fx[k].pt <= s) { v->fx[k].held = 0; v->fx[k].pt = s + 1; v->fx[k].from = v->fx[k].val; v->fx[k].t = 0; }
+    }
   }
   if (v->mode == 3 && v->looping) {          /* loop until release, then on to the end */
     v->looping = 0;

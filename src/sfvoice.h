@@ -65,6 +65,11 @@ typedef struct SmpSfVoice {
      are worked out at every derive (the start and each controller change); the coefficients (xc) step toward them
      sample by sample (xdc) as the first filter's do; xs is each one's state (x1, x2, y1, y2). */
   int xn; double xt[4][5], xc[4][5], xdc[4][5], xs[4][4];
+  /* SFZ's flex envelopes (cond.flex, nfx of them): each one's point it is heading for (pt; npts once past the last),
+     held at its sustain point (held), samples into the segment (t), the value it set out from and its value now,
+     each point's length in samples (its time and the controllers on it at note-on), and its depths now */
+  int nfx, keydelta;                     /* keydelta: SFZ's CC140, set by the player after the start */
+  struct { int pt, held; double t, from, val, len[SMP_FLEX_PTS], depth[4]; } fx[SMP_FLEX_MAX];
   double level;                          /* the last envelope level times the attenuation, for stealing */
   /* kill: a linear fade */
   int killing; double fade, fade_step;
