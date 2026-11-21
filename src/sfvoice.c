@@ -199,6 +199,34 @@ static void x_targets(SmpSfVoice *v, const SmpSfChan *c) {
 /* a segment's shape at x (0..1) through its curve: SFZ's 4 (x^2) and 5 (sqrt x); anything else is a straight line */
 static double fx_shape(int curve, double x) { return curve == 4 ? x * x : curve == 5 ? sqrt(x) : x; }
 
+/* an LFO's wave at phase x (0..1), SFZ's lfoN_wave numbers */
+static double lfo_wave(int w, double x) {
+  switch (w) {
+    case 0: return x < 0.25 ? 4 * x : x < 0.75 ? 2 - 4 * x : 4 * x - 4;   /* triangle, from 0 rising */
+    case 2: return x < 0.75 ? 1 : -1;
+    case 3: return x < 0.5 ? 1 : -1;
+    case 4: return x < 0.25 ? 1 : -1;
+    case 5: return x < 0.125 ? 1 : -1;
+    case 6: return 2 * x - 1;
+    case 7: return 1 - 2 * x;
+    default: return sin(2 * PI * x);
+  }
+}
+
+/* an LFO (kind 1) n samples on: t its phase, from the samples since note-on, len[0] its delay and len[1] its fade
+   (samples), len[2] its rate now (Hz, fx_depths) */
+static void flfo_step(SmpSfVoice *v, int k, double n) {
+  const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+  double f = v->fx[k].len[2], amt;
+  if (g->fsrc >= 0 && g->fsrc < v->nfx) f += g->famount * v->fx[g->fsrc].val;
+  v->fx[k].from += n;
+  if (v->fx[k].from <= v->fx[k].len[0]) { v->fx[k].val = 0; return; }
+  if (f > 0) v->fx[k].t += f * n / v->rate;
+  v->fx[k].t -= floor(v->fx[k].t);
+  amt = v->fx[k].len[1] > 0 ? (v->fx[k].from - v->fx[k].len[0]) / v->fx[k].len[1] : 1;
+  v->fx[k].val = lfo_wave(g->wave, v->fx[k].t) * (amt < 1 ? amt : 1);
+}
+
 /* each envelope n samples on: along its segment toward point pt, from point to point; at the sustain point it holds
    until the release (smp_sfv_off moves it past), and past the last point it stays at the last level */
 static void fx_step(SmpSfVoice *v, double n) {
@@ -206,6 +234,7 @@ static void fx_step(SmpSfVoice *v, double n) {
   for (k = 0; k < v->nfx; k++) {
     const SmpSfFlexEg *g = &v->reg->cond.flex[k];
     double m = n;
+    if (g->kind == 1) { flfo_step(v, k, n); continue; }
     while (m > 0 && v->fx[k].pt < g->npts && !v->fx[k].held) {
       int pt = v->fx[k].pt;
       double len = v->fx[k].len[pt], to = g->level[pt];
@@ -233,6 +262,11 @@ static void fx_depths(SmpSfVoice *v, const SmpSfChan *c) {
       double x = n < 128 ? c->cc[n] / 127.0 : n == 140 ? v->keydelta : abs(v->keydelta);
       v->fx[k].depth[g->dm[j].target & 3] += g->dm[j].amount * x;
     }
+    if (g->kind == 1) {                 /* an LFO's rate, live */
+      double f = g->freq;
+      for (j = 0; j < g->nlm; j++) if (g->lm[j].what == SMP_LFO_FREQ) f += g->lm[j].amount * c->cc[g->lm[j].cc & 127] / 127.0;
+      v->fx[k].len[2] = f;
+    }
   }
 }
 
@@ -244,6 +278,17 @@ static void fx_start(SmpSfVoice *v, const SmpSfChan *c) {
   if (v->nfx > SMP_FLEX_MAX) v->nfx = SMP_FLEX_MAX;
   for (k = 0; k < v->nfx; k++) {
     const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+    if (g->kind == 1) {                 /* an LFO: its delay, fade and phase at note-on */
+      double dl = g->delay, fd = g->fade, ph = g->phase;
+      for (j = 0; j < g->nlm; j++) {
+        double a = g->lm[j].amount * c->cc[g->lm[j].cc & 127] / 127.0;
+        if (g->lm[j].what == SMP_LFO_DELAY) dl += a; else if (g->lm[j].what == SMP_LFO_FADE) fd += a;
+        else if (g->lm[j].what == SMP_LFO_PHASE) ph += a;
+      }
+      v->fx[k].len[0] = dl > 0 ? dl * v->rate : 0; v->fx[k].len[1] = fd > 0 ? fd * v->rate : 0;
+      v->fx[k].t = ph - floor(ph); v->fx[k].from = 0; v->fx[k].val = 0; v->fx[k].len[2] = g->freq;
+      continue;
+    }
     for (j = 0; j < g->npts && j < SMP_FLEX_PTS; j++) v->fx[k].len[j] = g->time[j];
     for (j = 0; j < g->ntm; j++)
       if (g->tm[j].pt < SMP_FLEX_PTS) v->fx[k].len[g->tm[j].pt] += g->tm[j].amount * c->cc[g->tm[j].cc & 127] / 127.0;
@@ -751,6 +796,7 @@ void smp_sfv_off(SmpSfVoice *v) {
     int k;
     for (k = 0; k < v->nfx; k++) {
       int s = v->reg->cond.flex[k].sustain;
+      if (v->reg->cond.flex[k].kind == 1) continue;   /* an LFO runs on */
       if (v->fx[k].held || v->fx[k].pt <= s) { v->fx[k].held = 0; v->fx[k].pt = s + 1; v->fx[k].from = v->fx[k].val; v->fx[k].t = 0; }
     }
   }

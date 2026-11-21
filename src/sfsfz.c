@@ -147,6 +147,13 @@ typedef struct {
     struct { uint8_t cc, pt; double amount; } tm[4];
     struct { uint8_t cc, target; double amount; } dm[4];
   } flex[SMP_FLEX_MAX];
+  /* LFOs by number (lfoN is lfo[N - 1]), as SmpSfFlexEg has them (kind 1); fsrc: lfoN_freq_lfoM's M, 0 none */
+  struct LfoO {
+    uint8_t set, wave, ndm, nlm; int fsrc;
+    double freq, delay, fade, phase, famount, depth[4];
+    struct { uint8_t cc, target; double amount; } dm[4];
+    struct { uint8_t cc, what; double amount; } lm[6];
+  } lfo[SMP_FLEX_MAX];
   double offset_random; int ndelay_cc; struct { uint8_t cc; double amount; } delay_cc[2];   /* frames; seconds */
   Lfo amplfo, fillfo, pitchlfo, lfo1, lfo2;
   int lfo1_set, lfo2_set;
@@ -597,6 +604,65 @@ static int flex_opcode(P *p, Opts *o, const char *nm, const char *v) {
   }
   return 0;
 }
+/* an LFO's opcode, lfoN_... (SFZ v2): 1 when nm was one this can play. lfoN_freq, lfoN_wave, lfoN_delay,
+   lfoN_fade, lfoN_phase and their controllers (_onccN / _ccN), lfoN_pitch / cutoff / volume / amplitude and
+   controllers on them, and lfoN_freq_lfoM (another LFO on this one's rate). lfoN_pan, lfoN_eqK, lfoN_count, the
+   step sequencer and curves on its controllers aren't. */
+static int lfo_opcode(P *p, Opts *o, const char *nm, const char *v) {
+  static const char *const tgn[4] = {"pitch", "cutoff", "volume", "amplitude"};
+  static const char *const prm[4] = {"freq", "delay", "fade", "phase"};
+  char *e; long n = strtol(nm + 3, &e, 10);
+  struct LfoO *x;
+  double d; int i, cc;
+  (void)p;
+  if (e == nm + 3 || *e != '_' || n < 1 || n > SMP_FLEX_MAX) return 0;
+  x = &o->lfo[n - 1]; e++;
+  if (!strcmp(e, "wave")) { if (inum(v, &i)) { x->wave = (uint8_t)clampi(i, 0, 7); x->set = 1; } return 1; }
+  for (i = 0; i < 4; i++) {
+    size_t L = strlen(tgn[i]);
+    if (!strncmp(e, tgn[i], L)) {
+      if (!e[L]) { if (num(v, &d)) { x->depth[i] = d; x->set = 1; } return 1; }
+      if ((cc = cc_suffix(e + L, "_oncc")) >= 0 || (cc = cc_suffix(e + L, "_cc")) >= 0) {
+        int j;
+        if (!num(v, &d)) return 1;
+        for (j = 0; j < x->ndm && !(x->dm[j].cc == cc && x->dm[j].target == i); j++) {}
+        if (j == x->ndm) { if (x->ndm >= 4) return 0; x->ndm++; x->dm[j].cc = (uint8_t)cc; x->dm[j].target = (uint8_t)i; }
+        x->dm[j].amount = d; x->set = 1;
+        return 1;
+      }
+      return 0;
+    }
+  }
+  for (i = 0; i < 4; i++) {
+    size_t L = strlen(prm[i]);
+    if (!strncmp(e, prm[i], L)) {
+      if (!e[L]) {
+        if (num(v, &d)) {
+          if (i == SMP_LFO_FREQ) x->freq = d; else if (i == SMP_LFO_DELAY) x->delay = d;
+          else if (i == SMP_LFO_FADE) x->fade = d; else x->phase = d;
+          x->set = 1;
+        }
+        return 1;
+      }
+      if (i == SMP_LFO_FREQ && !strncmp(e + L, "_lfo", 4)) {   /* lfoN_freq_lfoM */
+        char *f; long m = strtol(e + L + 4, &f, 10);
+        if (f == e + L + 4 || *f || m < 1 || m > SMP_FLEX_MAX || m == n) return 0;
+        if (num(v, &d)) { x->fsrc = (int)m; x->famount = d; x->set = 1; }
+        return 1;
+      }
+      if ((cc = cc_suffix(e + L, "_oncc")) >= 0 || (cc = cc_suffix(e + L, "_cc")) >= 0) {
+        int j;
+        if (!num(v, &d)) return 1;
+        for (j = 0; j < x->nlm && !(x->lm[j].cc == cc && x->lm[j].what == i); j++) {}
+        if (j == x->nlm) { if (x->nlm >= 6) return 0; x->nlm++; x->lm[j].cc = (uint8_t)cc; x->lm[j].what = (uint8_t)i; }
+        x->lm[j].amount = d; x->set = 1;
+        return 1;
+      }
+      return 0;
+    }
+  }
+  return 0;
+}
 /* The second filter's and the EQ's opcodes: 1 when nm was one. Each value X has its controllers in SFZ's two
    spellings, X_onccN and X_ccN (the EQ's also XccN: eq1_freqcc80), and X_curveccN for their curve. */
 static int xdsp_opcode(P *p, Opts *o, const char *nm, const char *v) {
@@ -701,6 +767,7 @@ static void opcode(P *p, Opts *o, const char *nm, const char *v) {
   }
   if (xdsp_opcode(p, o, nm, v)) return;           /* the second filter and the EQ (cutoff2_cc115 isn't cutoff_cc) */
   if (nm[0] == 'e' && nm[1] == 'g' && nm[2] >= '0' && nm[2] <= '9' && flex_opcode(p, o, nm, v)) return;
+  if (nm[0] == 'l' && nm[1] == 'f' && nm[2] == 'o' && nm[3] >= '0' && nm[3] <= '9' && lfo_opcode(p, o, nm, v)) return;
   if (IS("offset_random")) { num(v, &o->offset_random); return; }
   if ((k = cc_suffix(nm, "delay_cc")) >= 0 || (k = cc_suffix(nm, "delay_oncc")) >= 0) {   /* seconds at the CC's 127 */
     if (num(v, &d)) {
@@ -1729,6 +1796,38 @@ static int add_flex(P *p, const Opts *o, int *n) {
     for (j = 0; j < x->ntm; j++) { g->tm[j].cc = x->tm[j].cc; g->tm[j].pt = x->tm[j].pt; g->tm[j].amount = (float)x->tm[j].amount; }
     for (j = 0; j < x->ndm; j++) { g->dm[j].cc = x->dm[j].cc; g->dm[j].target = x->dm[j].target; g->dm[j].amount = (float)x->dm[j].amount; }
     m++;
+  }
+  {                                             /* then the LFOs (kind 1), lfoN_freq_lfoM by index in the set */
+    int at[SMP_FLEX_MAX];
+    for (i = 0; i < SMP_FLEX_MAX; i++) at[i] = -1;
+    for (i = 0; i < SMP_FLEX_MAX && m < SMP_FLEX_MAX; i++) {
+      const struct LfoO *x = &o->lfo[i];
+      SmpSfFlexEg *g = &set[m];
+      int deep = x->ndm > 0;
+      for (j = 0; j < 4; j++) if (x->depth[j] != 0) deep = 1;
+      if (!x->set || !deep) continue;
+      memset(g, 0, sizeof *g);
+      g->kind = 1; g->wave = x->wave; g->fsrc = -1; g->famount = (float)x->famount;
+      g->freq = (float)x->freq; g->delay = (float)x->delay; g->fade = (float)x->fade; g->phase = (float)x->phase;
+      for (j = 0; j < 4; j++) g->depth[j] = (float)x->depth[j];
+      g->ndm = x->ndm; g->nlm = x->nlm;
+      for (j = 0; j < x->ndm; j++) { g->dm[j].cc = x->dm[j].cc; g->dm[j].target = x->dm[j].target; g->dm[j].amount = (float)x->dm[j].amount; }
+      for (j = 0; j < x->nlm; j++) { g->lm[j].cc = x->lm[j].cc; g->lm[j].what = x->lm[j].what; g->lm[j].amount = (float)x->lm[j].amount; }
+      at[i] = m++;
+    }
+    for (i = 0; i < SMP_FLEX_MAX; i++)
+      if (at[i] >= 0 && o->lfo[i].fsrc > 0) {
+        int s = o->lfo[i].fsrc - 1;
+        if (at[s] < 0 && o->lfo[s].set) {       /* a rate-only LFO (no depth of its own): add it as one with none */
+          if (m >= SMP_FLEX_MAX) continue;
+          memset(&set[m], 0, sizeof set[m]);
+          set[m].kind = 1; set[m].wave = o->lfo[s].wave; set[m].fsrc = -1;
+          set[m].freq = (float)o->lfo[s].freq; set[m].delay = (float)o->lfo[s].delay;
+          set[m].fade = (float)o->lfo[s].fade; set[m].phase = (float)o->lfo[s].phase;
+          at[s] = m++;
+        }
+        if (at[s] >= 0) set[at[i]].fsrc = (int8_t)at[s];
+      }
   }
   if (!m) return -1;
   *n = m;

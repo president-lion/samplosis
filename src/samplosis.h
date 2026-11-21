@@ -246,7 +246,17 @@ typedef struct SmpSfFlexEg {
   float depth[4];
   struct { uint8_t cc, pt; float amount; } tm[4];
   struct { uint8_t cc, target; float amount; } dm[4];
+  /* added for SFZ's LFOs (lfoN_freq, lfoN_wave, lfoN_pitch...), kind 1 (0: the envelope above). An LFO has no
+     points: its value is wave (SFZ's lfoN_wave: 0 triangle, 1 sine, 2 pulse 75%, 3 square, 4 pulse 25%,
+     5 pulse 12.5%, 6 saw up, 7 saw down) at freq Hz from phase (0..1), silent for delay seconds and then
+     fading in over fade. depth and dm as the envelope's. lm: a controller's on freq (live, Hz), delay, fade
+     (seconds) or phase (at note-on), what SMP_LFO_*; fsrc: another one of the region's (its index, -1 none)
+     whose value times famount Hz adds to freq (lfoN_freq_lfoM). */
+  uint8_t kind, wave, nlm; int8_t fsrc;
+  float freq, delay, fade, phase, famount;
+  struct { uint8_t cc, what; float amount; } lm[6];
 } SmpSfFlexEg;
+enum { SMP_LFO_FREQ, SMP_LFO_DELAY, SMP_LFO_FADE, SMP_LFO_PHASE };
 
 typedef struct SmpSfxDsp {
   uint8_t fil2_on, fil2_type;   /* fil2_type: SMP_FIL_* */
