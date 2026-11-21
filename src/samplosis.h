@@ -255,6 +255,11 @@ typedef struct SmpSfFlexEg {
   uint8_t kind, wave, nlm; int8_t fsrc;
   float freq, delay, fade, phase, famount;
   struct { uint8_t cc, what; float amount; } lm[6];
+  /* added for Decent Sampler's modulators: depth2, cents on the second filter's cutoff (egN_cutoff2, lfoN_cutoff2);
+     dsmod, the preset's modulator (1-based, 0 none) whose values a player keeps live (sfknob.h's SF_MP_*: its scale
+     on the depths, an envelope's attack, decay, sustain and release, an LFO's rate); kind 2 is a controller as the
+     source (cc, its value 0..1), as Decent Sampler's midiCC modulator is */
+  float depth2; uint8_t dsmod, cc;
 } SmpSfFlexEg;
 enum { SMP_LFO_FREQ, SMP_LFO_DELAY, SMP_LFO_FADE, SMP_LFO_PHASE };
 

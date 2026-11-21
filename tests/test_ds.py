@@ -92,8 +92,8 @@ def test_ds_mapping(lib, tmp_path):
         assert r[8].gen[34] == round(1200 * math.log2(0.5))         # ampEnvAttack wins over attack
         walk(lib, f)
         n, first = ignored(lib, f)
-        assert n == 3 and first == "glideTime", (n, first)          # glideTime loopCrossfade <modulators> (the knob,
-                                                                    # its effect and its CC are read now)
+        assert n == 2 and first == "glideTime", (n, first)          # glideTime loopCrossfade (the knob, its effect,
+                                                                    # its CC and the modulators are read now)
         x, nv = note(lib, f, 62)
         assert nv == 1
         assert abs(peak_hz(x[2000:20000, 0], OUT) - 440 * 2 ** (70 / 1200)) < 2

@@ -228,6 +228,8 @@ struct SmpSynth {
   int nks; int kpub[KSLOTS]; const SfKnobs *kk[KSLOTS];
   LONG kseen;
   float lgain[KSLOTS][KLAYERS + 1], lcents[KSLOTS][KLAYERS + 1];
+  float lfx[KSLOTS][KLAYERS + 1][SF_LFX_N];   /* each layer's group filters and envelope (sf_knobs_levels_ex) */
+  float kmod[KSLOTS][SF_MOD_MAX * SF_MP_N];   /* each slot's modulators' values */
   /* their effects chains: the newest load's (main thread writes), the one the audio thread plays (it writes), the
      retired ones (main thread), each slot's stereo bus (max_block frames) and the host's tempo (any thread) */
   Chains *volatile chs_want, *volatile chs;
@@ -271,7 +273,7 @@ static int knob_slots(const SmpFont *f, int *pub, const SfKnobs **kk) {
   if (!f || !f->knobs) return 0;
   for (i = 0; i < np && n < KSLOTS; i++) {
     const SfKnobs *k = f->knobs[f->order[i]];
-    if (!k || (!k->nknob && !k->nfx)) continue;
+    if (!k || (!k->nknob && !k->nfx && !k->nmod)) continue;
     pub[n] = i; kk[n] = k; n++;
   }
   return n;
@@ -294,13 +296,15 @@ static void knob_apply(SmpSynth *s) {
     const SfKnobs *k = s->kk[sl];
     double vals[SF_KNOB_MAX];
     for (i = 0; i < k->nknob; i++) vals[i] = kget(s, sl, i);
-    sf_knobs_levels(k, vals, k->nlayer < KLAYERS ? k->nlayer : KLAYERS, s->lgain[sl], s->lcents[sl]);
+    sf_knobs_levels_ex(k, vals, k->nlayer < KLAYERS ? k->nlayer : KLAYERS, s->lgain[sl], s->lcents[sl], s->lfx[sl],
+                       s->kmod[sl]);
     if (!s->chs || !s->chs->c[sl]) continue;
     for (i = 0; i < k->nknob; i++) {           /* an effect's parameter: its chain's */
       const SfKnob *n = &k->knob[i];
       float v = (float)kvalue(n, vals[i]);
       for (j = 0; j < n->nb; j++)
-        if (n->b[j].target == SF_KT_FX)
+        if (n->b[j].target == SF_KT_FX && n->b[j].param != SF_FXP_LEVEL &&
+            (n->b[j].state < 0 || (int)floor(v + 0.5) == n->b[j].state))   /* a button's: in its state */
           sf_chain_set(s->chs->c[sl], n->b[j].fx, n->b[j].param, sf_trans(&n->b[j].tr, v, n->lo, n->hi));
     }
   }
@@ -549,9 +553,9 @@ static int try_start(SmpSynth *s, int i) {
                      floor(param(s, SMP_P_SF_TRANSPOSE) + 0.5), s->st, i, t->held))
     return 0;
   if (t->kslot >= 0 && t->kslot < s->nks && t->reg->cond.layer && t->reg->cond.layer <= KLAYERS) {
-    s->v[i].lgain = &s->lgain[t->kslot][t->reg->cond.layer];   /* its knobbed layer's gain and tuning, live */
-    s->v[i].lcents = &s->lcents[t->kslot][t->reg->cond.layer];
-    smp_sfv_update(&s->v[i], &s->ch[t->chan].c);
+    int L = t->reg->cond.layer;               /* its knobbed layer's gain, tuning and filters, and the modulators, live */
+    smp_sfv_set_layer(&s->v[i], &s->lgain[t->kslot][L], &s->lcents[t->kslot][L], s->lfx[t->kslot][L],
+                      s->kk[t->kslot]->nmod ? s->kmod[t->kslot] : NULL, &s->ch[t->chan].c);
   }
   if (t->keydelta && s->v[i].nfx) { s->v[i].keydelta = t->keydelta; smp_sfv_update(&s->v[i], &s->ch[t->chan].c); }
   if (t->rt && ((t->reg->gen[G_MODES] & 3) == 1 || (t->reg->gen[G_MODES] & 3) == 3))

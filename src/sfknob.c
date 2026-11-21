@@ -9,7 +9,7 @@
 
 void sf_knobs_free(SfKnobs *k) {
   if (!k) return;
-  free(k->layer_vol); free(k->layer_tune); free(k->layer_list);
+  free(k->layer_vol); free(k->layer_tune); free(k->layer_list); free(k->layer_en); free(k->layer_fx);
   free(k);
 }
 
@@ -41,32 +41,92 @@ double sf_knob_value(const SfKnob *n, double v) {
   return n->vtype == SF_KV_FLOAT ? v : floor(v + 0.5);
 }
 
+float sf_q_db(float q) {
+  double m;
+  if (!(q > 0.70710678f)) return 0;
+  m = q / sqrt(1 - 1 / (4.0 * q * q));          /* a 2-pole lowpass's peak at that Q */
+  return (float)(20 * log10(m));
+}
+
 void sf_knobs_levels(const SfKnobs *k, const double *values, int nl, float *lgain, float *lcents) {
-  float gv = k->global_vol, gt = k->global_tune;
+  sf_knobs_levels_ex(k, values, nl, lgain, lcents, NULL, NULL);
+}
+
+void sf_knobs_levels_ex(const SfKnobs *k, const double *values, int nl, float *lgain, float *lcents,
+                        float (*lfx)[SF_LFX_N], float *kmod) {
+  float gv = k->global_vol, gt = k->global_tune, fxl[SF_FX_MAX], mod[SF_MOD_MAX][SF_MP_N];
   int i, j, l, m;
   if (nl > k->nlayer) nl = k->nlayer;
-  for (l = 1; l <= nl; l++) { lgain[l] = k->layer_vol[l]; lcents[l] = k->layer_tune[l]; }
+  for (i = 0; i < k->nfx && i < SF_FX_MAX; i++) fxl[i] = k->fx[i].level;
+  memcpy(mod, k->mod, sizeof mod);
+  for (l = 1; l <= nl; l++) {
+    lgain[l] = k->layer_vol[l]; lcents[l] = k->layer_tune[l];
+    if (lfx) {
+      const float *b = k->layer_fx ? k->layer_fx[l] : NULL;
+      lfx[l][0] = lfx[l][2] = 0;
+      lfx[l][1] = b && b[0] > 0 ? sf_q_db(b[1]) : NAN;
+      lfx[l][3] = b && b[2] > 0 ? sf_q_db(b[3]) : NAN;
+      lfx[l][4] = lfx[l][5] = lfx[l][6] = lfx[l][7] = NAN;
+    }
+  }
   for (i = 0; i < k->nknob; i++) {
     const SfKnob *n = &k->knob[i];
     float v = (float)sf_knob_value(n, values ? values[i] : n->value);
     for (j = 0; j < n->nb; j++) {
       const SfKBind *b = &n->b[j];
-      float out = sf_trans(&b->tr, v, n->lo, n->hi);
+      float out;
+      if (b->state >= 0 && (int)floor(v + 0.5) != b->state) continue;   /* a button's other state */
+      out = sf_trans(&b->tr, v, n->lo, n->hi);
       switch (b->target) {
         case SF_KT_GLOBAL_VOL: gv = out; break;
         case SF_KT_GLOBAL_TUNE: gt = out; break;
-        case SF_KT_GROUP_VOL: case SF_KT_GROUP_TUNE:
+        case SF_KT_FX: if (b->param == SF_FXP_LEVEL && b->fx < SF_FX_MAX) fxl[b->fx] = out; break;
+        case SF_KT_MOD:
+          if (b->mod < SF_MOD_MAX && b->param >= 0 && b->param < SF_MP_N) mod[b->mod][b->param] = out;
+          break;
+        case SF_KT_GROUP_VOL: case SF_KT_GROUP_TUNE: case SF_KT_GROUP_EN: case SF_KT_LFX: case SF_KT_GROUP_ENV:
           for (m = 0; m < b->nlayers; m++) {
             int L = k->layer_list[b->first_layer + m];
             if (L < 1 || L > nl) continue;
-            if (b->target == SF_KT_GROUP_VOL) lgain[L] = out; else lcents[L] = out;
+            if (b->target == SF_KT_GROUP_VOL) lgain[L] = out;
+            else if (b->target == SF_KT_GROUP_TUNE) lcents[L] = out;
+            else if (b->target == SF_KT_GROUP_EN) continue;   /* below, once the levels are known */
+            else if (b->target == SF_KT_GROUP_ENV) { if (lfx && b->param >= 0 && b->param < 4) lfx[L][4 + b->param] = out; }
+            else if (lfx && k->layer_fx && b->fx < 2) {
+              const float *base = k->layer_fx[L];
+              if (base[2 * b->fx] <= 0) continue;   /* the group has no such filter */
+              if (b->param == SF_FXP_FREQ) lfx[L][2 * b->fx] = out > 0 ? (float)(1200 * log2(out / base[2 * b->fx])) : -9600;
+              else if (b->param == SF_FXP_Q) lfx[L][2 * b->fx + 1] = sf_q_db(out);
+            }
           }
           break;
         default: break;
       }
     }
   }
+  if (k->layer_en)                              /* on or off: the group's own, then the buttons' in order */
+    for (l = 1; l <= nl; l++) {
+      int on = k->layer_en[l];
+      for (i = 0; i < k->nknob; i++) {
+        const SfKnob *n = &k->knob[i];
+        float v = (float)sf_knob_value(n, values ? values[i] : n->value);
+        for (j = 0; j < n->nb; j++) {
+          const SfKBind *b = &n->b[j];
+          if (b->target != SF_KT_GROUP_EN || (b->state >= 0 && (int)floor(v + 0.5) != b->state)) continue;
+          for (m = 0; m < b->nlayers; m++)
+            if (k->layer_list[b->first_layer + m] == l) { on = sf_trans(&b->tr, v, n->lo, n->hi) >= 0.5f; break; }
+        }
+      }
+      if (!on) lgain[l] = 0;
+    }
+  for (i = 0; i < k->nfx && i < SF_FX_MAX; i++)
+    if (k->fx[i].type == SF_FX_GAIN) gv *= k->fx[i].db ? (float)pow(10, fxl[i] / 20) : (fxl[i] > 0 ? fxl[i] : 0);
   for (l = 1; l <= nl; l++) { lgain[l] *= gv; lcents[l] = 100.0f * (lcents[l] + gt); }
+  if (kmod)
+    for (i = 0; i < k->nmod && i < SF_MOD_MAX; i++) {
+      for (j = 0; j < SF_MP_N; j++) kmod[i * SF_MP_N + j] = mod[i][j];
+      kmod[i * SF_MP_N + SF_MP_ENABLED] = mod[i][SF_MP_ENABLED] >= 0.5f ? mod[i][SF_MP_AMOUNT] : 0;
+    }
 }
 
 /* Decent Sampler's musical_time list (decentsamples.com, "How to add tempo-synced delay", 2024): each a note value
@@ -119,9 +179,11 @@ static size_t put_trans(char *out, size_t cap, size_t at, const SfTrans *t) {
 int smp_sf_test_knobs_text(const SmpFont *f, int preset, char *out, int cap) {
   static const char *const vt[] = {"float", "int", "mtime"};
   static const char *const wd[] = {"number", "percent", "semitones", "mtime", "int"};
-  static const char *const tg[] = {"group_vol", "global_vol", "group_tune", "global_tune", "fx"};
-  static const char *const pn[] = {"freq", "q", "wet", "room", "damp", "time", "feedback"};
-  static const char *const ft[] = {"lp", "lp1", "hp", "bp", "reverb", "delay", "none"};
+  static const char *const tg[] = {"group_vol", "global_vol", "group_tune", "global_tune", "fx", "group_en", "group_fx", "mod", "group_env"};
+  static const char *const ep[] = {"attack", "decay", "sustain", "release"};
+  static const char *const pn[] = {"freq", "q", "wet", "room", "damp", "time", "feedback", "level"};
+  static const char *const mp[] = {"enabled", "amount", "attack", "decay", "sustain", "release", "freq"};
+  static const char *const ft[] = {"lp", "lp1", "hp", "bp", "reverb", "delay", "gain", "none"};
   const SfKnobs *k;
   size_t at = 0, c = cap > 0 ? (size_t)cap : 0;
   int i, j, l;
@@ -133,7 +195,10 @@ int smp_sf_test_knobs_text(const SmpFont *f, int preset, char *out, int cap) {
     at = put(out, c, at, "knob %d \"%s\" %s %g %g %g %s\n", i + 1, n->label, vt[n->vtype], n->lo, n->hi, n->value, wd[n->words]);
     for (j = 0; j < n->nb; j++) {
       const SfKBind *b = &n->b[j];
-      at = put(out, c, at, "  bind %s fx=%d param=%s layers=", tg[b->target], b->fx, b->param >= 0 ? pn[b->param] : "none");
+      if (b->target == SF_KT_MOD) at = put(out, c, at, "  bind mod %d param=%s layers=", b->mod, mp[b->param]);
+      else if (b->target == SF_KT_GROUP_ENV) at = put(out, c, at, "  bind group_env param=%s layers=", ep[b->param & 3]);
+      else at = put(out, c, at, "  bind %s fx=%d param=%s layers=", tg[b->target], b->fx, b->param >= 0 ? pn[b->param] : "none");
+      if (b->state >= 0) at = put(out, c, at, "state=%d ", b->state);
       for (l = 0; l < b->nlayers; l++) at = put(out, c, at, "%s%d", l ? "," : "", k->layer_list[b->first_layer + l]);
       at = put(out, c, at, " ");
       at = put_trans(out, c, at, &b->tr);
@@ -142,9 +207,15 @@ int smp_sf_test_knobs_text(const SmpFont *f, int preset, char *out, int cap) {
   }
   for (i = 0; i < k->nfx; i++) {
     const SfFxDesc *x = &k->fx[i];
-    at = put(out, c, at, "fx %d %s freq=%g q=%g room=%g damp=%g wet=%g time=%g musical=%d feedback=%g offset=%g\n", i,
+    at = put(out, c, at, "fx %d %s freq=%g q=%g room=%g damp=%g wet=%g time=%g musical=%d feedback=%g offset=%g", i,
              ft[x->type], x->freq, x->q, x->room, x->damp, x->wet, x->time, x->musical, x->feedback, x->offset);
+    if (x->type == SF_FX_GAIN) at = put(out, c, at, " level=%g%s", x->level, x->db ? "dB" : "");
+    at = put(out, c, at, "\n");
   }
+  for (i = 0; i < k->nmod; i++)
+    at = put(out, c, at, "mod %d enabled=%g amount=%g attack=%g decay=%g sustain=%g release=%g freq=%g\n", i,
+             k->mod[i][SF_MP_ENABLED], k->mod[i][SF_MP_AMOUNT], k->mod[i][SF_MP_ATTACK], k->mod[i][SF_MP_DECAY],
+             k->mod[i][SF_MP_SUSTAIN], k->mod[i][SF_MP_RELEASE], k->mod[i][SF_MP_FREQ]);
   for (i = 0; i < k->ncc; i++) {
     at = put(out, c, at, "cc %d knob=%d ", k->cc[i].cc, k->cc[i].knob + 1);
     at = put_trans(out, c, at, &k->cc[i].tr);

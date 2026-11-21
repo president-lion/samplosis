@@ -187,6 +187,7 @@ static void x_targets(SmpSfVoice *v, const SmpSfChan *c) {
   }
   if (x->fil2_on) {
     double cents = val[SMP_XM_CUTOFF2] + x->fil2_keytrack * (v->pkey - x->fil2_keycenter) + x->fil2_veltrack * vel;
+    v->x2cents = cents; v->x2reso = val[SMP_XM_RESO2];
     x_filter(x->fil2_type, x->cutoff2 * pow(2.0, cents / 1200.0), val[SMP_XM_RESO2], v->rate, v->xt[n++]);
   }
   for (b = 0; b < 3; b++)
@@ -234,10 +235,11 @@ static void fx_step(SmpSfVoice *v, double n) {
   for (k = 0; k < v->nfx; k++) {
     const SmpSfFlexEg *g = &v->reg->cond.flex[k];
     double m = n;
-    if (g->kind == 1) { flfo_step(v, k, n); continue; }
+    if (g->kind) { if (g->kind == 1) flfo_step(v, k, n); continue; }   /* an LFO; a controller (kind 2) is set by fx_depths */
     while (m > 0 && v->fx[k].pt < g->npts && !v->fx[k].held) {
       int pt = v->fx[k].pt;
       double len = v->fx[k].len[pt], to = g->level[pt];
+      if (v->lmod && g->dsmod && pt == g->sustain) to = v->lmod[(g->dsmod - 1) * SF_MP_N + SF_MP_SUSTAIN];
       if (len > 0 && v->fx[k].t + m < len) {
         v->fx[k].t += m; m = 0;
         v->fx[k].val = v->fx[k].from + (to - v->fx[k].from) * fx_shape(g->curve[pt], v->fx[k].t / len);
@@ -257,6 +259,7 @@ static void fx_depths(SmpSfVoice *v, const SmpSfChan *c) {
   for (k = 0; k < v->nfx; k++) {
     const SmpSfFlexEg *g = &v->reg->cond.flex[k];
     for (j = 0; j < 4; j++) v->fx[k].depth[j] = g->depth[j];
+    v->fx[k].depth2 = g->depth2;
     for (j = 0; j < g->ndm; j++) {          /* CC140 is ARIA's key delta (semitones from the last note), 141 its size */
       int n = g->dm[j].cc;
       double x = n < 128 ? c->cc[n] / 127.0 : n == 140 ? v->keydelta : abs(v->keydelta);
@@ -265,7 +268,14 @@ static void fx_depths(SmpSfVoice *v, const SmpSfChan *c) {
     if (g->kind == 1) {                 /* an LFO's rate, live */
       double f = g->freq;
       for (j = 0; j < g->nlm; j++) if (g->lm[j].what == SMP_LFO_FREQ) f += g->lm[j].amount * c->cc[g->lm[j].cc & 127] / 127.0;
+      if (v->lmod && g->dsmod) f = v->lmod[(g->dsmod - 1) * SF_MP_N + SF_MP_FREQ];
       v->fx[k].len[2] = f;
+    }
+    if (g->kind == 2) v->fx[k].val = c->cc[g->cc & 127] / 127.0;   /* a controller as the source */
+    if (v->lmod && g->dsmod) {          /* a Decent Sampler modulator: on or off, and its amount, live */
+      double s = v->lmod[(g->dsmod - 1) * SF_MP_N + SF_MP_ENABLED];
+      for (j = 0; j < 4; j++) v->fx[k].depth[j] *= s;
+      v->fx[k].depth2 *= s;
     }
   }
 }
@@ -278,6 +288,7 @@ static void fx_start(SmpSfVoice *v, const SmpSfChan *c) {
   if (v->nfx > SMP_FLEX_MAX) v->nfx = SMP_FLEX_MAX;
   for (k = 0; k < v->nfx; k++) {
     const SmpSfFlexEg *g = &v->reg->cond.flex[k];
+    if (g->kind == 2) { v->fx[k].val = 0; continue; }   /* a controller: its value at every update */
     if (g->kind == 1) {                 /* an LFO: its delay, fade and phase at note-on */
       double dl = g->delay, fd = g->fade, ph = g->phase;
       for (j = 0; j < g->nlm; j++) {
@@ -292,19 +303,24 @@ static void fx_start(SmpSfVoice *v, const SmpSfChan *c) {
     for (j = 0; j < g->npts && j < SMP_FLEX_PTS; j++) v->fx[k].len[j] = g->time[j];
     for (j = 0; j < g->ntm; j++)
       if (g->tm[j].pt < SMP_FLEX_PTS) v->fx[k].len[g->tm[j].pt] += g->tm[j].amount * c->cc[g->tm[j].cc & 127] / 127.0;
+    if (v->lmod && g->dsmod && g->npts >= 4) {   /* Decent Sampler's envelope (sfds.c): attack, decay, release */
+      const float *m = v->lmod + (g->dsmod - 1) * SF_MP_N;
+      v->fx[k].len[1] = m[SF_MP_ATTACK]; v->fx[k].len[2] = m[SF_MP_DECAY]; v->fx[k].len[3] = m[SF_MP_RELEASE];
+    }
     for (j = 0; j < SMP_FLEX_PTS; j++) v->fx[k].len[j] = v->fx[k].len[j] > 0 ? v->fx[k].len[j] * v->rate : 0;
   }
 }
 
 /* their sum on pitch (cents), cutoff (cents), volume (dB) and amplitude (a factor) */
-static void fx_sum(const SmpSfVoice *v, double *pitch, double *cutoff, double *gain) {
+static void fx_sum(const SmpSfVoice *v, double *pitch, double *cutoff, double *cutoff2, double *gain) {
   int k;
   double db = 0, amp = 1;
-  *pitch = *cutoff = 0;
+  *pitch = *cutoff = *cutoff2 = 0;
   for (k = 0; k < v->nfx; k++) {
     double x = v->fx[k].val;
     *pitch += x * v->fx[k].depth[SMP_FX_PITCH];
     *cutoff += x * v->fx[k].depth[SMP_FX_CUTOFF];
+    *cutoff2 += x * v->fx[k].depth2;
     db += x * v->fx[k].depth[SMP_FX_VOLUME];
     amp *= 1 + x * v->fx[k].depth[SMP_FX_AMPLITUDE] / 100;
   }
@@ -361,6 +377,8 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
      the DC is -5 dB and the peak +5 dB. (FluidSynth reads it differently, Q cB less 3.01 dB as a linear Q with
      1/sqrt(Q) gain: 7.2 dB of resonance at Q 100 and +1.5 dB at Q 0. The spec's text is clear, so it is followed.) */
   q_db = clampd(g[G_Q], 0, 960) / 10.0;
+  if (v->lx && !isnan(v->lx[1])) q_db = clampd(v->lx[1], 0, 96);   /* a Decent Sampler group filter's, live */
+  v->q_db1 = q_db;
   peak = pow(10.0, q_db / 20.0);
   v->q_lin = sqrt((peak * peak + peak * sqrt(peak * peak - 1)) / 2);
   v->q_gain = r->cond.fil_unity ? 1.0 : 1.0 / sqrt(peak);   /* SFZ: the passband stays at unity, the peak at +Q */
@@ -381,6 +399,12 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->v_decay = tc_samples(g[G_DECAY_VOLENV] + k * g[G_KEY_VOLENV_DECAY], -12000, 8000, rate);
   v->v_sus_db = -clampd(g[G_SUSTAIN_VOLENV], 0, 1440) / 10.0;
   v->v_release = tc_samples(g[G_RELEASE_VOLENV], -7200, 8000, rate);
+  if (v->lx) {                    /* a Decent Sampler knob on the group's envelope, live */
+    if (!isnan(v->lx[4])) v->v_attack = clampd(v->lx[4], 0.0001, 100) * rate;
+    if (!isnan(v->lx[5])) v->v_decay = clampd(v->lx[5], 0.0001, 100) * rate;
+    if (!isnan(v->lx[6])) v->v_sus_db = v->lx[6] > 1e-7 ? (v->lx[6] < 1 ? 20 * log10(v->lx[6]) : 0) : -144;
+    if (!isnan(v->lx[7])) v->v_release = clampd(v->lx[7], 0.0156, 100) * rate;
+  }
   v->m_delay = tc_samples(g[G_DELAY_MODENV], -12000, 5000, rate);
   v->m_attack = tc_samples(g[G_ATTACK_MODENV], -12000, 8000, rate);
   v->m_hold = tc_samples(g[G_HOLD_MODENV] + k * g[G_KEY_MODENV_HOLD], -12000, 5000, rate);
@@ -389,6 +413,11 @@ static void derive(SmpSfVoice *v, const SmpSfChan *c) {
   v->m_release = tc_samples(g[G_RELEASE_MODENV], -12000, 8000, rate);
   if (r->cond.xdsp) x_targets(v, c);
   if (v->nfx) fx_depths(v, c);
+  v->x2live = 0;
+  if (r->cond.xdsp && r->cond.xdsp->fil2_on) {   /* the second filter follows a knob or an envelope, at every update */
+    if (v->lx) v->x2live = 1;
+    for (k = 0; k < v->nfx; k++) if (v->fx[k].depth2 != 0) v->x2live = 1;
+  }
 }
 
 /* ---- envelopes and LFOs, stepped n samples at a time ---- */
@@ -506,7 +535,7 @@ static double menv_out(const SmpSfEnv *e) { return e->stage == E_ATTACK ? curve(
 static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
   double hz, w, cs, alpha, a0;
   int kind = v->reg->cond.fil_type;
-  if ((kind == SMP_FIL_LP || kind == SMP_FIL_LP1) && fc_cents >= 13500 && (kind == SMP_FIL_LP1 || v->g[G_Q] <= 0)) {
+  if ((kind == SMP_FIL_LP || kind == SMP_FIL_LP1) && fc_cents >= 13500 && (kind == SMP_FIL_LP1 || v->q_db1 <= 0)) {
     c[0] = 1; c[1] = c[2] = c[3] = c[4] = 0;
     return;
   }
@@ -548,7 +577,7 @@ static void filter_target(const SmpSfVoice *v, double fc_cents, double *c) {
 
 static void control(SmpSfVoice *v) {
   const double inv = 1.0 / SMP_SFV_CTL, *g = v->g;
-  double amp, cents, ratio, gain, c[5], me, fx_cut = 0;
+  double amp, cents, ratio, gain, c[5], me, fx_cut = 0, fx_cut2 = 0;
   int wire;
   venv_step(v, SMP_SFV_CTL);
   menv_step(v, SMP_SFV_CTL);
@@ -564,9 +593,16 @@ static void control(SmpSfVoice *v) {
   amp = venv_amp(&v->venv);
   gain = amp * v->atten_gain * pow(10.0, v->modlfo.val * g[G_MODLFO_VOL] / 200.0);
   if (v->nfx) {                   /* the flex envelopes on pitch, cutoff and level */
-    double fp, fc, fg;
-    fx_sum(v, &fp, &fc, &fg);
-    ratio *= pow(2.0, fp / 1200.0); gain *= fg; fx_cut = fc;
+    double fp, fc, fc2, fg;
+    fx_sum(v, &fp, &fc, &fc2, &fg);
+    ratio *= pow(2.0, fp / 1200.0); gain *= fg; fx_cut = fc; fx_cut2 = fc2;
+  }
+  if (v->lx) fx_cut += v->lx[0];  /* a Decent Sampler group filter's frequency, live */
+  if (v->x2live && v->xn > 0) {   /* the second filter's target, now */
+    const SmpSfxDsp *x = v->reg->cond.xdsp;
+    double q2 = v->lx && !isnan(v->lx[3]) ? v->lx[3] : v->x2reso;
+    x_filter(x->fil2_type, x->cutoff2 * pow(2.0, (v->x2cents + fx_cut2 + (v->lx ? v->lx[2] : 0)) / 1200.0), q2, v->rate,
+             v->xt[0]);
   }
   v->level = amp * v->atten_gain;
   filter_target(v, g[G_FC] + me * g[G_MODENV_FC] + v->modlfo.val * g[G_MODLFO_FC] + fx_cut, c);
@@ -796,7 +832,7 @@ void smp_sfv_off(SmpSfVoice *v) {
     int k;
     for (k = 0; k < v->nfx; k++) {
       int s = v->reg->cond.flex[k].sustain;
-      if (v->reg->cond.flex[k].kind == 1) continue;   /* an LFO runs on */
+      if (v->reg->cond.flex[k].kind != 0) continue;   /* an LFO (or a controller) runs on */
       if (v->fx[k].held || v->fx[k].pt <= s) { v->fx[k].held = 0; v->fx[k].pt = s + 1; v->fx[k].from = v->fx[k].val; v->fx[k].t = 0; }
     }
   }
@@ -834,6 +870,14 @@ void smp_sfv_kill(SmpSfVoice *v, double fade_ms) {
 
 void smp_sfv_update(SmpSfVoice *v, const SmpSfChan *c) {
   if (!v->live || !c) return;
+  derive(v, c);
+}
+
+void smp_sfv_set_layer(SmpSfVoice *v, const float *lgain, const float *lcents, const float *lx, const float *lmod,
+                       const SmpSfChan *c) {
+  if (!v->live || !c) return;
+  v->lgain = lgain; v->lcents = lcents; v->lx = lx; v->lmod = lmod;
+  if (lmod && v->nfx) fx_start(v, c);   /* the modulators' times as the knobs have them */
   derive(v, c);
 }
 

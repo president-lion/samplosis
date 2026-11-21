@@ -181,11 +181,10 @@ def test_ds_knob_regions(lib, tmp_path):
 def test_ds_knob_unsupported_counted(lib, tmp_path):
     write_layers(tmp_path)
     cases = [
-        ('<ui><tab><button x="1"><state name="a"/></button></tab></ui>', "<button>"),
         ('<ui><tab><menu x="1"><option name="a"/></menu></tab></ui>', "<menu>"),
         ('<ui><tab><control label="A"><binding type="amp" level="instrument" parameter="ENABLED"/></control></tab></ui>',
          "binding ENABLED"),
-        ("<ui><tab>%s</tab></ui>" % "".join('<control label="K%d"/>' % i for i in range(33)), "too many knobs"),
+        ("<ui><tab>%s</tab></ui>" % "".join('<control label="K%d"/>' % i for i in range(65)), "too many knobs"),
     ]
     for i, (ui, name) in enumerate(cases):
         f = opened(lib, write_ds(tmp_path / ("u%d.dspreset" % i), kit_text(ui=ui, effects="", midi="")))

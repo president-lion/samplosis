@@ -146,6 +146,7 @@ typedef struct {
     double depth[4];
     struct { uint8_t cc, pt; double amount; } tm[4];
     struct { uint8_t cc, target; double amount; } dm[4];
+    double depth2; uint8_t dsmod;                 /* egN_cutoff2; samplosis_dsmod (Decent Sampler's modulators) */
   } flex[SMP_FLEX_MAX];
   /* LFOs by number (lfoN is lfo[N - 1]), as SmpSfFlexEg has them (kind 1); fsrc: lfoN_freq_lfoM's M, 0 none */
   struct LfoO {
@@ -153,6 +154,7 @@ typedef struct {
     double freq, delay, fade, phase, famount, depth[4];
     struct { uint8_t cc, target; double amount; } dm[4];
     struct { uint8_t cc, what; double amount; } lm[6];
+    double depth2; uint8_t dsmod; int srccc;     /* lfoN_cutoff2; samplosis_dsmod; samplosis_cc (its CC + 1, 0 none) */
   } lfo[SMP_FLEX_MAX];
   double offset_random; int ndelay_cc; struct { uint8_t cc; double amount; } delay_cc[2];   /* frames; seconds */
   Lfo amplfo, fillfo, pitchlfo, lfo1, lfo2;
@@ -555,7 +557,9 @@ static int fil_kind(const char *v) {
 #define IS_(s) (!strcmp(nm, s))
 /* a flex envelope's opcode, egN_...: 1 when nm was one this can play. egN_timeK, egN_levelK, egN_curveK (K a point,
    0..SMP_FLEX_PTS-1), egN_sustain, egN_pitch / cutoff / volume / amplitude, and controllers on a point's time
-   (egN_timeK_onccN) or on a depth (egN_pitch_onccN). egN_shapeK, egN_dynamic, egN_loop and controllers past 127
+   (egN_timeK_onccN) or on a depth (egN_pitch_onccN), and egN_cutoff2 (the second filter). For Decent Sampler's
+   modulators (sfds.c), egN_samplosis_dsmod and lfoN_samplosis_dsmod tie one to the preset's modulator whose values
+   the player keeps live, and lfoN_samplosis_cc=N makes an LFO a controller's value instead (kind 2). egN_shapeK, egN_dynamic, egN_loop and controllers past 127
    (ARIA's extended ones) aren't. */
 static int flex_opcode(P *p, Opts *o, const char *nm, const char *v) {
   static const char *const tgn[4] = {"pitch", "cutoff", "volume", "amplitude"};
@@ -565,6 +569,8 @@ static int flex_opcode(P *p, Opts *o, const char *nm, const char *v) {
   (void)p;
   if (e == nm + 2 || *e != '_' || n < 1 || n > SMP_FLEX_MAX) return 0;
   x = &o->flex[n - 1]; e++;
+  if (!strcmp(e, "cutoff2")) { if (num(v, &d)) { x->depth2 = d; x->set = 1; } return 1; }
+  if (!strcmp(e, "samplosis_dsmod")) { if (inum(v, &i)) { x->dsmod = (uint8_t)clampi(i, 0, 255); x->set = 1; } return 1; }
   if (!strcmp(e, "sustain")) { if (inum(v, &i)) { x->sustain = (uint8_t)clampi(i, 0, SMP_FLEX_PTS - 1); x->set = 1; } return 1; }
   for (i = 0; i < 4; i++) {
     size_t L = strlen(tgn[i]);
@@ -606,7 +612,7 @@ static int flex_opcode(P *p, Opts *o, const char *nm, const char *v) {
 }
 /* an LFO's opcode, lfoN_... (SFZ v2): 1 when nm was one this can play. lfoN_freq, lfoN_wave, lfoN_delay,
    lfoN_fade, lfoN_phase and their controllers (_onccN / _ccN), lfoN_pitch / cutoff / volume / amplitude and
-   controllers on them, and lfoN_freq_lfoM (another LFO on this one's rate). lfoN_pan, lfoN_eqK, lfoN_count, the
+   controllers on them, lfoN_cutoff2, and lfoN_freq_lfoM (another LFO on this one's rate). lfoN_pan, lfoN_eqK, lfoN_count, the
    step sequencer and curves on its controllers aren't. */
 static int lfo_opcode(P *p, Opts *o, const char *nm, const char *v) {
   static const char *const tgn[4] = {"pitch", "cutoff", "volume", "amplitude"};
@@ -617,6 +623,9 @@ static int lfo_opcode(P *p, Opts *o, const char *nm, const char *v) {
   (void)p;
   if (e == nm + 3 || *e != '_' || n < 1 || n > SMP_FLEX_MAX) return 0;
   x = &o->lfo[n - 1]; e++;
+  if (!strcmp(e, "cutoff2")) { if (num(v, &d)) { x->depth2 = d; x->set = 1; } return 1; }
+  if (!strcmp(e, "samplosis_dsmod")) { if (inum(v, &i)) { x->dsmod = (uint8_t)clampi(i, 0, 255); x->set = 1; } return 1; }
+  if (!strcmp(e, "samplosis_cc")) { if (inum(v, &i)) { x->srccc = clampi(i, 0, 127) + 1; x->set = 1; } return 1; }
   if (!strcmp(e, "wave")) { if (inum(v, &i)) { x->wave = (uint8_t)clampi(i, 0, 7); x->set = 1; } return 1; }
   for (i = 0; i < 4; i++) {
     size_t L = strlen(tgn[i]);
@@ -1785,10 +1794,11 @@ static int add_flex(P *p, const Opts *o, int *n) {
   for (i = 0; i < SMP_FLEX_MAX; i++) {
     const struct FlexO *x = &o->flex[i];
     SmpSfFlexEg *g = &set[m];
-    int deep = x->ndm > 0;
+    int deep = x->ndm > 0 || x->depth2 != 0;
     for (j = 0; j < 4; j++) if (x->depth[j] != 0) deep = 1;
     if (!x->set || !x->npts || !deep) continue;
     memset(g, 0, sizeof *g);
+    g->depth2 = (float)x->depth2; g->dsmod = x->dsmod;
     g->npts = x->npts; g->sustain = (uint8_t)(x->sustain < x->npts ? x->sustain : x->npts - 1);
     for (j = 0; j < x->npts; j++) { g->time[j] = (float)x->time[j]; g->level[j] = (float)x->level[j]; g->curve[j] = x->curve[j]; }
     for (j = 0; j < 4; j++) g->depth[j] = (float)x->depth[j];
@@ -1803,10 +1813,12 @@ static int add_flex(P *p, const Opts *o, int *n) {
     for (i = 0; i < SMP_FLEX_MAX && m < SMP_FLEX_MAX; i++) {
       const struct LfoO *x = &o->lfo[i];
       SmpSfFlexEg *g = &set[m];
-      int deep = x->ndm > 0;
+      int deep = x->ndm > 0 || x->depth2 != 0;
       for (j = 0; j < 4; j++) if (x->depth[j] != 0) deep = 1;
       if (!x->set || !deep) continue;
       memset(g, 0, sizeof *g);
+      g->depth2 = (float)x->depth2; g->dsmod = x->dsmod;
+      if (x->srccc) { g->kind = 2; g->cc = (uint8_t)(x->srccc - 1); g->fsrc = -1; for (j = 0; j < 4; j++) g->depth[j] = (float)x->depth[j]; at[i] = m++; continue; }
       g->kind = 1; g->wave = x->wave; g->fsrc = -1; g->famount = (float)x->famount;
       g->freq = (float)x->freq; g->delay = (float)x->delay; g->fade = (float)x->fade; g->phase = (float)x->phase;
       for (j = 0; j < 4; j++) g->depth[j] = (float)x->depth[j];

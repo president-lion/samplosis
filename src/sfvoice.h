@@ -69,7 +69,7 @@ typedef struct SmpSfVoice {
      held at its sustain point (held), samples into the segment (t), the value it set out from and its value now,
      each point's length in samples (its time and the controllers on it at note-on), and its depths now */
   int nfx, keydelta;                     /* keydelta: SFZ's CC140, set by the player after the start */
-  struct { int pt, held; double t, from, val, len[SMP_FLEX_PTS], depth[4]; } fx[SMP_FLEX_MAX];
+  struct { int pt, held; double t, from, val, len[SMP_FLEX_PTS], depth[4], depth2; } fx[SMP_FLEX_MAX];
   double level;                          /* the last envelope level times the attenuation, for stealing */
   /* kill: a linear fade */
   int killing; double fade, fade_step;
@@ -90,6 +90,12 @@ typedef struct SmpSfVoice {
   /* Decent Sampler's knobs: the region's layer gain (linear) and tuning (cents) as the player keeps them now, or
      NULL; set after the start (then smp_sfv_update), read at every derive */
   const float *lgain, *lcents;
+  /* and its layer's live values (sfknob.h's sf_knobs_levels_ex lfx: its group filters' and amplitude envelope's)
+     and the preset's modulators' values (kmod, SF_MP_N each), or NULL */
+  const float *lx, *lmod;
+  double q_db1;                          /* the first filter's resonance (dB) as last worked out */
+  int x2live; double x2cents, x2reso;    /* the second filter moves at every update (a knob or an envelope on it):
+                                            its cents and resonance from the controllers, as x_targets left them */
 } SmpSfVoice;
 
 /* starts the voice for region r of a note. Returns 0 (and holds nothing) when the sample isn't loaded. st and slot:
@@ -110,6 +116,10 @@ void smp_sfv_release(SmpSfVoice *v);                   /* note-off: the envelope
 void smp_sfv_off(SmpSfVoice *v);                       /* the release stages even for a one-shot (an off_by stop) */
 void smp_sfv_kill(SmpSfVoice *v, double fade_ms);      /* fades out over fade_ms; 0 or less ends it at once */
 void smp_sfv_update(SmpSfVoice *v, const SmpSfChan *c);   /* a controller changed: the modulators again */
+/* just after the start: the voice's Decent Sampler layer (its gain and tuning, its group filters' values, the
+   preset's modulators' values; see above), its envelopes started again with them and its values worked out */
+void smp_sfv_set_layer(SmpSfVoice *v, const float *lgain, const float *lcents, const float *lx, const float *lmod,
+                       const SmpSfChan *c);
 /* adds n frames into l and r (and the effect sends into rev and cho, either may be NULL). Returns 0 once the
    voice has ended, and on every call after. */
 int smp_sfv_render(SmpSfVoice *v, float *l, float *r, float *rev, float *cho, int n);
