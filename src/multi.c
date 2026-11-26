@@ -2,8 +2,9 @@
 
    Each sample (a zone) plays in an engine of its own (engine.c, unchanged), so everything one sample does (streaming,
    keep-length copies, reversed copies, glide) is as before. The zones' key and velocity ranges reach their engines as
-   the engine's own Lowest and Highest note and velocity: the zone's range inside the instrument's. Root note is each
-   zone's own; the other parameters are the instrument's, the same in every engine.
+   the engine's own Lowest and Highest note and velocity, and its mode and free-mode pitches as the engine's Mode and
+   Pitch at lowest and highest note (smp_param_per_sample). Root note is each zone's own too; the other parameters
+   are the instrument's, the same in every engine.
 
    Threads. The zone list is the main thread's. The audio thread sees a snapshot of it (MSnap: the engines and their
    ranges), published by atomic pointer whenever the list or a range changes; the audio thread pins the snapshot it
@@ -28,6 +29,8 @@ typedef struct {
   int picked;                            /* main thread: picked in the window's list (several may be) */
   volatile LONG pc;                      /* 0: the keys klo to khi; else a bit per note (bit 0 C to bit 11 B): every key of
                                             those notes, whatever its octave, and klo and khi the lowest and highest */
+  volatile LONG mode;                    /* 0 sample, 1 note, 2 free */
+  double plo, phi;                       /* free mode: semitones at klo and at khi */
 } Zone;
 
 /* one note name without its octave ("C", "f#", "Bb"): 0 to 11, or -1. A plain letter is that note only: D isn't D#. */
@@ -103,23 +106,25 @@ static LONG64 bits(double v) { LONG64 b; memcpy(&b, &v, 8); return b; }
 static double pget(const SmpMulti *m, int id) { LONG64 b = m->p[id]; double v; memcpy(&v, &b, 8); return v; }
 static int on_main(const SmpMulti *m) { return GetCurrentThreadId() == m->main_tid; }
 
-/* what an engine's parameter id should be for a zone with these ranges */
-static double eff(const SmpMulti *m, int id, int klo, int khi, int vlo, int vhi) {
-  double v = pget(m, id);
+/* what an engine's parameter id should be for zone z */
+static double eff(const SmpMulti *m, int id, const Zone *z) {
   switch (id) {
-    case SMP_P_NOTE_LO: return v > klo ? v : klo;
-    case SMP_P_NOTE_HI: return v < khi ? v : khi;
-    case SMP_P_VEL_LO: return v > vlo ? v : vlo;
-    case SMP_P_VEL_HI: return v < vhi ? v : vhi;
+    case SMP_P_NOTE_LO: return z->klo;
+    case SMP_P_NOTE_HI: return z->khi;
+    case SMP_P_VEL_LO: return z->vlo;
+    case SMP_P_VEL_HI: return z->vhi;
+    case SMP_P_MODE: return z->mode;
+    case SMP_P_PITCH_LO: return z->plo;
+    case SMP_P_PITCH_HI: return z->phi;
   }
-  return v;
+  return pget(m, id);
 }
 static void set_if(SmpEngine *e, int id, double v) {
   if (smp_engine_get_param(e, id) != v) smp_engine_set_param(e, id, v);
 }
 static void sync_engine(const SmpMulti *m, SmpEngine *e, const Zone *z) {
   int id;
-  for (id = 0; id < SMP_NPARAMS; id++) if (id != SMP_P_ROOT) set_if(e, id, eff(m, id, z->klo, z->khi, z->vlo, z->vhi));
+  for (id = 0; id < SMP_NPARAMS; id++) if (id != SMP_P_ROOT) set_if(e, id, eff(m, id, z));
   set_if(e, SMP_P_ROOT, z->root);
 }
 static void sync_zone(const SmpMulti *m, Zone *z) { if (z->e) sync_engine(m, z->e, z); }
@@ -237,6 +242,8 @@ static Zone *zone_new(int root) {
   Zone *z = calloc(1, sizeof *z);
   if (!z) return NULL;
   z->klo = 0; z->khi = 127; z->vlo = 1; z->vhi = 127; z->root = root < 0 ? 60 : root > 127 ? 127 : root; z->pc = 0;
+  z->mode = (LONG)smp_param_info(SMP_P_MODE)->def;
+  z->plo = smp_param_info(SMP_P_PITCH_LO)->def; z->phi = smp_param_info(SMP_P_PITCH_HI)->def;
   return z;
 }
 
@@ -324,6 +331,28 @@ SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root) {
   InterlockedExchange(&m->z[i]->root, root < 0 ? 0 : root > 127 ? 127 : root);
   if (m->z[i]->e) set_if(m->z[i]->e, SMP_P_ROOT, m->z[i]->root);
 }
+SMP_API int smp_multi_mode(const SmpMulti *m, int i) {
+  return m && i >= 0 && i < m->n ? m->z[i]->mode : (int)smp_param_info(SMP_P_MODE)->def;
+}
+SMP_API void smp_multi_set_mode(SmpMulti *m, int i, int mode) {
+  if (!m || i < 0 || i >= m->n || mode < 0 || mode > 2) return;
+  InterlockedExchange(&m->z[i]->mode, mode);
+  sync_zone(m, m->z[i]);
+}
+SMP_API void smp_multi_pitch(const SmpMulti *m, int i, double *lo, double *hi) {
+  int ok = m && i >= 0 && i < m->n;
+  *lo = ok ? m->z[i]->plo : smp_param_info(SMP_P_PITCH_LO)->def;
+  *hi = ok ? m->z[i]->phi : smp_param_info(SMP_P_PITCH_HI)->def;
+}
+static double clamp_semi(int id, double v) {
+  const SmpParamInfo *pi = smp_param_info(id);
+  return v != v ? pi->def : v < pi->lo ? pi->lo : v > pi->hi ? pi->hi : v;
+}
+SMP_API void smp_multi_set_pitch(SmpMulti *m, int i, double lo, double hi) {
+  if (!m || i < 0 || i >= m->n) return;
+  m->z[i]->plo = clamp_semi(SMP_P_PITCH_LO, lo); m->z[i]->phi = clamp_semi(SMP_P_PITCH_HI, hi);
+  sync_zone(m, m->z[i]);
+}
 SMP_API int smp_multi_selected(const SmpMulti *m) { return m ? m->sel : -1; }
 SMP_API int smp_multi_picked(const SmpMulti *m, int i) { return m && i >= 0 && i < m->n ? m->z[i]->picked : 0; }
 SMP_API void smp_multi_pick(SmpMulti *m, int i, int on) { if (m && i >= 0 && i < m->n) m->z[i]->picked = on != 0; }
@@ -340,10 +369,17 @@ SMP_API void smp_multi_line(const SmpMulti *m, int i, char *out, int cap) {
   smp_note_name(m->z[i]->klo, lo, sizeof lo); smp_note_name(m->z[i]->khi, hi, sizeof hi);
   if (m->z[i]->pc) { char w[80]; pc_name(m->z[i]->pc, 1, w, sizeof w); snprintf(keys, sizeof keys, "every %s", w); }
   else snprintf(keys, sizeof keys, "%s to %s", lo, hi);
-  if (s) snprintf(out, (size_t)cap, "%s, root %s, keys %s, velocity %d to %d", s->name, root, keys,
-                  m->z[i]->vlo, m->z[i]->vhi);
-  else snprintf(out, (size_t)cap, "Missing: %s, root %s, keys %s, velocity %d to %d", m->z[i]->path, root, keys,
-                m->z[i]->vlo, m->z[i]->vhi);
+  char md[96] = "";                      /* the mode when it isn't note: ", sample mode", ", free mode, pitch -12 to 12" */
+  if (m->z[i]->mode == 0) snprintf(md, sizeof md, ", sample mode");
+  else if (m->z[i]->mode == 2) {
+    char a[32], b[32];
+    smp_value_text(SMP_P_PITCH_LO, m->z[i]->plo, a, sizeof a); smp_value_text(SMP_P_PITCH_HI, m->z[i]->phi, b, sizeof b);
+    snprintf(md, sizeof md, ", free mode, pitch %s to %s", a, b);
+  }
+  if (s) snprintf(out, (size_t)cap, "%s, root %s, keys %s, velocity %d to %d%s", s->name, root, keys,
+                  m->z[i]->vlo, m->z[i]->vhi, md);
+  else snprintf(out, (size_t)cap, "Missing: %s, root %s, keys %s, velocity %d to %d%s", m->z[i]->path, root, keys,
+                m->z[i]->vlo, m->z[i]->vhi, md);
   }
 }
 
@@ -354,6 +390,21 @@ SMP_API void smp_multi_set_param(SmpMulti *m, int id, double v) {
   if (!m || id < 0 || id >= SMP_NPARAMS || v != v) return;
   if (v < pi->lo) v = pi->lo;
   if (v > pi->hi) v = pi->hi;
+  if (smp_param_per_sample(id)) {        /* the window's Mode and pitches: every picked sample (main thread only) */
+    int any = 0;
+    if (!on_main(m)) return;
+    for (i = 0; i < m->n; i++) any |= m->z[i]->picked;
+    for (i = 0; i < m->n; i++) {
+      Zone *z = m->z[i];
+      if (!(any ? z->picked : i == m->sel)) continue;
+      if (id == SMP_P_MODE) z->mode = (LONG)(v + 0.5);
+      else if (id == SMP_P_PITCH_LO) z->plo = v;
+      else if (id == SMP_P_PITCH_HI) z->phi = v;
+      else continue;                     /* the ranges: smp_multi_set_range */
+      sync_zone(m, z);
+    }
+    return;
+  }
   if (id == SMP_P_ROOT) {                /* the selected sample's */
     Zone *z = on_main(m) ? (m->sel >= 0 ? m->z[m->sel] : NULL) : m->selz;
     if (z) { InterlockedExchange(&z->root, (LONG)(v + 0.5)); if (z->e) smp_engine_set_param(z->e, id, z->root); }
@@ -364,13 +415,14 @@ SMP_API void smp_multi_set_param(SmpMulti *m, int id, double v) {
     MSnap *s = view(m);
     for (i = 0; s && i < s->n; i++) {
       Zone *z = s->z[i];
-      if (z->e) smp_engine_set_param(z->e, id, eff(m, id, z->klo, z->khi, z->vlo, z->vhi));
+      if (z->e) smp_engine_set_param(z->e, id, eff(m, id, z));
     }
   }
 }
 SMP_API double smp_multi_get_param(const SmpMulti *m, int id) {
   if (!m || id < 0 || id >= SMP_NPARAMS) return 0;
   if (id == SMP_P_ROOT) return m->sel >= 0 ? m->z[m->sel]->root : smp_param_info(id)->def;
+  if (smp_param_per_sample(id)) return m->sel >= 0 ? eff(m, id, m->z[m->sel]) : smp_param_info(id)->def;
   return pget(m, id);
 }
 
@@ -545,11 +597,15 @@ SMP_API int smp_multi_script_write(const SmpMulti *m, char *out, int cap) {
       at += snprintf(line + at, sizeof line - (size_t)at, " keys=%s..%s", a, b);
     }
     if (z->vlo != 1 || z->vhi != 127) at += snprintf(line + at, sizeof line - (size_t)at, " velocity=%d..%d", z->vlo, z->vhi);
+    if (z->mode != 1) at += snprintf(line + at, sizeof line - (size_t)at, " mode=%s", z->mode ? "free" : "sample");
+    if (z->plo != smp_param_info(SMP_P_PITCH_LO)->def || z->phi != smp_param_info(SMP_P_PITCH_HI)->def)
+      at += snprintf(line + at, sizeof line - (size_t)at, " pitch=%.10g..%.10g", z->plo, z->phi);
     snprintf(line + at, sizeof line - (size_t)at, "\n");
     put(&o, line);
   }
   for (i = 0; i < SMP_NPARAMS; i++) {
     char v[64];
+    if (smp_param_per_sample(i)) continue;   /* on the sample lines */
     smp_value_text(i, m ? smp_multi_get_param(m, i) : smp_param_info(i)->def, v, sizeof v);
     snprintf(line, sizeof line, "%s %s\n", smp_param_info(i)->name, v);
     put(&o, line);
@@ -583,7 +639,16 @@ static int read_range(const char *v, int notes, int *lo, int *hi) {
   return *lo <= *hi;
 }
 
-typedef struct { char path[1024]; uint64_t key; int has_key, root, klo, khi, vlo, vhi, pc, line; } SLine;
+typedef struct { char path[1024]; uint64_t key; int has_key, root, klo, khi, vlo, vhi, pc, line, mode, has_pitch; double plo, phi; } SLine;
+
+/* "-12..12" (semitones, -48 to 48, low first or not): 1, else 0 */
+static int read_pitch(const char *v, double *lo, double *hi) {
+  char a[32], *e1, *e2; const char *dots = strstr(v, "..");
+  if (!dots || dots == v || dots - v >= 32 || !dots[2]) return 0;
+  memcpy(a, v, (size_t)(dots - v)); a[dots - v] = 0;     /* "0..12": strtod alone would read "0." */
+  *lo = strtod(a, &e1); *hi = strtod(dots + 2, &e2);
+  return !*e1 && !*e2 && *lo >= -48 && *lo <= 48 && *hi >= -48 && *hi <= 48;
+}
 
 SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, char *err, int cap) {
   double val[SMP_NPARAMS]; char have[SMP_NPARAMS] = {0};
@@ -613,7 +678,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
     if (!strcmp(name, "sample")) {
       SLine L; char *q, *end;
       memset(&L, 0, sizeof L);
-      L.root = -1; L.klo = 0; L.khi = 127; L.vlo = 1; L.vhi = 127; L.pc = 0; L.line = lineno;
+      L.root = -1; L.klo = 0; L.khi = 127; L.vlo = 1; L.vhi = 127; L.pc = 0; L.line = lineno; L.mode = -1;
       if (*rest != '"') { fail(err, cap, lineno, "sample needs the path in quotes, like %s", "sample \"E:\\samples\\a.wav\""); free(sl); return 1; }
       q = rest + 1;
       if (!(end = strchr(q, '"'))) { fail(err, cap, lineno, "sample: %s", "the closing quote is missing"); free(sl); return 1; }
@@ -621,7 +686,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
       if (!*q) { fail(err, cap, lineno, "sample: %s", "the path is empty"); free(sl); return 1; }
       snprintf(L.path, sizeof L.path, "%s", q);
       rest = end + 1;
-      for (;;) {                           /* key=, root=, keys=, velocity= */
+      for (;;) {                           /* key=, root=, keys=, velocity=, mode=, pitch= */
         char word[300], *eq; size_t wl;
         while (isspace((unsigned char)*rest)) rest++;
         if (!*rest) break;
@@ -643,6 +708,12 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
           else if (!read_range(eq, 1, &L.klo, &L.khi)) { fail(err, cap, lineno, "sample: keys=%s should be two notes, low first, like keys=C2..C3, or notes in every octave, like keys=C or keys=D,F", eq); free(sl); return 1; }
         } else if (!strcmp(word, "velocity")) {
           if (!read_range(eq, 0, &L.vlo, &L.vhi)) { fail(err, cap, lineno, "sample: velocity=%s should be 1 to 127, low first, like velocity=15..80", eq); free(sl); return 1; }
+        } else if (!strcmp(word, "mode")) {
+          if (!_stricmp(eq, "sample")) L.mode = 0; else if (!_stricmp(eq, "note")) L.mode = 1; else if (!_stricmp(eq, "free")) L.mode = 2;
+          else { fail(err, cap, lineno, "sample: mode=%s should be sample, note or free", eq); free(sl); return 1; }
+        } else if (!strcmp(word, "pitch")) {
+          if (!read_pitch(eq, &L.plo, &L.phi)) { fail(err, cap, lineno, "sample: pitch=%s should be two semitones from -48 to 48, like pitch=-12..12", eq); free(sl); return 1; }
+          L.has_pitch = 1;
         } else { fail(err, cap, lineno, "sample: unknown setting '%s'", word); free(sl); return 1; }
       }
       if (ns >= SMP_MULTI_MAX) { fail(err, cap, lineno, "%s", "more than 128 samples"); free(sl); return 1; }
@@ -668,7 +739,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
   }
   /* every line reads: the parameters, then the samples (those already here with the same path and key are kept) */
   for (i = 0; i < SMP_NPARAMS; i++)
-    if (i != SMP_P_ROOT) InterlockedExchange64(&m->p[i], bits(have[i] ? val[i] : smp_param_info(i)->def));
+    if (i != SMP_P_ROOT && !smp_param_per_sample(i)) InterlockedExchange64(&m->p[i], bits(have[i] ? val[i] : smp_param_info(i)->def));
   for (i = 0; i < ns; i++) {
     SLine *L = &sl[i]; Zone *z = NULL;
     nz[i] = NULL;
@@ -696,6 +767,17 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
     }
     if (root >= 0) z->root = root;         /* else kept, or the new sample's */
     z->klo = L->klo; z->khi = L->khi; z->vlo = L->vlo; z->vhi = L->vhi; z->pc = L->pc;
+    /* Older projects: the instrument's mode and free-mode pitches are every sample's unless its line says, and its
+       Lowest and Highest note and velocity narrow every sample's ranges */
+    z->mode = L->mode >= 0 ? L->mode : have[SMP_P_MODE] ? (int)(val[SMP_P_MODE] + 0.5) : (int)smp_param_info(SMP_P_MODE)->def;
+    z->plo = L->has_pitch ? L->plo : have[SMP_P_PITCH_LO] ? val[SMP_P_PITCH_LO] : smp_param_info(SMP_P_PITCH_LO)->def;
+    z->phi = L->has_pitch ? L->phi : have[SMP_P_PITCH_HI] ? val[SMP_P_PITCH_HI] : smp_param_info(SMP_P_PITCH_HI)->def;
+    if (have[SMP_P_NOTE_LO] && val[SMP_P_NOTE_LO] > z->klo) z->klo = (int)(val[SMP_P_NOTE_LO] + 0.5);
+    if (have[SMP_P_NOTE_HI] && val[SMP_P_NOTE_HI] < z->khi) z->khi = (int)(val[SMP_P_NOTE_HI] + 0.5);
+    if (have[SMP_P_VEL_LO] && val[SMP_P_VEL_LO] > z->vlo) z->vlo = (int)(val[SMP_P_VEL_LO] + 0.5);
+    if (have[SMP_P_VEL_HI] && val[SMP_P_VEL_HI] < z->vhi) z->vhi = (int)(val[SMP_P_VEL_HI] + 0.5);
+    if (z->khi < z->klo) z->khi = z->klo;
+    if (z->vhi < z->vlo) z->vhi = z->vlo;
     nz[i] = z;
   }
   for (j = 0; j < m->n; j++) if (m->z[j]) bury(m, m->z[j]);

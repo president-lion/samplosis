@@ -92,7 +92,7 @@ typedef struct Gui {
   int page;                                   /* PG_SAMPLER, PG_SETTINGS or PG_FONT */
   HWND tabs;                                  /* the Player tab control: first on both main pages */
   bool setting_tab;                           /* the window moves the tab itself: not the user's choice */
-  HWND sample, browse, status, settings;
+  HWND sample, status, settings;
   HWND val[SMP_NALLPARAMS];                   /* each parameter's slider or combo box */
   Slider sl[SMP_NALLPARAMS + 1 + NKNOB + 2]; int nsl;
   Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
@@ -293,7 +293,11 @@ static void sl_set(Gui *g, Slider *s, double v) {
     sl_show(g, g->zlo, true); sl_show(g, g->zhi, true);   /* "every C" on the other one ends too */
     zones_show(g);
   }
-  else if (s->what == SL_LIMIT) set_limit(g, v); else smp_plug_set_param(g->P, s->what, v);
+  else if (s->what == SL_LIMIT) set_limit(g, v);
+  else {
+    smp_plug_set_param(g->P, s->what, v);
+    if (smp_param_per_sample(s->what)) zones_show(g);   /* the list says a free sample's pitches */
+  }
   sl_show(g, s, true);
 }
 /* Up and Down: a semitone, a cent, a dB, 10 ms, 1 %, 1 GB (by: 1, 10 or 0.1, and the sign); whole-number values
@@ -361,6 +365,7 @@ static void edit_end(Gui *g, Slider *s, bool apply, bool to_slider) {
 
 static void show_param(Gui *g, int id, bool force) {
   double v = smp_plug_get_param(g->P, id);
+  if (!g->val[id]) return;                       /* not in the window: a sample's range (Start key, End key, Velocity) */
   if (is_choice(id)) {
     int k = (int)floor(v + 0.5);
     if (SendMessageW(g->val[id], CB_GETCURSEL, 0, 0) != k) SendMessageW(g->val[id], CB_SETCURSEL, (WPARAM)k, 0);
@@ -1144,8 +1149,8 @@ static void file_chosen(Gui *g, int kind, int k) {
   file_list(g, kind, true);                   /* the loaded file selected (again, when the load failed) */
 }
 
-/* Browse (how SMP_LOAD_ALL) and Add samples (SMP_LOAD_ADD) on the Sampler page: several files may be chosen;
-   the SoundFont page's Browse chooses one */
+/* Add samples (SMP_LOAD_ADD) on the Sampler page: several files may be chosen; the SoundFont page's Browse chooses
+   one */
 static void browse_file_as(Gui *g, int kind, int how);
 static void browse_file(Gui *g, int kind) { browse_file_as(g, kind, SMP_LOAD_ALL); }
 /* Enter on the Sampler's File combo box: the file shown joins the samples, and the selected sample goes back to the
@@ -1194,7 +1199,7 @@ static void browse_file_as(Gui *g, int kind, int how) {
     free_files(list, n);
   }
   free(file);
-  focus(kind ? g->sfbrowse : how == SMP_LOAD_ADD ? g->zadd : g->browse);
+  focus(kind ? g->sfbrowse : g->zadd);
 }
 
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
@@ -1331,7 +1336,6 @@ static void set_tab(Gui *g, int which) {
 static void click(Gui *g, int id) {
   int m;
   switch (id) {
-    case ID_BROWSE: browse_file(g, 0); break;
     case ID_ZADD: browse_file_as(g, 0, SMP_LOAD_ADD); break;
     case ID_ZREMOVE: zone_remove(g); break;
     case ID_SFBROWSE: browse_file(g, 1); break;
@@ -1434,6 +1438,7 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NALLPARAMS) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) smp_plug_set_param(g->P, id - ID_VAL, (double)k);
+        if (k >= 0 && smp_param_per_sample(id - ID_VAL)) zones_show(g);   /* the list says each sample's mode */
       } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE || id == ID_DECLICK || id == ID_RAWRATE ||
                                            id == ID_RAWCH || id == ID_RAWFMT || id == ID_RAWEND)) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
@@ -1543,7 +1548,7 @@ static HWND param_box(Gui *g, int page, int id, int x, int y, int lw, int cw) {
   return c;
 }
 
-#define N_REST (SMP_NPARAMS - 2)
+#define N_REST (SMP_NPARAMS - 2 - 4)                  /* not Keep length and Mode, nor the four ranges */
 #define REST_ROWS ((N_REST + 1) / 2)
 #define W_HEIGHT_S (8 + (8 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page: the tabs, 3 rows, the samples (4
                                                              rows), the rest in two columns, Status and Settings */
@@ -1587,8 +1592,7 @@ static bool build(Gui *g, HWND parent) {
   y += ROW;
   g->sample = labelled(g, 0, "Sample", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 120, W_WIDTH - 140, 24, ID_SAMPLE);
   y += ROW;
-  g->browse = ctl(g, 0, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_BROWSE);
-  g->file[0] = labelled(g, PG_SAMPLER, "File", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 240, y, 40, 470, 320, ID_FILE);
+  g->file[0] = labelled(g, PG_SAMPLER, "File", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 120, 470, 320, ID_FILE);
   y += ROW;
   /* the samples: the list, three rows high, with Add samples and Remove sample beside it, Velocity under them;
      Start key and End key below (Tab: the list, the buttons, Start key, End key, Velocity) */
@@ -1606,6 +1610,7 @@ static bool build(Gui *g, HWND parent) {
   y += ROW;
   for (id = 0, k = 0; id < SMP_NPARAMS; id++) {
     if (id == SMP_P_KEEP_LENGTH || id == SMP_P_MODE) continue;
+    if (id == SMP_P_NOTE_LO || id == SMP_P_NOTE_HI || id == SMP_P_VEL_LO || id == SMP_P_VEL_HI) continue;   /* each sample's: Start key, End key, Velocity */
     param_box(g, PG_SAMPLER, id, k % 2 ? 384 : 8, y + (k / 2) * ROW, k % 2 ? 160 : 120, k % 2 ? 200 : 236);
     k++;
   }

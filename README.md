@@ -26,7 +26,7 @@ The Sampler:
 
 - Load one audio file (wav, flac, ogg, mp3, opus, wv, ape and the other formats the bundled decoders read, and m4a,
   aac, wma and whatever else Windows itself decodes; with FFmpeg installed, also dsf, tta and anything else it
-  decodes; see "File formats") with the Browse button, by dragging it onto the window, or from a saved REAPER project. Files from the
+  decodes; see "File formats") with the Add samples button, by dragging it onto the window, or from a saved REAPER project. Files from the
   window load in the background: the status says "Loading x.wav" or "Decoding x.dsf with FFmpeg" until it's ready.
   A damaged file of a built-in format (a .wav or .flac the built-in decoders refuse) may still load through FFmpeg;
   the status then says "(decoded by FFmpeg)". Known limit: a saved project loads its sample while REAPER waits, so
@@ -43,14 +43,15 @@ The Sampler:
   (shared out between the instances; an octave each way always fits). A key played before its copy is ready goes to the front of the queue. Until a copy
   is ready the note plays by changing speed, as an ordinary sampler would.
 - With Keep length off, pitch changes by changing speed.
-- Several samples in one instance (up to 128): choose several files at once in Browse (they replace the samples
-  loaded) or Add samples (they join them), or drop several on the window. Each sample has its own Start key and End
-  key, its own Velocity range (1 to 127 unless set, typed like "15,80"), and its own root note; a note plays every
-  sample whose keys and velocities it falls in. See "The samples".
-- Envelope, loop, start and end points, reverse, speed, velocity response, key and velocity ranges, probability,
-  pitch bend and polyphony (up to 64 voices, 16 by default).
+- Several samples in one instance (up to 128): choose several files at once in Add samples, or drop several on the
+  window (they replace the samples loaded). Each sample has its own Start key and End key, its own Velocity range (1
+  to 127 unless set, typed like "15,80"), its own root note and its own Mode (sample, note or free, with free mode's
+  pitch range); a note plays every sample whose keys and velocities it falls in. See "The samples".
+- Envelope, loop, start and end points, reverse, speed, velocity response, probability, pitch bend and polyphony
+  (up to 64 voices, 16 by default).
 - Glide: a note slides in from the pitch of the note before it.
-- Every control is also a REAPER parameter you can automate.
+- Every control is also a REAPER parameter you can automate, except each sample's own (Start key, End key,
+  Velocity, Mode and the two pitch sliders).
 - The whole instrument can be read and written as plain text (see "The script format").
 
 ## The window, in Tab order
@@ -59,35 +60,36 @@ Sampler page:
 
 0. Player: the tab control (Sampler or SoundFont), first on both main pages (see "The window: the Player tabs").
 1. Sample: the selected sample's file, its length and its root note and where it came from. Read only.
-2. Browse button: one or more files, which replace the samples loaded.
-3. File: a combo box of the audio files in the selected sample's folder (see "The File combo box"); choosing one
+2. File: a combo box of the audio files in the selected sample's folder (see "The File combo box"); choosing one
    replaces the selected sample, keeping its keys and velocities, so Up and Down try each file in its place. Enter
    adds the file shown as a new sample instead, and the selected sample goes back to the file it had when you came
    to the box; try another and press Enter again to add more.
-4. Samples: a list of the samples, one line each ("Guitar C3.wav, root C3, keys C-1 to G9, velocity 1 to 127").
+3. Samples: a list of the samples, one line each ("Guitar C3.wav, root C3, keys C-1 to G9, velocity 1 to 127"; a
+   sample not in note mode ends ", sample mode" or ", free mode, pitch -12 st to +12 st").
    Several can be picked, as in any Windows list: Up and Down pick one; Shift with Up, Down, Home, End or a click
    picks a run; Ctrl+A picks them all; Ctrl+Up and Ctrl+Down move without picking, and Ctrl+Space picks or unpicks
    the one moved to; Ctrl+click picks or unpicks one. Delete removes the picked ones. The one moved to last is the
-   selected sample: the Sample box, File and Root note are its. With none it says "No samples loaded".
-5. Add samples button: one or more files, added to the list (they are picked, the first of them selected).
-6. Remove sample button: removes the picked samples (Ctrl+A, then Remove sample, empties the list).
-7. Start key and End key: sliders (notes, like the other note sliders) for the keys of every picked sample (they
+   selected sample: the Sample box, File, Root note, Mode and the pitch sliders are its. With none it says "No
+   samples loaded".
+4. Add samples button: one or more files, added to the list (they are picked, the first of them selected).
+5. Remove sample button: removes the picked samples (Ctrl+A, then Remove sample, empties the list).
+6. Start key and End key: sliders (notes, like the other note sliders) for the keys of every picked sample (they
    show the selected one's). Moving one
    past the other takes the other with it. Typing note names without an octave in either one ("C", "D F", "C, E, G",
    "F#", "Bb") makes the sample play those notes in every octave instead: both then read "every D and F". A plain
    letter is that note only (D isn't D#; type D# for it). An arrow key afterwards makes it a range again, from the
    lowest to the highest of those keys.
-8. Velocity: an edit box with the selected sample's velocities, like "1,127"; what you type goes to every picked
+7. Velocity: an edit box with the selected sample's velocities, like "1,127"; what you type goes to every picked
    sample. Type two numbers from 1 to 127
    ("15,80", "15 80", "15-80" or "15 to 80", either way round; one number is both ends), then Enter, or Tab away. A
    value that doesn't read beeps and the box goes back to what it was; Escape puts it back too.
-9. Keep length (on or off).
-10. Mode.
-11. Then the other parameters in the order of the list below, from Root note to Glide mode (the window lays them out
+8. Keep length (on or off).
+9. Mode: the selected sample's (sample, note or free); choosing one sets every picked sample's.
+10. Then the other parameters in the order of the list below, from Root note to Glide mode (the window lays them out
    in two columns, but Tab follows the list order), each one a slider (or a combo box for choices). Root note is the
-   selected sample's.
-12. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
-13. Settings button.
+   selected sample's; Pitch at start key and Pitch at end key are the selected sample's and set every picked one's.
+11. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
+12. Settings button.
 
 Settings page:
 
@@ -135,8 +137,8 @@ The first control on both main pages is a tab control named Player, with two tab
   so switching back is quick; the presets load again then).
 - Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset, .dslibrary or .exs) loads
   into the SoundFont player and switches to it; any other audio file loads into the Sampler and switches to it.
-- Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
-  stays; on the Sampler page a .sf2 does the same.
+- The SoundFont page's Browse and the Sampler page's Add samples load only their own kind. On the SoundFont page a
+  .wav gives an error and a beep and the font stays; on the Sampler page a .sf2 does the same.
 - Settings is one page for both. Back returns to the main page that plays.
 
 ### The samples
@@ -146,13 +148,16 @@ The first control on both main pages is a tab control named Player, with two tab
   Samples can overlap: a note in two samples' ranges plays both. A new sample has every key and velocity.
 - Each sample's root note is its own: from its file name, or detected, as for one sample. The Root note slider (and
   REAPER parameter) is the selected sample's, so selecting another sample moves it.
+- Each sample's Mode is its own too: one sample can play every key at its recorded pitch (sample) while another
+  pitches each key from its root (note), and a free-mode sample spreads its Pitch at start key to Pitch at end key
+  over its own Start key to End key.
 - Every other parameter is the instrument's and applies to every sample alike: the envelope, volume, loop, keep
-  length and the rest. Lowest note, Highest note, Lowest velocity and Highest velocity still limit the whole
-  instrument: a sample sounds only inside both its own ranges and those.
+  length and the rest. (The instrument's old Lowest note, Highest note, Lowest velocity and Highest velocity are gone:
+  each sample's ranges do that. An older project that set them still loads: they narrow every sample's ranges, and its
+  Mode and free-mode pitches become every sample's.)
 - Voices is per sample (16 means up to 16 notes of each sample at once), glide and legato follow notes within a
   sample, and Probability is drawn for each sample.
-- Browse and a drop of several files replace the samples; Add samples adds; the File combo box replaces the selected
-  one. While several load the status says "Loading 2 of 5 samples". Those that load are taken; the first that
+- A drop of several files replaces the samples; Add samples adds; the File combo box replaces the selected one. While several load the status says "Loading 2 of 5 samples". Those that load are taken; the first that
   doesn't is told ("Can't load bad.wav: why (and 1 more didn't load)", with a beep). When none loads, nothing
   changes.
 - With several samples the status says "Ready: 3 samples". A sample from a project whose file is gone stays in the
@@ -160,7 +165,8 @@ The first control on both main pages is a tab control named Player, with two tab
 
 ### The File combo box
 
-File replaces the old Previous file and Next file buttons, on both main pages. It comes right after Browse.
+File replaces the old Previous file and Next file buttons, on both main pages. It comes right after the Sample box
+(on the SoundFont page, after Browse).
 
 - It lists the files in the loaded file's folder of that page's kind (audio files on the Sampler page, every
   instrument kind on the SoundFont page: .sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset, .dslibrary and .exs): names
@@ -437,7 +443,7 @@ not its name, so a misnamed file still loads.
    stopped and the status says "FFmpeg took too long to decode it". Without FFmpeg, a file only it could read says
    "FFmpeg isn't installed; this format needs it".
 
-Browse and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
+Add samples and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
 .rf64 .caf .raw .pcm .opus .wv .ape .m4a .aac .mp4 .wma .ac3 .amr .3gp .alac .dsf .dff .tta .mka .webm .au .snd
 .mpc .spx .oga .m4b .eac3 .dts .mlp .thd .voc .mov .mkv. A decoded file is at most 2 GiB of float samples (about
 1.5 hours of stereo at 48 kHz); a longer one is refused with a plain reason.
@@ -542,13 +548,10 @@ to 35 and are described with the SoundFont page.
 - Sustain: dB under full level (minus 60 to 0, 0).
 - Velocity sensitivity: percent (0 to 100, default 100).
 - Minimum volume: the quietest a soft note can get (minus 60 to 0 dB, off by default).
-- Mode: sample, note or free. Note (the default) pitches each key from the root note. Sample plays every key at the
-  recorded pitch. Free spreads a pitch range over a key range (see the next four).
-- Lowest note and Highest note: the keys that sound (default all, C-1 to G9). In free mode they are also the ends of
-  the pitch range.
-- Pitch at lowest note and Pitch at highest note: semitones (minus 48 to plus 48, default minus 12 and plus 12) used
-  in free mode.
-- Lowest velocity and Highest velocity: 1 to 127.
+- Mode (each sample's): sample, note or free. Note (the default) pitches each key from the root note. Sample plays
+  every key at the recorded pitch. Free spreads a pitch range over the sample's Start key to End key (the next two).
+- Pitch at start key and Pitch at end key (each sample's): semitones (minus 48 to plus 48, default minus 12 and plus
+  12) used in free mode.
 - Obey note off: on by default. Off lets the whole sample play out when the key is released, as a one-shot.
 - Loop: off, forward or pingpong. Loop start: percent into the selected region.
   With Keep length on, a key away from the root plays a pitch-shifted copy whose loop no longer quite meets itself
@@ -579,20 +582,21 @@ to 35 and are described with the SoundFont page.
 
 The instrument is plain text, one thing per line. Blank lines and lines starting with # are ignored. After the
 sample lines (none, one, or one per sample), each parameter is `name value-in-words`. Names are the lower case ones used by the engine (root,
-transpose, fine, volume, pan, attack, decay, sustain, release, velocity_sens, min_volume, mode, note_lo, note_hi,
-pitch_lo, vel_lo, vel_hi, obey_note_off, loop, loop_start, start, end, bend_range, pitch_hi, reverse, keep_length,
-voices, probability, speed, glide, glide_mode). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
+transpose, fine, volume, pan, attack, decay, sustain, release, velocity_sens, min_volume, obey_note_off, loop,
+loop_start, start, end, bend_range, reverse, keep_length, voices, probability, speed, glide, glide_mode). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
 sample's cache key (the key below is only an example). With several samples, each sample line also has its root
 (`root=C3`), and, when they aren't every key or every velocity, its keys (`keys=C2..C3`, or `keys=D,F` for every D and F) and velocities
 (`velocity=15..80`); the root line is then the first sample's (the selected one when saved). With one sample its
-root is the root line, as before. Example, shortened:
+root is the root line, as before. Every sample line has its mode when it isn't note (`mode=sample` or `mode=free`)
+and its free-mode pitches when they aren't minus 12 and plus 12 (`pitch=-5..7`, semitones). Older texts' mode,
+note_lo, note_hi, pitch_lo, pitch_hi, vel_lo and vel_hi lines still read: mode and the pitches become each sample's
+unless its line says, and the note and velocity limits narrow each sample's ranges. Example, shortened:
 
     # Samplosis 0.1.0
     sample "D:\guitar\Guitar C3.wav" key=0123456789abcdef
     root C3
     volume -6.0 dB
     release 250 ms
-    mode note
     keep_length on
     voices 8
 
@@ -804,8 +808,8 @@ offline and in real time:
   have been rendered.
 - The copies of a long sample take a lot of cache space: each copy is as big as the decoded sample. Copies past a
   quarter of the cache size limit (beyond an octave each way) are made only when their key is first played, and
-  that first note is resampled. Narrowing the key range (Lowest note, Highest note) renders less and frees the
-  copies it no longer reaches.
+  that first note is resampled. Narrowing a sample's keys (Start key, End key) renders less and frees the copies
+  it no longer reaches.
 - At most 128 samples in one instance. Each has its own engine (three threads and its voices' buffers, 8 MB at 16
   voices), so a big set uses more memory than one sample. Removing a sample stops its notes at once (no fade).
 - Streaming from a slow disk: a big chord struck all at once, on samples not read since the computer started, can

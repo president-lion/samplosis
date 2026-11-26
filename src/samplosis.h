@@ -21,6 +21,14 @@ enum {
   SMP_P_BEND_RANGE = 22, SMP_P_PITCH_HI = 23, SMP_P_REVERSE = 24, SMP_P_KEEP_LENGTH = 25,
   SMP_P_VOICES = 26, SMP_P_PROBABILITY = 27, SMP_P_SPEED = 28, SMP_P_GLIDE = 29, SMP_P_GLIDE_MODE = 30
 };
+/* Each sample's own, not the instrument's: Mode, Pitch at start key and Pitch at end key (free mode), and the
+   key and velocity ranges (Start key, End key, Velocity). The host doesn't see them; the window's Mode and pitch
+   controls set them for the picked samples. The ids stay, so the others keep theirs. */
+static __inline int smp_param_per_sample(int id) {
+  return id == SMP_P_MODE || id == SMP_P_NOTE_LO || id == SMP_P_NOTE_HI || id == SMP_P_PITCH_LO || id == SMP_P_PITCH_HI ||
+         id == SMP_P_VEL_LO || id == SMP_P_VEL_HI;
+}
+#define SMP_NPERSAMPLE 7
 #define SMP_NPARAMS 31           /* the sampler's parameters */
 /* the SoundFont player's parameters follow in the same table */
 enum { SMP_P_SF_VOLUME = 31, SMP_P_SF_VOICES = 32, SMP_P_SF_EFFECTS = 33, SMP_P_SF_TRANSPOSE = 34 };
@@ -191,6 +199,11 @@ SMP_API int smp_note_class_parse(const char *t);   /* "D F", "C,E,G", "f#", "Bb"
 SMP_API void smp_note_class_name(int mask, char *out, int cap);   /* "D and F", "C, E and G" */
 SMP_API int smp_multi_root(const SmpMulti *m, int i);
 SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root);
+/* a sample's mode (0 sample, 1 note, 2 free) and, in free mode, the semitones at its Start key and End key */
+SMP_API int smp_multi_mode(const SmpMulti *m, int i);
+SMP_API void smp_multi_set_mode(SmpMulti *m, int i, int mode);
+SMP_API void smp_multi_pitch(const SmpMulti *m, int i, double *lo, double *hi);
+SMP_API void smp_multi_set_pitch(SmpMulti *m, int i, double lo, double hi);
 SMP_API int smp_multi_selected(const SmpMulti *m);         /* -1 when there are none */
 SMP_API void smp_multi_select(SmpMulti *m, int i);
 /* the samples picked in the window's list (several may be; the window's changes to keys and velocities go to them

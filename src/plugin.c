@@ -442,7 +442,7 @@ static void event(Plug *P, const clap_event_header_t *h, int at, int plays) {
   if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
   if (h->type == CLAP_EVENT_PARAM_VALUE) {
     const clap_event_param_value_t *v = (const clap_event_param_value_t *)h;
-    set_value(P, (int)v->param_id, v->value);
+    if (v->param_id < SMP_NALLPARAMS && !smp_param_per_sample((int)v->param_id)) set_value(P, (int)v->param_id, v->value);
     return;
   }
   if (plays) { synth_event(P, h, at); return; }
@@ -477,7 +477,7 @@ static void emit_gui_params(Plug *P, const clap_output_events_t *out) {
   if (!out || !P->e || !P->s || !InterlockedExchange(&P->gui_any, 0)) return;
   for (id = 0; id < SMP_NALLPARAMS; id++) {
     clap_event_param_gesture_t g; clap_event_param_value_t v;
-    if (!InterlockedExchange(&P->gui_pending[id], 0)) continue;
+    if (!InterlockedExchange(&P->gui_pending[id], 0) || smp_param_per_sample(id)) continue;
     memset(&g, 0, sizeof g); memset(&v, 0, sizeof v);
     g.header.size = sizeof g; g.header.space_id = CLAP_CORE_EVENT_SPACE_ID; g.header.type = CLAP_EVENT_PARAM_GESTURE_BEGIN;
     g.param_id = (clap_id)id;
@@ -659,15 +659,18 @@ static const clap_plugin_audio_ports_t audio_ports = {ap_count, ap_get};
 /* ---- parameters (ids are the engine's) ---- */
 const char *const smp_param_label[SMP_NALLPARAMS] = {
   "Root note", "Transpose", "Fine tune", "Volume", "Pan", "Attack", "Decay", "Sustain", "Release",
-  "Velocity sensitivity", "Minimum volume", "Mode", "Lowest note", "Highest note", "Pitch at lowest note",
+  "Velocity sensitivity", "Minimum volume", "Mode", "Lowest note", "Highest note", "Pitch at start key",
   "Lowest velocity", "Highest velocity", "Obey note off", "Loop", "Loop start", "Start", "End", "Bend range",
-  "Pitch at highest note", "Reverse", "Keep length", "Voices", "Probability", "Speed", "Glide", "Glide mode",
+  "Pitch at end key", "Reverse", "Keep length", "Voices", "Probability", "Speed", "Glide", "Glide mode",
   "SoundFont volume", "SoundFont voices", "Reverb and chorus", "SoundFont transpose"};
 
-static uint32_t pa_count(const clap_plugin_t *p) { (void)p; return SMP_NALLPARAMS; }
-static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info) {
-  const SmpParamInfo *pi = smp_param_info((int)i);
+/* the host's list: every parameter but each sample's own (smp_param_per_sample), by id; ids keep their numbers */
+static uint32_t pa_count(const clap_plugin_t *p) { (void)p; return SMP_NALLPARAMS - SMP_NPERSAMPLE; }
+static bool pa_info(const clap_plugin_t *p, uint32_t at, clap_param_info_t *info) {
+  const SmpParamInfo *pi; uint32_t i, k = 0;
   (void)p;
+  for (i = 0; i < SMP_NALLPARAMS; i++) if (!smp_param_per_sample((int)i) && k++ == at) break;
+  pi = smp_param_info((int)i);
   if (!pi || i >= SMP_NALLPARAMS) return false;
   memset(info, 0, sizeof *info);
   info->id = i;
@@ -683,19 +686,19 @@ static bool pa_info(const clap_plugin_t *p, uint32_t i, clap_param_info_t *info)
 }
 static bool pa_value(const clap_plugin_t *p, clap_id id, double *v) {
   Plug *P = p->plugin_data;
-  if (id >= SMP_NALLPARAMS) return false;
+  if (id >= SMP_NALLPARAMS || smp_param_per_sample((int)id)) return false;
   *v = smp_plug_get_param(P, (int)id);
   return true;
 }
 static bool pa_text(const clap_plugin_t *p, clap_id id, double v, char *out, uint32_t cap) {
   (void)p;
-  if (id >= SMP_NALLPARAMS || !cap) return false;
+  if (id >= SMP_NALLPARAMS || smp_param_per_sample((int)id) || !cap) return false;
   smp_value_text((int)id, v, out, (int)cap);
   return true;
 }
 static bool pa_parse(const clap_plugin_t *p, clap_id id, const char *s, double *v) {
   (void)p;
-  return id < SMP_NALLPARAMS && smp_value_parse((int)id, s, v);
+  return id < SMP_NALLPARAMS && !smp_param_per_sample((int)id) && smp_value_parse((int)id, s, v);
 }
 static void pa_flush(const clap_plugin_t *p, const clap_input_events_t *in, const clap_output_events_t *out) {
   Plug *P = p->plugin_data; uint32_t i, n = in ? in->size(in) : 0;

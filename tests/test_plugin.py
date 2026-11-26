@@ -14,7 +14,9 @@ from test_sfsynth import write_font as write_sf_font
 
 HOST = os.path.join(ROOT, "tests", "host.exe")
 CLAP = os.path.join(ROOT, "samplosis.clap")
-NP = 35         # the sampler's 31 and the SoundFont player's 4
+NP = 28         # the sampler's 31 less each sample's own 7 (Mode, the key, velocity and pitch ranges), and the
+                # SoundFont player's 4
+PER_SAMPLE = ("mode", "note_lo", "note_hi", "pitch_lo", "pitch_hi", "vel_lo", "vel_hi")   # not the instrument's
 VOLUME = 3
 
 
@@ -62,7 +64,8 @@ def P(lib, tmp_path):
             buf = ctypes.create_string_buffer(n + 1)
             lib.smp_script_write(e, buf, n + 1)
             lib.smp_engine_free(e)                      # closes its cache files
-            return buf.value.decode()
+            # as the plugin writes it: each sample's own settings (these at their defaults) aren't instrument lines
+            return "".join(ln for ln in buf.value.decode().splitlines(True) if ln.split(" ")[0] not in PER_SAMPLE)
 
         def apply(self, e, text):
             err = ctypes.create_string_buffer(512)
@@ -153,8 +156,10 @@ def test_param_info(P):
     params = [ln for ln in out.splitlines() if ln.startswith("param ")]
     assert len(params) == NP
     assert params[3].startswith("param 3 Volume -60 12 0 automatable") and "text 0.0 dB" in params[3]
-    assert "stepped" in params[11] and "text note" in params[11]          # mode: a choice
-    assert "stepped" in params[24]                                         # reverse: on or off
+    by_id = {int(x.split()[1]): x for x in params}
+    assert "stepped" in by_id[18] and "text off" in by_id[18]              # loop: a choice
+    assert "stepped" in by_id[24]                                          # reverse: on or off
+    assert 11 not in by_id                                                 # mode: each sample's
     assert "stepped" not in params[3]
     assert "parse -6 dB = -6" in out
 
@@ -508,7 +513,8 @@ def test_plugin_params(P):
     code, out, err = host("state", P.state_file("# Samplosis 0.1.0\n"))
     assert code == 0, out + err
     params = [ln for ln in out.splitlines() if ln.startswith("param ")]
-    assert params[31:35] == SF_PARAMS, params[31:35]
+    assert params[-4:] == SF_PARAMS, params[-4:]
+    assert not [x for x in params if x.split()[1] in ("11", "12", "13", "14", "15", "16", "23")]   # each sample's
     f = P.font()
     text = 'plays soundfont\nsoundfont "%s"\nsf_used 0:0 0:33 128:0\n' % f
     events = "midi 144 57 100 0"
@@ -522,16 +528,15 @@ def test_plugin_params(P):
 
 # ---- the window, driven by messages through host.exe's gui command ----
 MAIN_ORDER = [
-    ("Tab", "Player"), ("Edit", "Sample"), ("Button", "Browse"), ("ComboBox", "File"),
+    ("Tab", "Player"), ("Edit", "Sample"), ("ComboBox", "File"),
     ("ListBox", "Samples"), ("Button", "Add samples"), ("Button", "Remove sample"), ("Slider", "Start key"),
     ("Slider", "End key"), ("Edit", "Velocity"),
     ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
     ("Slider", "Root note"), ("Slider", "Transpose"), ("Slider", "Fine tune"), ("Slider", "Volume"), ("Slider", "Pan"),
     ("Slider", "Attack"), ("Slider", "Decay"), ("Slider", "Sustain"), ("Slider", "Release"),
-    ("Slider", "Velocity sensitivity"), ("Slider", "Minimum volume"), ("Slider", "Lowest note"),
-    ("Slider", "Highest note"), ("Slider", "Pitch at lowest note"), ("Slider", "Lowest velocity"),
-    ("Slider", "Highest velocity"), ("ComboBox", "Obey note off"), ("ComboBox", "Loop"), ("Slider", "Loop start"),
-    ("Slider", "Start"), ("Slider", "End"), ("Slider", "Bend range"), ("Slider", "Pitch at highest note"),
+    ("Slider", "Velocity sensitivity"), ("Slider", "Minimum volume"), ("Slider", "Pitch at start key"),
+    ("ComboBox", "Obey note off"), ("ComboBox", "Loop"), ("Slider", "Loop start"),
+    ("Slider", "Start"), ("Slider", "End"), ("Slider", "Bend range"), ("Slider", "Pitch at end key"),
     ("ComboBox", "Reverse"), ("Slider", "Voices"), ("Slider", "Probability"), ("Slider", "Speed"), ("Slider", "Glide"),
     ("ComboBox", "Glide mode"), ("Edit", "Status"), ("Button", "Settings"),
 ]
@@ -727,13 +732,14 @@ def test_gui_settings_page(P, tmp_path, settings_file):
 def test_gui_keep_length_combo(P, tmp_path):
     text = P.script(P.sample(), "keep_length on")
     out = gui(P, tmp_path, text, ["focus Keep length", "say", "key up", "param 25", "flush",
-                                  "focus Mode", "say", "key down", "key down", "param 11"])
+                                  "focus Mode", "say", "key down", "key down", "state sample"])
     f = got(out, "focus")
     assert f[0] == ["ComboBox", "Keep length", "On"] and f[1] == ["ComboBox", "Keep length", "Off"]
     assert "param 25: 0" in out
     assert "out: value 25 0" in out
     assert [x[2] for x in f[2:]] == ["Note", "Free", "Free"]
-    assert "param 11: 2" in out
+    assert got(out, "state")[0][0].endswith(" mode=free")       # the sample's mode, not a host parameter
+    assert "param 11:" not in out
 
 
 def test_gui_closed_during_dialog(P, tmp_path, settings_file):
@@ -746,13 +752,13 @@ def test_gui_closed_during_dialog(P, tmp_path, settings_file):
         os.replace(tmp_path / n, d / n)
     text = P.script(d / "b.wav")
     c = d / "c.wav"
-    out = gui(P, tmp_path, text, ["dialog pick %s" % c, "focus Browse", "key enter", "read Sample", "say"])
+    out = gui(P, tmp_path, text, ["dialog pick %s" % c, "focus Add samples", "key enter", "read Sample", "say"])
     assert got(out, "read")[0][1].startswith("c.wav, ")
-    assert got(out, "focus")[-1][:2] == ["Button", "Browse"]
-    out = gui(P, tmp_path, text, ["dialog closegui %s" % c, "focus Browse", "key enter", "pump 600", "state", "alive"])
+    assert got(out, "focus")[-1][:2] == ["Button", "Add samples"]
+    out = gui(P, tmp_path, text, ["dialog closegui %s" % c, "focus Add samples", "key enter", "pump 600", "state", "alive"])
     assert ('state: sample "%s"' % (d / "b.wav")) in out          # not loaded: the window had gone
     assert "alive: plugin\n" in out and "closed" in out
-    out = gui(P, tmp_path, text, ["dialog destroy %s" % c, "focus Browse", "key enter", "pump 600", "alive"])
+    out = gui(P, tmp_path, text, ["dialog destroy %s" % c, "focus Add samples", "key enter", "pump 600", "alive"])
     assert "alive: plugin destroyed" in out and "closed" in out
     # the Settings page's Browse folder
     new = tmp_path / "cache2"
@@ -852,7 +858,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
                                   # each page's Browse loads its own kind, whatever the file
                                   "dialog pick %s" % wav, "focus Browse", "key enter", "read SoundFont",
                                   "read Status", "state sample", "counts",
-                                  "key tab ctrl", "dialog pick %s" % (d / "a.sf2"), "focus Browse", "key enter",
+                                  "key tab ctrl", "dialog pick %s" % (d / "a.sf2"), "focus Add samples", "key enter",
                                   "read Sample", "read Status", "state plays", "counts",
                                   # a dropped .sfz and .dls go to the SoundFont tab; File lists every instrument kind
                                   "drop %s" % (k / "kit.sfz"), "say", "read SoundFont", "list File",
@@ -878,7 +884,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     # a wav through the SoundFont page's Browse: the SoundFont player's error; the sample stays
     assert r[8] == "B.sf2, 6 presets" and r[9].startswith("Can't load drop A3.wav: ") and c[1] == "beeps 1"
     assert st[3].startswith('sample "%s"' % wav)
-    # a .sf2 through the Sampler page's Browse: the sampler's error; the sampler still plays its sample
+    # a .sf2 through the Sampler page's Add samples: the sampler's error; the sampler still plays its sample
     assert r[10].startswith("drop A3.wav, ") and r[11].startswith("Can't load a.sf2: ")
     assert r[11].endswith(". Still playing drop A3.wav."), r[11]       # the failure says what still plays
     assert st[4] == "plays sampler" and c[2] == "beeps 2"
@@ -982,7 +988,7 @@ def set_ffmpeg(lib, path):
 
 @pytest.mark.skipif(not FFMPEG, reason="ffmpeg isn't installed")
 def test_gui_load_does_not_block(P, tmp_path):
-    # Browse an FFmpeg-only file: the window's call returns at once with "Decoding ...", the old sample still plays,
+    # Drop an FFmpeg-only file: the window's call returns at once with "Decoding ...", the old sample still plays,
     # and the new one is swapped in when FFmpeg is done (the test flag holds FFmpeg back 1.5 s)
     src = P.sample("src.wav")
     f = tmp_path / "tone A3.tta"
@@ -990,9 +996,9 @@ def test_gui_load_does_not_block(P, tmp_path):
     junk = tmp_path / "junk.wav"
     junk.write_bytes(b" not a wav" * 200)
     text = P.script(P.sample())
-    out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % f, "focus Browse", "clock", "key enter", "clock",
+    out = gui(P, tmp_path, text, ["async on", "clock", "drop %s" % f, "clock",
                                   "pump 300", "read Status", "read Sample", "wait", "read Status", "read Sample",
-                                  "state", "counts", "dialog pick %s" % junk, "focus Browse", "key enter", "wait",
+                                  "state", "counts", "drop %s" % junk, "wait",
                                   "status", "counts", "pump 6500", "status", "read Status"],
               env={"SAMPLOSIS_TEST_DECODE_FLAGS": "512"})
     r = [x[1] for x in got(out, "read")]
@@ -1044,10 +1050,10 @@ def test_background_load_cancel(lib, P, tmp_path):
     pids = d / "pids.txt"
     set_ffmpeg(lib, d / "ffmpeg.exe")
     try:
-        out = gui(P, tmp_path, text, ["async on", "dialog pick %s" % junk, "focus Browse", "key enter", "pump 1500",
-                                      "read Status", "pids %s" % pids, "dialog pick %s" % second, "focus Browse",
-                                      "key enter", "wait", "pids %s" % pids, "read Status", "read Sample", "pump 600",
-                                      "read Sample", "state", "dialog pick %s" % third, "focus Browse", "key enter",
+        out = gui(P, tmp_path, text, ["async on", "drop %s" % junk, "pump 1500",
+                                      "read Status", "pids %s" % pids, "drop %s" % second,
+                                      "wait", "pids %s" % pids, "read Status", "read Sample", "pump 600",
+                                      "read Sample", "state", "drop %s" % third,
                                       "pump 1000", "pids %s" % pids, "alive"])
     finally:
         set_ffmpeg(lib, "")
@@ -1224,8 +1230,9 @@ def test_plugin_plays_samples_by_key(P, tmp_path):
     assert np.abs(y[50000:, 0]).max() < 1e-6                 # velocity 10 is below the second sample's 20
     code, out, err = host("state", P.state_file(text))
     st = saved_state(out)
-    assert 'sample "%s" key=' % a in st and " root=C3 keys=C-1..B3\n" in st
-    assert " root=C5 keys=C4..G9 velocity=20..100\n" in st
+    assert 'sample "%s" key=' % a in st and " root=C3 keys=C-1..B3 mode=sample\n" in st   # the old mode line: each's
+    assert " root=C5 keys=C4..G9 velocity=20..100 mode=sample\n" in st
+    assert "\nmode " not in st
 
 
 def test_gui_samples_list(P, tmp_path):
@@ -1233,8 +1240,8 @@ def test_gui_samples_list(P, tmp_path):
     out = gui(P, tmp_path, text, ["list Samples", "read Sample", "read Root note", "focus Samples", "key down",
                                   "read Sample", "read Root note", "read Start key", "read End key", "read Velocity",
                                   "param 0", "key up", "read Velocity"])
-    lines = ["low C3.wav, root C3, keys C-1 to B3, velocity 1 to 127",
-             "high C5.wav, root C5, keys C4 to G9, velocity 20 to 100"]
+    lines = ["low C3.wav, root C3, keys C-1 to B3, velocity 1 to 127, sample mode",
+             "high C5.wav, root C5, keys C4 to G9, velocity 20 to 100, sample mode"]
     assert got(out, "list")[0] == ["Samples"] + lines
     r = [x[1] for x in got(out, "read")]
     assert r[0].startswith("low C3.wav, 0.80 s, root C3") and r[1] == "C3"
@@ -1255,9 +1262,9 @@ def test_gui_sample_ranges(P, tmp_path):
     assert v[:4] == ["C#-1", "B-1", "C-1", "15,80"]          # End below Start takes Start down with it
     assert [x[1] for x in got(out, "read")] == ["C-1"]
     st = [x[0] for x in got(out, "state")]
-    assert len(st) == 4 and st[0].endswith(" keys=C-1..C-1 velocity=15..80")
+    assert len(st) == 4 and st[0].endswith(" keys=C-1..C-1 velocity=15..80 mode=sample")
     assert v[4] == "15,80" and got(out, "counts")[0][0] == "beeps 1"   # "loud" doesn't read: beep, it stays
-    assert st[2].endswith(" keys=C-1..C-1 velocity=30..90")            # leaving the box reads it; low first
+    assert st[2].endswith(" keys=C-1..C-1 velocity=30..90 mode=sample")            # leaving the box reads it; low first
 
 
 def test_gui_add_and_remove_samples(P, tmp_path):
@@ -1283,15 +1290,6 @@ def test_gui_no_samples(P, tmp_path):
     assert got(out, "list")[0] == ["Samples", "No samples loaded"]
     c = got(out, "counts")
     assert c[0][0] == "beeps 1" and c[1][0] == "beeps 2"
-
-
-def test_gui_browse_several_replaces(P, tmp_path):
-    a = tone(tmp_path, "a C3.wav", 220)
-    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
-    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Browse", "key enter", "list Samples",
-                                         "read Status"])
-    assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["b D3.wav", "c E3.wav"]
-    assert got(out, "read")[0][1] == "Ready: 2 samples"
 
 
 def test_gui_file_combo_replaces_selected(P, tmp_path):
@@ -1332,8 +1330,8 @@ def test_gui_key_name_without_octave(P, tmp_path):
     v = [x[2] for x in got(out, "focus")]
     r = [x[1] for x in got(out, "read")]
     assert v[1] == "every C" and r[0] == "every C"
-    assert got(out, "list")[0][1].endswith("keys every C, velocity 1 to 127")
-    assert got(out, "state")[0][0].endswith(" keys=C")
+    assert got(out, "list")[0][1].endswith("keys every C, velocity 1 to 127, sample mode")
+    assert got(out, "state")[0][0].endswith(" keys=C mode=sample")
     assert v[2] == "C#-1" and r[1] == "C9"              # an arrow makes it a range again, from the lowest and highest C
     assert v[4] == "every F#"
     assert v[6] == "every F#" and got(out, "counts")[0][0] == "beeps 1"
@@ -1426,3 +1424,19 @@ def test_gui_add_selects_the_new_ones(P, tmp_path):
     out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Add samples", "key enter",
                                          "picked Samples"])
     assert got(out, "picked")[0] == ["Samples", "1 2"]
+
+
+def test_gui_mode_is_each_samples(P, tmp_path):
+    """Mode and the pitch sliders show the selected sample's and set every picked one's."""
+    a, b, text = two_samples(tmp_path)                       # both in sample mode (the old instrument line)
+    out = gui(P, tmp_path, text, ["focus Mode", "say", "key down", "list Samples",          # only the first is picked
+                                  "focus Samples", "key down", "focus Mode", "say",       # the second: still sample
+                                  "focus Samples", "key a ctrl", "focus Mode", "key down", "key down", "list Samples",
+                                  "focus Pitch at start key", "key down", "list Samples"])
+    f = got(out, "focus")
+    lists = got(out, "list")
+    assert f[0][:3] == ["ComboBox", "Mode", "Sample"]
+    assert lists[0][1].endswith("velocity 1 to 127") and lists[0][2].endswith(", sample mode")   # note: no mode said
+    assert [x[:3] for x in f if x[1] == "Mode"][2] == ["ComboBox", "Mode", "Sample"]
+    assert all(", free mode, pitch " in x for x in lists[1][1:]), lists[1]
+    assert all(", free mode, pitch -13" in x for x in lists[2][1:]), lists[2]
