@@ -522,7 +522,7 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     if (!strcmp(a, "key")) {
       static const struct { const char *n; WPARAM vk; } keys[] = {{"tab", VK_TAB}, {"up", VK_UP}, {"down", VK_DOWN},
         {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT},
-        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}, {"delete", VK_DELETE}};
+        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}, {"delete", VK_DELETE}, {"a", 'A'}};
       char k[32] = ""; int i, found = 0;
       sscanf(arg, "%31s", k);
       for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++)
@@ -614,6 +614,11 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
         else if (SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(c, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
         utf8(t, u, sizeof u); printf(" | %s", u);
       }
+      printf("\n");
+    } else if (!strcmp(a, "picked")) {     /* a list box's selected items, by index */
+      HWND c = find_named(arg); int items[256], n = c ? (int)SendMessageW(c, LB_GETSELITEMS, 256, (LPARAM)items) : 0, i;
+      printf("picked: %s |", arg);
+      for (i = 0; i < n; i++) printf("%s%d", i ? " " : " ", items[i]);
       printf("\n");
     } else if (!strcmp(a, "drop")) {        /* files dropped on the window (several: a|b), as Explorer's WM_DROPFILES */
       wchar_t wp[4400]; size_t k, j; HGLOBAL hg; DROPFILES *df;

@@ -1270,9 +1270,9 @@ def test_gui_add_and_remove_samples(P, tmp_path):
     assert names(ls[0]) == ["a C3.wav", "b D3.wav", "c E3.wav"]
     r = [x[1] for x in got(out, "read")]
     assert r[0].startswith("b D3.wav") and r[1].startswith("b D3.wav")   # the first one added is selected
-    assert names(ls[1]) == ["a C3.wav", "c E3.wav"] and r[2].startswith("c E3.wav")
-    assert names(ls[2]) == ["a C3.wav"]                                   # Delete on the list removes it too
-    assert len(got(out, "state")) == 1 and got(out, "counts")[0][2] != "mark_dirty 0"
+    assert names(ls[1]) == ["a C3.wav"] and r[2].startswith("a C3.wav")  # both added were picked: both go
+    assert names(ls[2]) == ["No samples loaded"]                          # Delete on the list removes it too
+    assert got(out, "state")[0] == ["(none)"] and got(out, "counts")[0][2] != "mark_dirty 0"
 
 
 def test_gui_no_samples(P, tmp_path):
@@ -1354,3 +1354,73 @@ def test_gui_several_note_names(P, tmp_path):
     assert got(out, "list")[0][1].endswith("keys every D and F, velocity 1 to 127")
     assert got(out, "state")[0][0].endswith(" keys=D,F")
     assert v[3] == "every D# and F"
+
+
+def test_gui_file_enter_adds(P, tmp_path):
+    d = tmp_path / "kit"
+    d.mkdir()
+    a, b, c = tone(d, "a C3.wav", 220), tone(d, "b D3.wav", 330), tone(d, "c E3.wav", 440)
+    out = gui(P, tmp_path, 'sample "%s" keys=C2..C3\nkeep_length off\n' % a,
+              ["focus File", "key down", "key enter", "list Samples", "read Sample", "read File", "key down",
+               "key down", "key enter", "list Samples", "state sample", "counts"])
+    names = lambda row: [x.split(",")[0] for x in row[1:]]
+    ls = got(out, "list")
+    assert names(ls[0]) == ["a C3.wav", "b D3.wav"]                 # b tried in a's place, Enter: a back, b added
+    assert ls[0][1].endswith("keys C2 to C3, velocity 1 to 127")     # a as it was
+    r = [x[1] for x in got(out, "read")]
+    assert r[0].startswith("a C3.wav") and r[1] == "a C3.wav"
+    assert names(ls[1]) == ["a C3.wav", "b D3.wav", "c E3.wav"]
+    assert len(got(out, "state")) == 3 and got(out, "counts")[0][0] == "beeps 0"
+
+
+def three_samples(tmp_path):
+    a, b, c = tone(tmp_path, "a C3.wav", 220), tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
+    return 'sample "%s"\nsample "%s"\nsample "%s"\nkeep_length off\n' % (a, b, c)
+
+
+def test_gui_samples_several_selected(P, tmp_path):
+    out = gui(P, tmp_path, three_samples(tmp_path),
+              ["focus Samples", "key down shift", "picked Samples", "read Sample", "focus Velocity", "type 10,50",
+               "key enter", "focus End key", "key enter", "type D F", "key enter", "focus Start key", "key end",
+               "list Samples"])
+    assert got(out, "picked")[0] == ["Samples", "0 1"]
+    assert got(out, "read")[0][1].startswith("b D3.wav")        # the one moved to is the Sample shown
+    rows = got(out, "list")[-1][1:]
+    assert rows[0].endswith("keys G9 to G9, velocity 10 to 50") and rows[1].endswith("keys G9 to G9, velocity 10 to 50")
+    assert rows[2].endswith("keys C-1 to G9, velocity 1 to 127")  # not selected: as it was
+    out = gui(P, tmp_path, three_samples(tmp_path),
+              ["focus Samples", "key down shift", "focus End key", "key enter", "type D F", "key enter",
+               "list Samples"])
+    rows = got(out, "list")[0][1:]
+    assert [r.split("keys ")[1].split(",")[0] for r in rows] == ["every D and F", "every D and F", "C-1 to G9"]
+
+
+def test_gui_samples_select_all_and_remove(P, tmp_path):
+    out = gui(P, tmp_path, three_samples(tmp_path),
+              ["focus Samples", "key a ctrl", "picked Samples", "focus Remove sample", "key enter", "list Samples",
+               "read Sample"])
+    assert got(out, "picked")[0] == ["Samples", "0 1 2"]
+    assert got(out, "list")[0] == ["Samples", "No samples loaded"]
+    assert got(out, "read")[0][1] == "No sample loaded"
+
+
+def test_gui_samples_ctrl_keys(P, tmp_path):
+    out = gui(P, tmp_path, three_samples(tmp_path),
+              ["focus Samples", "key down ctrl", "key down ctrl", "picked Samples", "read Sample", "key space ctrl",
+               "picked Samples", "key space ctrl", "picked Samples", "key delete", "list Samples",
+               "key down", "picked Samples"])
+    p = [x[1] for x in got(out, "picked")]
+    assert p[0] == "0"                                             # Ctrl+Down moves without selecting
+    assert got(out, "read")[0][1].startswith("c E3.wav")
+    assert p[1] == "0 2"                                           # Ctrl+Space adds the one it is on
+    assert p[2] == "0"                                             # and takes it away again
+    assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["b D3.wav", "c E3.wav"]   # Delete: the picked
+    assert p[3] == "1"                                             # Down alone: just the next one
+
+
+def test_gui_add_selects_the_new_ones(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
+    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Add samples", "key enter",
+                                         "picked Samples"])
+    assert got(out, "picked")[0] == ["Samples", "1 2"]

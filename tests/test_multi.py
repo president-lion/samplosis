@@ -314,3 +314,24 @@ def test_several_notes_in_every_octave(M, lib):
         assert np.abs(M.render(m, "on %d 100 0\noff %d 20000" % (k, k))).max() < 1e-6, k
     r, _, err = M.apply(m, 'sample "%s" keys=C,E,G\n' % a)
     assert r == 0 and M.line(m, 0).endswith("keys every C, E and G, velocity 1 to 127"), err
+
+
+def test_picked_samples(M, lib):
+    lib.smp_multi_picked.restype, lib.smp_multi_picked.argtypes = c_int, [vp, c_int]
+    lib.smp_multi_pick.restype, lib.smp_multi_pick.argtypes = None, [vp, c_int, c_int]
+    m = M.new()
+    a, b, c = M.wav("a.wav", 220), M.wav("b.wav", 330), M.wav("c.wav", 440)
+    r, _, err = M.apply(m, 'sample "%s"\nsample "%s"\nsample "%s"\n' % (a, b, c))
+    assert r == 0, err
+    picked = lambda: [lib.smp_multi_picked(m, i) for i in range(lib.smp_multi_count(m))]
+    assert picked() == [1, 0, 0]                       # the selected one, after a load
+    lib.smp_multi_pick(m, 2, 1)
+    assert picked() == [1, 0, 1] and lib.smp_multi_selected(m) == 0
+    lib.smp_multi_remove(m, 0)
+    assert picked() == [0, 1]                          # the others keep theirs
+    lib.smp_multi_pick(m, 1, 0)
+    lib.smp_multi_remove(m, 1)
+    assert picked() == [1]                             # none left picked: the selected one is
+    m2 = M.new()
+    lib.smp_multi_add(m2, M.load(a)); lib.smp_multi_add(m2, M.load(b))
+    assert [lib.smp_multi_picked(m2, i) for i in (0, 1)] == [1, 0]   # the first one added to an empty list

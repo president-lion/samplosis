@@ -76,6 +76,14 @@ void smp_plug_zone_line(Plug *P, int i, char *out, int cap);   /* "Guitar C3.wav
 void smp_plug_zone_range(Plug *P, int i, int *key_lo, int *key_hi, int *vel_lo, int *vel_hi);
 int smp_plug_zone_set_range(Plug *P, int i, int key_lo, int key_hi, int vel_lo, int vel_hi);   /* 0: not a range */
 void smp_plug_zone_remove(Plug *P, int i);
+int smp_plug_zone_picked(Plug *P, int i);          /* picked in the list: what range changes and Remove act on */
+void smp_plug_zone_pick(Plug *P, int i, int on);
+void smp_plug_zone_remove_picked(Plug *P);
+/* Enter on the Sampler's File combo box: the selected sample goes back to restore (the file it had when the box got
+   the focus, if trying files there changed it) and add joins the list as a new sample, selected and picked
+   (selection stays on the restored one). Loads now, on this thread (they are in the cache: both were loaded just
+   before); a load still under way is dropped. 1 done, 0 and a reason. */
+int smp_plug_zone_keep(Plug *P, const char *restore, const char *add, char *err, int cap);         /* every picked sample (or the selected one when none is) */
 int smp_plug_zone_key_class(Plug *P, int i);       /* notes in every octave: a bit per note (C is 1), or 0 (a range) */
 int smp_plug_zone_set_key_class(Plug *P, int i, int pc);
 /* A finished background load swapped in (main thread): 1 loaded, -1 it failed (load_failed counts up, load_err says

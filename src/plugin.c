@@ -830,7 +830,12 @@ static int take_samples(Plug *P, SmpSample **ss, int n, int how, int index) {
       if (k >= 0) { took++; if (first < 0) first = k; }
     }
   }
-  if (first >= 0) smp_multi_select(P->e, first);
+  if (first >= 0) {                      /* the new ones are picked: all that Add samples added, else the first */
+    int k;
+    for (k = 0; k < smp_multi_count(P->e); k++)
+      smp_multi_pick(P->e, k, how == SMP_LOAD_ADD ? k >= first && k < first + took : k == first);
+    smp_multi_select(P->e, first);
+  }
   P->missing = 0;
   for (i = 0; i < smp_multi_count(P->e); i++) { char path[8]; if (smp_multi_path(P->e, i, path, sizeof path) == 2) P->missing++; }
   t = engine_text(P->e);
@@ -1366,9 +1371,53 @@ int smp_plug_zone_set_key_class(Plug *P, int i, int pc) {
   mark_dirty(P);
   return 1;
 }
+int smp_plug_zone_keep(Plug *P, const char *restore, const char *add, char *err, int cap) {
+  int sel, k, i; char cur[1100]; SmpSample *s; char *t;
+  if (!P->e || (sel = smp_multi_selected(P->e)) < 0) { snprintf(err, (size_t)cap, "no sample is selected"); return 0; }
+  if (P->loading && !P->loading_font) loader_cancel(P);   /* the file shown is loaded here instead */
+  if (smp_multi_count(P->e) >= SMP_MULTI_MAX) { snprintf(err, (size_t)cap, "an instrument holds at most %d samples", SMP_MULTI_MAX); return 0; }
+  if (!(s = smp_sample_load(add, err, cap))) return 0;
+  smp_multi_path(P->e, sel, cur, sizeof cur);
+  if (restore[0] && strcmp(cur, restore)) {     /* the sample tried in its place goes back as it was */
+    char why[600];
+    SmpSample *r = smp_sample_load(restore, why, sizeof why);
+    if (r) smp_multi_replace(P->e, sel, r);
+  }
+  if ((k = smp_multi_add(P->e, s)) < 0) { snprintf(err, (size_t)cap, "out of memory"); return 0; }
+  for (i = 0; i < smp_multi_count(P->e); i++) smp_multi_pick(P->e, i, i == sel);
+  P->missing = 0;
+  for (i = 0; i < smp_multi_count(P->e); i++) { char path[8]; if (smp_multi_path(P->e, i, path, sizeof path) == 2) P->missing++; }
+  t = engine_text(P->e);
+  if (t) { free(P->text); P->text = t; }
+  if (P->missing) missing_status(P, P->missing); else ready_status(P);
+  P->bad = 0; P->told_until = 0;
+  tell_host(P, SMP_P_ROOT);
+  mark_dirty(P);
+  if (!P->active) smp_multi_collect(P->e, 1);
+  ask_collect(P);
+  return 1;
+}
+int smp_plug_zone_picked(Plug *P, int i) { return P->e ? smp_multi_picked(P->e, i) : 0; }
+void smp_plug_zone_pick(Plug *P, int i, int on) { if (P->e) smp_multi_pick(P->e, i, on); }
+void smp_plug_zone_remove_picked(Plug *P) {
+  int i, any = 0;
+  if (!P->e) return;
+  for (i = 0; i < smp_multi_count(P->e); i++) any |= smp_multi_picked(P->e, i);
+  if (!any) { smp_plug_zone_remove(P, smp_multi_selected(P->e)); return; }
+  {                                      /* which, first: removing one may pick another (none left picked) */
+    int list[SMP_MULTI_MAX], n = 0;
+    for (i = 0; i < smp_multi_count(P->e); i++) if (smp_multi_picked(P->e, i)) list[n++] = i;
+    while (n--) {
+      int sel = smp_multi_selected(P->e);
+      smp_multi_remove(P->e, list[n]);
+      if (sel > list[n]) smp_multi_select(P->e, sel - 1);   /* the selected one stays the same sample */
+    }
+  }
+  smp_plug_zone_remove(P, -1);           /* the status, the host and the project told (removes nothing) */
+}
 void smp_plug_zone_remove(Plug *P, int i) {
-  if (!P->e || i < 0 || i >= smp_multi_count(P->e)) return;
-  smp_multi_remove(P->e, i);
+  if (!P->e || i >= smp_multi_count(P->e)) return;
+  if (i >= 0) smp_multi_remove(P->e, i);
   P->missing = 0;
   { int k; char path[8]; for (k = 0; k < smp_multi_count(P->e); k++) if (smp_multi_path(P->e, k, path, sizeof path) == 2) P->missing++; }
   if (P->missing) missing_status(P, P->missing); else ready_status(P);

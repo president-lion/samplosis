@@ -189,6 +189,10 @@ SMP_API int smp_multi_root(const SmpMulti *m, int i);
 SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root);
 SMP_API int smp_multi_selected(const SmpMulti *m);         /* -1 when there are none */
 SMP_API void smp_multi_select(SmpMulti *m, int i);
+/* the samples picked in the window's list (several may be; the window's changes to keys and velocities go to them
+   all). A load picks the first; removing every picked one picks the selected one */
+SMP_API int smp_multi_picked(const SmpMulti *m, int i);
+SMP_API void smp_multi_pick(SmpMulti *m, int i, int on);
 SMP_API void smp_multi_line(const SmpMulti *m, int i, char *out, int cap);  /* "Guitar C3.wav, root C3, keys C-1 to
                                     G9, velocity 1 to 127", or "Missing: <path>, ..." */
 SMP_API void smp_multi_set_param(SmpMulti *m, int id, double v);   /* any thread; Root note: the selected sample's */

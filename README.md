@@ -61,17 +61,24 @@ Sampler page:
 1. Sample: the selected sample's file, its length and its root note and where it came from. Read only.
 2. Browse button: one or more files, which replace the samples loaded.
 3. File: a combo box of the audio files in the selected sample's folder (see "The File combo box"); choosing one
-   replaces the selected sample, keeping its keys and velocities.
+   replaces the selected sample, keeping its keys and velocities, so Up and Down try each file in its place. Enter
+   adds the file shown as a new sample instead, and the selected sample goes back to the file it had when you came
+   to the box; try another and press Enter again to add more.
 4. Samples: a list of the samples, one line each ("Guitar C3.wav, root C3, keys C-1 to G9, velocity 1 to 127").
-   Up and Down select one; Delete removes it. With none it says "No samples loaded".
-5. Add samples button: one or more files, added to the list (the first of them is selected).
-6. Remove sample button: removes the selected sample.
-7. Start key and End key: sliders (notes, like the other note sliders) for the selected sample's keys. Moving one
+   Several can be picked, as in any Windows list: Up and Down pick one; Shift with Up, Down, Home, End or a click
+   picks a run; Ctrl+A picks them all; Ctrl+Up and Ctrl+Down move without picking, and Ctrl+Space picks or unpicks
+   the one moved to; Ctrl+click picks or unpicks one. Delete removes the picked ones. The one moved to last is the
+   selected sample: the Sample box, File and Root note are its. With none it says "No samples loaded".
+5. Add samples button: one or more files, added to the list (they are picked, the first of them selected).
+6. Remove sample button: removes the picked samples (Ctrl+A, then Remove sample, empties the list).
+7. Start key and End key: sliders (notes, like the other note sliders) for the keys of every picked sample (they
+   show the selected one's). Moving one
    past the other takes the other with it. Typing note names without an octave in either one ("C", "D F", "C, E, G",
    "F#", "Bb") makes the sample play those notes in every octave instead: both then read "every D and F". A plain
    letter is that note only (D isn't D#; type D# for it). An arrow key afterwards makes it a range again, from the
    lowest to the highest of those keys.
-8. Velocity: an edit box with the selected sample's velocities, like "1,127". Type two numbers from 1 to 127
+8. Velocity: an edit box with the selected sample's velocities, like "1,127"; what you type goes to every picked
+   sample. Type two numbers from 1 to 127
    ("15,80", "15 80", "15-80" or "15 to 80", either way round; one number is both ends), then Enter, or Tab away. A
    value that doesn't read beeps and the box goes back to what it was; Escape puts it back too.
 9. Keep length (on or off).

@@ -131,6 +131,8 @@ typedef struct Gui {
   HWND zlist, zadd, zremove, zvel;
   Slider *zlo, *zhi;
   uint64_t zlist_key;                         /* what the list shows now (its lines and count), to rebuild on change */
+  char file_base[1100];                       /* the selected sample's file when the Sampler's File box got the focus:
+                                                 Enter puts it back and adds the file shown */
   int modal;                                  /* file or folder dialogs open (see modal_begin) */
   long fails_seen;                            /* the plugin's failed background loads the window has told of */
   long notes_seen;                            /* and its loads stopped by a load of the other kind */
@@ -201,6 +203,8 @@ static void gb_text(double gb, char *out, int cap) {
 static void set_limit(Gui *g, double gb);
 static void say_note(Gui *g, const char *msg);
 static void zones_show(Gui *g);
+static int zone_targets(Gui *g, int *out);
+static void refresh(Gui *g);
 
 /* ---- sliders ---- */
 /* a knob slider's knob (as the player has it now); 0 when there is none */
@@ -278,12 +282,14 @@ static void sl_set(Gui *g, Slider *s, double v) {
   if (v < lo) v = lo;                            /* past either end it stays at the end */
   if (v > hi) v = hi;
   if (IS_KNOB(s->what)) smp_plug_knob_set(g->P, SL_KNOB0 - s->what, v);
-  else if (IS_ZONE(s->what)) {                   /* a key past the other end takes the other end with it */
-    int i = smp_plug_zone_selected(g->P), a, b, c, d, k = (int)floor(v + 0.5);
-    if (i < 0) { beep(); return; }               /* no sample to set it for */
-    smp_plug_zone_range(g->P, i, &a, &b, &c, &d);
-    if (s->what == SL_ZLO) { a = k; if (b < a) b = a; } else { b = k; if (a > b) a = b; }
-    smp_plug_zone_set_range(g->P, i, a, b, c, d);
+  else if (IS_ZONE(s->what)) {                   /* every picked sample; a key past the other end takes it along */
+    int t[SMP_MULTI_MAX], nt = zone_targets(g, t), j, a, b, c, d, k = (int)floor(v + 0.5);
+    if (!nt) { beep(); return; }                 /* no sample to set it for */
+    for (j = 0; j < nt; j++) {
+      smp_plug_zone_range(g->P, t[j], &a, &b, &c, &d);
+      if (s->what == SL_ZLO) { a = k; if (b < a) b = a; } else { b = k; if (a > b) a = b; }
+      smp_plug_zone_set_range(g->P, t[j], a, b, c, d);
+    }
     sl_show(g, g->zlo, true); sl_show(g, g->zhi, true);   /* "every C" on the other one ends too */
     zones_show(g);
   }
@@ -338,8 +344,9 @@ static void edit_end(Gui *g, Slider *s, bool apply, bool to_slider) {
     if (strcmp(t, s->said)) {
       int pc = IS_ZONE(s->what) ? smp_note_class_parse(t) : 0;
       if (pc) {                                  /* a key box: notes without octaves ("D F") are those in every octave */
-        int i = smp_plug_zone_selected(g->P);
-        if (i < 0) beep(); else smp_plug_zone_set_key_class(g->P, i, pc);
+        int t[SMP_MULTI_MAX], nt = zone_targets(g, t), j;
+        if (!nt) beep();
+        for (j = 0; j < nt; j++) smp_plug_zone_set_key_class(g->P, t[j], pc);
         sl_show(g, g->zlo, true); sl_show(g, g->zhi, true);
         zones_show(g);
       }
@@ -616,7 +623,11 @@ static void zones_show(Gui *g) {
     SendMessageW(g->zlist, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g->zlist, NULL, TRUE);
   }
-  if (SendMessageW(g->zlist, LB_GETCURSEL, 0, 0) != (n ? sel : 0)) SendMessageW(g->zlist, LB_SETCURSEL, (WPARAM)(n ? sel : 0), 0);
+  for (i = 0; i < (n ? n : 1); i++) {      /* the picked ones, and the caret on the selected one */
+    int want = n ? smp_plug_zone_picked(g->P, i) : 1;
+    if ((SendMessageW(g->zlist, LB_GETSEL, (WPARAM)i, 0) > 0) != want) SendMessageW(g->zlist, LB_SETSEL, (WPARAM)want, (LPARAM)i);
+  }
+  if (SendMessageW(g->zlist, LB_GETCARETINDEX, 0, 0) != (n ? sel : 0)) SendMessageW(g->zlist, LB_SETCARETINDEX, (WPARAM)(n ? sel : 0), FALSE);
   if (!g->zlo->editing) sl_show(g, g->zlo, false);
   if (!g->zhi->editing) sl_show(g, g->zhi, false);
   if (GetFocus() != g->zvel) {
@@ -660,20 +671,53 @@ static void vel_apply(Gui *g) {
   snprintf(v, sizeof v, "%d,%d", c, d);
   if (!strcmp(t, v)) return;
   if (i < 0 || !vel_parse(t, &lo, &hi)) { beep(); set_text(g->zvel, v); SendMessageW(g->zvel, EM_SETSEL, 0, -1); return; }
-  {
-    int pc = smp_plug_zone_key_class(g->P, i);   /* every C stays every C */
-    smp_plug_zone_set_range(g->P, i, a, b, lo, hi);
-    if (pc) smp_plug_zone_set_key_class(g->P, i, pc);
+  {                                            /* every picked sample, its keys as they are (every C stays) */
+    int t[SMP_MULTI_MAX], nt = zone_targets(g, t), j;
+    for (j = 0; j < nt; j++) {
+      int pc = smp_plug_zone_key_class(g->P, t[j]);
+      smp_plug_zone_range(g->P, t[j], &a, &b, &c, &d);
+      smp_plug_zone_set_range(g->P, t[j], a, b, lo, hi);
+      if (pc) smp_plug_zone_set_key_class(g->P, t[j], pc);
+    }
   }
   snprintf(v, sizeof v, "%d,%d", lo, hi);
   set_text(g->zvel, v);
   zones_show(g);
 }
 static void zone_remove(Gui *g) {
-  int i = smp_plug_zone_selected(g->P);
-  if (i < 0) { beep(); return; }
-  smp_plug_zone_remove(g->P, i);
-  zones_show(g);
+  if (smp_plug_zone_selected(g->P) < 0) { beep(); return; }
+  smp_plug_zone_remove_picked(g->P);
+  refresh(g);                                  /* the list, the Sample box, Root note */
+}
+/* what the list shows picked becomes the samples picked; the item with the caret becomes the selected one */
+static void zones_taken(Gui *g) {
+  int n = smp_plug_zone_count(g->P), i; LRESULT k = SendMessageW(g->zlist, LB_GETCARETINDEX, 0, 0);
+  for (i = 0; i < n; i++) smp_plug_zone_pick(g->P, i, SendMessageW(g->zlist, LB_GETSEL, (WPARAM)i, 0) > 0);
+  if (k >= 0 && k < n) smp_plug_zone_select(g->P, (int)k);
+  refresh(g);
+}
+/* the list's own keys beyond a list box's: Ctrl+A picks every sample, Ctrl+Up and Ctrl+Down move without picking,
+   Ctrl+Space picks or unpicks the one moved to. 1 when the key was one of these. */
+static bool zones_key(Gui *g, WPARAM w) {
+  int n = smp_plug_zone_count(g->P), k = (int)SendMessageW(g->zlist, LB_GETCARETINDEX, 0, 0);
+  if (GetKeyState(VK_CONTROL) >= 0 || !n) return false;
+  if (w == 'A') SendMessageW(g->zlist, LB_SETSEL, TRUE, -1);
+  else if (w == VK_UP || w == VK_DOWN) {
+    k += w == VK_UP ? -1 : 1;
+    if (k < 0) k = 0;
+    if (k >= n) k = n - 1;
+    SendMessageW(g->zlist, LB_SETCARETINDEX, (WPARAM)k, FALSE);
+  } else if (w == VK_SPACE) SendMessageW(g->zlist, LB_SETSEL, SendMessageW(g->zlist, LB_GETSEL, (WPARAM)k, 0) <= 0, k);
+  else return false;
+  zones_taken(g);
+  return true;
+}
+/* the samples a change in the window goes to: the picked ones, or the selected one; how many, in out */
+static int zone_targets(Gui *g, int *out) {
+  int n = smp_plug_zone_count(g->P), i, k = 0;
+  for (i = 0; i < n; i++) if (smp_plug_zone_picked(g->P, i)) out[k++] = i;
+  if (!k && smp_plug_zone_selected(g->P) >= 0) out[k++] = smp_plug_zone_selected(g->P);
+  return k;
 }
 
 /* the SoundFont player's settings, read from its state lines */
@@ -1102,6 +1146,24 @@ static void file_chosen(Gui *g, int kind, int k) {
    the SoundFont page's Browse chooses one */
 static void browse_file_as(Gui *g, int kind, int how);
 static void browse_file(Gui *g, int kind) { browse_file_as(g, kind, SMP_LOAD_ALL); }
+/* Enter on the Sampler's File combo box: the file shown joins the samples, and the selected sample goes back to the
+   file it had (trying files there changed it) */
+static void file_keep(Gui *g) {
+  HWND c = g->file[0]; wchar_t t[600], full[1800]; char u[1900], err[700], msg[1900];
+  int k = (int)SendMessageW(c, CB_GETCURSEL, 0, 0);
+  if (SendMessageW(c, CB_GETDROPPEDSTATE, 0, 0)) SendMessageW(c, CB_SHOWDROPDOWN, FALSE, 0);
+  if (k < 0 || !g->file_live[0] || SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)k, 0) >= 600) { beep(); return; }
+  SendMessageW(c, CB_GETLBTEXT, (WPARAM)k, (LPARAM)t);
+  swprintf(full, 1800, L"%s\\%s", g->file_dir[0], t);
+  if (WideCharToMultiByte(CP_UTF8, 0, full, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
+  if (!smp_plug_zone_keep(g->P, g->file_base, u, err, sizeof err)) {
+    smp_plug_cant_load(g->P, u, err, msg, sizeof msg);
+    say_note(g, msg); beep();
+  } else g->note[0] = 0;
+  if (smp_plug_sample_path(g->P, g->file_base, sizeof g->file_base) != 1) g->file_base[0] = 0;
+  refresh(g);
+  file_list(g, 0, true);                       /* on the selected sample's file again */
+}
 static void browse_file_as(Gui *g, int kind, int how) {
   const FileKind *K = &kinds[kind];
   enum { BIG = 65536 };
@@ -1297,6 +1359,9 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
   if (g->closing) return DefSubclassProc(h, m, w, l);
   if (m == WM_SETFOCUS) { g->last = h; g->had_focus = true; }
   if (m == WM_SETFOCUS && (id == ID_FILE || id == ID_SFFILE)) file_list(g, id == ID_SFFILE, true);   /* new files show */
+  if (m == WM_SETFOCUS && id == ID_FILE && smp_plug_sample_path(g->P, g->file_base, sizeof g->file_base) != 1) g->file_base[0] = 0;
+  if (m == WM_KEYDOWN && w == VK_RETURN && id == ID_FILE) { file_keep(g); return 0; }
+  if (m == WM_CHAR && (w == '\r' || w == '\n') && id == ID_FILE) return 0;
   if (m == WM_KILLFOCUS && !(w && IsChild(g->win, (HWND)w))) g->had_focus = false;   /* gone out of the window */
   shift = GetKeyState(VK_SHIFT) < 0; ctrl = GetKeyState(VK_CONTROL) < 0;
   s = slider_of(g, h);
@@ -1334,6 +1399,8 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
     if (m == WM_CHAR) return 0;
   }
   if (m == WM_KEYDOWN && w == VK_DELETE && id == ID_ZLIST) { zone_remove(g); return 0; }
+  if (m == WM_KEYDOWN && id == ID_ZLIST && zones_key(g, w)) return 0;
+  if (m == WM_CHAR && id == ID_ZLIST && (w == 1 || (w == ' ' && GetKeyState(VK_CONTROL) < 0))) return 0;   /* Ctrl+A, Ctrl+Space */
   if (m == WM_KEYDOWN && w == VK_ESCAPE && id == ID_ZVEL) {   /* as it was */
     char v[32]; int a, b, c, d;
     smp_plug_zone_range(g->P, smp_plug_zone_selected(g->P), &a, &b, &c, &d);
@@ -1376,10 +1443,8 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       } else if (code == CBN_SELCHANGE && (id == ID_SFMODE || id == ID_SFPRESET || id == ID_SFCHANNEL ||
                                            (id >= ID_CHAN && id < ID_CHAN + NCH) || (id >= ID_OUT && id < ID_OUT + NCH))) {
         sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
-      } else if (code == LBN_SELCHANGE && id == ID_ZLIST) {   /* a sample chosen in the list */
-        LRESULT k = SendMessageW((HWND)l, LB_GETCURSEL, 0, 0);
-        if (k >= 0 && k < smp_plug_zone_count(g->P)) smp_plug_zone_select(g->P, (int)k);
-        refresh(g);
+      } else if (code == LBN_SELCHANGE && id == ID_ZLIST) {   /* samples picked in the list */
+        zones_taken(g);
       } else if (code == BN_CLICKED) click(g, id);
       return 0;
     }
@@ -1525,7 +1590,7 @@ static bool build(Gui *g, HWND parent) {
   y += ROW;
   /* the samples: the list, three rows high, with Add samples and Remove sample beside it, Velocity under them;
      Start key and End key below (Tab: the list, the buttons, Start key, End key, Velocity) */
-  g->zlist = labelled(g, PG_SAMPLER, "Samples", L"LISTBOX", T | LBS_NOTIFY | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT,
+  g->zlist = labelled(g, PG_SAMPLER, "Samples", L"LISTBOX", T | LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT,
                       8, y, 120, 400, 3 * ROW - 6, ID_ZLIST);
   g->zadd = ctl(g, PG_SAMPLER, L"BUTTON", L"Add samples", T | BS_PUSHBUTTON, 548, y, 160, 26, ID_ZADD);
   g->zremove = ctl(g, PG_SAMPLER, L"BUTTON", L"Remove sample", T | BS_PUSHBUTTON, 548, y + ROW, 160, 26, ID_ZREMOVE);

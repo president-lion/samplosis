@@ -25,6 +25,7 @@ typedef struct {
   char path[1024]; uint64_t key; int has_key;
   char why[600];                         /* missing: why it didn't load */
   volatile LONG klo, khi, vlo, vhi, root;
+  int picked;                            /* main thread: picked in the window's list (several may be) */
   volatile LONG pc;                      /* 0: the keys klo to khi; else a bit per note (bit 0 C to bit 11 B): every key of
                                             those notes, whatever its octave, and klo and khi the lowest and highest */
 } Zone;
@@ -247,7 +248,7 @@ SMP_API int smp_multi_add(SmpMulti *m, SmpSample *s) {
   if (m->n >= SMP_MULTI_MAX || !(z = zone_new(s->root))) { smp_sample_free(s); return -1; }
   if (!zone_engine(m, z, s)) { free(z); return -1; }
   m->z[m->n++] = z;
-  if (m->sel < 0) m->sel = 0;
+  if (m->sel < 0) { m->sel = 0; z->picked = 1; }
   publish(m);
   return m->n - 1;
 }
@@ -268,6 +269,11 @@ SMP_API void smp_multi_remove(SmpMulti *m, int i) {
   memmove(&m->z[i], &m->z[i + 1], sizeof m->z[0] * (size_t)(m->n - i - 1));
   m->n--;
   if (m->sel >= m->n) m->sel = m->n - 1;
+  {                                      /* none left picked: the selected one is */
+    int k, any = 0;
+    for (k = 0; k < m->n; k++) any |= m->z[k]->picked;
+    if (!any && m->sel >= 0) m->z[m->sel]->picked = 1;
+  }
   publish(m);
 }
 
@@ -319,6 +325,8 @@ SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root) {
   if (m->z[i]->e) set_if(m->z[i]->e, SMP_P_ROOT, m->z[i]->root);
 }
 SMP_API int smp_multi_selected(const SmpMulti *m) { return m ? m->sel : -1; }
+SMP_API int smp_multi_picked(const SmpMulti *m, int i) { return m && i >= 0 && i < m->n ? m->z[i]->picked : 0; }
+SMP_API void smp_multi_pick(SmpMulti *m, int i, int on) { if (m && i >= 0 && i < m->n) m->z[i]->picked = on != 0; }
 SMP_API void smp_multi_select(SmpMulti *m, int i) { if (m && i >= 0 && i < m->n) set_sel(m, i); }
 
 SMP_API void smp_multi_line(const SmpMulti *m, int i, char *out, int cap) {
@@ -695,6 +703,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
   for (i = 0; i < ns; i++) if (nz[i]) m->z[m->n++] = nz[i];
   for (i = 0; i < m->n; i++) sync_zone(m, m->z[i]);
   m->sel = m->n ? 0 : -1;
+  for (i = 0; i < m->n; i++) m->z[i]->picked = i == 0;
   publish(m);
   free(sl);
   if (missing) *missing = nmiss;
