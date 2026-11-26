@@ -451,10 +451,20 @@ static void render(SmpEngine *e, const Snap *P, float *l, float *r, int a, int b
 }
 
 SMP_API void smp_engine_process(SmpEngine *e, float *l, float *r, int n) {
+  if (n > 0) { memset(l, 0, sizeof(float) * (size_t)n); memset(r, 0, sizeof(float) * (size_t)n); }
+  smp_engine_process_mix(e, l, r, n);
+}
+
+/* adds the block into l and r. An engine with no voice sounding, no event queued and no new sample only counts the
+   block (its retirements go on), so many silent engines cost next to nothing (multi.c) */
+void smp_engine_process_mix(SmpEngine *e, float *l, float *r, int n) {
   Snap P; int i, j, pos = 0;
   SmpSample *s = e->sample;
   if (n <= 0) { e->nev = 0; return; }
-  memset(l, 0, sizeof(float) * (size_t)n); memset(r, 0, sizeof(float) * (size_t)n);
+  if (!e->nev && s == e->cur) {
+    for (i = 0; i < SMP_MAXV; i++) if (e->v[i].live || e->v[i].underrun) break;
+    if (i == SMP_MAXV) { InterlockedIncrement64(&e->epoch); return; }
+  }
   if (s != e->cur) {                                     /* a new sample: fade out the old one's voices */
     for (i = 0; i < SMP_MAXV; i++) if (e->v[i].live && e->v[i].smp != s) fade_out(e, &e->v[i]);
     e->cur = s;

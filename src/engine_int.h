@@ -123,6 +123,7 @@ struct SmpEngine {
 };
 
 double smp_eng_param(const SmpEngine *e, int id);
+void smp_engine_process_mix(SmpEngine *e, float *l, float *r, int n);   /* audio thread: adds the block into l, r */
 int smp_stream_start(SmpEngine *e);
 void smp_stream_stop(SmpEngine *e);
 void smp_stream_wait_idle(SmpEngine *e);  /* offline helper: returns after a full streamer pass has run */

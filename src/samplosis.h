@@ -154,6 +154,62 @@ SMP_API int smp_script_write(const SmpEngine *e, char *out, int cap);   /* retur
 SMP_API int smp_script_apply(SmpEngine *e, const char *text, char *err, int cap); /* 0 ok; on error nothing changes and
                                     err says "line N: ..." */
 
+/* The Sampler with several samples (multi.c): a list of samples, each with its own key range, velocity range and
+   root note, and the instrument's other parameters shared by them all. Each sample plays in an engine of its own
+   (the engine above, unchanged); a note goes to every one, and each sounds only inside its ranges (and inside the
+   instrument's Lowest and Highest note and velocity, which still apply to all). The output is their sum.
+   Threads as the engine's: main (everything that changes the list, the scripts, collect), audio (note_on/off/bend,
+   process, reset), set_param from any thread. One sample is the selected one: the Root note parameter is its root.
+   A sample whose file couldn't be loaded keeps its place (silent), its path and key, and is written back. */
+#define SMP_MULTI_MAX 128                /* samples in one instrument */
+typedef struct SmpMulti SmpMulti;
+SMP_API SmpMulti *smp_multi_new(double rate, int max_block);
+SMP_API void smp_multi_free(SmpMulti *m);
+SMP_API int smp_multi_count(const SmpMulti *m);
+SMP_API int smp_multi_add(SmpMulti *m, SmpSample *s);      /* takes s (freed on failure); every key and velocity,
+                                    the sample's own root; returns its index, or -1 when the list is full */
+SMP_API int smp_multi_replace(SmpMulti *m, int i, SmpSample *s);   /* takes s: sample i becomes s, keeping its key
+                                    and velocity ranges; its root becomes s's. 0 when i is out of range (s freed) */
+SMP_API void smp_multi_remove(SmpMulti *m, int i);         /* the selected one stays put, or moves to the last */
+SMP_API void smp_multi_clear(SmpMulti *m);
+SMP_API const SmpSample *smp_multi_sample(const SmpMulti *m, int i);   /* NULL when out of range or missing */
+SMP_API int smp_multi_path(const SmpMulti *m, int i, char *out, int cap);   /* 1 loaded, 2 missing, 0 none */
+SMP_API const char *smp_multi_why(const SmpMulti *m, int i);           /* why a missing one didn't load, or "" */
+SMP_API void smp_multi_range(const SmpMulti *m, int i, int *key_lo, int *key_hi, int *vel_lo, int *vel_hi);
+SMP_API int smp_multi_set_range(SmpMulti *m, int i, int key_lo, int key_hi, int vel_lo, int vel_hi);   /* keys 0 to
+                                    127, velocities 1 to 127, each low not above its high; 0 when they aren't */
+SMP_API int smp_multi_root(const SmpMulti *m, int i);
+SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root);
+SMP_API int smp_multi_selected(const SmpMulti *m);         /* -1 when there are none */
+SMP_API void smp_multi_select(SmpMulti *m, int i);
+SMP_API void smp_multi_line(const SmpMulti *m, int i, char *out, int cap);  /* "Guitar C3.wav, root C3, keys C-1 to
+                                    G9, velocity 1 to 127", or "Missing: <path>, ..." */
+SMP_API void smp_multi_set_param(SmpMulti *m, int id, double v);   /* any thread; Root note: the selected sample's */
+SMP_API double smp_multi_get_param(const SmpMulti *m, int id);
+SMP_API void smp_multi_note_on(SmpMulti *m, int key, int vel, int at);
+SMP_API void smp_multi_note_off(SmpMulti *m, int key, int at);
+SMP_API void smp_multi_bend(SmpMulti *m, double semis_fraction, int at);
+SMP_API void smp_multi_process(SmpMulti *m, float *l, float *r, int n);   /* audio thread: writes l and r */
+SMP_API void smp_multi_reset(SmpMulti *m, int now);
+SMP_API void smp_multi_collect(SmpMulti *m, int idle);    /* main thread: frees what nothing can reach any more;
+                                    idle: nothing processes (between deactivate and activate), so it is all free now */
+SMP_API int smp_multi_active_voices(const SmpMulti *m);
+SMP_API long smp_multi_underruns(const SmpMulti *m);
+SMP_API int smp_multi_render_status(SmpMulti *m, int *ready, int *total, char *why, int cap);   /* summed over the
+                                    samples, as smp_engine_render_status */
+SMP_API int smp_multi_wait_renders(SmpMulti *m, int timeout_ms);   /* tests: 0 once every render thread is idle */
+SMP_API void smp_multi_seed(SmpMulti *m, unsigned seed);
+/* tests: as smp_engine_render_test, through every sample */
+SMP_API int smp_multi_render_test(SmpMulti *m, const char *events, long frames, int block, const char *wav_out);
+/* The instrument as text: as smp_script_write, with one sample line per sample, in order. A sample line may carry
+   root=C3, keys=C2..C3 and velocity=15..80 after its key (each left out at its default: velocity 1..127, every key,
+   and with one sample its root, which the root line then gives, as before). Main thread only. */
+SMP_API int smp_multi_script_write(const SmpMulti *m, char *out, int cap);
+/* 0 ok; on a line that doesn't read, nothing changes and err says "line N: ...". A sample that can't be loaded
+   isn't an error: it stays in the list as missing (smp_multi_path says 2) and *missing counts it (may be NULL).
+   Samples already loaded with the same path and key are kept, not loaded again. */
+SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, char *err, int cap);
+
 /* SoundFonts (sf2.c). Generator ids are the SF2.04 numbers, 0 startAddrsOffset to 58 overridingRootKey. */
 #define SMP_SF_NGEN 60
 typedef struct { uint16_t src, dest; int16_t amount; uint16_t amt_src, trans; } SmpSfMod;  /* as in pmod/imod */
