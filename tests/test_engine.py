@@ -39,9 +39,10 @@ def rms_db(x):
 
 
 class Engine:
-    def __init__(self, lib, tmp_path, data, rate=44100, name="tone A3.wav", host_rate=48000, max_block=512):
+    def __init__(self, lib, tmp_path, data, rate=44100, name="tone A3.wav", host_rate=48000, max_block=512,
+                 declick=True):
         self.lib, self.tmp, self.host_rate = lib, tmp_path, host_rate
-        point_cache(lib, tmp_path / "cache")
+        point_cache(lib, tmp_path / "cache", declick=declick)   # off: the output is the data, frame for frame
         f = tmp_path / name
         write_wav(f, data, rate)
         err = ctypes.create_string_buffer(512)
@@ -113,6 +114,67 @@ def test_free_mode(lib, tmp_path):
     y = e.render("on 47 127 0", 0.3)                     # outside note_lo..note_hi: ignored
     assert np.max(np.abs(y)) == 0
     e.free()
+
+
+def declick_pair(lib, tmp_path, data, events, secs, setup=None):
+    """The same note with declick on and off (44.1 kHz in and out, so the frames line up)."""
+    ys = []
+    for on in (True, False):
+        d = tmp_path / ("on" if on else "off")
+        d.mkdir()
+        e = Engine(lib, d, data, host_rate=44100)
+        point_cache(lib, d / "cache", declick=on)
+        e.set(OBEY_NOTE_OFF, 0)                           # plays to the end
+        if setup:
+            setup(e)
+        ys.append(e.render(events % e.root, secs)[:, 0])
+        e.free()
+    point_cache(lib, tmp_path / "cache")
+    return ys
+
+
+FADE = int(0.002 * 44100)                                 # declick fades over 2 ms
+
+
+def test_declick_fades_in_a_start_mid_wave(lib, tmp_path):
+    n = np.arange(44100)
+    on, off = declick_pair(lib, tmp_path, (0.5 * np.cos(2 * np.pi * n / 100)).astype(np.float32), "on %d 127 0", 1.2)
+    assert abs(off[0]) > 0.4                              # without it: full level at once
+    assert abs(on[0]) < 0.02 and np.all(np.abs(on[:FADE]) <= np.abs(off[:FADE]) + 1e-6)
+    assert abs(on[FADE // 2]) < 0.6 * abs(off[FADE // 2])
+    assert np.abs(on[FADE + 2:40000] - off[FADE + 2:40000]).max() < 1e-6   # after the fade: untouched
+
+
+def test_declick_leaves_a_clean_start_alone(lib, tmp_path):
+    on, off = declick_pair(lib, tmp_path, sine(441, 1.0, 44100), "on %d 127 0", 1.2)
+    assert np.abs(on[:40000] - off[:40000]).max() < 1e-6  # starts at zero: its attack stays sharp
+
+
+def test_declick_fades_out_an_end_cut_mid_wave(lib, tmp_path):
+    n = np.arange(44125)                                  # ends a quarter period in: at the peak
+    on, off = declick_pair(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), "on %d 127 0", 1.2)
+    end = int(last_sound(off[:, None], 1))
+    assert abs(off[end - 3]) > 0.4                         # without it: stops dead at the peak
+    assert int(last_sound(on[:, None], 1)) <= end
+    assert np.abs(on[end - 3:end + 3]).max() < 0.03
+    assert np.abs(on[:end - FADE - 4] - off[:end - FADE - 4]).max() < 1e-6
+
+
+def test_declick_start_point_mid_file(lib, tmp_path):
+    n = np.arange(40000)
+    data = (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32)
+    on, off = declick_pair(lib, tmp_path, data, "on %d 127 0", 1.0, lambda e: e.set(START, 10.0626))   # frame 4025: a peak
+    assert abs(off[0]) > 0.4
+    assert abs(on[0]) < 0.02
+    assert np.abs(on[FADE + 2:30000] - off[FADE + 2:30000]).max() < 1e-6
+
+
+def test_declick_reversed_start(lib, tmp_path):
+    n = np.arange(40025)                                  # reversed, the note starts at the file's last frame: a peak
+    data = (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32)
+    on, off = declick_pair(lib, tmp_path, data, "on %d 127 0", 1.0, lambda e: e.set(REVERSE, 1))
+    assert abs(off[0]) > 0.4
+    assert abs(on[0]) < 0.02
 
 
 def last_sound(y, rate, floor=1e-4):
@@ -220,7 +282,7 @@ def test_reverse(lib, tmp_path):
     rate = 48000                                           # same rate as the engine: output equals the data
     rng = np.random.default_rng(3)
     data = (0.3 * rng.standard_normal(rate * 2)).astype(np.float32)   # 2 s: streamed after the head
-    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav", declick=False)
     e.set(REVERSE, 1)
     y = e.render("on 57 127 0", 1.5)[:, 0]
     want = data[::-1][:len(y)]
@@ -236,7 +298,7 @@ def test_start_end(lib, tmp_path):
     rate = 48000
     rng = np.random.default_rng(4)
     data = (0.3 * rng.standard_normal(rate * 4)).astype(np.float32)
-    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav", declick=False)
     e.set(START, 50); e.set(END, 75); e.set(OBEY_NOTE_OFF, 0)
     # in offline renders the streamer has time to fill a ring that starts past the head
     y = e.render("on 57 127 0", 1.5)[:, 0]
@@ -312,7 +374,7 @@ def test_streaming_long_sample(lib, tmp_path):
     data = (0.3 * np.sin(2 * np.pi * 440 * t) + 0.2 * np.sin(2 * np.pi * 1234.5 * t)
             + 0.1 * np.sin(2 * np.pi * 3.3 * t)).astype(np.float32)
     proc = psutil.Process()
-    e = Engine(lib, tmp_path, data, rate=rate, name="long A4.wav")
+    e = Engine(lib, tmp_path, data, rate=rate, name="long A4.wav", declick=False)
     del t
     before = proc.memory_info().rss
     out = tmp_path / "long_out.wav"
@@ -355,7 +417,7 @@ def test_start_past_head_realtime(lib, tmp_path):
     rate = 48000
     rng = np.random.default_rng(5)
     data = (0.3 * rng.standard_normal(rate * 4)).astype(np.float32)
-    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav", declick=False)
     for rev in (0, 1):
         e.set(REVERSE, rev); e.set(START, 50)
         time.sleep(0.3)                                   # the user set start a moment before playing
@@ -427,7 +489,7 @@ def test_start_changes_without_process_never_stall(lib, tmp_path):
     rate = 48000
     rng = np.random.default_rng(9)
     data = (0.3 * rng.standard_normal(rate * 4)).astype(np.float32)
-    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav")
+    e = Engine(lib, tmp_path, data, rate=rate, name="noise A3.wav", declick=False)
     t0 = time.perf_counter()
     for i in range(150):
         e.set(START, 30 + i * 0.2)

@@ -671,6 +671,7 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         fake.parent.mkdir()
         fake.write_bytes(b"MZ")
         out = gui(P, tmp_path, text, ["focus Settings", "key enter", "key down", "key down", "key tab", "key down",
+                                      "key tab", "key up", "key down",
                                       "key tab", "key tab", "key tab", "key enter", "type 5", "key enter",
                                       "key up", "key down",
                                       # the raw settings and FFmpeg, after Cache size limit
@@ -687,36 +688,37 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert f[0] == ["ComboBox", "Stretcher", "Signalsmith Stretch, fast"]
         assert f[1] == f[2] == ["ComboBox", "Stretcher", "Rubber Band, slower"]   # Down stops at the last
         assert f[3] == ["ComboBox", "Keep the tone", "Off"] and f[4] == ["ComboBox", "Keep the tone", "On"]
-        assert f[5][:3] == ["Edit", "Cache folder", str(tmp_path / "cache")]
-        assert f[6][:2] == ["Button", "Browse folder"]
-        assert f[7] == ["Slider", "Cache size limit", "10 GB"]
-        assert f[8] == ["Edit", "Cache size limit", "10 GB"]
-        assert f[9][2] == "5 GB" and f[10][2] == "6 GB" and f[11][2] == "5 GB"
-        assert f[12] == ["ComboBox", "Raw sample rate", "44100 Hz"] and f[13][2] == "48000 Hz"
-        assert f[14][2] == "8000 Hz" and f[15][2] == f[16][2] == "192000 Hz"   # Home, End; Down stops at the last
-        assert f[17] == ["ComboBox", "Raw channels", "Stereo"] and f[18][2] == "Mono"
-        assert f[19] == ["ComboBox", "Raw sample format", "16-bit integer"]
-        assert f[20] == ["ComboBox", "Raw byte order", "Little endian"] and f[21][2] == "Big endian"
-        assert f[22][:2] == ["Edit", "FFmpeg"]                               # the path found, or Not found
-        assert f[22][2] == "Not found" or f[22][2].lower().endswith("ffmpeg.exe"), f[22]
-        assert f[23][:2] == ["Button", "Browse for FFmpeg"]
-        assert f[24][:2] == ["Edit", "Cache in use"] and f[24][2].endswith(" of 5 GB")
-        assert [x[:2] for x in f[25:27]] == [["Button", "Clear cache"], ["Button", "Back"]]
-        assert [x[:2] for x in f[27:30]] == [["Button", "Clear cache"], ["Edit", "Cache in use"],
+        assert f[5] == ["ComboBox", "Declick", "On"] and f[6][2] == "Off" and f[7][2] == "On"
+        assert f[8][:3] == ["Edit", "Cache folder", str(tmp_path / "cache")]
+        assert f[9][:2] == ["Button", "Browse folder"]
+        assert f[10] == ["Slider", "Cache size limit", "10 GB"]
+        assert f[11] == ["Edit", "Cache size limit", "10 GB"]
+        assert f[12][2] == "5 GB" and f[13][2] == "6 GB" and f[14][2] == "5 GB"
+        assert f[15] == ["ComboBox", "Raw sample rate", "44100 Hz"] and f[16][2] == "48000 Hz"
+        assert f[17][2] == "8000 Hz" and f[18][2] == f[19][2] == "192000 Hz"   # Home, End; Down stops at the last
+        assert f[20] == ["ComboBox", "Raw channels", "Stereo"] and f[21][2] == "Mono"
+        assert f[22] == ["ComboBox", "Raw sample format", "16-bit integer"]
+        assert f[23] == ["ComboBox", "Raw byte order", "Little endian"] and f[24][2] == "Big endian"
+        assert f[25][:2] == ["Edit", "FFmpeg"]                               # the path found, or Not found
+        assert f[25][2] == "Not found" or f[25][2].lower().endswith("ffmpeg.exe"), f[25]
+        assert f[26][:2] == ["Button", "Browse for FFmpeg"]
+        assert f[27][:2] == ["Edit", "Cache in use"] and f[27][2].endswith(" of 5 GB")
+        assert [x[:2] for x in f[28:30]] == [["Button", "Clear cache"], ["Button", "Back"]]
+        assert [x[:2] for x in f[30:33]] == [["Button", "Clear cache"], ["Edit", "Cache in use"],
                                              ["Button", "Browse for FFmpeg"]]          # Shift+Tab back up
-        assert f[30][:2] == ["Button", "after"]                              # past the end: out of the plugin
-        assert f[31][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
+        assert f[33][:2] == ["Button", "after"]                              # past the end: out of the plugin
+        assert f[34][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
         assert got(out, "read")[0] == ["FFmpeg", str(fake)]
         assert got(out, "read")[1] == ["Status", "Raw settings apply the next time a raw file loads"]
-        assert f[32][:2] == ["Button", "Settings"]           # Back: on the Settings button again
-        assert f[33][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+        assert f[35][:2] == ["Button", "Settings"]           # Back: on the Settings button again
+        assert f[36][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
         n = [int(x[0]) for x in got(out, "ffsearches")]
         assert len(n) == 2 and n[0] >= 1 and n[1] == n[0], n               # searched on the first visit and after Browse only
         with open(settings_file) as fh:
             saved = fh.read()
         assert "raw_rate 192000\n" in saved and "raw_channels 1\n" in saved and "raw_endian big\n" in saved
         assert ("ffmpeg_path %s\n" % fake) in saved
-        assert "cache_limit_gb 5\n" in saved and "stretcher rubberband\n" in saved and "keep_tone on\n" in saved
+        assert "cache_limit_gb 5\n" in saved and "stretcher rubberband\n" in saved and "keep_tone on\n" in saved and "declick on\n" in saved
     finally:
         with open(settings_file, "w") as fh:
             fh.write(before)

@@ -13,6 +13,8 @@
 #define SMP_MAXEV 1024
 #define SMP_NOFILL INT64_MAX             /* v0 of a voice that needs no ring (whole entry) */
 #define SMP_UFADE 64                     /* samples of fade out and in around a ring underrun */
+#define SMP_DECLICK 0.002                /* seconds of a declick fade (Settings: declick) */
+#define SMP_DECLICK_FLOOR 0.001f         /* -60 dB: a first or last frame this quiet needs no fade */
 
 /* a counter packed with a voice generation: (gen & 0xFFFFFF) << 40 | frames */
 #define SMP_TAG(g) (((LONG64)((g) & 0xFFFFFF)) << 40)
@@ -74,6 +76,8 @@ typedef struct SmpVoice {
   double pos, vgain, env, k, att_inc, fade, fade_step;
   double ug;                             /* underrun gain: fades out before the ring runs dry, back in after */
   double gl, gl_step; int64_t gl_left;   /* glide: semitones still to go (to 0), per sample, samples left */
+  int dc, dce;                           /* declick on for this note; its end: 0 not looked at yet, 1 fades, 2 clean */
+  double din;                            /* declick fade in: 0 to 1 (1 when the first frame was near silence) */
   int64_t left, path_len;
   uint64_t order;
 

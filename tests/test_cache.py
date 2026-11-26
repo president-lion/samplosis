@@ -14,12 +14,13 @@ def get(lib):
     return s
 
 
-def point_cache(lib, folder, gb=10.0, stretcher=0, keep_tone=0):
-    """The cache folder and limit; and the stretcher (0 Signalsmith, 1 Rubber Band) and keep tone."""
+def point_cache(lib, folder, gb=10.0, stretcher=0, keep_tone=0, declick=True):
+    """The cache folder and limit; the stretcher (0 Signalsmith, 1 Rubber Band) and keep tone; and declick."""
     s = SmpSettings()
     s.cache_dir = str(folder).encode()
     s.cache_limit_gb = gb
     s.stretcher, s.keep_tone = stretcher, keep_tone
+    s.no_declick = 0 if declick else 1
     assert lib.smp_settings_set(ctypes.byref(s)) == 0
 
 
@@ -74,7 +75,7 @@ def test_settings_raw_and_ffmpeg_roundtrip(lib, settings_file, tmp_path):
     assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (96000, 1, 3, 1)
     text = open(settings_file, encoding="utf-8").read().splitlines()
     names = [ln.split(" ")[0] for ln in text]             # in this order, after keep_tone
-    assert names == ["cache_dir", "cache_limit_gb", "stretcher", "keep_tone", "ffmpeg_path",
+    assert names == ["cache_dir", "cache_limit_gb", "stretcher", "keep_tone", "declick", "ffmpeg_path",
                      "raw_rate", "raw_channels", "raw_format", "raw_endian"]
     assert "raw_rate 96000" in text and "raw_channels 1" in text
     assert "raw_format f32" in text and "raw_endian big" in text
@@ -95,6 +96,22 @@ def test_settings_raw_and_ffmpeg_roundtrip(lib, settings_file, tmp_path):
     s = get(lib)
     assert (s.raw_rate, s.raw_channels, s.raw_format, s.raw_endian) == (44100, 2, 0, 0)
     assert "raw_rate 44100" in open(settings_file).read()
+    point_cache(lib, tmp_path)
+
+
+def test_settings_declick(lib, settings_file, tmp_path):
+    if os.path.exists(settings_file):
+        os.remove(settings_file)
+    assert get(lib).no_declick == 0                      # on by default
+    point_cache(lib, tmp_path, declick=False)
+    assert get(lib).no_declick == 1
+    assert "declick off" in open(settings_file).read().splitlines()
+    point_cache(lib, tmp_path)
+    assert "declick on" in open(settings_file).read().splitlines()
+    for text, off in (("declick OFF \n", 1), ("declick on\n", 0), ("declick maybe\n", 0)):   # by hand
+        with open(settings_file, "w") as f:
+            f.write("cache_dir %s\n%s" % (tmp_path, text))
+        assert get(lib).no_declick == off, text
     point_cache(lib, tmp_path)
 
 

@@ -60,7 +60,7 @@
 #define NCH 16                                /* MIDI channels */
 enum { ID_VAL = 100,                          /* + parameter id: its slider or combo box */
        ID_SAMPLE = 200, ID_BROWSE, ID_FILE, ID_STATUS, ID_SETTINGS,
-       ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
+       ID_STRETCHER, ID_KEEPTONE, ID_DECLICK, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
        ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
        ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
        ID_ZLIST, ID_ZADD, ID_ZREMOVE, ID_ZLO, ID_ZHI, ID_ZVEL,
@@ -97,7 +97,7 @@ typedef struct Gui {
   Slider sl[SMP_NALLPARAMS + 1 + NKNOB + 2]; int nsl;
   Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
   IAccPropServices *aps;                      /* the words a screen reader reads for a slider; NULL: numbers */
-  HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
+  HWND stretcher, keeptone, declick, dir, dirbrowse, used, clear, back;
   Slider *limit;
   char dir_shown[1024], used_text[700];
   HWND rawrate, rawch, rawfmt, rawend, ffmpeg, ffbrowse;  /* how raw files read; where FFmpeg is */
@@ -404,6 +404,7 @@ static void show_settings(Gui *g) {
   set_text(g->used, g->used_text);
   sel(g->stretcher, s.stretcher);
   sel(g->keeptone, s.keep_tone);
+  sel(g->declick, s.no_declick ? 0 : 1);
   sel(g->rawrate, rate_index(s.raw_rate));
   sel(g->rawch, s.raw_channels == 1 ? 0 : 1);
   sel(g->rawfmt, s.raw_format);
@@ -441,6 +442,7 @@ static void choose(Gui *g, int id, int k) {
   smp_settings_get(&s);
   if (id == ID_STRETCHER) s.stretcher = k;
   else if (id == ID_KEEPTONE) s.keep_tone = k;
+  else if (id == ID_DECLICK) s.no_declick = !k;
   else if (id == ID_RAWRATE) s.raw_rate = r[k < n ? k : n - 1];
   else if (id == ID_RAWCH) s.raw_channels = k ? 2 : 1;
   else if (id == ID_RAWFMT) s.raw_format = k;
@@ -1432,7 +1434,7 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (code == CBN_SELCHANGE && id >= ID_VAL && id < ID_VAL + SMP_NALLPARAMS) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) smp_plug_set_param(g->P, id - ID_VAL, (double)k);
-      } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE || id == ID_RAWRATE ||
+      } else if (code == CBN_SELCHANGE && (id == ID_STRETCHER || id == ID_KEEPTONE || id == ID_DECLICK || id == ID_RAWRATE ||
                                            id == ID_RAWCH || id == ID_RAWFMT || id == ID_RAWEND)) {
         LRESULT k = SendMessageW((HWND)l, CB_GETCURSEL, 0, 0);
         if (k >= 0) choose(g, id, (int)k);
@@ -1670,6 +1672,10 @@ static bool build(Gui *g, HWND parent) {
   g->keeptone = labelled(g, 1, "Keep the tone", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_KEEPTONE);
   SendMessageW(g->keeptone, CB_ADDSTRING, 0, (LPARAM)L"Off");
   SendMessageW(g->keeptone, CB_ADDSTRING, 0, (LPARAM)L"On");
+  y += ROW;
+  g->declick = labelled(g, 1, "Declick", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 8, y, 140, 260, 200, ID_DECLICK);
+  cb_add(g->declick, "Off");
+  cb_add(g->declick, "On");
   y += ROW;
   g->dir = labelled(g, 1, "Cache folder", L"EDIT", T | ES_AUTOHSCROLL, 8, y, 140, 470, 24, ID_DIR);
   SendMessageW(g->dir, EM_SETLIMITTEXT, 1000, 0);

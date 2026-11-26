@@ -51,7 +51,7 @@ class Settings(ctypes.Structure):
                 ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int),
                 ("ffmpeg_path", ctypes.c_char * 1024),
                 ("raw_rate", ctypes.c_int), ("raw_channels", ctypes.c_int),
-                ("raw_format", ctypes.c_int), ("raw_endian", ctypes.c_int)]
+                ("raw_format", ctypes.c_int), ("raw_endian", ctypes.c_int), ("no_declick", ctypes.c_int)]
 lib.smp_settings_get.argtypes = [ctypes.POINTER(Settings)]
 work = tempfile.mkdtemp(prefix="samplosis_measure_", dir=work_parent())
 atexit.register(shutil.rmtree, work, True)   # the cache copies are gigabytes; do not leave them

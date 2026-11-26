@@ -52,10 +52,14 @@ typedef struct {
   char cache_dir[1024]; double cache_limit_gb; int stretcher, keep_tone;
   char ffmpeg_path[1024];
   int raw_rate, raw_channels, raw_format, raw_endian;
+  int no_declick;                                     /* 0: declick on (the default), 1: off ("declick off") */
 } SmpSettings;
 SMP_API void smp_settings_get(SmpSettings *s);        /* defaults when the file is missing; reloads when it changes */
 SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */
 int smp_raw_rates(const int **list);                  /* the rates raw_rate may be, lowest first; returns how many */
+/* Declick, as last read from the settings (any thread, no lock): the Sampler fades a note in over 2 ms when its first
+   frame isn't near silence, and out over its last 2 ms when it ends (no loop) on a frame that isn't. */
+int smp_declick_on(void);
 
 /* disk cache of decoded audio: <16 hex>.smpc, 32 byte header then float32 stereo interleaved */
 typedef struct SmpEntry SmpEntry;

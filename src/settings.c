@@ -1,5 +1,5 @@
 /* Settings file: "name value" per line (cache_dir, cache_limit_gb, stretcher signalsmith|rubberband,
-   keep_tone on|off, ffmpeg_path, raw_rate, raw_channels 1|2, raw_format s16|s24|s32|f32|u8, raw_endian little|big).
+   keep_tone on|off, declick on|off, ffmpeg_path, raw_rate, raw_channels 1|2, raw_format s16|s24|s32|f32|u8, raw_endian little|big).
    Reloaded when the file's last-write time changes. Words read in any case; a value that doesn't read keeps the
    default. */
 #include <windows.h>
@@ -13,6 +13,8 @@ static CRITICAL_SECTION cs;
 static SmpSettings cur;
 static ULONGLONG cur_stamp; /* last-write time of the loaded file; 0 = file missing */
 static int loaded;
+static volatile LONG declick = 1;   /* cur's declick, for the audio thread */
+int smp_declick_on(void) { return declick; }
 
 static BOOL CALLBACK init_cs(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&cs); return TRUE; }
 
@@ -36,6 +38,7 @@ static void tidy(SmpSettings *s) {
   if (s->raw_channels != 1 && s->raw_channels != 2) s->raw_channels = 2;
   if (s->raw_format < 0 || s->raw_format > SMP_RAW_U8) s->raw_format = SMP_RAW_S16;
   if (s->raw_endian != SMP_RAW_BIG) s->raw_endian = SMP_RAW_LITTLE;
+  if (s->no_declick) s->no_declick = 1;
 }
 
 static int path_w(wchar_t *out, int cap) {
@@ -72,6 +75,9 @@ static void parse(char *text, SmpSettings *s) {
       } else if (!strcmp(line, "keep_tone")) {
         if (!_stricmp(sp, "on")) s->keep_tone = 1;
         else if (!_stricmp(sp, "off")) s->keep_tone = 0;
+      } else if (!strcmp(line, "declick")) {
+        if (!_stricmp(sp, "on")) s->no_declick = 0;
+        else if (!_stricmp(sp, "off")) s->no_declick = 1;
       } else if (!strcmp(line, "ffmpeg_path")) {
         if (strlen(sp) < sizeof s->ffmpeg_path) strcpy(s->ffmpeg_path, sp);
       } else if (!strcmp(line, "raw_rate")) {
@@ -96,7 +102,7 @@ static void reload(void) {
   wchar_t p[1100];
   SmpSettings s;
   defaults(&s);
-  if (!path_w(p, 1100)) { cur = s; loaded = 1; cur_stamp = 0; return; }
+  if (!path_w(p, 1100)) { cur = s; loaded = 1; cur_stamp = 0; InterlockedExchange(&declick, 1); return; }
   ULONGLONG st = stamp_of(p);
   if (loaded && st == cur_stamp) return;
   if (st) {
@@ -108,6 +114,7 @@ static void reload(void) {
     }
   }
   cur = s; cur_stamp = st; loaded = 1;
+  InterlockedExchange(&declick, !s.no_declick);
 }
 
 void smp_settings_get(SmpSettings *out) {
@@ -132,10 +139,10 @@ int smp_settings_set(const SmpSettings *s) {
   if (!path_w(p, 1100)) return -1;
   tidy(&t);
   t.cache_dir[sizeof t.cache_dir - 1] = 0; t.ffmpeg_path[sizeof t.ffmpeg_path - 1] = 0;
-  int n = snprintf(text, sizeof text, "cache_dir %s\r\ncache_limit_gb %.10g\r\nstretcher %s\r\nkeep_tone %s\r\n"
+  int n = snprintf(text, sizeof text, "cache_dir %s\r\ncache_limit_gb %.10g\r\nstretcher %s\r\nkeep_tone %s\r\ndeclick %s\r\n"
                    "ffmpeg_path %s\r\nraw_rate %d\r\nraw_channels %d\r\nraw_format %s\r\nraw_endian %s\r\n",
                    t.cache_dir, t.cache_limit_gb, t.stretcher == SMP_STRETCH_RUBBERBAND ? "rubberband" : "signalsmith",
-                   t.keep_tone ? "on" : "off", t.ffmpeg_path, t.raw_rate, t.raw_channels, raw_formats[t.raw_format],
+                   t.keep_tone ? "on" : "off", t.no_declick ? "off" : "on", t.ffmpeg_path, t.raw_rate, t.raw_channels, raw_formats[t.raw_format],
                    t.raw_endian == SMP_RAW_BIG ? "big" : "little");
   if (n <= 0 || n >= (int)sizeof text) return -1;
   EnterCriticalSection(&cs);

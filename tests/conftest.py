@@ -29,7 +29,8 @@ class SmpSettings(ctypes.Structure):
                 ("stretcher", ctypes.c_int), ("keep_tone", ctypes.c_int),
                 ("ffmpeg_path", ctypes.c_char * 1024),
                 ("raw_rate", ctypes.c_int), ("raw_channels", ctypes.c_int),
-                ("raw_format", ctypes.c_int), ("raw_endian", ctypes.c_int)]   # raw_format 0 s16, 1 s24, 2 s32, 3 f32, 4 u8; raw_endian 0 little, 1 big
+                ("raw_format", ctypes.c_int), ("raw_endian", ctypes.c_int),   # raw_format 0 s16, 1 s24, 2 s32, 3 f32, 4 u8; raw_endian 0 little, 1 big
+                ("no_declick", ctypes.c_int)]                 # 0: declick on (the default), 1: off
 
 
 class SmpSfMod(ctypes.Structure):

@@ -345,6 +345,12 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   v->src_semis = k ? k->semis : 0;
   v->kl = k || self;
   v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0; v->ug = 1;
+  /* declick: a first frame that isn't near silence fades in (one not read yet counts as not) */
+  v->dc = smp_declick_on(); v->dce = 0; v->din = 1;
+  if (v->dc) {
+    const float *f0 = v->whole || v->v0 > 0 ? v->hp : NULL;
+    if (!f0 || fabsf(f0[0]) > SMP_DECLICK_FLOOR || fabsf(f0[1]) > SMP_DECLICK_FLOOR) v->din = 0;
+  }
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;
   if (vdb < P->p[SMP_P_MIN_VOLUME]) vdb = P->p[SMP_P_MIN_VOLUME];
   v->vgain = db2a(vdb);
@@ -416,6 +422,7 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
   double ratio = v->gl_left > 0 ? base * pow(2.0, v->gl * LOG2_12) : base,
          gmul = v->gl_left > 0 ? pow(2.0, v->gl_step * LOG2_12) : 1;   /* a glide: the ratio's change per sample */
   double sus = db2a(P->p[SMP_P_SUSTAIN]), la = SMP_UFADE * ratio;   /* la: path frames SMP_UFADE samples ahead */
+  double dcn = SMP_DECLICK * e->rate;                    /* a declick fade, in output samples */
   int64_t avail = 0;
   int i;
   if (!v->whole) {
@@ -443,9 +450,21 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
       float yl = ((c3l * tf + c2l) * tf + c1l) * tf + x1l, yr = ((c3r * tf + c2r) * tf + c1r) * tf + x1r;
       g = v->env * v->vgain * v->ug;
       if (v->fading) g *= v->fade;
+      if (v->din < 1) g *= v->din;
+      if (v->dc && !v->loop) {                           /* declick: the last 2 ms of a note that ends on a loud frame */
+        double left = ((double)v->path_len - v->pos) / ratio;
+        if (left < dcn) {
+          if (!v->dce) {
+            float el, er; int got = fetch(v, v->path_len - 1, avail, &el, &er);
+            v->dce = got <= 0 || fabsf(el) > SMP_DECLICK_FLOOR || fabsf(er) > SMP_DECLICK_FLOOR ? 1 : 2;
+          }
+          if (v->dce == 1) g *= left > 0 ? left / dcn : 0;
+        }
+      }
       l[i] += (float)(yl * g * gl); r[i] += (float)(yr * g * gr);
     }
     v->pos += ratio;
+    if (v->din < 1 && (v->din += 1.0 / dcn) > 1) v->din = 1;
     if (v->gl_left > 0) {
       if (--v->gl_left == 0) { v->gl = 0; ratio = base; }
       else { v->gl += v->gl_step; ratio *= gmul; }

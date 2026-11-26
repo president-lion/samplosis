@@ -94,14 +94,16 @@ Settings page:
 1. Stretcher: Signalsmith Stretch, fast, or Rubber Band, slower.
 2. Keep the tone: off or on. On keeps the body of the instrument where it was, so a note shifted up doesn't go
    thin and a note shifted down doesn't go boomy.
-3. Cache folder (edit box), then Browse folder.
-4. Cache size limit (in gigabytes), a slider.
-5. Raw sample rate, Raw channels, Raw sample format and Raw byte order: combo boxes for files ending .raw or .pcm
+3. Declick: on or off. On (the default) fades a Sampler note in over 2 ms when its sample starts mid-wave, and out
+   over its last 2 ms when it ends mid-wave, so neither clicks (like REAPER's item fades).
+4. Cache folder (edit box), then Browse folder.
+5. Cache size limit (in gigabytes), a slider.
+6. Raw sample rate, Raw channels, Raw sample format and Raw byte order: combo boxes for files ending .raw or .pcm
    (see "Settings").
-6. FFmpeg: the ffmpeg.exe in use, or "Not found" (read only), then Browse for FFmpeg.
-7. Cache in use (read only).
-8. Clear cache button.
-9. Back button.
+7. FFmpeg: the ffmpeg.exe in use, or "Not found" (read only), then Browse for FFmpeg.
+8. Cache in use (read only).
+9. Clear cache button.
+10. Back button.
 
 Keys: Tab and Shift+Tab move through the controls and, past the first or last, out to REAPER's FX window.
 
@@ -614,6 +616,13 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
 - Stretcher: `stretcher signalsmith` (default) or `stretcher rubberband`. Keep the tone: `keep_tone off` (default) or
   `keep_tone on`. They apply to every Samplosis in every project. Changing either makes new keep-length copies; the
   old ones stay in the cache, so changing back is instant.
+- Declick: `declick on` (default) or `declick off`. When a note's first frame isn't near silence (above -60 dB, on
+  either channel), the note fades in over 2 ms; this covers a file that starts mid-wave, a Start point moved into
+  the middle and a reversed sample whose file ends mid-wave. A sample that starts at silence keeps its full attack,
+  so drum hits stay sharp. A note that plays to its end without a loop does the same with its last frame: it fades
+  out over its last 2 ms (2 ms of playing time, whatever the pitch). Loops and note-offs aren't changed (the Release
+  already fades a note-off). It applies to every Samplosis at once, from the next note; the SoundFont player has its
+  own envelopes and isn't changed.
 - Raw sample rate (`raw_rate`, default 44100; 8000 to 192000 from a list), Raw channels (`raw_channels 1` or `2`,
   default 2), Raw sample format (`raw_format s16`, `s24`, `s32`, `f32` or `u8`, default s16) and Raw byte order
   (`raw_endian little` or `big`, default little): how a file ending .raw or .pcm is read, since it has no header to
