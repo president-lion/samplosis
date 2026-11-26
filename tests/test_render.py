@@ -567,6 +567,32 @@ def test_free_while_other_engines_render(lib, tmp_path):
     assert took < 0.5, took
 
 
+def test_declick_loop_from_the_start_with_keep_length(lib, tmp_path):
+    """A loop from the first frame, played off its root from a keep-length copy: nothing before the loop start to
+    crossfade with, so with declick the note dips around each wrap; without it, it clicks."""
+    setup(lib)
+    n = np.arange(40025)                                   # ends at a peak: the wrap to frame 0 jumps
+    data = (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32)
+    worst = {}
+    for on in (True, False):
+        d = tmp_path / ("on" if on else "off")
+        d.mkdir()
+        point_cache(lib, d / "cache", declick=on)
+        s = load(lib, d, data, "tone A4.wav")
+        e = KL(lib, d, s, 72, 72, host_rate=44100)
+        e.set(18, 1)                                       # loop forward, from 0 %
+        e.wait()
+        y = e.render("on 72 127 0\noff 72 170000", 4.0)
+        x = y[2000:165000]
+        ideal = np.percentile(np.abs(x), 99.9) * 2 * np.pi * 441 * 2 ** (3 / 12) / 44100
+        worst[on] = np.abs(np.diff(x)).max() / ideal
+        assert lib.smp_engine_underruns(e.e) == 0
+        e.free()
+    point_cache(lib, tmp_path / "cache")
+    assert worst[False] > 5, worst
+    assert worst[True] < 1.5, worst
+
+
 def test_loop_wrap_doesnt_pop_with_keep_length(lib, tmp_path):
     """A seamless loop (a 441 Hz sine, its loop exactly 200 periods) played off its root with keep length: the copy's
     loop no longer meets itself (the period moved, the loop points didn't), so its end crossfades into the frames

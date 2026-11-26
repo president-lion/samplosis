@@ -28,7 +28,8 @@
 typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n, end; float *lr; int dip; } SmpStartHead;
 /* The same struct, for declick (the source's forward loop, e->lt): n frames of crossfaded tail when the loop's end
    doesn't meet its start and there is room before the loop start; else n 0 and dip 1 when it doesn't meet (no room:
-   the note fades out and back in around each wrap), dip 0 when it does (nothing to do). */
+   the note fades out and back in around each wrap), dip 0 when it does (nothing to do). A keep-length copy's tail
+   (SmpKl.lt) has dip 1 when there's no room to crossfade: used only with declick on. */
 #define SMP_LOOP_XFADE 0.085                    /* seconds of a loop tail's crossfade, at most */
 #define SMP_MAXSHRET 64
 

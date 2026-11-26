@@ -369,6 +369,9 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
         if (e->offline) { smp_worker_wait_idle(e); h = lt_for(e, v); }
       }
       if (h) lt_take(v, h); else v->ltw = 1;              /* taken up before the first wrap, when it's ready */
+    } else if (loop == 1 && k) {                         /* a copy's loop with no room to crossfade: dip */
+      const SmpStartHead *lt = k->lt;
+      if (lt && lt->at == rls && lt->end == re && lt->n == 0) v->ldip = lt->dip;
     }
   }
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;

@@ -313,6 +313,17 @@ def test_declick_loop_from_the_start_dips_at_the_wrap(lib, tmp_path):
     assert np.abs(on[FADE + 2:40025 - FADE - 2] - off[FADE + 2:40025 - FADE - 2]).max() < 1e-6   # elsewhere untouched
 
 
+def test_declick_loop_starting_on_a_spike(lib, tmp_path):
+    """The file's first frame is a lone spike (0.4, then the wave from 0), and the loop starts there: the wave just
+    after the loop start isn't steep, the spike is. Every wrap plays the spike unless declick dips around it."""
+    n = np.arange(40000)
+    data = (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32)   # seamless from 0 % but for the spike
+    data[0] = 0.4
+    on, off = loop_pair(lib, tmp_path, data, 0)
+    assert worst_step(off[1000:], 441) > 5
+    assert worst_step(on[1000:], 441) < 1.5
+
+
 def test_declick_loop_with_room_crossfades(lib, tmp_path):
     """A loop from 50 % whose end doesn't meet its start: the end crossfades into the frames before the loop start,
     so it doesn't dip."""

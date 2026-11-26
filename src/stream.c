@@ -199,6 +199,8 @@ static void kl_sh_build(SmpEngine *e) {
    SMP_LOOP_XFADE, the part before the loop and half the loop. With detect (declick), first looks whether the loop's
    end meets its start: the frame after the end, carried on from the last two, against the loop's first frame. If it
    does, n 0 (nothing to do); if it doesn't and the crossfade would be shorter than a declick fade, n 0 and dip 1.
+   The wave's own steepness is from the frames either side away from the join (the 3 before the end, and the 3 after
+   the loop's first frame), so a spike on the join itself doesn't count as steep.
    NULL when it can't be read. */
 static SmpStartHead *loop_tail(SmpEntry *src, int64_t rs, int64_t re, int64_t rls, int detect) {
   SmpStartHead *h = calloc(1, sizeof *h); int64_t n, j; float *b;
@@ -206,14 +208,18 @@ static SmpStartHead *loop_tail(SmpEntry *src, int64_t rs, int64_t re, int64_t rl
   if (!h) return NULL;
   h->src = src; h->at = rls; h->end = re;
   if (detect) {
-    float a[4], c[4]; int ch, bad = 0;
-    if (re - rls < 4 || smp_entry_read(src, (uint64_t)(re - 2), a, 2) != 2 || smp_entry_read(src, (uint64_t)rls, c, 2) != 2) {
-      if (re - rls >= 4) { free(h); return NULL; }
+    float a[8], c[8]; int ch, j, bad = 0;          /* a: the loop's last 4 frames; c: its first 4 */
+    if (re - rls < 8 || smp_entry_read(src, (uint64_t)(re - 4), a, 4) != 4 || smp_entry_read(src, (uint64_t)rls, c, 4) != 4) {
+      if (re - rls >= 8) { free(h); return NULL; }
       return h;                                           /* a loop this short: left as it is */
     }
     for (ch = 0; ch < 2; ch++) {
-      double x0 = a[ch], x1 = a[2 + ch], y0 = c[ch], y1 = c[2 + ch];
-      double err = fabs(y0 - (2 * x1 - x0)), step = fabs(x1 - x0) > fabs(y1 - y0) ? fabs(x1 - x0) : fabs(y1 - y0);
+      double x0 = a[4 + ch], x1 = a[6 + ch], step = 0, err = fabs(c[ch] - (2 * x1 - x0));
+      for (j = 0; j < 3; j++) {
+        double da = fabs(a[2 * (j + 1) + ch] - a[2 * j + ch]), dc = fabs(c[2 * (j + 1) + ch] - c[2 * j + ch]);
+        if (da > step) step = da;
+        if (j > 0 && dc > step) step = dc;                /* not c[0] to c[1]: the join's own frame */
+      }
       if (err > SMP_DECLICK_FLOOR && err > 1.5 * step) bad = 1;
     }
     if (!bad) return h;
@@ -222,7 +228,7 @@ static SmpStartHead *loop_tail(SmpEntry *src, int64_t rs, int64_t re, int64_t rl
   if (n > rls - rs) n = rls - rs;
   if (n > (re - rls) / 2) n = (re - rls) / 2;
   if (detect && n < (int64_t)(SMP_DECLICK * rate)) { h->dip = 1; return h; }
-  if (n < 8) return h;                                    /* too short to crossfade: as it is */
+  if (n < 8) { h->dip = 1; return h; }                    /* too short to crossfade: a dip, with declick on */
   if (!(h->lr = malloc((size_t)n * 8)) || !(b = malloc((size_t)n * 8))) { free(h->lr); free(h); return NULL; }
   if (smp_entry_read(src, (uint64_t)(re - n), h->lr, (long)n) != n || smp_entry_read(src, (uint64_t)(rls - n), b, (long)n) != n) {
     free(b); free(h->lr); free(h); return NULL;
