@@ -195,6 +195,71 @@ static void kl_sh_build(SmpEngine *e) {
   }
 }
 
+/* A loop tail: the loop's last n frames crossfaded (equal power) into the n frames before the loop start, n at most
+   SMP_LOOP_XFADE, the part before the loop and half the loop. With detect (declick), first looks whether the loop's
+   end meets its start: the frame after the end, carried on from the last two, against the loop's first frame. If it
+   does, n 0 (nothing to do); if it doesn't and the crossfade would be shorter than a declick fade, n 0 and dip 1.
+   NULL when it can't be read. */
+static SmpStartHead *loop_tail(SmpEntry *src, int64_t rs, int64_t re, int64_t rls, int detect) {
+  SmpStartHead *h = calloc(1, sizeof *h); int64_t n, j; float *b;
+  int rate = smp_entry_rate(src);
+  if (!h) return NULL;
+  h->src = src; h->at = rls; h->end = re;
+  if (detect) {
+    float a[4], c[4]; int ch, bad = 0;
+    if (re - rls < 4 || smp_entry_read(src, (uint64_t)(re - 2), a, 2) != 2 || smp_entry_read(src, (uint64_t)rls, c, 2) != 2) {
+      if (re - rls >= 4) { free(h); return NULL; }
+      return h;                                           /* a loop this short: left as it is */
+    }
+    for (ch = 0; ch < 2; ch++) {
+      double x0 = a[ch], x1 = a[2 + ch], y0 = c[ch], y1 = c[2 + ch];
+      double err = fabs(y0 - (2 * x1 - x0)), step = fabs(x1 - x0) > fabs(y1 - y0) ? fabs(x1 - x0) : fabs(y1 - y0);
+      if (err > SMP_DECLICK_FLOOR && err > 1.5 * step) bad = 1;
+    }
+    if (!bad) return h;
+  }
+  n = (int64_t)(SMP_LOOP_XFADE * rate);
+  if (n > rls - rs) n = rls - rs;
+  if (n > (re - rls) / 2) n = (re - rls) / 2;
+  if (detect && n < (int64_t)(SMP_DECLICK * rate)) { h->dip = 1; return h; }
+  if (n < 8) return h;                                    /* too short to crossfade: as it is */
+  if (!(h->lr = malloc((size_t)n * 8)) || !(b = malloc((size_t)n * 8))) { free(h->lr); free(h); return NULL; }
+  if (smp_entry_read(src, (uint64_t)(re - n), h->lr, (long)n) != n || smp_entry_read(src, (uint64_t)(rls - n), b, (long)n) != n) {
+    free(b); free(h->lr); free(h); return NULL;
+  }
+  for (j = 0; j < n; j++) {
+    double t = ((double)j + 0.5) / (double)n * 1.5707963267948966, go = cos(t), gi = sin(t);
+    h->lr[2 * j] = (float)(h->lr[2 * j] * go + b[2 * j] * gi);
+    h->lr[2 * j + 1] = (float)(h->lr[2 * j + 1] * go + b[2 * j + 1] * gi);
+  }
+  free(b);
+  h->n = n;
+  return h;
+}
+
+static void lt_publish(SmpEngine *e, int d, SmpStartHead *h) {   /* the caller made room (sh_room) */
+  SmpStartHead *old = InterlockedExchangePointer((PVOID volatile *)&e->lt[d], h);
+  if (!old) return;
+  e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++;
+}
+
+/* Declick's loop fix for the source, built when a note-on asks (want_lt). One for another sample is dropped. */
+static void lt_build(SmpEngine *e, int d) {
+  SmpSample *s = e->sample; SmpEntry *src; SmpStartHead *cur = e->lt[d], *h; int64_t F, rs, re, rls;
+  if (cur && cur->s != s && sh_room(e)) { lt_publish(e, d, NULL); cur = NULL; }
+  if (!e->want_lt[d]) return;
+  InterlockedExchange(&e->want_lt[d], 0);
+  if (!s) return;
+  src = d ? *(SmpEntry *volatile *)&s->rev : s->fwd;
+  if (!src || (F = (int64_t)smp_entry_frames(src)) <= 0) return;
+  smp_region(smp_eng_param(e, SMP_P_START), smp_eng_param(e, SMP_P_END), smp_eng_param(e, SMP_P_LOOP_START), F, d, &rs, &re, &rls);
+  if (cur && cur->s == s && cur->src == src && cur->at == rls && cur->end == re) return;
+  if (cur && !sh_room(e)) { InterlockedExchange(&e->want_lt[d], 1); return; }
+  if (!(h = loop_tail(src, rs, re, rls, 1))) return;
+  h->s = s;
+  lt_publish(e, d, h);
+}
+
 /* Loop tails for keep-length copies, built when a note-on asks (want_lt) for the loop as it is now: the loop's last
    n frames crossfade (equal power) into the n frames before the loop start, so the end flows into the start. n is
    SMP_LOOP_XFADE at most, and no more than the part before the loop or half the loop. Replaced ones are retired as
@@ -202,7 +267,7 @@ static void kl_sh_build(SmpEngine *e) {
 static void kl_lt_build(SmpEngine *e) {
   int i;
   for (i = 0; i < SMP_KLN; i++) {
-    SmpKl *k = e->kl[i]; SmpStartHead *cur, *h, *old; int64_t F, rs, re, rls, n, j; float *b;
+    SmpKl *k = e->kl[i]; SmpStartHead *cur, *h, *old; int64_t F, rs, re, rls;
     if (!k || !k->want_lt) continue;
     InterlockedExchange(&k->want_lt, 0);
     F = (int64_t)smp_entry_frames(k->e);
@@ -211,24 +276,7 @@ static void kl_lt_build(SmpEngine *e) {
     cur = k->lt;
     if (cur && cur->at == rls && cur->end == re) continue;
     if (cur && !sh_room(e)) { InterlockedExchange(&k->want_lt, 1); continue; }
-    n = (int64_t)(SMP_LOOP_XFADE * smp_entry_rate(k->e));
-    if (n > rls - rs) n = rls - rs;
-    if (n > (re - rls) / 2) n = (re - rls) / 2;
-    if (n < 8) n = 0;                                   /* too short to crossfade: the copy as it is */
-    h = calloc(1, sizeof *h);
-    if (!h || (n && !(h->lr = malloc((size_t)n * 8)))) { free(h); continue; }
-    b = n ? malloc((size_t)n * 8) : NULL;
-    if (n && (!b || smp_entry_read(k->e, (uint64_t)(re - n), h->lr, (long)n) != n ||
-              smp_entry_read(k->e, (uint64_t)(rls - n), b, (long)n) != n)) {
-      free(b); free(h->lr); free(h); continue;          /* can't read it: the note resamples, as without a copy */
-    }
-    for (j = 0; j < n; j++) {
-      double t = ((double)j + 0.5) / (double)n * 1.5707963267948966, go = cos(t), gi = sin(t);
-      h->lr[2 * j] = (float)(h->lr[2 * j] * go + b[2 * j] * gi);
-      h->lr[2 * j + 1] = (float)(h->lr[2 * j + 1] * go + b[2 * j + 1] * gi);
-    }
-    free(b);
-    h->s = NULL; h->src = k->e; h->at = rls; h->end = re; h->n = n;
+    if (!(h = loop_tail(k->e, rs, re, rls, 0))) continue;   /* can't read it: the note resamples, as without a copy */
     old = InterlockedExchangePointer((PVOID volatile *)&k->lt, h);
     if (old) { e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++; }
   }
@@ -252,6 +300,8 @@ static DWORD WINAPI worker(LPVOID arg) {
     sh_build(e, 1);
     kl_sh_build(e);
     kl_lt_build(e);
+    lt_build(e, 0);
+    lt_build(e, 1);
     sh_sweep(e);
     InterlockedIncrement64(&e->wpass);
     SetEvent(e->widle);
@@ -285,6 +335,8 @@ void smp_worker_stop(SmpEngine *e) {   /* also frees every start head: call only
   e->nshret = 0;
   sh_free(e->sh[0]); sh_free(e->sh[1]);
   e->sh[0] = e->sh[1] = NULL;
+  sh_free(e->lt[0]); sh_free(e->lt[1]);
+  e->lt[0] = e->lt[1] = NULL;
 }
 
 void smp_worker_wait_idle(SmpEngine *e) {

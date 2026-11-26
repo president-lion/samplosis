@@ -25,7 +25,10 @@
    made by the worker thread and published by atomic pointer. The same struct holds a keep-length copy's loop tail
    (SmpKl.lt): its loop's last n frames, crossfaded into the n frames before the loop start (at: the loop start, end:
    the loop's end), so the loop meets itself; n 0 when the loop is too short to crossfade */
-typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n, end; float *lr; } SmpStartHead;
+typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n, end; float *lr; int dip; } SmpStartHead;
+/* The same struct, for declick (the source's forward loop, e->lt): n frames of crossfaded tail when the loop's end
+   doesn't meet its start and there is room before the loop start; else n 0 and dip 1 when it doesn't meet (no room:
+   the note fades out and back in around each wrap), dip 0 when it does (nothing to do). */
 #define SMP_LOOP_XFADE 0.085                    /* seconds of a loop tail's crossfade, at most */
 #define SMP_MAXSHRET 64
 
@@ -69,7 +72,8 @@ typedef struct SmpVoice {
   const float *head; uint64_t head_frames;
   const float *hp;                       /* path frames below v0 come from here: the head or a start head */
   const SmpStartHead *volatile sh;       /* the start head in use, if any (its retirement check reads this) */
-  const SmpStartHead *volatile lt;       /* a keep-length copy's loop tail in use (forward loop), or NULL */
+  const SmpStartHead *volatile lt;       /* a loop tail in use (forward loop), or NULL */
+  int ldip, ltw, ltd;                    /* declick: dip around each wrap; waiting for e->lt[ltd] */
   double src_semis;                      /* semitones already in src (0 when resampling) */
   int kl;                                /* src is a keep-length copy (or the source standing in for shift 0):
                                             speed is already in it, so it doesn't scale the rate */
@@ -114,6 +118,8 @@ struct SmpEngine {
   HANDLE work, widle, worker;           /* low-priority worker: reversed copies and start heads */
   volatile LONG64 wpass;                 /* passes the worker has finished */
   SmpStartHead *volatile sh[2];          /* forward, reversed */
+  SmpStartHead *volatile lt[2];          /* declick's loop fix for the source, forward and reversed */
+  volatile LONG want_lt[2];              /* the audio thread asks the worker for it */
   struct { SmpStartHead *h; LONG64 a0; } shret[SMP_MAXSHRET]; int nshret;   /* worker only */
   int offline;                           /* set only inside smp_engine_render_test: note-ons may wait for the streamer */
   CRITICAL_SECTION rev_cs;               /* main and streamer, around smp_sample_reversed */

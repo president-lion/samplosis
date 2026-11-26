@@ -119,10 +119,11 @@ SMP_API void smp_engine_collect(SmpEngine *e) {
   if (!e) return;
   while (i < e->nret) {
     SmpRetired *r = &e->ret[i];
-    SmpStartHead *h0 = e->sh[0], *h1 = e->sh[1];
+    SmpStartHead *h0 = e->sh[0], *h1 = e->sh[1], *t0 = e->lt[0], *t1 = e->lt[1];
     if (r->phase == 0 && e->epoch >= r->a0 + 2 && !voice_uses(e, r->s)) { r->s0 = e->spass; r->w0 = e->wpass; r->phase = 1; }
     if (r->phase == 1 && e->spass >= r->s0 + 2 && e->wpass >= r->w0 + 2 &&
-        !(h0 && h0->s == r->s) && !(h1 && h1->s == r->s) && e->r_using != r->s) {
+        !(h0 && h0->s == r->s) && !(h1 && h1->s == r->s) && !(t0 && t0->s == r->s) && !(t1 && t1->s == r->s) &&
+        e->r_using != r->s) {
       smp_sample_free(r->s);
       e->ret[i] = e->ret[--e->nret];
       continue;
@@ -285,6 +286,16 @@ static SmpVoice *carried(SmpEngine *e) {             /* Voices at 1, legato: the
 }
 static int mono_legato(const Snap *P) { return P->p[SMP_P_GLIDE_MODE] >= 0.5 && (int)P->p[SMP_P_VOICES] == 1; }
 
+static void lt_take(SmpVoice *v, const SmpStartHead *h) {
+  v->ltw = 0;
+  if (h->n > 0) v->lt = h; else v->ldip = h->dip;
+}
+/* the voice's sample, region and loop as declick's loop fix (e->lt) was built for, or NULL */
+static const SmpStartHead *lt_for(const SmpEngine *e, const SmpVoice *v) {
+  const SmpStartHead *h = e->lt[v->ltd];
+  return h && h->s == v->smp && h->src == v->src && h->at == v->rls && h->end == v->re ? h : NULL;
+}
+
 static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   SmpSample *s = e->cur; SmpEntry *src, *rev; SmpVoice *v = NULL; SmpKl *k; int self;
   int i, count = 0, voices = (int)P->p[SMP_P_VOICES], nr = e->nring;   /* slots with a ring */
@@ -346,10 +357,19 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   v->kl = k || self;
   v->key = key; v->pos = 0; v->fading = 0; v->underrun = 0; v->ug = 1;
   /* declick: a first frame that isn't near silence fades in (one not read yet counts as not) */
-  v->dc = smp_declick_on(); v->dce = 0; v->din = 1;
+  v->dc = smp_declick_on(); v->dce = 0; v->din = 1; v->ldip = 0; v->ltw = 0; v->ltd = rev ? 1 : 0;
   if (v->dc) {
     const float *f0 = v->whole || v->v0 > 0 ? v->hp : NULL;
     if (!f0 || fabsf(f0[0]) > SMP_DECLICK_FLOOR || fabsf(f0[1]) > SMP_DECLICK_FLOOR) v->din = 0;
+    if (loop == 1 && !k) {                               /* the loop's end against its start (the worker looks) */
+      const SmpStartHead *h; v->smp = s; h = lt_for(e, v);
+      if (!h) {
+        InterlockedExchange(&e->want_lt[v->ltd], 1);
+        SetEvent(e->work);
+        if (e->offline) { smp_worker_wait_idle(e); h = lt_for(e, v); }
+      }
+      if (h) lt_take(v, h); else v->ltw = 1;              /* taken up before the first wrap, when it's ready */
+    }
   }
   vdb = -P->p[SMP_P_VELOCITY_SENS] / 100.0 * 40.0 * (127 - (vel > 127 ? 127 : vel)) / 126.0;
   if (vdb < P->p[SMP_P_MIN_VOLUME]) vdb = P->p[SMP_P_MIN_VOLUME];
@@ -430,6 +450,13 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
     if (SMP_TAGOF(f) == (v->gen & 0xFFFFFF)) avail = SMP_VALOF(f);
   }
   if (v->stage == 2) v->env = sus;
+  if (v->ltw) {                                          /* declick's loop fix came after the note-on: take it up */
+    const SmpStartHead *h = lt_for(e, v);                /* unless the note is already in the part it changes */
+    int64_t at, run; int dir;
+    if (h && smp_path_run(v->rs, v->re, v->rls, 1, (int64_t)v->pos, &at, &dir, &run) &&
+        (double)run > (double)(h->n + 4) + 2 * dcn * ratio + (b - a) * ratio)
+      lt_take(v, h);
+  }
   for (i = a; i < b; i++) {
     int64_t i0 = (int64_t)floor(v->pos);
     float x0l, x0r, x1l, x1r, x2l, x2r, x3l, x3r;
@@ -459,6 +486,15 @@ static void render_voice(SmpEngine *e, SmpVoice *v, const Snap *P, float *l, flo
             v->dce = got <= 0 || fabsf(el) > SMP_DECLICK_FLOOR || fabsf(er) > SMP_DECLICK_FLOOR ? 1 : 2;
           }
           if (v->dce == 1) g *= left > 0 ? left / dcn : 0;
+        }
+      }
+      if (v->ldip) {                                     /* declick: down to silence at each wrap and back up */
+        double first = (double)(v->path_len), L = (double)(v->re - v->rls), to, since = 1e300, m;
+        if (L > 4 * dcn * ratio) {
+          if (v->pos < first) to = first - v->pos;
+          else { double w = fmod(v->pos - first, L); to = L - w; since = w; }
+          m = (to < since ? to : since) / ratio;
+          if (m < dcn) g *= m / dcn;
         }
       }
       l[i] += (float)(yl * g * gl); r[i] += (float)(yr * g * gr);

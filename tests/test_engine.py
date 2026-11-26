@@ -278,6 +278,82 @@ def test_loop_forward_and_pingpong(lib, tmp_path):
             e.free()
 
 
+def worst_step(x, freq, rate=44100):
+    """The largest jump between frames, against the sine's own steepest step."""
+    ideal = np.percentile(np.abs(x), 99.9) * 2 * np.pi * freq / rate
+    return np.abs(np.diff(x)).max() / ideal
+
+
+def loop_pair(lib, tmp_path, data, loop_start, secs=3.0, rev=0):
+    """A held note on a forward loop, with declick on and off (44.1 kHz in and out)."""
+    ys = []
+    for on in (True, False):
+        d = tmp_path / ("on" if on else "off")
+        d.mkdir()
+        e = Engine(lib, d, data, host_rate=44100, declick=on)
+        e.set(LOOP, 1); e.set(LOOP_START, loop_start); e.set(REVERSE, rev)
+        ys.append(e.render("on %d 127 0" % e.root, secs)[:, 0])
+        assert lib.smp_engine_underruns(e.e) == 0
+        e.free()
+    point_cache(lib, tmp_path / "cache")
+    return ys
+
+
+def test_declick_loop_from_the_start_dips_at_the_wrap(lib, tmp_path):
+    """The loop starts at the file's first frame (nothing before it to crossfade with) and the file ends at a peak:
+    every wrap jumps by the whole amplitude. Declick fades out the 2 ms before each wrap and in the 2 ms after."""
+    n = np.arange(40025)
+    on, off = loop_pair(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), 0)
+    assert worst_step(off[1000:], 441) > 5                # without it: a click at every wrap
+    assert worst_step(on[1000:], 441) < 1.5
+    wraps = [40025 * k for k in (1, 2, 3)]
+    for w in wraps:                                        # down to silence at the wrap, full level 2 ms either side
+        assert np.abs(on[w - 3:w + 3]).max() < 0.05, w
+        assert np.abs(on[w + FADE + 10:w + FADE + 110]).max() > 0.45, w
+    assert np.abs(on[FADE + 2:40025 - FADE - 2] - off[FADE + 2:40025 - FADE - 2]).max() < 1e-6   # elsewhere untouched
+
+
+def test_declick_loop_with_room_crossfades(lib, tmp_path):
+    """A loop from 50 % whose end doesn't meet its start: the end crossfades into the frames before the loop start,
+    so it doesn't dip."""
+    n = np.arange(40025)
+    on, off = loop_pair(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), 50)
+    assert worst_step(off[1000:], 441) > 3
+    assert worst_step(on[1000:], 441) < 1.5
+    first = 40025
+    loop = 40025 - int(0.5 * 40025)
+    for w in (first, first + loop, first + 2 * loop):
+        assert np.abs(on[w - 200:w + 200]).max() > 0.45, w   # no dip: a 441 Hz sine still reaches its peaks
+    cut = 40025 - int(0.085 * 44100) - 10
+    assert np.abs(on[FADE + 2:cut] - off[FADE + 2:cut]).max() < 1e-6
+
+
+def test_declick_leaves_a_seamless_loop_alone(lib, tmp_path):
+    n = np.arange(40000)                                  # 400 periods; from 50 %: the loop is exactly 200
+    on, off = loop_pair(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), 50)
+    assert np.abs(on - off).max() < 1e-6
+
+
+def test_declick_loop_reversed(lib, tmp_path):
+    n = np.arange(40025)                                  # reversed, from 0 %: the reversed file ends at frame 0 (0)
+    data = (0.5 * np.sin(2 * np.pi * n / 100 + 0.3)).astype(np.float32)   # and starts at a peak: a jump
+    on, off = loop_pair(lib, tmp_path, data, 0, rev=1)
+    assert worst_step(off[1000:], 441) > 3
+    assert worst_step(on[1000:], 441) < 1.5
+
+
+def test_declick_loop_realtime(lib, tmp_path):
+    """Played live, the loop's fix is built in the background and the note picks it up before its first wrap."""
+    n = np.arange(44125)
+    e = Engine(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), host_rate=44100)
+    e.set(LOOP, 1); e.set(LOOP_START, 0)
+    lib.smp_engine_note_on(e.e, e.root, 127, 0)
+    blocks = 3 * 44100 // 256
+    y = play_live(lib, e, blocks, speed=2.0, keep=blocks)
+    assert worst_step(y[1000:], 441) < 1.5
+    e.free()
+
+
 def test_reverse(lib, tmp_path):
     rate = 48000                                           # same rate as the engine: output equals the data
     rng = np.random.default_rng(3)

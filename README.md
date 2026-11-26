@@ -95,7 +95,8 @@ Settings page:
 2. Keep the tone: off or on. On keeps the body of the instrument where it was, so a note shifted up doesn't go
    thin and a note shifted down doesn't go boomy.
 3. Declick: on or off. On (the default) fades a Sampler note in over 2 ms when its sample starts mid-wave, and out
-   over its last 2 ms when it ends mid-wave, so neither clicks (like REAPER's item fades).
+   over its last 2 ms when it ends mid-wave, and smooths a forward loop whose end doesn't meet its start, so none of
+   them click (like REAPER's item fades).
 4. Cache folder (edit box), then Browse folder.
 5. Cache size limit (in gigabytes), a slider.
 6. Raw sample rate, Raw channels, Raw sample format and Raw byte order: combo boxes for files ending .raw or .pcm
@@ -620,8 +621,13 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
   either channel), the note fades in over 2 ms; this covers a file that starts mid-wave, a Start point moved into
   the middle and a reversed sample whose file ends mid-wave. A sample that starts at silence keeps its full attack,
   so drum hits stay sharp. A note that plays to its end without a loop does the same with its last frame: it fades
-  out over its last 2 ms (2 ms of playing time, whatever the pitch). Loops and note-offs aren't changed (the Release
-  already fades a note-off). It applies to every Samplosis at once, from the next note; the SoundFont player has its
+  out over its last 2 ms (2 ms of playing time, whatever the pitch). A forward loop is checked where it wraps: the
+  frame after the loop's end, carried on from the last two, against the loop's first frame. When they don't meet
+  (a jump steeper than the wave itself), the loop's last 85 ms (less for a short loop) crossfade into the sound just
+  before the loop start; when the loop starts too near the beginning for that (under 2 ms before it), the note
+  fades out over the 2 ms before each wrap and back in over the 2 ms after. A loop that already meets itself plays as
+  it is. Played live, this is worked out in the background just after the note starts, and taken up before its
+  first wrap. Ping-pong loops and note-offs aren't changed (the Release already fades a note-off). It applies to every Samplosis at once, from the next note; the SoundFont player has its
   own envelopes and isn't changed.
 - Raw sample rate (`raw_rate`, default 44100; 8000 to 192000 from a list), Raw channels (`raw_channels 1` or `2`,
   default 2), Raw sample format (`raw_format s16`, `s24`, `s32`, `f32` or `u8`, default s16) and Raw byte order
