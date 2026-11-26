@@ -113,7 +113,7 @@ void smp_stream_wait_idle(SmpEngine *e) {
 /* ---- the worker ---- */
 static int sh_in_use(const SmpEngine *e, const SmpStartHead *h) {
   int i;
-  for (i = 0; i < SMP_MAXV; i++) if (e->v[i].live && e->v[i].sh == h) return 1;
+  for (i = 0; i < SMP_MAXV; i++) if (e->v[i].live && (e->v[i].sh == h || e->v[i].lt == h)) return 1;
   return 0;
 }
 
@@ -195,6 +195,45 @@ static void kl_sh_build(SmpEngine *e) {
   }
 }
 
+/* Loop tails for keep-length copies, built when a note-on asks (want_lt) for the loop as it is now: the loop's last
+   n frames crossfade (equal power) into the n frames before the loop start, so the end flows into the start. n is
+   SMP_LOOP_XFADE at most, and no more than the part before the loop or half the loop. Replaced ones are retired as
+   start heads are. */
+static void kl_lt_build(SmpEngine *e) {
+  int i;
+  for (i = 0; i < SMP_KLN; i++) {
+    SmpKl *k = e->kl[i]; SmpStartHead *cur, *h, *old; int64_t F, rs, re, rls, n, j; float *b;
+    if (!k || !k->want_lt) continue;
+    InterlockedExchange(&k->want_lt, 0);
+    F = (int64_t)smp_entry_frames(k->e);
+    if (F <= 0) continue;
+    smp_region(smp_eng_param(e, SMP_P_START), smp_eng_param(e, SMP_P_END), smp_eng_param(e, SMP_P_LOOP_START), F, k->rev, &rs, &re, &rls);
+    cur = k->lt;
+    if (cur && cur->at == rls && cur->end == re) continue;
+    if (cur && !sh_room(e)) { InterlockedExchange(&k->want_lt, 1); continue; }
+    n = (int64_t)(SMP_LOOP_XFADE * smp_entry_rate(k->e));
+    if (n > rls - rs) n = rls - rs;
+    if (n > (re - rls) / 2) n = (re - rls) / 2;
+    if (n < 8) n = 0;                                   /* too short to crossfade: the copy as it is */
+    h = calloc(1, sizeof *h);
+    if (!h || (n && !(h->lr = malloc((size_t)n * 8)))) { free(h); continue; }
+    b = n ? malloc((size_t)n * 8) : NULL;
+    if (n && (!b || smp_entry_read(k->e, (uint64_t)(re - n), h->lr, (long)n) != n ||
+              smp_entry_read(k->e, (uint64_t)(rls - n), b, (long)n) != n)) {
+      free(b); free(h->lr); free(h); continue;          /* can't read it: the note resamples, as without a copy */
+    }
+    for (j = 0; j < n; j++) {
+      double t = ((double)j + 0.5) / (double)n * 1.5707963267948966, go = cos(t), gi = sin(t);
+      h->lr[2 * j] = (float)(h->lr[2 * j] * go + b[2 * j] * gi);
+      h->lr[2 * j + 1] = (float)(h->lr[2 * j + 1] * go + b[2 * j + 1] * gi);
+    }
+    free(b);
+    h->s = NULL; h->src = k->e; h->at = rls; h->end = re; h->n = n;
+    old = InterlockedExchangePointer((PVOID volatile *)&k->lt, h);
+    if (old) { e->shret[e->nshret].h = old; e->shret[e->nshret].a0 = e->epoch; e->nshret++; }
+  }
+}
+
 static DWORD WINAPI worker(LPVOID arg) {
   SmpEngine *e = arg;
   while (!e->quit) {
@@ -212,6 +251,7 @@ static DWORD WINAPI worker(LPVOID arg) {
     sh_build(e, 0);
     sh_build(e, 1);
     kl_sh_build(e);
+    kl_lt_build(e);
     sh_sweep(e);
     InterlockedIncrement64(&e->wpass);
     SetEvent(e->widle);

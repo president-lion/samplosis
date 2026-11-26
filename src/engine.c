@@ -239,6 +239,15 @@ static SmpKl *kl_pick(SmpEngine *e, const Snap *P, SmpSample *s, int rev, int ke
       if (!sh || sh->at != rs) return NULL;              /* resample until it's there */
     }
   }
+  if (P->p[SMP_P_LOOP] >= 0.5 && P->p[SMP_P_LOOP] < 1.5 && P->p[SMP_P_OBEY_NOTE_OFF] >= 0.5) {
+    const SmpStartHead *lt = k->lt;                      /* a forward loop: the copy's tail, so the wrap doesn't pop */
+    if (!lt || lt->at != rls || lt->end != re) {
+      InterlockedExchange(&k->want_lt, 1);
+      SetEvent(e->work);
+      if (e->offline) { smp_worker_wait_idle(e); lt = k->lt; }
+      if (!lt || lt->at != rls || lt->end != re) return NULL;   /* resample until it's there: no pop meanwhile */
+    }
+  }
   return k;
 }
 
@@ -321,6 +330,11 @@ static void note_on(SmpEngine *e, const Snap *P, int key, int vel) {
   v->whole = smp_entry_whole(src);
   v->path_len = re - rs;
   v->sh = NULL; v->hp = v->head + 2 * rs; v->v0 = 0;
+  v->lt = NULL;
+  if (k && loop == 1) {                                  /* kl_pick saw it ready for this loop */
+    const SmpStartHead *lt = k->lt;
+    if (lt && lt->at == rls && lt->end == re && lt->n > 0) v->lt = lt;
+  }
   if (v->whole) v->v0 = SMP_NOFILL;
   else {
     SmpStartHead *sh = k ? k->sh : e->sh[rev ? 1 : 0];
@@ -379,6 +393,11 @@ static double voice_semis(const SmpEngine *e, const SmpVoice *v, const Snap *P) 
 static __inline int fetch(const SmpVoice *v, int64_t idx, int64_t avail, float *L, float *R) {
   const float *f;
   if (idx < 0 || (!v->loop && idx >= v->path_len)) { *L = *R = 0; return 0; }
+  if (v->lt) {                                           /* the loop's last frames: its crossfaded tail */
+    int64_t first = v->re - v->rs, at = idx < first ? v->rs + idx : v->rls + (idx - first) % (v->re - v->rls);
+    int64_t z = at - (v->re - v->lt->n);
+    if (z >= 0) { f = v->lt->lr + 2 * z; *L = f[0]; *R = f[1]; return 1; }
+  }
   if (v->whole) {
     int64_t at, run; int dir;
     if (!smp_path_run(v->rs, v->re, v->rls, v->loop, idx, &at, &dir, &run)) { *L = *R = 0; return 0; }

@@ -548,6 +548,11 @@ to 35 and are described with the SoundFont page.
 - Lowest velocity and Highest velocity: 1 to 127.
 - Obey note off: on by default. Off lets the whole sample play out when the key is released, as a one-shot.
 - Loop: off, forward or pingpong. Loop start: percent into the selected region.
+  With Keep length on, a key away from the root plays a pitch-shifted copy whose loop no longer quite meets itself
+  (the pitch moved, the loop points didn't), so a forward loop's last 85 ms (less for a short loop) crossfade into
+  the sound just before the loop start: the wrap doesn't pop. A pure tone can dip by a few dB for those few
+  milliseconds. Until that crossfade is ready (just after the loop moves), the note plays by changing speed instead.
+  The root key, Keep length off and pingpong loops play the sample's own loop, as it is.
 - Start and End: percent of the sample played (0 and 100).
 - Bend range: semitones of pitch bend (0 to 48, default 2).
 - Reverse: off or on.

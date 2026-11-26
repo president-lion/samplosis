@@ -252,6 +252,7 @@ static void sh_free1(SmpStartHead *h) { if (h) { free(h->lr); free(h); } }
 void smp_kl_free(SmpKl *k) {
   if (!k) return;
   sh_free1(k->sh);
+  sh_free1(k->lt);
   smp_cache_close(k->e);
   free(k);
 }

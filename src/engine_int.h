@@ -20,8 +20,11 @@
 #define SMP_VALOF(x) ((x) & ((1LL << 40) - 1))
 
 /* a pre-read copy of the first frames of the region from the current start point (start past the entry's head),
-   made by the worker thread and published by atomic pointer */
-typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n; float *lr; } SmpStartHead;
+   made by the worker thread and published by atomic pointer. The same struct holds a keep-length copy's loop tail
+   (SmpKl.lt): its loop's last n frames, crossfaded into the n frames before the loop start (at: the loop start, end:
+   the loop's end), so the loop meets itself; n 0 when the loop is too short to crossfade */
+typedef struct SmpStartHead { SmpSample *s; SmpEntry *src; int64_t at, n, end; float *lr; } SmpStartHead;
+#define SMP_LOOP_XFADE 0.085                    /* seconds of a loop tail's crossfade, at most */
 #define SMP_MAXSHRET 64
 
 /* A keep-length copy, published in the engine's table by atomic pointer (slot = shift + 127). It is identified by
@@ -38,6 +41,10 @@ typedef struct SmpKl {
   int semis, rev;                         /* rev: rendered from the reversed copy */
   SmpStartHead *volatile sh;             /* written by the worker, read by the audio thread */
   volatile LONG want_sh;                 /* the audio thread asks the worker for a start head */
+  /* A forward loop played from a copy: the pitch moved but the loop points didn't, so the loop no longer meets
+     itself and would pop at every wrap. Its tail (built by the worker for the loop as it is) crossfades the end. */
+  SmpStartHead *volatile lt;
+  volatile LONG want_lt;
 } SmpKl;
 typedef struct { SmpKl *k; LONG64 a0, s0, w0; int phase; } SmpKlRet;
 #define SMP_RQ 16
@@ -60,6 +67,7 @@ typedef struct SmpVoice {
   const float *head; uint64_t head_frames;
   const float *hp;                       /* path frames below v0 come from here: the head or a start head */
   const SmpStartHead *volatile sh;       /* the start head in use, if any (its retirement check reads this) */
+  const SmpStartHead *volatile lt;       /* a keep-length copy's loop tail in use (forward loop), or NULL */
   double src_semis;                      /* semitones already in src (0 when resampling) */
   int kl;                                /* src is a keep-length copy (or the source standing in for shift 0):
                                             speed is already in it, so it doesn't scale the rate */

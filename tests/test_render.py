@@ -565,3 +565,31 @@ def test_free_while_other_engines_render(lib, tmp_path):
     busy.free()
     point_cache(lib, tmp_path / "cache")
     assert took < 0.5, took
+
+
+def test_loop_wrap_doesnt_pop_with_keep_length(lib, tmp_path):
+    """A seamless loop (a 441 Hz sine, its loop exactly 200 periods) played off its root with keep length: the copy's
+    loop no longer meets itself (the period moved, the loop points didn't), so its end crossfades into the frames
+    before the loop start. Before, every wrap jumped by up to 16 times the sine's own steepest step."""
+    setup(lib)
+    point_cache(lib, tmp_path / "cache")
+    n = np.arange(40000)
+    s = load(lib, tmp_path, (0.5 * np.sin(2 * np.pi * n / 100)).astype(np.float32), "tone A4.wav")
+    e = KL(lib, tmp_path, s, 66, 76, host_rate=44100)
+    e.set(18, 1)                                       # loop forward
+    e.set(19, 50)                                      # from 50 %: frame 20000
+    e.wait()
+    for key in (70, 72, 66, 76):
+        y = e.render("on %d 127 0\noff %d 190000" % (key, key), 4.4)
+        x = y[2000:185000]
+        f = 441 * 2 ** ((key - 69) / 12)
+        ideal = np.percentile(np.abs(x), 99.9) * 2 * np.pi * f / 44100
+        assert np.abs(np.diff(x)).max() < 1.5 * ideal, key
+    e.set(18, 0)                                       # the same note without the loop: the copy itself
+    plain = e.render("on 72 127 0\noff 72 190000", 1.0)
+    e.set(18, 1)
+    looped = e.render("on 72 127 0\noff 72 190000", 1.0)
+    cut = 40000 - int(0.085 * 44100) - 10              # up to the crossfade: the copy, not a resampled note
+    assert np.abs(looped[:cut] - plain[:cut]).max() < 1e-5
+    assert lib.smp_engine_underruns(e.e) == 0
+    e.free()
