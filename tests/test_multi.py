@@ -15,9 +15,10 @@ RATE = 48000
 @pytest.fixture
 def M(lib, tmp_path):
     point_cache(lib, tmp_path / "cache")
+    SP = lib.smp_sample_load.restype              # conftest's sample pointer (shared: left as it is)
     for name, res, args in [
         ("smp_multi_new", vp, [c_dbl, c_int]), ("smp_multi_free", None, [vp]), ("smp_multi_count", c_int, [vp]),
-        ("smp_multi_add", c_int, [vp, vp]), ("smp_multi_replace", c_int, [vp, c_int, vp]),
+        ("smp_multi_add", c_int, [vp, SP]), ("smp_multi_replace", c_int, [vp, c_int, SP]),
         ("smp_multi_remove", None, [vp, c_int]), ("smp_multi_clear", None, [vp]),
         ("smp_multi_sample", vp, [vp, c_int]), ("smp_multi_path", c_int, [vp, c_int, c_char_p, c_int]),
         ("smp_multi_range", None, [vp, c_int] + [ctypes.POINTER(c_int)] * 4),
@@ -34,7 +35,6 @@ def M(lib, tmp_path):
     ]:
         f = getattr(lib, name)
         f.restype, f.argtypes = res, args
-    lib.smp_sample_load.restype = vp
 
     class H:
         def __init__(self):
@@ -266,3 +266,51 @@ def test_add_replace_remove(M, lib):
     lib.smp_multi_remove(m, 0)
     assert lib.smp_multi_count(m) == 0 and lib.smp_multi_selected(m) == -1
     lib.smp_multi_collect(m, 1)
+
+
+def test_every_octave_of_a_note(M, lib):
+    lib.smp_multi_key_class.restype, lib.smp_multi_key_class.argtypes = c_int, [vp, c_int]
+    lib.smp_multi_set_key_class.restype, lib.smp_multi_set_key_class.argtypes = c_int, [vp, c_int, c_int]
+    a = M.wav("a.wav", 220)
+    m = M.new()
+    r, _, err = M.apply(m, 'sample "%s" keys=C\n%s' % (a, BASE))      # keys=C: every C, whatever its octave
+    assert r == 0, err
+    assert lib.smp_multi_key_class(m, 0) == 1
+    assert M.line(m, 0).endswith("keys every C, velocity 1 to 127")
+    for k in (36, 48, 60, 120):
+        assert np.abs(M.render(m, "on %d 100 0\noff %d 20000" % (k, k))).max() > 0.1, k
+    for k in (49, 59, 61):
+        assert np.abs(M.render(m, "on %d 100 0\noff %d 20000" % (k, k))).max() < 1e-6, k
+    assert ' keys=C\n' in M.text(m)
+    assert lib.smp_multi_set_key_class(m, 0, 1 << 6) == 1 and ' keys=F#\n' in M.text(m)
+    assert lib.smp_multi_set_key_class(m, 0, 0) == 0 and lib.smp_multi_set_key_class(m, 0, 4096) == 0
+    lib.smp_multi_set_range(m, 0, 10, 20, 1, 127)                       # a range again
+    assert lib.smp_multi_key_class(m, 0) == 0 and ' keys=A#-1..G#0\n' in M.text(m)
+    r, _, err = M.apply(m, 'sample "%s" keys=Bb\n' % a)
+    assert r == 0 and lib.smp_multi_key_class(m, 0) == 1 << 10, err
+    r, _, err = M.apply(m, 'sample "%s" keys=H\n' % a)
+    assert r != 0 and "keys" in err
+
+
+def test_several_notes_in_every_octave(M, lib):
+    lib.smp_multi_key_class.restype, lib.smp_multi_key_class.argtypes = c_int, [vp, c_int]
+    lib.smp_note_class_parse.restype, lib.smp_note_class_parse.argtypes = c_int, [c_char_p]
+    parse = lambda t: lib.smp_note_class_parse(t.encode())
+    assert parse("D F") == (1 << 2) | (1 << 5)
+    assert parse("d, f") == parse("D,F") == parse("D F")
+    assert parse("D#") == 1 << 3 and parse("Eb") == 1 << 3
+    assert parse("C E G") == 1 | 1 << 4 | 1 << 7
+    for bad in ("", "D4", "H", "D F4", "C-1", "Dx"):
+        assert parse(bad) == 0, bad
+    a = M.wav("a.wav", 220)
+    m = M.new()
+    r, _, err = M.apply(m, 'sample "%s" keys=D,F\n%s' % (a, BASE))
+    assert r == 0, err
+    assert M.line(m, 0).endswith("keys every D and F, velocity 1 to 127")
+    assert ' keys=D,F\n' in M.text(m)
+    for k in (50, 53, 62, 65):
+        assert np.abs(M.render(m, "on %d 100 0\noff %d 20000" % (k, k))).max() > 0.1, k
+    for k in (51, 52, 54, 60):                                  # D# and the rest: not unless typed
+        assert np.abs(M.render(m, "on %d 100 0\noff %d 20000" % (k, k))).max() < 1e-6, k
+    r, _, err = M.apply(m, 'sample "%s" keys=C,E,G\n' % a)
+    assert r == 0 and M.line(m, 0).endswith("keys every C, E and G, velocity 1 to 127"), err

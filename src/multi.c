@@ -25,7 +25,58 @@ typedef struct {
   char path[1024]; uint64_t key; int has_key;
   char why[600];                         /* missing: why it didn't load */
   volatile LONG klo, khi, vlo, vhi, root;
+  volatile LONG pc;                      /* 0: the keys klo to khi; else a bit per note (bit 0 C to bit 11 B): every key of
+                                            those notes, whatever its octave, and klo and khi the lowest and highest */
 } Zone;
+
+/* one note name without its octave ("C", "f#", "Bb"): 0 to 11, or -1. A plain letter is that note only: D isn't D#. */
+static int pc_one(const char *t, size_t n) {
+  static const int base[7] = {9, 11, 0, 2, 4, 5, 7};   /* A to G */
+  int c, k;
+  if (n < 1 || n > 2) return -1;
+  c = toupper((unsigned char)t[0]);
+  if (c < 'A' || c > 'G') return -1;
+  k = base[c - 'A'];
+  if (n == 2) { if (t[1] == '#') k++; else if (t[1] == 'b') k += 11; else return -1; }
+  return k % 12;
+}
+/* note names without octaves, apart by spaces or commas ("D F", "C,E,G", "D#"): their bits, or 0 when any isn't one */
+static int pc_parse(const char *t) {
+  int mask = 0;
+  while (*t) {
+    size_t n; int k;
+    while (*t == ' ' || *t == ',') t++;
+    if (!*t) break;
+    for (n = 0; t[n] && t[n] != ' ' && t[n] != ','; n++) {}
+    if ((k = pc_one(t, n)) < 0) return 0;
+    mask |= 1 << k;
+    t += n;
+  }
+  return mask;
+}
+/* sep between names: "D,F" (the script) or " and " (words: "D, F and A") */
+static void pc_name(int mask, int words, char *out, int cap) {
+  int k, n = 0, total = 0, at = 0;
+  for (k = 0; k < 12; k++) if (mask >> k & 1) total++;
+  if (cap > 0) out[0] = 0;
+  for (k = 0; k < 12; k++) {
+    char t[16]; int j;
+    if (!(mask >> k & 1)) continue;
+    smp_note_name(60 + k, t, sizeof t);
+    for (j = 0; t[j] && t[j] != '-' && (t[j] < '0' || t[j] > '9'); j++) {}
+    t[j] = 0;
+    n++;
+    at += snprintf(out + at, (size_t)(cap - at > 0 ? cap - at : 0), "%s%s",
+                   n == 1 ? "" : !words ? "," : n == total ? " and " : ", ", t);
+    if (at >= cap) break;
+  }
+}
+static void pc_keys(int mask, LONG *lo, LONG *hi) {
+  int k;
+  *lo = 0; *hi = 127;
+  for (k = 0; k < 128; k++) if (mask >> (k % 12) & 1) { *lo = k; break; }
+  for (k = 127; k >= 0; k--) if (mask >> (k % 12) & 1) { *hi = k; break; }
+}
 
 typedef struct { LONG64 gen; int n; Zone *z[SMP_MULTI_MAX]; } MSnap;
 
@@ -115,6 +166,9 @@ static void bury(SmpMulti *m, Zone *e) {     /* freed once the audio thread can'
 SMP_API void smp_multi_collect(SmpMulti *m, int idle) {
   int i = 0, k;
   if (!m) return;
+  /* nothing processes: a snapshot the audio thread pinned without a process after it (a parameter flush) is let go,
+     so it can't be used once freed */
+  if (idle) m->aud = NULL;
   for (k = 0; k < m->n; k++) if (m->z[k]->e) smp_engine_collect(m->z[k]->e);
   while (i < m->nret) {
     MRet *r = &m->ret[i];
@@ -181,7 +235,7 @@ static int zone_engine(SmpMulti *m, Zone *z, SmpSample *s) {
 static Zone *zone_new(int root) {
   Zone *z = calloc(1, sizeof *z);
   if (!z) return NULL;
-  z->klo = 0; z->khi = 127; z->vlo = 1; z->vhi = 127; z->root = root < 0 ? 60 : root > 127 ? 127 : root;
+  z->klo = 0; z->khi = 127; z->vlo = 1; z->vhi = 127; z->root = root < 0 ? 60 : root > 127 ? 127 : root; z->pc = 0;
   return z;
 }
 
@@ -244,7 +298,17 @@ SMP_API int smp_multi_set_range(SmpMulti *m, int i, int klo, int khi, int vlo, i
   Zone *z;
   if (!m || i < 0 || i >= m->n || klo < 0 || khi > 127 || klo > khi || vlo < 1 || vhi > 127 || vlo > vhi) return 0;
   z = m->z[i];
-  z->klo = klo; z->khi = khi; z->vlo = vlo; z->vhi = vhi;
+  z->klo = klo; z->khi = khi; z->vlo = vlo; z->vhi = vhi; z->pc = 0;
+  sync_zone(m, z);
+  return 1;
+}
+SMP_API int smp_multi_key_class(const SmpMulti *m, int i) { return m && i >= 0 && i < m->n ? m->z[i]->pc : 0; }
+SMP_API int smp_multi_set_key_class(SmpMulti *m, int i, int pc) {
+  Zone *z;
+  if (!m || i < 0 || i >= m->n || pc <= 0 || pc > 4095) return 0;
+  z = m->z[i];
+  pc_keys(pc, (LONG *)&z->klo, (LONG *)&z->khi);
+  z->pc = pc;
   sync_zone(m, z);
   return 1;
 }
@@ -261,13 +325,18 @@ SMP_API void smp_multi_line(const SmpMulti *m, int i, char *out, int cap) {
   const SmpSample *s = smp_multi_sample(m, i);
   char root[16], lo[16], hi[16];
   if (cap <= 0) return;
+  {
   if (!m || i < 0 || i >= m->n) { out[0] = 0; return; }
   smp_note_name(m->z[i]->root, root, sizeof root);
+  char keys[96];
   smp_note_name(m->z[i]->klo, lo, sizeof lo); smp_note_name(m->z[i]->khi, hi, sizeof hi);
-  if (s) snprintf(out, (size_t)cap, "%s, root %s, keys %s to %s, velocity %d to %d", s->name, root, lo, hi,
+  if (m->z[i]->pc) { char w[80]; pc_name(m->z[i]->pc, 1, w, sizeof w); snprintf(keys, sizeof keys, "every %s", w); }
+  else snprintf(keys, sizeof keys, "%s to %s", lo, hi);
+  if (s) snprintf(out, (size_t)cap, "%s, root %s, keys %s, velocity %d to %d", s->name, root, keys,
                   m->z[i]->vlo, m->z[i]->vhi);
-  else snprintf(out, (size_t)cap, "Missing: %s, root %s, keys %s to %s, velocity %d to %d", m->z[i]->path, root, lo,
-                hi, m->z[i]->vlo, m->z[i]->vhi);
+  else snprintf(out, (size_t)cap, "Missing: %s, root %s, keys %s, velocity %d to %d", m->z[i]->path, root, keys,
+                m->z[i]->vlo, m->z[i]->vhi);
+  }
 }
 
 /* ---- the instrument's parameters ---- */
@@ -300,7 +369,10 @@ SMP_API double smp_multi_get_param(const SmpMulti *m, int id) {
 /* ---- the audio thread ---- */
 SMP_API void smp_multi_note_on(SmpMulti *m, int key, int vel, int at) {
   MSnap *s = aud(m); int i;
-  for (i = 0; s && i < s->n; i++) if (s->z[i]->e) smp_engine_note_on(s->z[i]->e, key, vel, at);
+  for (i = 0; s && i < s->n; i++) {
+    Zone *z = s->z[i];
+    if (z->e && (!z->pc || (z->pc >> (key % 12) & 1))) smp_engine_note_on(z->e, key, vel, at);
+  }
 }
 SMP_API void smp_multi_note_off(SmpMulti *m, int key, int at) {
   MSnap *s = aud(m); int i;
@@ -354,8 +426,20 @@ SMP_API int smp_multi_render_status(SmpMulti *m, int *ready, int *total, char *w
 }
 SMP_API int smp_multi_wait_renders(SmpMulti *m, int timeout_ms) {
   int i, bad = 0;
-  for (i = 0; m && i < m->n; i++) if (m->z[i]->e && smp_engine_wait_renders(m->z[i]->e, timeout_ms)) bad = 1;
+  for (i = 0; m && i < m->n; i++) {
+    if (!m->z[i]->e) continue;
+    if (smp_engine_wait_renders(m->z[i]->e, timeout_ms)) bad = 1;
+    smp_worker_wait_idle(m->z[i]->e);    /* start heads */
+  }
   return bad;
+}
+SMP_API void smp_multi_test_offline(SmpMulti *m, int on) {
+  int i;
+  for (i = 0; m && i < m->n; i++) if (m->z[i]->e) m->z[i]->e->offline = on;
+}
+SMP_API void smp_multi_test_sync(SmpMulti *m) {
+  int i;
+  for (i = 0; m && i < m->n; i++) if (m->z[i]->e) smp_stream_wait_idle(m->z[i]->e);
 }
 SMP_API void smp_multi_seed(SmpMulti *m, unsigned seed) {
   int i;
@@ -447,7 +531,8 @@ SMP_API int smp_multi_script_write(const SmpMulti *m, char *out, int cap) {
     int at = snprintf(line, sizeof line, "sample \"%s\"", z->path);
     if (z->has_key) at += snprintf(line + at, sizeof line - (size_t)at, " key=%016llx", (unsigned long long)z->key);
     if (m->n > 1) { smp_note_name(z->root, a, sizeof a); at += snprintf(line + at, sizeof line - (size_t)at, " root=%s", a); }
-    if (z->klo != 0 || z->khi != 127) {
+    if (z->pc) { char w[80]; pc_name(z->pc, 0, w, sizeof w); at += snprintf(line + at, sizeof line - (size_t)at, " keys=%s", w); }
+    else if (z->klo != 0 || z->khi != 127) {
       smp_note_name(z->klo, a, sizeof a); smp_note_name(z->khi, b, sizeof b);
       at += snprintf(line + at, sizeof line - (size_t)at, " keys=%s..%s", a, b);
     }
@@ -490,7 +575,7 @@ static int read_range(const char *v, int notes, int *lo, int *hi) {
   return *lo <= *hi;
 }
 
-typedef struct { char path[1024]; uint64_t key; int has_key, root, klo, khi, vlo, vhi, line; } SLine;
+typedef struct { char path[1024]; uint64_t key; int has_key, root, klo, khi, vlo, vhi, pc, line; } SLine;
 
 SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, char *err, int cap) {
   double val[SMP_NPARAMS]; char have[SMP_NPARAMS] = {0};
@@ -520,7 +605,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
     if (!strcmp(name, "sample")) {
       SLine L; char *q, *end;
       memset(&L, 0, sizeof L);
-      L.root = -1; L.klo = 0; L.khi = 127; L.vlo = 1; L.vhi = 127; L.line = lineno;
+      L.root = -1; L.klo = 0; L.khi = 127; L.vlo = 1; L.vhi = 127; L.pc = 0; L.line = lineno;
       if (*rest != '"') { fail(err, cap, lineno, "sample needs the path in quotes, like %s", "sample \"E:\\samples\\a.wav\""); free(sl); return 1; }
       q = rest + 1;
       if (!(end = strchr(q, '"'))) { fail(err, cap, lineno, "sample: %s", "the closing quote is missing"); free(sl); return 1; }
@@ -546,7 +631,8 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
         } else if (!strcmp(word, "root")) {
           if ((L.root = smp_note_parse(eq)) < 0) { fail(err, cap, lineno, "sample: root=%s isn't a note, like C3", eq); free(sl); return 1; }
         } else if (!strcmp(word, "keys")) {
-          if (!read_range(eq, 1, &L.klo, &L.khi)) { fail(err, cap, lineno, "sample: keys=%s should be two notes, low first, like keys=C2..C3", eq); free(sl); return 1; }
+          if ((L.pc = pc_parse(eq)) != 0) { LONG a, b; pc_keys(L.pc, &a, &b); L.klo = a; L.khi = b; }
+          else if (!read_range(eq, 1, &L.klo, &L.khi)) { fail(err, cap, lineno, "sample: keys=%s should be two notes, low first, like keys=C2..C3, or notes in every octave, like keys=C or keys=D,F", eq); free(sl); return 1; }
         } else if (!strcmp(word, "velocity")) {
           if (!read_range(eq, 0, &L.vlo, &L.vhi)) { fail(err, cap, lineno, "sample: velocity=%s should be 1 to 127, low first, like velocity=15..80", eq); free(sl); return 1; }
         } else { fail(err, cap, lineno, "sample: unknown setting '%s'", word); free(sl); return 1; }
@@ -601,7 +687,7 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
       }
     }
     if (root >= 0) z->root = root;         /* else kept, or the new sample's */
-    z->klo = L->klo; z->khi = L->khi; z->vlo = L->vlo; z->vhi = L->vhi;
+    z->klo = L->klo; z->khi = L->khi; z->vlo = L->vlo; z->vhi = L->vhi; z->pc = L->pc;
     nz[i] = z;
   }
   for (j = 0; j < m->n; j++) if (m->z[j]) bury(m, m->z[j]);
@@ -614,3 +700,6 @@ SMP_API int smp_multi_script_apply(SmpMulti *m, const char *text, int *missing, 
   if (missing) *missing = nmiss;
   return 0;
 }
+
+SMP_API int smp_note_class_parse(const char *t) { return t ? pc_parse(t) : 0; }
+SMP_API void smp_note_class_name(int mask, char *out, int cap) { if (cap > 0) { if (mask > 0 && mask < 4096) pc_name(mask, 1, out, cap); else out[0] = 0; } }

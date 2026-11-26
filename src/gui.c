@@ -29,6 +29,9 @@
    of the other kind gives that player's error). A dropped file goes by its extension: an instrument (.sf2 .sf3 .sf4
    .sf2pack .sbk .dls .gig .sfz .dspreset .dslibrary .exs) loads into the SoundFont player, an audio file into the
    sampler, and the tab follows.
+   The Sampler's samples. Browse and Add samples choose several files at once (Browse replaces the samples, Add samples
+   adds them, a drop of several replaces them); the File combo box replaces the selected sample. The Samples list
+   selects one (Delete removes it), and Start key, End key and Velocity ("15,80") are that sample's.
    Everything here runs on the main thread (the window's). */
 #include <windows.h>
 #include <commctrl.h>
@@ -60,6 +63,7 @@ enum { ID_VAL = 100,                          /* + parameter id: its slider or c
        ID_STRETCHER, ID_KEEPTONE, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
        ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
        ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
+       ID_ZLIST, ID_ZADD, ID_ZREMOVE, ID_ZLO, ID_ZHI, ID_ZVEL,
        ID_EDIT = 300,                        /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
        ID_OUT = 420,                          /* + channel - 1: its output combo box */
@@ -69,6 +73,10 @@ enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, NPAGES = 3 };
 #define PAGE_STOPS 64
 #define SL_LIMIT (-1)                         /* the slider that isn't a parameter: the cache size limit */
 #define SL_KNOB0 (-2)                         /* SL_KNOB0 - i: the sliders of a Decent Sampler preset's knobs */
+#define SL_ZLO (-100)                         /* the selected sample's Start key and End key */
+#define SL_ZHI (-101)
+#define IS_KNOB(w) ((w) <= SL_KNOB0 && (w) > SL_KNOB0 - NKNOB)
+#define IS_ZONE(w) ((w) == SL_ZLO || (w) == SL_ZHI)
 #define NKNOB 16                              /* knob sliders on the SoundFont page */
 enum { T_REFRESH = 1, T_OPEN = 2 };
 #define WM_DROPPED (WM_APP + 1)
@@ -76,7 +84,7 @@ enum { T_REFRESH = 1, T_OPEN = 2 };
 typedef struct { IDropTarget t; struct Gui *g; int ok; } Drop;
 
 /* a value's slider and the edit box that stands in for it while typing */
-typedef struct { HWND tb, ed; int what; char said[64]; bool editing; const struct Gui *gui; } Slider;
+typedef struct { HWND tb, ed; int what; char said[96]; bool editing; const struct Gui *gui; } Slider;
 
 typedef struct Gui {
   Plug *P;
@@ -86,7 +94,7 @@ typedef struct Gui {
   bool setting_tab;                           /* the window moves the tab itself: not the user's choice */
   HWND sample, browse, status, settings;
   HWND val[SMP_NALLPARAMS];                   /* each parameter's slider or combo box */
-  Slider sl[SMP_NALLPARAMS + 1 + NKNOB]; int nsl;
+  Slider sl[SMP_NALLPARAMS + 1 + NKNOB + 2]; int nsl;
   Slider *sl_of[SMP_NALLPARAMS];              /* a parameter's slider, or NULL (a choice) */
   IAccPropServices *aps;                      /* the words a screen reader reads for a slider; NULL: numbers */
   HWND stretcher, keeptone, dir, dirbrowse, used, clear, back;
@@ -116,7 +124,13 @@ typedef struct Gui {
   HWND last; bool had_focus, closing;
   char note[800]; ULONGLONG note_until;       /* a message the status box shows for a while (a file that won't load) */
   Drop drop; int ole_init, drop_registered;
-  wchar_t dropped[1100];                      /* the file a drop noted, loaded on WM_DROPPED */
+  wchar_t *dropped;                           /* the files a drop noted (each ending in a zero, the list in two),
+                                                 loaded on WM_DROPPED; NULL when none */
+  /* the Sampler's samples: the list, Add samples, Remove sample, the selected one's Start key, End key and
+     Velocity ("15,80") */
+  HWND zlist, zadd, zremove, zvel;
+  Slider *zlo, *zhi;
+  uint64_t zlist_key;                         /* what the list shows now (its lines and count), to rebuild on change */
   int modal;                                  /* file or folder dialogs open (see modal_begin) */
   long fails_seen;                            /* the plugin's failed background loads the window has told of */
   long notes_seen;                            /* and its loads stopped by a load of the other kind */
@@ -186,6 +200,7 @@ static void gb_text(double gb, char *out, int cap) {
 }
 static void set_limit(Gui *g, double gb);
 static void say_note(Gui *g, const char *msg);
+static void zones_show(Gui *g);
 
 /* ---- sliders ---- */
 /* a knob slider's knob (as the player has it now); 0 when there is none */
@@ -199,7 +214,8 @@ static bool knob_whole(const SmpKnobInfo *k) { return k->vtype != SF_KV_FLOAT; }
 static void sl_range(const Slider *s, double *lo, double *hi, double *step) {
   const SmpParamInfo *pi;
   if (s->what == SL_LIMIT) { *lo = LIMIT_LO; *hi = LIMIT_HI; *step = 1; return; }
-  if (s->what <= SL_KNOB0) {                    /* a knob: whole numbers step by 1, the rest by a hundredth */
+  if (IS_ZONE(s->what)) { *lo = 0; *hi = 127; *step = 1; return; }
+  if (IS_KNOB(s->what)) {                       /* a knob: whole numbers step by 1, the rest by a hundredth */
     SmpKnobInfo k;
     if (!knob_of(s, &k) || !(k.hi > k.lo)) { *lo = 0; *hi = 1; *step = 0.01; return; }
     *lo = k.lo; *hi = k.hi; *step = knob_whole(&k) ? 1 : (k.hi - k.lo) / 100;
@@ -210,18 +226,29 @@ static void sl_range(const Slider *s, double *lo, double *hi, double *step) {
 }
 static double sl_get(Gui *g, const Slider *s) {
   SmpSettings st;
-  if (s->what <= SL_KNOB0) return smp_plug_knob_get(g->P, SL_KNOB0 - s->what);
+  if (IS_KNOB(s->what)) return smp_plug_knob_get(g->P, SL_KNOB0 - s->what);
+  if (IS_ZONE(s->what)) {
+    int a, b, c, d;
+    smp_plug_zone_range(g->P, smp_plug_zone_selected(g->P), &a, &b, &c, &d);
+    return s->what == SL_ZLO ? a : b;
+  }
   if (s->what != SL_LIMIT) return smp_plug_get_param(g->P, s->what);
   smp_settings_get(&st);
   return st.cache_limit_gb;
 }
 static void sl_text(const Slider *s, double v, char *out, int cap) {
-  if (s->what <= SL_KNOB0) { SmpKnobInfo k; if (knob_of(s, &k)) smp_knob_text(&k, v, out, cap); else if (cap > 0) out[0] = 0; }
+  if (IS_KNOB(s->what)) { SmpKnobInfo k; if (knob_of(s, &k)) smp_knob_text(&k, v, out, cap); else if (cap > 0) out[0] = 0; }
+  else if (IS_ZONE(s->what)) {                 /* a note in every octave reads "every C" on both */
+    int pc = smp_plug_zone_key_class(s->gui->P, smp_plug_zone_selected(s->gui->P));
+    if (pc) { char n[80]; smp_note_class_name(pc, n, sizeof n); snprintf(out, (size_t)cap, "every %s", n); }
+    else smp_note_name((int)floor(v + 0.5), out, cap);
+  }
   else if (s->what == SL_LIMIT) gb_text(v, out, cap); else param_text(s->what, v, out, cap);
 }
 static int sl_parse(const Slider *s, const char *t, double *v) {
   char *e;
-  if (s->what <= SL_KNOB0) { SmpKnobInfo k; return knob_of(s, &k) && smp_knob_parse(&k, t, v); }
+  if (IS_KNOB(s->what)) { SmpKnobInfo k; return knob_of(s, &k) && smp_knob_parse(&k, t, v); }
+  if (IS_ZONE(s->what)) return smp_value_parse(SMP_P_NOTE_LO, t, v);
   if (s->what != SL_LIMIT) return smp_value_parse(s->what, t, v);
   *v = strtod(t, &e);
   while (*e == ' ') e++;
@@ -250,7 +277,16 @@ static void sl_set(Gui *g, Slider *s, double v) {
   sl_range(s, &lo, &hi, &step);
   if (v < lo) v = lo;                            /* past either end it stays at the end */
   if (v > hi) v = hi;
-  if (s->what <= SL_KNOB0) smp_plug_knob_set(g->P, SL_KNOB0 - s->what, v);
+  if (IS_KNOB(s->what)) smp_plug_knob_set(g->P, SL_KNOB0 - s->what, v);
+  else if (IS_ZONE(s->what)) {                   /* a key past the other end takes the other end with it */
+    int i = smp_plug_zone_selected(g->P), a, b, c, d, k = (int)floor(v + 0.5);
+    if (i < 0) { beep(); return; }               /* no sample to set it for */
+    smp_plug_zone_range(g->P, i, &a, &b, &c, &d);
+    if (s->what == SL_ZLO) { a = k; if (b < a) b = a; } else { b = k; if (a > b) a = b; }
+    smp_plug_zone_set_range(g->P, i, a, b, c, d);
+    sl_show(g, g->zlo, true); sl_show(g, g->zhi, true);   /* "every C" on the other one ends too */
+    zones_show(g);
+  }
   else if (s->what == SL_LIMIT) set_limit(g, v); else smp_plug_set_param(g->P, s->what, v);
   sl_show(g, s, true);
 }
@@ -260,7 +296,8 @@ static void sl_nudge(Gui *g, Slider *s, double by) {
   double lo, hi, step, v;
   int kind = s->what <= SL_LIMIT ? -1 : smp_param_info(s->what)->kind;
   bool whole = kind == SMP_K_NOTE || kind == SMP_K_SEMI || kind == SMP_K_CENT || kind == SMP_K_COUNT || kind == SMP_K_PAN;
-  if (s->what <= SL_KNOB0) { SmpKnobInfo k; whole = knob_of(s, &k) && knob_whole(&k); }
+  if (IS_KNOB(s->what)) { SmpKnobInfo k; whole = knob_of(s, &k) && knob_whole(&k); }
+  if (IS_ZONE(s->what)) whole = true;
   sl_range(s, &lo, &hi, &step);
   step *= fabs(by);
   if (whole && step < 1) step = 1;
@@ -299,7 +336,14 @@ static void edit_end(Gui *g, Slider *s, bool apply, bool to_slider) {
     char t[128]; double v;
     get_text(s->ed, t, sizeof t);
     if (strcmp(t, s->said)) {
-      if (sl_parse(s, t, &v)) sl_set(g, s, v); else beep();
+      int pc = IS_ZONE(s->what) ? smp_note_class_parse(t) : 0;
+      if (pc) {                                  /* a key box: notes without octaves ("D F") are those in every octave */
+        int i = smp_plug_zone_selected(g->P);
+        if (i < 0) beep(); else smp_plug_zone_set_key_class(g->P, i, pc);
+        sl_show(g, g->zlo, true); sl_show(g, g->zhi, true);
+        zones_show(g);
+      }
+      else if (sl_parse(s, t, &v)) sl_set(g, s, v); else beep();
     }
   }
   ShowWindow(s->tb, SW_SHOW);
@@ -423,7 +467,7 @@ static bool modal_end(Gui *g) {          /* true when the window closed meanwhil
 }
 
 /* tests: a dialog that returns a path at once, after closing the window (2) or destroying the plugin (3) first */
-static int test_dialog; static char test_path[1100]; static const clap_plugin_t *test_plugin;
+static int test_dialog; static char test_path[4400]; static const clap_plugin_t *test_plugin;
 SMP_API void smp_test_gui_dialog(const clap_plugin_t *p, int action, const char *path) {
   test_plugin = p; test_dialog = action;
   snprintf(test_path, sizeof test_path, "%s", path ? path : "");
@@ -435,6 +479,40 @@ static int stub_dialog(Gui *g, wchar_t *out, int cap) {
   else if (a == 3 && test_plugin) test_plugin->destroy(test_plugin);
   return MultiByteToWideChar(CP_UTF8, 0, test_path, -1, out, cap) > 0;
 }
+/* The files a multiple-choice dialog returned (the folder, then each name, each ending in a zero; or one full path),
+   or the stub's ("a|b"), as full paths: how many, in *out (each and the list freed by the caller) */
+static int split_files(const wchar_t *buf, bool stub, wchar_t ***out) {
+  wchar_t **list = NULL; int n = 0, cap = 0;
+  const wchar_t *dir = buf, *q;
+  *out = NULL;
+  if (stub) {                                  /* "a|b|c" */
+    const wchar_t *a = buf;
+    while (*a) {
+      const wchar_t *e = wcschr(a, L'|'); size_t len = e ? (size_t)(e - a) : wcslen(a);
+      if (n == cap) { wchar_t **nl = realloc(list, sizeof *list * (size_t)(cap = cap ? cap * 2 : 8)); if (!nl) break; list = nl; }
+      if ((list[n] = malloc((len + 1) * sizeof(wchar_t))) != NULL) { memcpy(list[n], a, len * sizeof(wchar_t)); list[n][len] = 0; n++; }
+      a = e ? e + 1 : a + len;
+    }
+    *out = list;
+    return n;
+  }
+  q = dir + wcslen(dir) + 1;
+  if (!*q) {                                   /* one file: its full path */
+    if ((list = malloc(sizeof *list)) && (list[0] = _wcsdup(dir))) { *out = list; return 1; }
+    free(list); return 0;
+  }
+  for (; *q; q += wcslen(q) + 1) {
+    size_t len = wcslen(dir) + wcslen(q) + 2;
+    if (n == cap) { wchar_t **nl = realloc(list, sizeof *list * (size_t)(cap = cap ? cap * 2 : 8)); if (!nl) break; list = nl; }
+    if ((list[n] = malloc(len * sizeof(wchar_t))) != NULL) {
+      swprintf(list[n], len, L"%s%s%s", dir, dir[wcslen(dir) - 1] == L'\\' ? L"" : L"\\", q);
+      n++;
+    }
+  }
+  *out = list;
+  return n;
+}
+static void free_files(wchar_t **list, int n) { int i; for (i = 0; i < n; i++) free(list[i]); free(list); }
 
 static int pick_folder(HWND owner, wchar_t *out, int cap) {
   IFileOpenDialog *d = NULL; IShellItem *it = NULL; PWSTR path = NULL; DWORD opt = 0; int ok = 0;
@@ -512,6 +590,90 @@ static void show_status(Gui *g) {
 }
 static void show_sample(Gui *g) {
   char t[1500]; smp_plug_sample_text(g->P, t, sizeof t); set_text(g->sample, t);
+}
+
+/* The Sampler's samples: the list (one line each, the selected one selected; "No samples loaded" when there are
+   none), rebuilt only when its lines change and never while it is being moved through; the Velocity box, unless it
+   is being typed in */
+static uint64_t fnv(uint64_t h, const char *t) { for (; *t; t++) { h ^= (unsigned char)*t; h *= 1099511628211ull; } return h; }
+static void zones_show(Gui *g) {
+  int n = smp_plug_zone_count(g->P), sel = smp_plug_zone_selected(g->P), i;
+  char line[1500], v[32]; uint64_t key = 1469598103934665603ull;
+  if (!g->zlist) return;
+  for (i = 0; i < n; i++) { smp_plug_zone_line(g->P, i, line, sizeof line); key = fnv(fnv(key, line), "\n"); }
+  key ^= (uint64_t)n;
+  if (key != g->zlist_key) {
+    g->zlist_key = key;
+    SendMessageW(g->zlist, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g->zlist, LB_RESETCONTENT, 0, 0);
+    if (!n) SendMessageW(g->zlist, LB_ADDSTRING, 0, (LPARAM)L"No samples loaded");
+    for (i = 0; i < n; i++) {
+      wchar_t w[1500];
+      smp_plug_zone_line(g->P, i, line, sizeof line);
+      MultiByteToWideChar(CP_UTF8, 0, line, -1, w, 1500);
+      SendMessageW(g->zlist, LB_ADDSTRING, 0, (LPARAM)w);
+    }
+    SendMessageW(g->zlist, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g->zlist, NULL, TRUE);
+  }
+  if (SendMessageW(g->zlist, LB_GETCURSEL, 0, 0) != (n ? sel : 0)) SendMessageW(g->zlist, LB_SETCURSEL, (WPARAM)(n ? sel : 0), 0);
+  if (!g->zlo->editing) sl_show(g, g->zlo, false);
+  if (!g->zhi->editing) sl_show(g, g->zhi, false);
+  if (GetFocus() != g->zvel) {
+    int a, b, c, d;
+    smp_plug_zone_range(g->P, sel, &a, &b, &c, &d);
+    snprintf(v, sizeof v, "%d,%d", c, d);
+    set_text(g->zvel, v);
+  }
+}
+/* "15,80", "15 80", "15-80" or "15 to 80" (either way round), or one number for both: 1 to 127 */
+static int vel_parse(const char *t, int *lo, int *hi) {
+  long a, b; char *e;
+  while (*t == ' ') t++;
+  a = strtol(t, &e, 10);
+  if (e == t) return 0;
+  t = e;
+  while (*t == ' ') t++;
+  if (!*t) b = a;
+  else {
+    if (*t == ',' || *t == '-') t++;
+    else if (!_strnicmp(t, "to", 2)) t += 2;
+    else if (t[-1] != ' ') return 0;
+    while (*t == ' ') t++;
+    b = strtol(t, &e, 10);
+    if (e == t) return 0;
+    t = e;
+    while (*t == ' ') t++;
+    if (*t) return 0;
+  }
+  if (a > b) { long x = a; a = b; b = x; }
+  if (a < 1 || b > 127) return 0;
+  *lo = (int)a; *hi = (int)b;
+  return 1;
+}
+/* the Velocity box was left or Enter pressed: what it says becomes the range; one that doesn't read beeps and the box
+   says the range again */
+static void vel_apply(Gui *g) {
+  char t[64], v[32]; int i = smp_plug_zone_selected(g->P), a, b, c, d, lo, hi;
+  get_text(g->zvel, t, sizeof t);
+  smp_plug_zone_range(g->P, i, &a, &b, &c, &d);
+  snprintf(v, sizeof v, "%d,%d", c, d);
+  if (!strcmp(t, v)) return;
+  if (i < 0 || !vel_parse(t, &lo, &hi)) { beep(); set_text(g->zvel, v); SendMessageW(g->zvel, EM_SETSEL, 0, -1); return; }
+  {
+    int pc = smp_plug_zone_key_class(g->P, i);   /* every C stays every C */
+    smp_plug_zone_set_range(g->P, i, a, b, lo, hi);
+    if (pc) smp_plug_zone_set_key_class(g->P, i, pc);
+  }
+  snprintf(v, sizeof v, "%d,%d", lo, hi);
+  set_text(g->zvel, v);
+  zones_show(g);
+}
+static void zone_remove(Gui *g) {
+  int i = smp_plug_zone_selected(g->P);
+  if (i < 0) { beep(); return; }
+  smp_plug_zone_remove(g->P, i);
+  zones_show(g);
 }
 
 /* the SoundFont player's settings, read from its state lines */
@@ -750,12 +912,13 @@ static void refresh(Gui *g) {
     g->notes_seen = g->P->load_notes;
     say_note(g, g->P->load_note);
   }
-  if (g->P->e) smp_engine_collect(g->P->e);   /* replaced samples, when nothing is processing */
+  if (g->P->e) smp_multi_collect(g->P->e, !g->P->active);   /* replaced samples (all, when nothing processes) */
   if (g->page != PG_SETTINGS && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
     show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* the tab follows what plays (it refreshes) */
     return;
   }
   show_sample(g);
+  zones_show(g);
   if (g->page != PG_SETTINGS) file_list(g, g->page == PG_FONT, false);
   for (id = 0; id < SMP_NALLPARAMS; id++) show_param(g, id, false);
   show_status(g);
@@ -782,13 +945,37 @@ enum { LOAD_SAMPLE, LOAD_FONT, LOAD_DROPPED };
    file's header), which then plays. */
 static void load_path_w(Gui *g, const wchar_t *w, int how) {
   char u[1100], err[700], msg[1900]; bool sf = how == LOAD_DROPPED ? font_name(w) : how == LOAD_FONT;
-  int ok;
+  int ok, sel = smp_plug_zone_selected(g->P);
+  const char *one = u;
   if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof u, NULL, NULL) <= 0) { beep(); return; }
-  ok = sf ? smp_plug_load_font_start(g->P, u, err, sizeof err) : smp_plug_load_start(g->P, u, how == LOAD_DROPPED, err, sizeof err);
+  /* the Sampler's File combo box: the file replaces the selected sample (its ranges stay) */
+  ok = sf ? smp_plug_load_font_start(g->P, u, err, sizeof err)
+          : smp_plug_load_many(g->P, &one, 1, sel >= 0 ? SMP_LOAD_ONE : SMP_LOAD_ALL, sel, how == LOAD_DROPPED, err, sizeof err);
   if (!ok) {                                  /* refused at once: "Can't load x: why. Still playing y." */
     smp_plug_cant_load(g->P, u, err, msg, sizeof msg);   /* one full stop between, as the background failure */
     say_note(g, msg); beep();
   } else g->note[0] = 0;
+  refresh(g);
+}
+
+/* several sample files at once (Browse, Add samples, a drop): how is SMP_LOAD_ALL or SMP_LOAD_ADD */
+static void load_paths_w(Gui *g, wchar_t **w, int n, int how, bool dropped) {
+  char **u = calloc((size_t)(n > 0 ? n : 1), sizeof *u), err[700], msg[1900]; int i, ok = 0, k = 0;
+  if (!u) { beep(); return; }
+  for (i = 0; i < n; i++) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
+    if (len <= 0 || !(u[k] = malloc((size_t)len))) continue;
+    WideCharToMultiByte(CP_UTF8, 0, w[i], -1, u[k], len, NULL, NULL);
+    k++;
+  }
+  if (k) ok = smp_plug_load_many(g->P, (const char *const *)u, k, how, -1, dropped, err, sizeof err);
+  else snprintf(err, sizeof err, "no file chosen");
+  if (!ok) {
+    smp_plug_cant_load(g->P, k ? u[0] : "", err, msg, sizeof msg);
+    say_note(g, msg); beep();
+  } else g->note[0] = 0;
+  for (i = 0; i < k; i++) free(u[i]);
+  free(u);
   refresh(g);
 }
 
@@ -911,9 +1098,15 @@ static void file_chosen(Gui *g, int kind, int k) {
   file_list(g, kind, true);                   /* the loaded file selected (again, when the load failed) */
 }
 
-static void browse_file(Gui *g, int kind) {
+/* Browse (how SMP_LOAD_ALL) and Add samples (SMP_LOAD_ADD) on the Sampler page: several files may be chosen;
+   the SoundFont page's Browse chooses one */
+static void browse_file_as(Gui *g, int kind, int how);
+static void browse_file(Gui *g, int kind) { browse_file_as(g, kind, SMP_LOAD_ALL); }
+static void browse_file_as(Gui *g, int kind, int how) {
   const FileKind *K = &kinds[kind];
-  wchar_t file[1100] = L"", dirw[1100] = L""; char path[1100]; OPENFILENAMEW of; int ok;
+  enum { BIG = 65536 };
+  wchar_t *file = calloc(BIG, sizeof(wchar_t)), dirw[1100] = L""; char path[1100]; OPENFILENAMEW of; int ok, stub = test_dialog;
+  if (!file) { beep(); return; }
   if (K->path(g->P, path, sizeof path) && MultiByteToWideChar(CP_UTF8, 0, path, -1, dirw, 1100)) {
     wchar_t *s = wcsrchr(dirw, L'\\'), *s2 = wcsrchr(dirw, L'/');
     if (s2 > s) s = s2;
@@ -923,15 +1116,21 @@ static void browse_file(Gui *g, int kind) {
   of.lStructSize = sizeof of;
   of.hwndOwner = GetAncestor(g->win, GA_ROOT);
   of.lpstrFilter = K->filter ? K->filter : audio_filter();
-  of.lpstrFile = file; of.nMaxFile = 1100;
+  of.lpstrFile = file; of.nMaxFile = kind ? 1100 : BIG;
   of.lpstrInitialDir = dirw[0] ? dirw : NULL;
-  of.lpstrTitle = K->title;
-  of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+  of.lpstrTitle = kind ? K->title : how == SMP_LOAD_ADD ? L"Add samples" : L"Load samples";
+  of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR | (kind ? 0 : OFN_ALLOWMULTISELECT);
   modal_begin(g);
-  ok = test_dialog ? stub_dialog(g, file, 1100) : GetOpenFileNameW(&of);
-  if (modal_end(g)) return;               /* the window (and maybe the plugin) went while the dialog was open */
-  if (ok) load_path_w(g, file, kind ? LOAD_FONT : LOAD_SAMPLE);   /* this page's player, whatever the file */
-  focus(kind ? g->sfbrowse : g->browse);
+  ok = stub ? stub_dialog(g, file, BIG) : GetOpenFileNameW(&of);
+  if (modal_end(g)) { free(file); return; }   /* the window (and maybe the plugin) went while the dialog was open */
+  if (ok && kind) load_path_w(g, file, LOAD_FONT);   /* this page's player, whatever the file */
+  else if (ok) {
+    wchar_t **list; int n = split_files(file, stub != 0, &list);
+    load_paths_w(g, list, n, how, false);
+    free_files(list, n);
+  }
+  free(file);
+  focus(kind ? g->sfbrowse : how == SMP_LOAD_ADD ? g->zadd : g->browse);
 }
 
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
@@ -951,9 +1150,29 @@ static HRESULT STDMETHODCALLTYPE d_over(IDropTarget *t, DWORD k, POINTL p, DWORD
   (void)k; (void)p; *eff = ((Drop *)t)->ok ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE d_leave(IDropTarget *t) { ((Drop *)t)->ok = 0; return S_OK; }
+/* Dropped files: an instrument first loads that instrument (the SoundFont player plays); otherwise every file loads
+   as the Sampler's samples, in place of those it has (and the Sampler plays) */
+static void drop_files(Gui *g, wchar_t **list, int n) {
+  if (n <= 0) return;
+  if (font_name(list[0])) load_path_w(g, list[0], LOAD_DROPPED);
+  else load_paths_w(g, list, n, SMP_LOAD_ALL, true);
+}
+/* the files of a drop, as full paths (freed with free_files) */
+static int hdrop_files(HDROP h, wchar_t ***out) {
+  UINT n = DragQueryFileW(h, 0xFFFFFFFF, NULL, 0), i; int k = 0;
+  wchar_t **list = n ? calloc(n, sizeof *list) : NULL;
+  *out = list;
+  for (i = 0; list && i < n && i < SMP_MULTI_MAX; i++) {
+    UINT len = DragQueryFileW(h, i, NULL, 0);
+    if (!len || !(list[k] = malloc((len + 1) * sizeof(wchar_t)))) continue;
+    if (DragQueryFileW(h, i, list[k], len + 1)) k++; else free(list[k]);
+  }
+  return k;
+}
 static void drop_hdrop(Gui *g, HDROP h) {
-  wchar_t w[1100];
-  if (DragQueryFileW(h, 0, w, 1100)) load_path_w(g, w, LOAD_DROPPED);
+  wchar_t **list; int n = hdrop_files(h, &list);
+  drop_files(g, list, n);
+  free_files(list, n);
 }
 /* The drop only notes the file and posts WM_DROPPED: the load (maybe a decode) runs after the drag has returned, so
    Explorer or the Media Explorer isn't kept waiting, and nothing loads inside OLE's drag loop. */
@@ -963,10 +1182,15 @@ static HRESULT STDMETHODCALLTYPE d_drop(IDropTarget *t, IDataObject *o, DWORD k,
   if (o && d->g && !d->g->closing && SUCCEEDED(o->lpVtbl->GetData(o, &hdrop_fmt, &m))) {
     HDROP h = (HDROP)GlobalLock(m.hGlobal);
     if (h) {
-      if (DragQueryFileW(h, 0, d->g->dropped, 1100) && d->g->win) {
+      wchar_t **list; int n = hdrop_files(h, &list), i; size_t len = 1;
+      for (i = 0; i < n; i++) len += wcslen(list[i]) + 1;
+      if (n && d->g->win && !d->g->dropped && (d->g->dropped = calloc(len, sizeof(wchar_t))) != NULL) {
+        wchar_t *at = d->g->dropped;
+        for (i = 0; i < n; i++) { wcscpy(at, list[i]); at += wcslen(list[i]) + 1; }
         PostMessageW(d->g->win, WM_DROPPED, 0, 0);
         *eff = DROPEFFECT_COPY;
       }
+      free_files(list, n);
       GlobalUnlock(m.hGlobal);
     }
     ReleaseStgMedium(&m);
@@ -1044,6 +1268,8 @@ static void click(Gui *g, int id) {
   int m;
   switch (id) {
     case ID_BROWSE: browse_file(g, 0); break;
+    case ID_ZADD: browse_file_as(g, 0, SMP_LOAD_ADD); break;
+    case ID_ZREMOVE: zone_remove(g); break;
     case ID_SFBROWSE: browse_file(g, 1); break;
     case ID_SETTINGS: case ID_SFSETTINGS: show_page(g, PG_SETTINGS, NULL); break;
     case ID_BACK:                             /* to the main page that plays, on its Settings button */
@@ -1107,12 +1333,22 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
     if (m == WM_CHAR && w > ' ' && w != 127) { edit_begin(g, s, (wchar_t)w); return 0; }   /* typing starts the box */
     if (m == WM_CHAR) return 0;
   }
+  if (m == WM_KEYDOWN && w == VK_DELETE && id == ID_ZLIST) { zone_remove(g); return 0; }
+  if (m == WM_KEYDOWN && w == VK_ESCAPE && id == ID_ZVEL) {   /* as it was */
+    char v[32]; int a, b, c, d;
+    smp_plug_zone_range(g->P, smp_plug_zone_selected(g->P), &a, &b, &c, &d);
+    snprintf(v, sizeof v, "%d,%d", c, d);
+    set_text(h, v); SendMessageW(h, EM_SETSEL, 0, -1);
+    return 0;
+  }
   if (m == WM_KEYDOWN && w == VK_RETURN) {
     if (id == ID_DIR) { apply_dir(g); SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
+    if (id == ID_ZVEL) { vel_apply(g); SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
     if (is_class(h, L"Button")) { SendMessageW(h, BM_CLICK, 0, 0); return 0; }
     if (is_class(h, L"Edit")) return 0;
   }
   if (m == WM_KILLFOCUS && id == ID_DIR) apply_dir(g);
+  if (m == WM_KILLFOCUS && id == ID_ZVEL) vel_apply(g);
   return DefSubclassProc(h, m, w, l);
 }
 
@@ -1140,6 +1376,10 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       } else if (code == CBN_SELCHANGE && (id == ID_SFMODE || id == ID_SFPRESET || id == ID_SFCHANNEL ||
                                            (id >= ID_CHAN && id < ID_CHAN + NCH) || (id >= ID_OUT && id < ID_OUT + NCH))) {
         sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
+      } else if (code == LBN_SELCHANGE && id == ID_ZLIST) {   /* a sample chosen in the list */
+        LRESULT k = SendMessageW((HWND)l, LB_GETCURSEL, 0, 0);
+        if (k >= 0 && k < smp_plug_zone_count(g->P)) smp_plug_zone_select(g->P, (int)k);
+        refresh(g);
       } else if (code == BN_CLICKED) click(g, id);
       return 0;
     }
@@ -1158,7 +1398,15 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SETFOCUS: keep_focus(g); return 0;
     case WM_DROPFILES: drop_hdrop(g, (HDROP)w); DragFinish((HDROP)w); return 0;
-    case WM_DROPPED: if (g->dropped[0]) { wchar_t f[1100]; wcscpy(f, g->dropped); g->dropped[0] = 0; load_path_w(g, f, LOAD_DROPPED); } return 0;
+    case WM_DROPPED:
+      if (g->dropped) {
+        wchar_t *buf = g->dropped, *at, *list[SMP_MULTI_MAX]; int n = 0;
+        g->dropped = NULL;
+        for (at = buf; *at && n < SMP_MULTI_MAX; at += wcslen(at) + 1) list[n++] = at;
+        drop_files(g, list, n);
+        free(buf);
+      }
+      return 0;
   }
   return DefWindowProcW(h, m, w, l);
 }
@@ -1230,8 +1478,8 @@ static HWND param_box(Gui *g, int page, int id, int x, int y, int lw, int cw) {
 
 #define N_REST (SMP_NPARAMS - 2)
 #define REST_ROWS ((N_REST + 1) / 2)
-#define W_HEIGHT_S (8 + (4 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page: the tabs, 3 rows, the rest in two
-                                                             columns, Status and Settings */
+#define W_HEIGHT_S (8 + (8 + REST_ROWS + 2) * ROW + 8)   /* the Sampler page: the tabs, 3 rows, the samples (4
+                                                             rows), the rest in two columns, Status and Settings */
 #define W_HEIGHT_F (8 + 23 * ROW + 26 + 8)   /* the SoundFont page with every knob: Settings 23 rows down */
 #define W_HEIGHT (W_HEIGHT_S > W_HEIGHT_F ? W_HEIGHT_S : W_HEIGHT_F)
 
@@ -1275,6 +1523,17 @@ static bool build(Gui *g, HWND parent) {
   g->browse = ctl(g, 0, L"BUTTON", L"Browse", T | BS_PUSHBUTTON, 132, y, 100, 26, ID_BROWSE);
   g->file[0] = labelled(g, PG_SAMPLER, "File", L"COMBOBOX", T | CBS_DROPDOWNLIST | WS_VSCROLL, 240, y, 40, 470, 320, ID_FILE);
   y += ROW;
+  /* the samples: the list, three rows high, with Add samples and Remove sample beside it, Velocity under them;
+     Start key and End key below (Tab: the list, the buttons, Start key, End key, Velocity) */
+  g->zlist = labelled(g, PG_SAMPLER, "Samples", L"LISTBOX", T | LBS_NOTIFY | WS_VSCROLL | WS_BORDER | LBS_NOINTEGRALHEIGHT,
+                      8, y, 120, 400, 3 * ROW - 6, ID_ZLIST);
+  g->zadd = ctl(g, PG_SAMPLER, L"BUTTON", L"Add samples", T | BS_PUSHBUTTON, 548, y, 160, 26, ID_ZADD);
+  g->zremove = ctl(g, PG_SAMPLER, L"BUTTON", L"Remove sample", T | BS_PUSHBUTTON, 548, y + ROW, 160, 26, ID_ZREMOVE);
+  g->zlo = slider(g, PG_SAMPLER, "Start key", SL_ZLO, 8, y + 3 * ROW, 120, 236, ID_ZLO);
+  g->zhi = slider(g, PG_SAMPLER, "End key", SL_ZHI, 384, y + 3 * ROW, 160, 200, ID_ZHI);
+  g->zvel = labelled(g, PG_SAMPLER, "Velocity", L"EDIT", T | ES_AUTOHSCROLL, 548, y + 2 * ROW, 60, 96, 24, ID_ZVEL);
+  SendMessageW(g->zvel, EM_SETLIMITTEXT, 30, 0);
+  y += 4 * ROW;
   param_box(g, PG_SAMPLER, SMP_P_KEEP_LENGTH, 8, y, 120, 130);
   param_box(g, PG_SAMPLER, SMP_P_MODE, 384, y, 160, 130);
   y += ROW;
@@ -1420,6 +1679,7 @@ static void gui_free(Gui *g) {
   if (g->aps) g->aps->lpVtbl->Release(g->aps);
   if (g->ole_init) OleUninitialize();
   if (g->font) DeleteObject(g->font);
+  free(g->dropped);
   memset(g, 0xDD, sizeof *g);                 /* a use after free shows up as garbage, not as old values */
   free(g);
 }

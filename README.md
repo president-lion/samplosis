@@ -17,8 +17,8 @@ Licence: GPL version 2 (see COPYING). It includes these libraries, each under it
 
 ## What it does
 
-Samplosis has two players in one plugin, chosen by a tab: the Sampler, which plays one sample across the keyboard
-(stage 1), and the SoundFont player (stage 4, see "The SoundFont player"), which also plays SFZ, Decent Sampler,
+Samplosis has two players in one plugin, chosen by a tab: the Sampler, which plays samples across the keyboard
+(stage 1; several samples, each on its own keys and velocities), and the SoundFont player (stage 4, see "The SoundFont player"), which also plays SFZ, Decent Sampler,
 Logic EXS, DLS and GigaStudio instruments. A new instance starts on the Sampler, and a project saved before the SoundFont
 player existed loads as it was. Every file format, and what reads it, is in "File formats".
 
@@ -43,6 +43,10 @@ The Sampler:
   (shared out between the instances; an octave each way always fits). A key played before its copy is ready goes to the front of the queue. Until a copy
   is ready the note plays by changing speed, as an ordinary sampler would.
 - With Keep length off, pitch changes by changing speed.
+- Several samples in one instance (up to 128): choose several files at once in Browse (they replace the samples
+  loaded) or Add samples (they join them), or drop several on the window. Each sample has its own Start key and End
+  key, its own Velocity range (1 to 127 unless set, typed like "15,80"), and its own root note; a note plays every
+  sample whose keys and velocities it falls in. See "The samples".
 - Envelope, loop, start and end points, reverse, speed, velocity response, key and velocity ranges, probability,
   pitch bend and polyphony (up to 64 voices, 16 by default).
 - Glide: a note slides in from the pitch of the note before it.
@@ -54,15 +58,29 @@ The Sampler:
 Sampler page:
 
 0. Player: the tab control (Sampler or SoundFont), first on both main pages (see "The window: the Player tabs").
-1. Sample: the loaded file, its length and its root note and where it came from. Read only.
-2. Browse button.
-3. File: a combo box of the audio files in the loaded sample's folder (see "The File combo box").
-4. Keep length (on or off).
-5. Mode.
-6. Then the other parameters in the order of the list below, from Root note to Glide mode (the window lays them out
-   in two columns, but Tab follows the list order), each one a slider (or a combo box for choices).
-7. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
-8. Settings button.
+1. Sample: the selected sample's file, its length and its root note and where it came from. Read only.
+2. Browse button: one or more files, which replace the samples loaded.
+3. File: a combo box of the audio files in the selected sample's folder (see "The File combo box"); choosing one
+   replaces the selected sample, keeping its keys and velocities.
+4. Samples: a list of the samples, one line each ("Guitar C3.wav, root C3, keys C-1 to G9, velocity 1 to 127").
+   Up and Down select one; Delete removes it. With none it says "No samples loaded".
+5. Add samples button: one or more files, added to the list (the first of them is selected).
+6. Remove sample button: removes the selected sample.
+7. Start key and End key: sliders (notes, like the other note sliders) for the selected sample's keys. Moving one
+   past the other takes the other with it. Typing note names without an octave in either one ("C", "D F", "C, E, G",
+   "F#", "Bb") makes the sample play those notes in every octave instead: both then read "every D and F". A plain
+   letter is that note only (D isn't D#; type D# for it). An arrow key afterwards makes it a range again, from the
+   lowest to the highest of those keys.
+8. Velocity: an edit box with the selected sample's velocities, like "1,127". Type two numbers from 1 to 127
+   ("15,80", "15 80", "15-80" or "15 to 80", either way round; one number is both ends), then Enter, or Tab away. A
+   value that doesn't read beeps and the box goes back to what it was; Escape puts it back too.
+9. Keep length (on or off).
+10. Mode.
+11. Then the other parameters in the order of the list below, from Root note to Glide mode (the window lays them out
+   in two columns, but Tab follows the list order), each one a slider (or a combo box for choices). Root note is the
+   selected sample's.
+12. Status: for example "Keep length: 10 of 25 copies ready", or the reason a file did not load.
+13. Settings button.
 
 Settings page:
 
@@ -110,6 +128,25 @@ The first control on both main pages is a tab control named Player, with two tab
 - Each page's Browse loads only its own kind. On the SoundFont page a .wav gives an error and a beep and the font
   stays; on the Sampler page a .sf2 does the same.
 - Settings is one page for both. Back returns to the main page that plays.
+
+### The samples
+
+- Each sample plays only for the keys from its Start key to its End key (or, when note names were typed, those
+  notes in every octave) and the velocities in its Velocity range.
+  Samples can overlap: a note in two samples' ranges plays both. A new sample has every key and velocity.
+- Each sample's root note is its own: from its file name, or detected, as for one sample. The Root note slider (and
+  REAPER parameter) is the selected sample's, so selecting another sample moves it.
+- Every other parameter is the instrument's and applies to every sample alike: the envelope, volume, loop, keep
+  length and the rest. Lowest note, Highest note, Lowest velocity and Highest velocity still limit the whole
+  instrument: a sample sounds only inside both its own ranges and those.
+- Voices is per sample (16 means up to 16 notes of each sample at once), glide and legato follow notes within a
+  sample, and Probability is drawn for each sample.
+- Browse and a drop of several files replace the samples; Add samples adds; the File combo box replaces the selected
+  one. While several load the status says "Loading 2 of 5 samples". Those that load are taken; the first that
+  doesn't is told ("Can't load bad.wav: why (and 1 more didn't load)", with a beep). When none loads, nothing
+  changes.
+- With several samples the status says "Ready: 3 samples". A sample from a project whose file is gone stays in the
+  list as "Missing: <path>", silent, and is saved back as it was.
 
 ### The File combo box
 
@@ -525,12 +562,15 @@ to 35 and are described with the SoundFont page.
 
 ## The script format
 
-The instrument is plain text, one thing per line. Blank lines and lines starting with # are ignored. After the optional
-sample line, each parameter is `name value-in-words`. Names are the lower case ones used by the engine (root,
+The instrument is plain text, one thing per line. Blank lines and lines starting with # are ignored. After the
+sample lines (none, one, or one per sample), each parameter is `name value-in-words`. Names are the lower case ones used by the engine (root,
 transpose, fine, volume, pan, attack, decay, sustain, release, velocity_sens, min_volume, mode, note_lo, note_hi,
 pitch_lo, vel_lo, vel_hi, obey_note_off, loop, loop_start, start, end, bend_range, pitch_hi, reverse, keep_length,
 voices, probability, speed, glide, glide_mode). The sample line has its path in quotes (backslashes literal) and the 16 hex digits of the
-sample's cache key (the key below is only an example). Example, shortened:
+sample's cache key (the key below is only an example). With several samples, each sample line also has its root
+(`root=C3`), and, when they aren't every key or every velocity, its keys (`keys=C2..C3`, or `keys=D,F` for every D and F) and velocities
+(`velocity=15..80`); the root line is then the first sample's (the selected one when saved). With one sample its
+root is the root line, as before. Example, shortened:
 
     # Samplosis 0.1.0
     sample "D:\guitar\Guitar C3.wav" key=0123456789abcdef
@@ -540,6 +580,11 @@ sample's cache key (the key below is only an example). Example, shortened:
     mode note
     keep_length on
     voices 8
+
+Two samples, a soft and a loud layer:
+
+    sample "D:\piano\soft C4.wav" key=0123456789abcdef root=C4 velocity=1..80
+    sample "D:\piano\loud C4.wav" key=fedcba9876543210 root=C4 velocity=81..127
 
 A project saved with this plugin starts with `plays sampler` or `plays soundfont`, and has the SoundFont lines after
 these (see "The SoundFont state lines").
@@ -734,7 +779,8 @@ offline and in real time:
   quarter of the cache size limit (beyond an octave each way) are made only when their key is first played, and
   that first note is resampled. Narrowing the key range (Lowest note, Highest note) renders less and frees the
   copies it no longer reaches.
-- One sample per instance in the Sampler.
+- At most 128 samples in one instance. Each has its own engine (three threads and its voices' buffers, 8 MB at 16
+  voices), so a big set uses more memory than one sample. Removing a sample stops its notes at once (no fade).
 - Streaming from a slow disk: a big chord struck all at once, on samples not read since the computer started, can
   drop out for a few hundred milliseconds about 0.6 to 1.3 seconds in on a USB hard disk (rarely at 64 voices, more
   often at 128) before the disk catches up (see "Formats (stage 3)" in the measured numbers). Notes already playing,
@@ -781,7 +827,7 @@ offline and in real time:
 
 ## What is still to come
 
-Done so far: stage 1 (one sample, keep length), the stretcher choice, stage 4 (SoundFonts, with 16 stereo outputs
+Done so far: stage 1 (samples, keep length; several samples with their own keys and velocities), the stretcher choice, stage 4 (SoundFonts, with 16 stereo outputs
 for them), and stage 3, many formats (the sound files and instruments in "File formats", streaming, and loading in
-the background). Still to come, from the design (docs\superpowers\specs): several samples and zones in the Sampler, filter and
+the background). Still to come, from the design (docs\superpowers\specs): round robins, crossfades and per-sample settings in the Sampler, filter and
 modulation, the command line tool, the tempo lock, and 16 outputs for the Sampler's zones.

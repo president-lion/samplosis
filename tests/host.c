@@ -400,6 +400,11 @@ static void describe(HWND h, char *cls, char *name, char *value) {
     t[0] = 0;
     if (i >= 0) SendMessageW(h, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
   }
+  if (cls_is(h, L"ListBox")) {
+    LRESULT i = SendMessageW(h, LB_GETCURSEL, 0, 0);
+    t[0] = 0;
+    if (i >= 0 && SendMessageW(h, LB_GETTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(h, LB_GETTEXT, (WPARAM)i, (LPARAM)t);
+  }
   utf8(t, value, 1100);
 }
 /* a tab control: the name of the tab MSAA reports as selected */
@@ -517,10 +522,10 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     if (!strcmp(a, "key")) {
       static const struct { const char *n; WPARAM vk; } keys[] = {{"tab", VK_TAB}, {"up", VK_UP}, {"down", VK_DOWN},
         {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT},
-        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}};
+        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}, {"delete", VK_DELETE}};
       char k[32] = ""; int i, found = 0;
       sscanf(arg, "%31s", k);
-      for (i = 0; i < 12; i++)
+      for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++)
         if (!strcmp(k, keys[i].n)) { key(keys[i].vk, strstr(arg, "shift") != NULL, strstr(arg, "ctrl") != NULL); found = 1; }
       if (!found) { printf("error: no key %s\n", k); return 1; }
       pump(60); settle(p, 0); say();
@@ -600,18 +605,21 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       if (load_state(p, arg) < 0) return 1;
       main_thread(p); pump(30);
     } else if (!strcmp(a, "list")) {
-      HWND c = find_named(arg); LRESULT i, n = c ? SendMessageW(c, CB_GETCOUNT, 0, 0) : 0;
+      HWND c = find_named(arg); int lb = c && cls_is(c, L"ListBox");
+      LRESULT i, n = c ? SendMessageW(c, lb ? LB_GETCOUNT : CB_GETCOUNT, 0, 0) : 0;
       printf("list: %s", arg);
       for (i = 0; i < n; i++) {
         wchar_t t[1100] = L""; char u[1100];
-        if (SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(c, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
+        if (lb) { if (SendMessageW(c, LB_GETTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(c, LB_GETTEXT, (WPARAM)i, (LPARAM)t); }
+        else if (SendMessageW(c, CB_GETLBTEXTLEN, (WPARAM)i, 0) < 1100) SendMessageW(c, CB_GETLBTEXT, (WPARAM)i, (LPARAM)t);
         utf8(t, u, sizeof u); printf(" | %s", u);
       }
       printf("\n");
-    } else if (!strcmp(a, "drop")) {        /* a file dropped on the window, as Explorer's WM_DROPFILES gives it */
-      wchar_t wp[1100]; size_t k; HGLOBAL hg; DROPFILES *df;
-      MultiByteToWideChar(CP_UTF8, 0, arg, -1, wp, 1100);
+    } else if (!strcmp(a, "drop")) {        /* files dropped on the window (several: a|b), as Explorer's WM_DROPFILES */
+      wchar_t wp[4400]; size_t k, j; HGLOBAL hg; DROPFILES *df;
+      MultiByteToWideChar(CP_UTF8, 0, arg, -1, wp, 4400);
       k = wcslen(wp);
+      for (j = 0; j < k; j++) if (wp[j] == L'|') wp[j] = 0;   /* each name ends in a zero, the list in two */
       hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DROPFILES) + (k + 2) * sizeof(wchar_t));
       if (!hg || !(df = GlobalLock(hg))) { printf("error: drop\n"); return 1; }
       df->pFiles = sizeof(DROPFILES); df->fWide = TRUE;

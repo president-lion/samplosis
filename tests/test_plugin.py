@@ -523,6 +523,8 @@ def test_plugin_params(P):
 # ---- the window, driven by messages through host.exe's gui command ----
 MAIN_ORDER = [
     ("Tab", "Player"), ("Edit", "Sample"), ("Button", "Browse"), ("ComboBox", "File"),
+    ("ListBox", "Samples"), ("Button", "Add samples"), ("Button", "Remove sample"), ("Slider", "Start key"),
+    ("Slider", "End key"), ("Edit", "Velocity"),
     ("ComboBox", "Keep length"), ("ComboBox", "Mode"),
     ("Slider", "Root note"), ("Slider", "Transpose"), ("Slider", "Fine tune"), ("Slider", "Volume"), ("Slider", "Pan"),
     ("Slider", "Attack"), ("Slider", "Decay"), ("Slider", "Sustain"), ("Slider", "Release"),
@@ -1190,3 +1192,165 @@ def test_state_new_file_resets_knobs(P, tmp_path):
     out = gui(P, tmp_path, text, ["read Force", "drop %s" % other, "say", "read Force", "drop %s" % kit, "say",
                                   "read Force"])
     assert [x[1] for x in got(out, "read")] == ["40 percent", "0 percent", "0 percent"], out
+
+
+# ---- the Sampler's samples: several in one instrument ----
+def tone(tmp_path, name, freq, secs=0.8, rate=44100):
+    f = tmp_path / name
+    t = np.arange(int(secs * rate)) / rate
+    write_wav(f, (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32), rate)
+    return f
+
+
+def peak_hz(x, rate=48000):
+    x = x[2000:14000]
+    s = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    return np.fft.rfftfreq(len(x), 1 / rate)[int(np.argmax(s))]
+
+
+def two_samples(tmp_path, extra=""):
+    a, b = tone(tmp_path, "low C3.wav", 220), tone(tmp_path, "high C5.wav", 880)
+    return a, b, ('sample "%s" keys=C-1..B3\nsample "%s" keys=C4..G9 velocity=20..100\nkeep_length off\n'
+                  'mode sample\nrelease 30 ms\n%s' % (a, b, extra))
+
+
+def test_plugin_plays_samples_by_key(P, tmp_path):
+    a, b, text = two_samples(tmp_path)
+    y, _, _ = P.play(text, "on 50 100 0\noff 50 20000\non 70 100 24000\noff 70 44000\non 70 10 48000", 72000)
+    assert peak_hz(y[:24000, 0]) == pytest.approx(220, abs=5)
+    assert peak_hz(y[24000:48000, 0]) == pytest.approx(880, abs=5)
+    assert np.abs(y[50000:, 0]).max() < 1e-6                 # velocity 10 is below the second sample's 20
+    code, out, err = host("state", P.state_file(text))
+    st = saved_state(out)
+    assert 'sample "%s" key=' % a in st and " root=C3 keys=C-1..B3\n" in st
+    assert " root=C5 keys=C4..G9 velocity=20..100\n" in st
+
+
+def test_gui_samples_list(P, tmp_path):
+    a, b, text = two_samples(tmp_path)
+    out = gui(P, tmp_path, text, ["list Samples", "read Sample", "read Root note", "focus Samples", "key down",
+                                  "read Sample", "read Root note", "read Start key", "read End key", "read Velocity",
+                                  "param 0", "key up", "read Velocity"])
+    lines = ["low C3.wav, root C3, keys C-1 to B3, velocity 1 to 127",
+             "high C5.wav, root C5, keys C4 to G9, velocity 20 to 100"]
+    assert got(out, "list")[0] == ["Samples"] + lines
+    r = [x[1] for x in got(out, "read")]
+    assert r[0].startswith("low C3.wav, 0.80 s, root C3") and r[1] == "C3"
+    assert got(out, "focus")[0] == ["ListBox", "Samples", lines[1]]
+    assert r[2].startswith("high C5.wav, ") and r[3] == "C5"            # Root note is the selected sample's
+    assert r[4:7] == ["C4", "G9", "20,100"]
+    assert "param 0: 72" in out
+    assert r[7] == "1,127"
+
+
+def test_gui_sample_ranges(P, tmp_path):
+    a, b, text = two_samples(tmp_path)
+    out = gui(P, tmp_path, text, ["focus Start key", "key up", "key up shift", "focus End key", "key home",
+                                  "read Start key", "focus Velocity", "type 15,80", "key enter", "say", "state sample",
+                                  "type loud", "key enter", "say", "counts", "type 90 to 30", "key tab", "focus Velocity",
+                                  "state sample"])
+    v = [x[2] for x in got(out, "focus")]
+    assert v[:4] == ["C#-1", "B-1", "C-1", "15,80"]          # End below Start takes Start down with it
+    assert [x[1] for x in got(out, "read")] == ["C-1"]
+    st = [x[0] for x in got(out, "state")]
+    assert len(st) == 4 and st[0].endswith(" keys=C-1..C-1 velocity=15..80")
+    assert v[4] == "15,80" and got(out, "counts")[0][0] == "beeps 1"   # "loud" doesn't read: beep, it stays
+    assert st[2].endswith(" keys=C-1..C-1 velocity=30..90")            # leaving the box reads it; low first
+
+
+def test_gui_add_and_remove_samples(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
+    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Add samples", "key enter",
+                                         "list Samples", "read Samples", "read Sample", "focus Remove sample",
+                                         "key enter", "list Samples", "read Samples", "focus Samples", "key delete",
+                                         "list Samples", "state sample", "counts"])
+    names = lambda row: [x.split(",")[0] for x in row[1:]]
+    ls = got(out, "list")
+    assert names(ls[0]) == ["a C3.wav", "b D3.wav", "c E3.wav"]
+    r = [x[1] for x in got(out, "read")]
+    assert r[0].startswith("b D3.wav") and r[1].startswith("b D3.wav")   # the first one added is selected
+    assert names(ls[1]) == ["a C3.wav", "c E3.wav"] and r[2].startswith("c E3.wav")
+    assert names(ls[2]) == ["a C3.wav"]                                   # Delete on the list removes it too
+    assert len(got(out, "state")) == 1 and got(out, "counts")[0][2] != "mark_dirty 0"
+
+
+def test_gui_no_samples(P, tmp_path):
+    out = gui(P, tmp_path, "keep_length off\n", ["list Samples", "focus Remove sample", "key enter", "counts",
+                                                 "focus Start key", "key up", "counts"])
+    assert got(out, "list")[0] == ["Samples", "No samples loaded"]
+    c = got(out, "counts")
+    assert c[0][0] == "beeps 1" and c[1][0] == "beeps 2"
+
+
+def test_gui_browse_several_replaces(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
+    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Browse", "key enter", "list Samples",
+                                         "read Status"])
+    assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["b D3.wav", "c E3.wav"]
+    assert got(out, "read")[0][1] == "Ready: 2 samples"
+
+
+def test_gui_file_combo_replaces_selected(P, tmp_path):
+    d = tmp_path / "kit"
+    d.mkdir()
+    a, b, c = tone(d, "a C3.wav", 220), tone(d, "b D3.wav", 330), tone(d, "c E3.wav", 440)
+    text = 'sample "%s"\nsample "%s" keys=C4..G9\nkeep_length off\n' % (a, b)
+    out = gui(P, tmp_path, text, ["focus Samples", "key down", "focus File", "key down", "list Samples", "state sample"])
+    rows = got(out, "list")[0][1:]
+    assert [x.split(",")[0] for x in rows] == ["a C3.wav", "c E3.wav"]
+    assert rows[1].endswith("keys C4 to G9, velocity 1 to 127")         # its ranges stay
+    st = [x[0] for x in got(out, "state")]
+    assert st[1].startswith('sample "%s" key=' % c) and st[1].endswith(" keys=C4..G9")
+
+
+def test_gui_drop_several(P, tmp_path):
+    a, b = tone(tmp_path, "a C3.wav", 220), tone(tmp_path, "b D3.wav", 330)
+    out = gui(P, tmp_path, P.script(P.sample()), ["drop %s|%s" % (a, b), "list Samples", "state plays"])
+    assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["a C3.wav", "b D3.wav"]
+
+
+def test_gui_some_samples_fail(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    bad = tmp_path / "bad.wav"
+    bad.write_bytes(b"not a wav")
+    out = gui(P, tmp_path, "keep_length off\n", ["dialog pick %s|%s" % (bad, a), "focus Add samples", "key enter",
+                                                 "list Samples", "read Status", "counts"])
+    assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["a C3.wav"]
+    assert got(out, "read")[0][1].startswith("Can't load bad.wav: ")
+    assert got(out, "counts")[0][0] == "beeps 1"
+
+
+def test_gui_key_name_without_octave(P, tmp_path):
+    a, b, text = two_samples(tmp_path)
+    out = gui(P, tmp_path, text, ["focus End key", "key enter", "type c", "key enter", "read Start key",
+                                  "list Samples", "state sample", "focus Start key", "key up", "read End key",
+                                  "key enter", "type F#", "key enter", "key enter", "type Q", "key enter", "counts"])
+    v = [x[2] for x in got(out, "focus")]
+    r = [x[1] for x in got(out, "read")]
+    assert v[1] == "every C" and r[0] == "every C"
+    assert got(out, "list")[0][1].endswith("keys every C, velocity 1 to 127")
+    assert got(out, "state")[0][0].endswith(" keys=C")
+    assert v[2] == "C#-1" and r[1] == "C9"              # an arrow makes it a range again, from the lowest and highest C
+    assert v[4] == "every F#"
+    assert v[6] == "every F#" and got(out, "counts")[0][0] == "beeps 1"
+
+
+def test_gui_velocity_keeps_every_octave(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    out = gui(P, tmp_path, 'sample "%s" keys=D\nkeep_length off\n' % a,
+              ["focus Velocity", "type 10,50", "key enter", "list Samples"])
+    assert got(out, "list")[0][1].endswith("keys every D, velocity 10 to 50")
+
+
+def test_gui_several_note_names(P, tmp_path):
+    a = tone(tmp_path, "a C3.wav", 220)
+    out = gui(P, tmp_path, 'sample "%s"\nkeep_length off\n' % a,
+              ["focus Start key", "key enter", "type d f", "key enter", "read End key", "list Samples",
+               "state sample", "key enter", "type D# F", "key enter"])
+    v = [x[2] for x in got(out, "focus")]
+    assert v[1] == "every D and F" and got(out, "read")[0][1] == "every D and F"
+    assert got(out, "list")[0][1].endswith("keys every D and F, velocity 1 to 127")
+    assert got(out, "state")[0][0].endswith(" keys=D,F")
+    assert v[3] == "every D# and F"

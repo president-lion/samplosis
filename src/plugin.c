@@ -11,7 +11,7 @@
    so a project opens with its sample. The window's loads (Browse, the File combo box, a drop) decode on a worker
    thread instead and are swapped in on the main thread when ready (see "the window's sample loads" below).
    Process runs on the audio thread: it splits the block at each event, so parameter changes and notes land on
-   their exact frame, and touches nothing but the engine. Replaced samples are freed by smp_engine_collect on the
+   their exact frame, and touches nothing but the players. Replaced samples are freed by smp_multi_collect on the
    main thread: after a state load the audio thread asks the host for a few main-thread callbacks (request_callback
    is thread-safe) and each one collects.
 
@@ -48,7 +48,7 @@ static const char *const features[] = {CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUG
                                        CLAP_PLUGIN_FEATURE_STEREO, NULL};
 static const clap_plugin_descriptor_t desc = {
   CLAP_VERSION_INIT, "com.audioskit.samplosis", "Samplosis", "audioskit", "", "", "", "0.1.0",
-  "A sampler you can use with a screen reader: one sample across the keyboard", features};
+  "A sampler you can use with a screen reader: samples across the keyboard, and SoundFonts", features};
 
 static Plug *plug_of(const clap_plugin_t *p) { return p && p->desc == &desc ? (Plug *)p->plugin_data : NULL; }
 static void loader_cancel(Plug *P);      /* the window's background loads (below) */
@@ -56,59 +56,12 @@ static int take_font(Plug *P, SmpFont *f, const char *path, char *err, int cap);
 static void loader_stop(Plug *P);
 
 /* ---- the instrument as text ---- */
-static char *engine_text(const SmpEngine *e) {
-  int n = smp_script_write(e, NULL, 0);
+static void keep_text(Plug *P, const char *text);
+static char *engine_text(const SmpMulti *m) {
+  int n = smp_multi_script_write(m, NULL, 0);
   char *t = malloc((size_t)n + 1);
-  if (t) smp_script_write(e, t, n + 1);
+  if (t) smp_multi_script_write(m, t, n + 1);
   return t;
-}
-
-/* The first `sample` line of text (without its line end) into line, and its path into path. 0 if there is none,
-   1 if it isn't well formed, 2 if it is (a quoted path, then nothing or key= and 16 hex digits). */
-static int sample_line(const char *text, char *line, int lcap, char *path, int pcap) {
-  const char *p = text;
-  while (p && *p) {
-    const char *eol = strchr(p, '\n'), *s = p, *end;
-    size_t len;
-    end = eol ? eol : p + strlen(p);
-    while (s < end && (*s == ' ' || *s == '\t')) s++;
-    if (end - s > 6 && !strncmp(s, "sample", 6) && (s[6] == ' ' || s[6] == '\t')) {
-      const char *q, *qe;
-      while (end > s && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
-      len = (size_t)(end - s);
-      snprintf(line, (size_t)lcap, "%.*s", (int)len, s);
-      q = strchr(s, '"');
-      qe = q && q < end ? memchr(q + 1, '"', (size_t)(end - q - 1)) : NULL;
-      if (qe) snprintf(path, (size_t)pcap, "%.*s", (int)(qe - q - 1), q + 1);
-      else snprintf(path, (size_t)pcap, "%s", "");
-      if (!qe || qe == q + 1) return 1;                    /* not well formed: no path */
-      qe++;
-      while (qe < end && (*qe == ' ' || *qe == '\t')) qe++;
-      if (qe == end) return 2;
-      if (end - qe != 20 || strncmp(qe, "key=", 4)) return 1;
-      for (q = qe + 4; q < end; q++) if (!isxdigit((unsigned char)*q)) return 1;
-      return 2;
-    }
-    p = eol ? eol + 1 : NULL;
-  }
-  return 0;
-}
-
-/* text without its sample lines */
-static char *without_sample(const char *text) {
-  char *out = malloc(strlen(text) + 1), *o = out;
-  const char *p = text;
-  if (!out) return NULL;
-  while (*p) {
-    const char *eol = strchr(p, '\n'), *s = p, *end = eol ? eol + 1 : p + strlen(p);
-    while (*s == ' ' || *s == '\t') s++;
-    if (!(!strncmp(s, "sample", 6) && (s[6] == ' ' || s[6] == '\t' || s[6] == '"'))) {
-      memcpy(o, p, (size_t)(end - p)); o += end - p;
-    }
-    p = end;
-  }
-  *o = 0;
-  return out;
 }
 
 /* The last line whose first word is word: 1, with the line (trimmed) in line, the rest after the word in rest and
@@ -179,10 +132,16 @@ static void keep_text(Plug *P, const char *text) {
   free(P->text); P->text = t;
 }
 
-/* "Ready: x.wav", and what decoded it when that wasn't built in: "Ready: x.m4a (decoded by Windows)" */
-static void ready_status(Plug *P, const SmpSample *s) {
-  const char *by = s->by == SMP_DEC_WINDOWS ? " (decoded by Windows)" : s->by == SMP_DEC_FFMPEG ? " (decoded by FFmpeg)" : "";
-  snprintf(P->status, sizeof P->status, "Ready: %s%s", s->name, by);
+/* "Ready: x.wav", and what decoded it when that wasn't built in: "Ready: x.m4a (decoded by Windows)"; with several
+   samples "Ready: 3 samples" */
+static void ready_status(Plug *P) {
+  int n = smp_multi_count(P->e), sel = smp_multi_selected(P->e);
+  const SmpSample *s = smp_multi_sample(P->e, sel);
+  if (n > 1) snprintf(P->status, sizeof P->status, "Ready: %d samples", n);
+  else if (s) {
+    const char *by = s->by == SMP_DEC_WINDOWS ? " (decoded by Windows)" : s->by == SMP_DEC_FFMPEG ? " (decoded by FFmpeg)" : "";
+    snprintf(P->status, sizeof P->status, "Ready: %s%s", s->name, by);
+  } else snprintf(P->status, sizeof P->status, "No sample loaded");
 }
 
 static void ask_collect(Plug *P) {
@@ -196,61 +155,39 @@ static int file_exists(const char *utf8) {
   return GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES;
 }
 
-/* Applies a state text to the sampler. 1 when it's taken (the sample may still be missing), 0 when it doesn't
-   read (nothing changes). Main thread. */
-static int apply_sampler(Plug *P, const char *text) {
-  char err[700] = "", line[1200], path[1100];
-  if (!P->e) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
-  if (!smp_script_apply(P->e, text, err, sizeof err)) {
-    const SmpSample *s;
-    if (!sample_line(text, line, sizeof line, path, sizeof path)) smp_engine_set_sample(P->e, NULL);   /* an empty
-                                    instrument: script_apply keeps the current sample, a state without one doesn't */
-    s = smp_engine_sample(P->e);
-    P->missing = 0;
-    keep_text(P, text);
-    if (s) ready_status(P, s);
-    else snprintf(P->status, sizeof P->status, "No sample loaded");
-    ask_collect(P);
-    return 1;
-  }
-  if (sample_line(text, line, sizeof line, path, sizeof path) == 2) {
-    /* a well-formed sample line that didn't load; if everything else reads, take it without the sample */
-    char *rest = without_sample(text), err2[700];
-    if (rest && !smp_script_apply(P->e, rest, err2, sizeof err2)) {
-      free(rest);
-      smp_engine_set_sample(P->e, NULL);
-      P->missing = 1;
-      keep_text(P, text);
-      if (!file_exists(path)) snprintf(P->status, sizeof P->status, "Missing: %s", path);
-      else snprintf(P->status, sizeof P->status, "Can't load %s: %s", path, err);
-      ask_collect(P);
-      return 1;
-    }
-    free(rest);
-  }
-  snprintf(P->status, sizeof P->status, "The saved instrument doesn't read, so nothing changed: %s", err);
-  return 0;
+/* the status for samples that didn't load: "Missing: <path>" or "Can't load <path>: why", and how many more */
+static void missing_status(Plug *P, int nmiss) {
+  int i, n = smp_multi_count(P->e), at;
+  char path[1100];
+  for (i = 0; i < n; i++) if (smp_multi_path(P->e, i, path, sizeof path) == 2) break;
+  if (i == n) return;
+  if (!file_exists(path)) at = snprintf(P->status, sizeof P->status, "Missing: %s", path);
+  else at = snprintf(P->status, sizeof P->status, "Can't load %s: %s", path, smp_multi_why(P->e, i));
+  if (nmiss > 1 && at > 0 && at < (int)sizeof P->status)
+    snprintf(P->status + at, sizeof P->status - (size_t)at, " (and %d more)", nmiss - 1);
 }
 
-/* The sampler's part of the state: the engine's text, or with the sample missing, its text with the original
-   sample line. */
-static char *sampler_text(Plug *P) {
-  char *t, *out, line[1200], path[1100];
-  if (!P->e) return _strdup(P->text ? P->text : "# Samplosis 0.1.0\n");
-  t = engine_text(P->e);
-  if (!t || !P->missing || !P->text || !sample_line(P->text, line, sizeof line, path, sizeof path)) return t;
-  {
-    char *nl = strchr(t, '\n');
-    size_t head = nl ? (size_t)(nl - t) + 1 : strlen(t), ll = strlen(line);
-    out = malloc(strlen(t) + ll + 2);
-    if (!out) return t;
-    memcpy(out, t, head);
-    memcpy(out + head, line, ll);
-    out[head + ll] = '\n';
-    strcpy(out + head + ll + 1, t + head);
-    free(t);
-    return out;
+/* Applies a state text to the sampler. 1 when it's taken (samples may be missing: they stay in the list, silent, and
+   are written back), 0 when it doesn't read (nothing changes). Main thread. */
+static int apply_sampler(Plug *P, const char *text) {
+  char err[700] = ""; int nmiss = 0;
+  if (!P->e) { snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return 0; }
+  if (smp_multi_script_apply(P->e, text, &nmiss, err, sizeof err)) {
+    snprintf(P->status, sizeof P->status, "The saved instrument doesn't read, so nothing changed: %s", err);
+    return 0;
   }
+  P->missing = nmiss;
+  keep_text(P, text);
+  if (nmiss) missing_status(P, nmiss); else ready_status(P);
+  if (!P->active) smp_multi_collect(P->e, 1);
+  ask_collect(P);
+  return 1;
+}
+
+/* The sampler's part of the state: its samples (missing ones as they came) and parameters */
+static char *sampler_text(Plug *P) {
+  if (!P->e) return _strdup(P->text ? P->text : "# Samplosis 0.1.0\n");
+  return engine_text(P->e);
 }
 
 /* every line of text that starts with word (and a space), joined by newlines; NULL when none */
@@ -387,7 +324,7 @@ static bool p_init(const clap_plugin_t *p) {
     P->host_params = P->host->get_extension(P->host, CLAP_EXT_PARAMS);
     P->host_state = P->host->get_extension(P->host, CLAP_EXT_STATE);
   }
-  P->e = smp_engine_new(P->rate, 4096);
+  P->e = smp_multi_new(P->rate, 4096);
   P->s = smp_synth_new(P->rate, SF_BLOCK);
   snprintf(P->status, sizeof P->status, P->e && P->s ? "No sample loaded" : "Not working: the sound engine couldn't start");
   return P->e != NULL && P->s != NULL;
@@ -396,7 +333,7 @@ static bool p_init(const clap_plugin_t *p) {
 static void p_deactivate(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   P->active = 0;
-  if (P->e) smp_engine_collect(P->e);
+  if (P->e) smp_multi_collect(P->e, 1);      /* nothing processes now */
   if (P->s) smp_synth_collect_now(P->s);  /* nothing processes now: every replaced font can close */
 }
 
@@ -404,7 +341,7 @@ static void p_destroy(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   smp_gui_close(P);                      /* a host that didn't destroy the window first */
   loader_stop(P);                        /* a window load still decoding is cancelled */
-  smp_engine_free(P->e);
+  smp_multi_free(P->e);
   smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
   free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used); free(P->sf_knobs);
   free(P);
@@ -424,9 +361,9 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
     char *t = state_text(P);
     SmpSynth *old = P->s, *s = smp_synth_new(rate, SF_BLOCK);
     if (!s) { free(t); snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return false; }
-    smp_engine_free(P->e);
+    smp_multi_free(P->e);
     P->rate = rate;
-    P->e = smp_engine_new(rate, (int)P->maxf);
+    P->e = smp_multi_new(rate, (int)P->maxf);
     P->s = s;
     if (!P->e) { free(t); smp_synth_free(old); snprintf(P->status, sizeof P->status, "Not working: the sound engine couldn't start"); return false; }
     if (t) apply_text(P, t);             /* text the players wrote (or were given) always reads */
@@ -434,7 +371,7 @@ static bool p_activate(const clap_plugin_t *p, double rate, uint32_t minf, uint3
     smp_synth_free(old);                 /* after the new one opened the same font, so it isn't loaded twice */
     smp_synth_set_offline(P->s, P->offline);
   } else {                               /* nothing processes now: voices from before deactivate end at once */
-    smp_engine_reset(P->e, 1);
+    smp_multi_reset(P->e, 1);
     smp_synth_flush(P->s, 1);            /* and no reverb tail; the state's sf_used presets stay loaded */
   }
   P->since = 0;
@@ -446,7 +383,7 @@ static bool p_start(const clap_plugin_t *p) { (void)p; return true; }
 static void p_stop(const clap_plugin_t *p) { (void)p; }
 static void p_reset(const clap_plugin_t *p) {   /* audio thread: every voice ends (a 5 ms fade), bend to center */
   Plug *P = p->plugin_data;
-  if (P->e) smp_engine_reset(P->e, 0);
+  if (P->e) smp_multi_reset(P->e, 0);
   /* REAPER resets on stop, seek and loop: every SoundFont voice and effect tail ends and the controllers go back
      to their defaults, but the state's sf_used presets stay loaded for the song's first notes */
   if (P->s) smp_synth_flush(P->s, 0);
@@ -455,7 +392,7 @@ static void p_reset(const clap_plugin_t *p) {   /* audio thread: every voice end
 /* ---- events ---- */
 static int vel127(double v) { int k = (int)floor(v * 127.0 + 0.5); return k < 0 ? 0 : k > 127 ? 127 : k; }
 
-static void all_off(SmpEngine *e, int at) { int k; for (k = 0; k < 128; k++) smp_engine_note_off(e, k, at); }
+static void all_off(SmpMulti *e, int at) { int k; for (k = 0; k < 128; k++) smp_multi_note_off(e, k, at); }
 
 static void midi3(SmpSynth *s, int st, int d1, int d2, int at) {
   uint8_t m[3]; m[0] = (uint8_t)st; m[1] = (uint8_t)(d1 & 127); m[2] = (uint8_t)(d2 & 127);
@@ -464,7 +401,7 @@ static void midi3(SmpSynth *s, int st, int d1, int d2, int at) {
 
 /* a parameter value: the sampler's ids to the engine, 31 to 34 to the SoundFont player */
 static void set_value(Plug *P, int id, double v) {
-  if (id >= 0 && id < SMP_NPARAMS) smp_engine_set_param(P->e, id, v);
+  if (id >= 0 && id < SMP_NPARAMS) smp_multi_set_param(P->e, id, v);
   else if (id >= SMP_NPARAMS && id < SMP_NALLPARAMS) smp_synth_set_param(P->s, id, v);
 }
 
@@ -501,7 +438,7 @@ static void synth_event(Plug *P, const clap_event_header_t *h, int at) {
 /* one event at offset `at` in the sub-block that follows, for the player `plays` (the block's snapshot);
    parameter values apply at once */
 static void event(Plug *P, const clap_event_header_t *h, int at, int plays) {
-  SmpEngine *e = P->e;
+  SmpMulti *e = P->e;
   if (h->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
   if (h->type == CLAP_EVENT_PARAM_VALUE) {
     const clap_event_param_value_t *v = (const clap_event_param_value_t *)h;
@@ -512,21 +449,21 @@ static void event(Plug *P, const clap_event_header_t *h, int at, int plays) {
   switch (h->type) {
     case CLAP_EVENT_NOTE_ON: {
       const clap_event_note_t *n = (const clap_event_note_t *)h;
-      if (n->key >= 0 && n->key < 128) smp_engine_note_on(e, n->key, vel127(n->velocity), at);
+      if (n->key >= 0 && n->key < 128) smp_multi_note_on(e, n->key, vel127(n->velocity), at);
       break;
     }
     case CLAP_EVENT_NOTE_OFF: case CLAP_EVENT_NOTE_CHOKE: {
       const clap_event_note_t *n = (const clap_event_note_t *)h;
       if (n->key < 0) all_off(e, at);
-      else if (n->key < 128) smp_engine_note_off(e, n->key, at);
+      else if (n->key < 128) smp_multi_note_off(e, n->key, at);
       break;
     }
     case CLAP_EVENT_MIDI: {
       const uint8_t *d = ((const clap_event_midi_t *)h)->data;
       int st = d[0] & 0xF0;
-      if (st == 0x90 && d[2]) smp_engine_note_on(e, d[1] & 0x7F, d[2] & 0x7F, at);
-      else if (st == 0x80 || st == 0x90) smp_engine_note_off(e, d[1] & 0x7F, at);
-      else if (st == 0xE0) smp_engine_bend(e, (((d[2] & 0x7F) << 7 | (d[1] & 0x7F)) - 8192) / 8192.0, at);
+      if (st == 0x90 && d[2]) smp_multi_note_on(e, d[1] & 0x7F, d[2] & 0x7F, at);
+      else if (st == 0x80 || st == 0x90) smp_multi_note_off(e, d[1] & 0x7F, at);
+      else if (st == 0xE0) smp_multi_bend(e, (((d[2] & 0x7F) << 7 | (d[1] & 0x7F)) - 8192) / 8192.0, at);
       else if (st == 0xB0 && (d[1] == 123 || d[1] == 120)) all_off(e, at);   /* all notes off, all sound off */
       break;
     }
@@ -623,7 +560,7 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
   float *l, *r;
   int plays = P->plays, fading;
   if (P->e && P->s && InterlockedExchange(&P->silence, 0)) {   /* plays changed: the other player fades out */
-    if (plays) smp_engine_reset(P->e, 0); else smp_synth_flush(P->s, 0);
+    if (plays) smp_multi_reset(P->e, 0); else smp_synth_flush(P->s, 0);
     P->switch_left = (uint32_t)(SWITCH_MS * 0.001 * P->rate);
   }
   fading = P->switch_left > 0 && n <= P->maxf;      /* the old player's fade is heard on output 1 */
@@ -632,7 +569,7 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
     /* the sampler runs on silently, so its fades end and its replaced samples can be freed; just after a switch
        its fade is added to output 1 (when the host gave a stereo pair there) */
     const clap_audio_buffer_t *b0 = pr->audio_outputs_count ? &pr->audio_outputs[0] : NULL;
-    if (n <= P->maxf) smp_engine_process(P->e, P->fade_buf, P->fade_buf + P->maxf, (int)n);
+    if (n <= P->maxf) smp_multi_process(P->e, P->fade_buf, P->fade_buf + P->maxf, (int)n);
     process_synth(P, pr);
     if (fading && b0 && b0->data32 && b0->channel_count >= 2 && b0->data32[0] && b0->data32[1])
       for (i = 0; i < n; i++) { b0->data32[0][i] += P->fade_buf[i]; b0->data32[1][i] += P->fade_buf[P->maxf + i]; }
@@ -655,11 +592,11 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
     const clap_event_header_t *h = pr->in_events->get(pr->in_events, i);
     uint32_t t = h->time >= n ? (n ? n - 1 : 0) : h->time;   /* a time past the block: its last frame */
     if (t < pos) t = pos;
-    if (t > pos) { smp_engine_process(P->e, l + pos, r + pos, (int)(t - pos)); pos = t; }
+    if (t > pos) { smp_multi_process(P->e, l + pos, r + pos, (int)(t - pos)); pos = t; }
     event(P, h, 0, 0);
   }
-  if (n > pos) smp_engine_process(P->e, l + pos, r + pos, (int)(n - pos));
-  else smp_engine_process(P->e, l, r, 0);              /* clears events queued at the very end */
+  if (n > pos) smp_multi_process(P->e, l + pos, r + pos, (int)(n - pos));
+  else smp_multi_process(P->e, l, r, 0);              /* clears events queued at the very end */
   if (r == P->scratch && l == ob->data32[0]) for (i = 0; i < n; i++) l[i] = 0.5f * (l[i] + r[i]);
   for (i = 2; i < ob->channel_count; i++) if (ob->data32[i]) memset(ob->data32[i], 0, sizeof(float) * n);
   zero_ports(pr, 1, n);                  /* the sampler writes output 1 only */
@@ -684,7 +621,7 @@ done:
 static void p_main(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   if (smp_plug_poll_load(P) && P->gui) smp_gui_loaded(P);   /* a window load finished: swapped in here */
-  if (P->e) smp_engine_collect(P->e);
+  if (P->e) smp_multi_collect(P->e, !P->active);
   if (P->collect_left > 0) InterlockedDecrement(&P->collect_left);
   /* a replaced font closes once the audio thread has let go of it: keep asking until it has */
   if (P->s && !P->active) smp_synth_collect_now(P->s);   /* nothing processes: close them now */
@@ -873,22 +810,38 @@ void smp_plug_set_param(Plug *P, int id, double v) {
 
 double smp_plug_get_param(Plug *P, int id) {
   if (id < 0 || id >= SMP_NALLPARAMS) return 0;
-  if (id < SMP_NPARAMS) return P->e ? smp_engine_get_param(P->e, id) : smp_param_info(id)->def;
+  if (id < SMP_NPARAMS) return P->e ? smp_multi_get_param(P->e, id) : smp_param_info(id)->def;
   return P->s ? smp_synth_get_param(P->s, id) : smp_param_info(id)->def;
 }
 
-/* a loaded sample becomes the sampler's (main thread) */
-static void take_sample(Plug *P, SmpSample *s) {
-  char *t;
-  smp_engine_set_sample(P->e, s);        /* the root follows the sample's */
+/* the samples a window load made become the sampler's (main thread): how is SMP_LOAD_* (plugin_int.h); index the
+   sample a replace is for. Returns how many were taken. */
+static int take_samples(Plug *P, SmpSample **ss, int n, int how, int index) {
+  char *t; int i, took = 0, first = -1;
+  if (how == SMP_LOAD_ONE && index >= 0 && index < smp_multi_count(P->e) && n > 0) {
+    if (smp_multi_replace(P->e, index, ss[0])) { took = 1; first = index; }
+    ss[0] = NULL;
+    for (i = 1; i < n; i++) { smp_sample_free(ss[i]); ss[i] = NULL; }
+  } else {
+    if (how == SMP_LOAD_ALL) smp_multi_clear(P->e);
+    for (i = 0; i < n; i++) {
+      int k = smp_multi_add(P->e, ss[i]);  /* takes it (freed when the list is full) */
+      ss[i] = NULL;
+      if (k >= 0) { took++; if (first < 0) first = k; }
+    }
+  }
+  if (first >= 0) smp_multi_select(P->e, first);
   P->missing = 0;
+  for (i = 0; i < smp_multi_count(P->e); i++) { char path[8]; if (smp_multi_path(P->e, i, path, sizeof path) == 2) P->missing++; }
   t = engine_text(P->e);
   if (t) { free(P->text); P->text = t; }
-  ready_status(P, s);
+  if (P->missing) missing_status(P, P->missing); else ready_status(P);
   P->bad = 0;
   tell_host(P, SMP_P_ROOT);
   mark_dirty(P);
+  if (!P->active) smp_multi_collect(P->e, 1);
   ask_collect(P);
+  return took;
 }
 
 /* ---- the window's sample loads, in the background ----
@@ -907,8 +860,11 @@ typedef struct Job {
   long serial;
   int dropped;
   int font;                              /* a SoundFont: parsed (not yet shared) into f */
-  char path[1100];
-  SmpSample *s;
+  int how, index;                        /* samples: SMP_LOAD_* and the sample a replace is for */
+  char path[1100];                       /* the first file (the font's, or the first sample's) */
+  int n; char (*paths)[1100];            /* samples: every file, in order */
+  SmpSample **ss;                        /* and what loaded (NULL for those that didn't) */
+  int nfail; char fail_path[1100];       /* how many didn't, and the first of them (its reason in err) */
   SmpFont *f;
   char err[700];
 } Job;
@@ -945,11 +901,24 @@ static int loading_text(Plug *P, char *out, int cap) {
     snprintf(out, (size_t)cap, "Unpacking %s: %ld of %ld files", P->loading_name, d >= n ? n : d / step * step, n);
     return 1;
   }
+  if (!P->loading_font && P->loading_n > 1) {
+    long d = P->loader->prog[2] == P->loader->serial ? P->loader->prog[0] : 0;
+    snprintf(out, (size_t)cap, ff ? "Loading %ld of %d samples: decoding %s with FFmpeg" : "Loading %ld of %d samples",
+             d + 1 > P->loading_n ? (long)P->loading_n : d + 1, P->loading_n, P->loading_name);
+    return 1;
+  }
   snprintf(out, (size_t)cap, ff ? "Decoding %s with FFmpeg" : "Loading %s", P->loading_name);
   return 1;
 }
 
-static void job_free(Job *j) { if (j) { smp_sample_free(j->s); smp_sf_discard(j->f); free(j); } }
+static void job_free(Job *j) {
+  int i;
+  if (!j) return;
+  for (i = 0; j->ss && i < j->n; i++) smp_sample_free(j->ss[i]);
+  free(j->ss); free(j->paths);
+  smp_sf_discard(j->f);
+  free(j);
+}
 static void loader_release(Loader *L) { if (!InterlockedDecrement(&L->refs)) free(L); }
 static int job_cancelled(void *a) { return InterlockedCompareExchange(&((Job *)a)->cancel, 0, 0) != 0; }
 static void job_at_ffmpeg(void *a) { Job *j = a; InterlockedExchange(&j->L->ffmpeg, j->serial); }
@@ -967,7 +936,18 @@ static DWORD WINAPI load_worker(void *arg) {
       InterlockedExchange(&L->prog[1], 0); InterlockedExchange(&L->prog[0], 0); InterlockedExchange(&L->prog[2], j->serial);
       j->f = smp_sf_parse_detached_ex(j->path, job_cancelled, j, L->prog, j->err, sizeof j->err);
     }
-    else j->s = smp_sample_load_ex(j->path, job_cancelled, job_at_ffmpeg, j, j->err, sizeof j->err);
+    else {
+      int i;
+      for (i = 0; i < j->n && !j->cancel; i++) {   /* "Loading 2 of 5 samples": how far */
+        char why[700] = "";
+        InterlockedExchange(&L->prog[0], i); InterlockedExchange(&L->prog[1], j->n); InterlockedExchange(&L->prog[2], j->serial);
+        j->ss[i] = smp_sample_load_ex(j->paths[i], job_cancelled, job_at_ffmpeg, j, why, sizeof why);
+        if (!j->ss[i] && !j->cancel && !j->nfail++) {
+          snprintf(j->fail_path, sizeof j->fail_path, "%s", j->paths[i]);
+          snprintf(j->err, sizeof j->err, "%s", why);
+        }
+      }
+    }
     AcquireSRWLockExclusive(&L->lock);
     L->busy = NULL;
     if (j->cancel || L->quit) job_free(j);   /* nobody wants it now */
@@ -1033,7 +1013,7 @@ static const char *base_name(const char *path) {
   return b;
 }
 
-static int load_job(Plug *P, const char *path, int dropped, int font, char *err, int cap);
+static int load_job(Plug *P, const char *const *paths, int n, int how, int index, int dropped, int font, char *err, int cap);
 
 /* a window load that failed or was stopped: told in the status for as long as the window's own note lasts (6 s) */
 #define TELL_MS 6000
@@ -1049,8 +1029,11 @@ void smp_plug_still_playing(Plug *P, char *out, int cap) {
   if (P->plays) {
     SmpFont *f = P->s ? smp_synth_font(P->s) : NULL;
     if (f && f->path) name = base_name(f->path);
+  } else if (P->e && smp_multi_count(P->e) > 1) {
+    snprintf(out, (size_t)cap, " Still playing %d samples.", smp_multi_count(P->e));
+    return;
   } else {
-    const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
+    const SmpSample *s = P->e ? smp_multi_sample(P->e, smp_multi_selected(P->e)) : NULL;
     if (s) name = s->name;
   }
   if (name && name[0]) snprintf(out, (size_t)cap, " Still playing %s.", name);
@@ -1072,19 +1055,35 @@ static void load_failed(Plug *P, const char *path, const char *why) {
 }
 
 int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap) {
-  return load_job(P, path, dropped, 0, err, cap);
+  return load_job(P, &path, 1, SMP_LOAD_ALL, -1, dropped, 0, err, cap);
+}
+
+int smp_plug_load_many(Plug *P, const char *const *paths, int n, int how, int index, int dropped, char *err, int cap) {
+  return load_job(P, paths, n, how, index, dropped, 0, err, cap);
 }
 
 int smp_plug_load_font_start(Plug *P, const char *path, char *err, int cap) {
   if (!P->s) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
-  return load_job(P, path, 0, 1, err, cap);
+  return load_job(P, &path, 1, 0, -1, 0, 1, err, cap);
 }
 
-static int load_job(Plug *P, const char *path, int dropped, int font, char *err, int cap) {
-  Loader *L; Job *j;
+static int load_job(Plug *P, const char *const *paths, int n, int how, int index, int dropped, int font, char *err, int cap) {
+  Loader *L; Job *j; int i;
+  const char *path = n > 0 ? paths[0] : "";
   if (!font && !P->e) { snprintf(err, (size_t)cap, "the sound engine isn't working"); return 0; }
-  if (strlen(path) >= sizeof j->path) { snprintf(err, (size_t)cap, "its path is too long"); return 0; }
+  if (n <= 0) { snprintf(err, (size_t)cap, "no file chosen"); return 0; }
+  if (!font && how == SMP_LOAD_ADD && smp_multi_count(P->e) + n > SMP_MULTI_MAX) {
+    snprintf(err, (size_t)cap, "an instrument holds at most %d samples", SMP_MULTI_MAX); return 0;
+  }
+  if (!font && n > SMP_MULTI_MAX) { snprintf(err, (size_t)cap, "an instrument holds at most %d samples", SMP_MULTI_MAX); return 0; }
+  for (i = 0; i < n; i++) if (strlen(paths[i]) >= sizeof j->path) { snprintf(err, (size_t)cap, "its path is too long"); return 0; }
   if (!(L = loader_of(P)) || !(j = calloc(1, sizeof *j))) { snprintf(err, (size_t)cap, "out of memory"); return 0; }
+  if (!font) {
+    j->paths = calloc((size_t)n, sizeof *j->paths); j->ss = calloc((size_t)n, sizeof *j->ss);
+    if (!j->paths || !j->ss) { job_free(j); snprintf(err, (size_t)cap, "out of memory"); return 0; }
+    for (i = 0; i < n; i++) strcpy(j->paths[i], paths[i]);
+    j->n = n; j->how = how; j->index = index;
+  }
   if (P->loading && P->loading_font != font) {
     /* the one worker serves both pages: a load of the other kind still running is stopped, and that is said (a
        newer load of the same kind replacing an older one is what was asked, so it isn't) */
@@ -1104,6 +1103,7 @@ static int load_job(Plug *P, const char *path, int dropped, int font, char *err,
   WakeConditionVariable(&L->cv);
   P->loading = 1;
   P->loading_font = font;
+  P->loading_n = font ? 1 : n;
   snprintf(P->loading_path, sizeof P->loading_path, "%s", path);
   snprintf(P->loading_name, sizeof P->loading_name, "%s", base_name(path));
   return 1;
@@ -1126,14 +1126,19 @@ int smp_plug_poll_load(Plug *P) {
       load_failed(P, j->path, err[0] ? err : j->err);   /* told by the window; the status says it for a while */
       r = -1;
     }
-  } else if (j->s && P->e) {
-    take_sample(P, j->s);
-    j->s = NULL;
+  } else if (P->e && j->nfail < j->n) {   /* some (or all) loaded: they are taken, and any that didn't are told */
+    take_samples(P, j->ss, j->n, j->how, j->index);
     if (j->dropped) smp_plug_set_plays(P, 0);   /* a dropped sample: the sampler plays */
     P->told_until = 0;
     r = 1;
+    if (j->nfail) {
+      char why[800];
+      snprintf(why, sizeof why, j->nfail > 1 ? "%s (and %d more didn't load)" : "%s", j->err, j->nfail - 1);
+      load_failed(P, j->fail_path, why);
+      r = -1;
+    }
   } else {
-    load_failed(P, j->path, j->s ? "the sound engine isn't working" : j->err);
+    load_failed(P, j->nfail ? j->fail_path : j->path, P->e ? j->err : "the sound engine isn't working");
     r = -1;
   }
   job_free(j);
@@ -1146,18 +1151,13 @@ SMP_API int smp_test_plugin_loading(const clap_plugin_t *p) {   /* tests: a wind
 }
 
 int smp_plug_sample_path(Plug *P, char *path, int cap) {
-  const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
-  char line[1200];
   if (P->loading && !P->loading_font) { snprintf(path, (size_t)cap, "%s", P->loading_path); return 1; }
-  if (s) { snprintf(path, (size_t)cap, "%s", s->path); return 1; }
-  if (P->missing && P->text && sample_line(P->text, line, sizeof line, path, cap) == 2) return 2;
-  if (cap > 0) path[0] = 0;
-  return 0;
+  return P->e ? smp_multi_path(P->e, smp_multi_selected(P->e), path, cap) : (cap > 0 ? (path[0] = 0) : 0);
 }
 
 void smp_plug_sample_text(Plug *P, char *out, int cap) {
   static const char *const from[] = {"from the file name", "detected", "by default"};
-  const SmpSample *s = P->e ? smp_engine_sample(P->e) : NULL;
+  const SmpSample *s = P->e ? smp_multi_sample(P->e, smp_multi_selected(P->e)) : NULL;
   char note[16], path[1100];
   if (s) {
     smp_note_name(s->root, note, sizeof note);
@@ -1173,7 +1173,7 @@ void smp_plug_status_text(Plug *P, char *out, int cap) {
   if (told_now(P)) { snprintf(out, (size_t)cap, "%s", P->told); return; }
   if (P->plays && !P->bad && P->e && P->s) { sf_status(P, out, cap); return; }
   if (!P->e || strncmp(P->status, "Ready", 5)) { snprintf(out, (size_t)cap, "%s", P->status); return; }
-  if (smp_engine_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_engine_render_status(P->e, &ready, &total, why, sizeof why)) {
+  if (smp_multi_get_param(P->e, SMP_P_KEEP_LENGTH) >= 0.5 && !smp_multi_render_status(P->e, &ready, &total, why, sizeof why)) {
     if (why[0]) snprintf(out, (size_t)cap, "%s", why);
     else snprintf(out, (size_t)cap, "Keep length: %d of %d copies ready", ready, total);
     return;
@@ -1337,6 +1337,47 @@ int smp_plug_font_path(Plug *P, char *path, int cap) {
   return 0;
 }
 
+/* the Sampler's samples, for the window (plugin_int.h) */
+int smp_plug_zone_count(Plug *P) { return P->e ? smp_multi_count(P->e) : 0; }
+int smp_plug_zone_selected(Plug *P) { return P->e ? smp_multi_selected(P->e) : -1; }
+void smp_plug_zone_select(Plug *P, int i) {
+  if (!P->e || i == smp_multi_selected(P->e)) return;
+  smp_multi_select(P->e, i);
+  tell_host(P, SMP_P_ROOT);              /* Root note is the selected sample's */
+}
+void smp_plug_zone_line(Plug *P, int i, char *out, int cap) { if (P->e) smp_multi_line(P->e, i, out, cap); else if (cap > 0) out[0] = 0; }
+void smp_plug_zone_range(Plug *P, int i, int *klo, int *khi, int *vlo, int *vhi) {
+  if (P->e) smp_multi_range(P->e, i, klo, khi, vlo, vhi); else { *klo = 0; *khi = 127; *vlo = 1; *vhi = 127; }
+}
+int smp_plug_zone_set_range(Plug *P, int i, int klo, int khi, int vlo, int vhi) {
+  int a, b, c, d;
+  if (!P->e) return 0;
+  smp_multi_range(P->e, i, &a, &b, &c, &d);
+  if (a == klo && b == khi && c == vlo && d == vhi) return 1;
+  if (!smp_multi_set_range(P->e, i, klo, khi, vlo, vhi)) return 0;
+  mark_dirty(P);
+  return 1;
+}
+int smp_plug_zone_key_class(Plug *P, int i) { return P->e ? smp_multi_key_class(P->e, i) : -1; }
+int smp_plug_zone_set_key_class(Plug *P, int i, int pc) {
+  if (!P->e) return 0;
+  if (smp_multi_key_class(P->e, i) == pc) return 1;
+  if (!smp_multi_set_key_class(P->e, i, pc)) return 0;
+  mark_dirty(P);
+  return 1;
+}
+void smp_plug_zone_remove(Plug *P, int i) {
+  if (!P->e || i < 0 || i >= smp_multi_count(P->e)) return;
+  smp_multi_remove(P->e, i);
+  P->missing = 0;
+  { int k; char path[8]; for (k = 0; k < smp_multi_count(P->e); k++) if (smp_multi_path(P->e, k, path, sizeof path) == 2) P->missing++; }
+  if (P->missing) missing_status(P, P->missing); else ready_status(P);
+  tell_host(P, SMP_P_ROOT);
+  mark_dirty(P);
+  if (!P->active) smp_multi_collect(P->e, 1);
+  ask_collect(P);
+}
+
 int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program) {
   return P->s ? smp_synth_channel_preset(P->s, ch, bank, program) : 0;
 }
@@ -1345,23 +1386,22 @@ int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program) {
 SMP_API int smp_test_plugin_wait(const clap_plugin_t *p, int timeout_ms) {   /* keep-length copies and start heads */
   Plug *P = plug_of(p);
   if (!P || !P->e) return 1;
-  if (smp_engine_wait_renders(P->e, timeout_ms)) return 1;
-  smp_worker_wait_idle(P->e);
+  if (smp_multi_wait_renders(P->e, timeout_ms)) return 1;   /* and each engine's worker */
   if (P->s && smp_synth_wait_loaded(P->s, timeout_ms)) return 1;   /* the state's sf_used presets */
   return 0;
 }
 SMP_API void smp_test_plugin_offline(const clap_plugin_t *p, int on) {   /* note-ons past the head wait for the streamer */
   Plug *P = plug_of(p);
-  if (P && P->e) P->e->offline = on;
+  if (P && P->e) smp_multi_test_offline(P->e, on);
 }
 SMP_API int smp_test_plugin_voices(const clap_plugin_t *p) {   /* sounding voices */
   Plug *P = plug_of(p);
   if (P && P->plays && P->s) return smp_synth_voices(P->s, NULL);
-  return P && P->e ? smp_engine_active_voices(P->e) : 0;
+  return P && P->e ? smp_multi_active_voices(P->e) : 0;
 }
 SMP_API void smp_test_plugin_sync(const clap_plugin_t *p) {   /* a whole streamer pass; call between process calls */
   Plug *P = plug_of(p);
-  if (P && P->e) smp_stream_wait_idle(P->e);
+  if (P && P->e) smp_multi_test_sync(P->e);
 }
 
 /* ---- factory and entry ---- */

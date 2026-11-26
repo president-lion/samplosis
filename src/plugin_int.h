@@ -12,7 +12,7 @@ typedef struct Plug {
   const clap_host_t *host;
   const clap_host_params_t *host_params;   /* NULL if the host has none */
   const clap_host_state_t *host_state;
-  SmpEngine *e;
+  SmpMulti *e;                       /* the Sampler: its samples (multi.c) */
   SmpSynth *s;                       /* the SoundFont player; made with the engine, freed in destroy */
   volatile LONG plays;               /* 0 the sampler, 1 the SoundFont player (any thread reads it) */
   volatile LONG silence;             /* the audio thread resets the player not playing at its next block */
@@ -25,7 +25,7 @@ typedef struct Plug {
   char sf_err[1400];                 /* then "Missing: <path>" or why it didn't load */
   double rate;
   char *text;                        /* the state as last accepted */
-  int missing;                       /* its sample couldn't be loaded: silent, and saving writes text's sample line */
+  int missing;                       /* how many of its samples couldn't be loaded (silent; written back as they came) */
   char status[1400];
   float *scratch; uint32_t maxf;     /* the right channel when a host gives a mono output */
   float *fade_buf;                   /* audio thread: a stereo pair (2 * maxf) the player switched away from plays
@@ -39,6 +39,7 @@ typedef struct Plug {
   struct Loader *loader;             /* the window's sample loads, on a worker thread (made at the first) */
   int loading;                       /* one of them is under way: its file is loading_path */
   int loading_font;                  /* and it is a SoundFont (the SoundFont page's), not a sample */
+  int loading_n;                     /* how many files it loads (several samples at once) */
   char loading_path[1100], loading_name[256];
   long load_failed;                  /* how many have failed; the last one's "Can't load x: why" is load_err */
   long load_notes;                   /* how many were stopped by a load of the other kind; the last one's "Stopped
@@ -61,6 +62,22 @@ double smp_plug_get_param(Plug *P, int id);
    window's call returns at once; the status says "Loading x.wav", or "Decoding x.dsf with FFmpeg". dropped: when it
    loads, the sampler plays. */
 int smp_plug_load_start(Plug *P, const char *path, int dropped, char *err, int cap);
+/* Several samples at once, the same way: SMP_LOAD_ALL replaces every sample with these, SMP_LOAD_ADD adds them to
+   the list, SMP_LOAD_ONE replaces sample index with the first (its ranges stay). Those that load are taken; the
+   first that didn't is told as a failed load ("(and 2 more didn't load)"). The first new one is selected. */
+enum { SMP_LOAD_ALL = 0, SMP_LOAD_ADD = 1, SMP_LOAD_ONE = 2 };
+int smp_plug_load_many(Plug *P, const char *const *paths, int n, int how, int index, int dropped, char *err, int cap);
+/* the Sampler's samples, for the window (main thread). Selecting one makes Root note its root (the host is told);
+   a range set, or a sample removed, marks the project changed */
+int smp_plug_zone_count(Plug *P);
+int smp_plug_zone_selected(Plug *P);               /* -1 when there are none */
+void smp_plug_zone_select(Plug *P, int i);
+void smp_plug_zone_line(Plug *P, int i, char *out, int cap);   /* "Guitar C3.wav, root C3, keys C-1 to G9, ..." */
+void smp_plug_zone_range(Plug *P, int i, int *key_lo, int *key_hi, int *vel_lo, int *vel_hi);
+int smp_plug_zone_set_range(Plug *P, int i, int key_lo, int key_hi, int vel_lo, int vel_hi);   /* 0: not a range */
+void smp_plug_zone_remove(Plug *P, int i);
+int smp_plug_zone_key_class(Plug *P, int i);       /* notes in every octave: a bit per note (C is 1), or 0 (a range) */
+int smp_plug_zone_set_key_class(Plug *P, int i, int pc);
 /* A finished background load swapped in (main thread): 1 loaded, -1 it failed (load_failed counts up, load_err says
    why), 0 nothing finished. on_main_thread asks too, and tells the window. */
 int smp_plug_poll_load(Plug *P);

@@ -178,6 +178,13 @@ SMP_API const char *smp_multi_why(const SmpMulti *m, int i);           /* why a 
 SMP_API void smp_multi_range(const SmpMulti *m, int i, int *key_lo, int *key_hi, int *vel_lo, int *vel_hi);
 SMP_API int smp_multi_set_range(SmpMulti *m, int i, int key_lo, int key_hi, int vel_lo, int vel_hi);   /* keys 0 to
                                     127, velocities 1 to 127, each low not above its high; 0 when they aren't */
+/* a sample that plays some notes in every octave (every D and F, say): a bit per note, bit 0 C to bit 11 B, or 0 for
+   a range of keys (setting a range ends it); smp_multi_range then gives its lowest and highest key */
+SMP_API int smp_multi_key_class(const SmpMulti *m, int i);
+SMP_API int smp_multi_set_key_class(SmpMulti *m, int i, int mask);   /* 0 when mask isn't 1 to 4095 */
+SMP_API int smp_note_class_parse(const char *t);   /* "D F", "C,E,G", "f#", "Bb": their bits; 0 when any isn't a note
+                                    name without an octave. D is D only: D# is typed as D# */
+SMP_API void smp_note_class_name(int mask, char *out, int cap);   /* "D and F", "C, E and G" */
 SMP_API int smp_multi_root(const SmpMulti *m, int i);
 SMP_API void smp_multi_set_root(SmpMulti *m, int i, int root);
 SMP_API int smp_multi_selected(const SmpMulti *m);         /* -1 when there are none */
@@ -199,10 +206,12 @@ SMP_API int smp_multi_render_status(SmpMulti *m, int *ready, int *total, char *w
                                     samples, as smp_engine_render_status */
 SMP_API int smp_multi_wait_renders(SmpMulti *m, int timeout_ms);   /* tests: 0 once every render thread is idle */
 SMP_API void smp_multi_seed(SmpMulti *m, unsigned seed);
+SMP_API void smp_multi_test_offline(SmpMulti *m, int on);   /* tests: note-ons past the head wait for the streamer */
+SMP_API void smp_multi_test_sync(SmpMulti *m);              /* tests: a whole streamer pass of every engine */
 /* tests: as smp_engine_render_test, through every sample */
 SMP_API int smp_multi_render_test(SmpMulti *m, const char *events, long frames, int block, const char *wav_out);
 /* The instrument as text: as smp_script_write, with one sample line per sample, in order. A sample line may carry
-   root=C3, keys=C2..C3 and velocity=15..80 after its key (each left out at its default: velocity 1..127, every key,
+   root=C3, keys=C2..C3 (or keys=C, keys=D,F: those notes in every octave) and velocity=15..80 after its key (each left out at its default: velocity 1..127, every key,
    and with one sample its root, which the root line then gives, as before). Main thread only. */
 SMP_API int smp_multi_script_write(const SmpMulti *m, char *out, int cap);
 /* 0 ok; on a line that doesn't read, nothing changes and err says "line N: ...". A sample that can't be loaded
