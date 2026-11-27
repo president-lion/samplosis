@@ -51,7 +51,10 @@ SMP_API const SmpParamInfo *smp_param_info(int id); /* NULL when id is out of ra
 
 SMP_API int smp_note_parse(const char *s);                  /* C-1 = 0, C4 = 60; -1 if not a note */
 SMP_API void smp_note_name(int n, char *out, int cap);      /* sharps: 61 = "C#4" */
-SMP_API int smp_note_from_filename(const char *path);       /* last note-like token of the base name, or -1 */
+SMP_API int smp_note_from_filename(const char *path);       /* last note-like token of the base name, or -1 ("Ab3P"
+                                    counts: a note, then a dynamic) */
+SMP_API int smp_dynamic_from_filename(const char *path);    /* a name with a note: its dynamic, ppp pp p mp mf f ff fff as
+                                    1 to 8 ("Ab3P", "C4_mf", "Ab3 FFF"); 0 none or no note */
 SMP_API double smp_detect_pitch(const float *mono, long n, int rate); /* fractional MIDI note, or -1 */
 SMP_API int smp_value_text(int param, double v, char *out, int cap);  /* returns length written */
 SMP_API int smp_value_parse(int param, const char *s, double *v);    /* 1 ok (clamped to range), 0 fail */

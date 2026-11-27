@@ -26,9 +26,17 @@ def test_note_name(lib):
 @pytest.mark.parametrize("p,n", [("Guitar C3.wav", 48), ("piano_f#2_soft.flac", 42), ("Bb4 pluck.wav", 70),
                                  ("Cello A 440.wav", 69), ("440.wav", 69), ("A440.wav", 69), ("Take2.wav", -1),
                                  ("Chord.wav", -1), ("E:/x/Kick 01.wav", -1), ("E:/c3 stuff/Kick.wav", -1),
-                                 ("x/Pad (D2) long.wav", 38), ("C3 then E4.wav", 64)])
+                                 ("x/Pad (D2) long.wav", 38), ("C3 then E4.wav", 64),
+                                 ("Ab3P.wav", 56), ("Ab3MF.wav", 56), ("C4_mf.wav", 60), ("C3then.wav", -1),
+                                 ("F.wav", -1)])
 def test_note_from_filename(lib, p, n):
     assert lib.smp_note_from_filename(p.encode()) == n
+
+
+@pytest.mark.parametrize("p,d", [("Ab3P.wav", 3), ("Ab3MF.wav", 5), ("Ab3 FFF.wav", 8), ("c4pp.wav", 2),
+                                 ("Ab3.wav", 0), ("Kick F.wav", 0), ("Guitar C3.wav", 0), ("x/Bb2_ppp.wav", 1)])
+def test_dynamic_from_filename(lib, p, d):
+    assert lib.smp_dynamic_from_filename(p.encode()) == d
 
 
 def test_param_table(lib):

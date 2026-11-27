@@ -105,12 +105,31 @@ static int is_sep(char c) {
          c == '{' || c == '}';
 }
 
-static int token_note(const char *s, const char *e) {
+/* a dynamic word, any case: ppp pp p mp mf f ff fff as 1 to 8; 0 when it isn't one */
+static int dyn_rank(const char *s, const char *e) {
+  static const char *const D[] = {"ppp", "pp", "p", "mp", "mf", "f", "ff", "fff"};
+  int i;
+  for (i = 0; i < 8; i++)
+    if ((size_t)(e - s) == strlen(D[i]) && !_strnicmp(s, D[i], (size_t)(e - s))) return i + 1;
+  return 0;
+}
+
+/* a note word; *dyn (may be NULL) gets the dynamic its octave is followed by ("Ab3P", "C4mf"), else 0 */
+static int token_note_dyn(const char *s, const char *e, int *dyn) {
+  const char *d = e;
+  if (dyn) *dyn = 0;
   if (e - s == 3 && !strncmp(s, "440", 3)) return 69;
   if (e - s == 4 && toupper((unsigned char)s[0]) == 'A' && !strncmp(s + 1, "440", 3)) return 69;
   if (e - s < 2 || isdigit((unsigned char)s[0])) return -1;
+  while (d > s && !isdigit((unsigned char)d[-1])) d--;           /* the letters after the last digit */
+  if (d > s && d < e) {
+    int r = dyn_rank(d, e), n = r ? parse_note_span(s, d) : -1;
+    if (n >= 0) { if (dyn) *dyn = r; return n; }
+    return -1;
+  }
   return parse_note_span(s, e); /* '-' is a separator, so filename octaves are never negative */
 }
+static int token_note(const char *s, const char *e) { return token_note_dyn(s, e, NULL); }
 
 SMP_API int smp_note_from_filename(const char *path) {
   if (!path) return -1;
@@ -133,6 +152,30 @@ SMP_API int smp_note_from_filename(const char *path) {
     i = j;
   }
   return found;
+}
+
+SMP_API int smp_dynamic_from_filename(const char *path) {
+  const char *base = path, *dot = NULL, *p;
+  size_t len, i = 0;
+  int note = 0, dyn = 0;
+  if (!path) return 0;
+  for (p = path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+  len = strlen(base);
+  for (p = base; *p; p++) if (*p == '.') dot = p;
+  if (dot && dot > base && strlen(dot) <= 6) len = (size_t)(dot - base);
+  while (i < len) {
+    size_t j;
+    while (i < len && is_sep(base[i])) i++;
+    j = i;
+    while (j < len && !is_sep(base[j])) j++;
+    if (j > i) {
+      int d, w = dyn_rank(base + i, base + j);
+      if (token_note_dyn(base + i, base + j, &d) >= 0) { note = 1; if (d) dyn = d; }
+      else if (w) dyn = w;
+    }
+    i = j;
+  }
+  return note ? dyn : 0;
 }
 
 /* ---- values in words ---- */

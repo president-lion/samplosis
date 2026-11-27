@@ -118,6 +118,8 @@ def lib(settings_file):
     dll.smp_note_name.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
     dll.smp_note_from_filename.restype = ctypes.c_int
     dll.smp_note_from_filename.argtypes = [ctypes.c_char_p]
+    dll.smp_dynamic_from_filename.restype = ctypes.c_int
+    dll.smp_dynamic_from_filename.argtypes = [ctypes.c_char_p]
     dll.smp_detect_pitch.restype = ctypes.c_double
     dll.smp_detect_pitch.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_long, ctypes.c_int]
     dll.smp_value_text.restype = ctypes.c_int
