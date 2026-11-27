@@ -9,7 +9,7 @@
 #include <string.h>
 #include "engine_int.h"
 
-SMP_API const char *smp_version(void) { return "0.1.0"; }
+SMP_API const char *smp_version(void) { return SMP_VERSION; }
 
 #define LOG2_12 (1.0 / 12.0)
 #define ENV_FLOOR 1e-4                    /* -80 dB: where release ends */

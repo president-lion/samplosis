@@ -3,6 +3,10 @@
 An accessible sampler for REAPER, written in C as a CLAP instrument for Windows. The window is made of plain Windows
 controls that NVDA reads as they are.
 
+Download: https://github.com/president-lion/samplosis/releases/latest/download/samplosis.clap is always the newest
+release's plugin. Put it in your CLAP folder (for example `C:\Program Files\Common Files\CLAP`) and rescan in REAPER.
+After that, the Settings page's Update Samplosis button fetches newer releases itself.
+
 Licence: GPL version 2 (see COPYING). It includes these libraries, each under its own licence:
 
 - Rubber Band (Particular Programs, GPL), in src\rubberband, and Signalsmith Stretch (Geraint Luff, MIT), in
@@ -641,13 +645,28 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
   looked for on PATH, then in the WinGet package folder
   (`%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\*\bin\ffmpeg.exe`). The Settings page shows the one found,
   or "Not found". Samplosis never installs it.
+- Update Samplosis (a button), then Update (a box saying what happened): asks GitHub for the latest release of
+  president-lion/samplosis. When its version is newer than this one, it downloads that release's samplosis.clap and
+  puts it in place of the loaded one, wherever that is: the loaded file is renamed samplosis.clap.old (Windows lets a
+  loaded plugin be renamed but not overwritten) and deleted the next time the plugin loads. The new version plays
+  after REAPER is restarted. The Update box says "This is Samplosis 0.2.0" until it's pressed, then "Checking for a
+  newer version...", then "Installed Samplosis 0.3.0. Restart REAPER to use it", "Samplosis 0.2.0 is the newest" or
+  "Update failed: " and why (no connection, no permission to write in the plugin's folder, a download that isn't a
+  plugin); a failure leaves the plugin as it was. When the check finishes with the focus still on the button, the
+  focus moves to the Update box so it is read. It never checks by itself.
 - The environment variable SAMPLOSIS_SETTINGS names a different settings file (the tests use it).
+  SAMPLOSIS_UPDATE_URL and SAMPLOSIS_UPDATE_TARGET point Update Samplosis at another release address and another file
+  to replace (the tests use them too).
 
 ## Build, install and test
 
 - `build.bat` builds `samplosis.clap`. `build.bat test` also builds `tests\host.exe`, a small CLAP host for the tests.
   It needs Visual Studio's C++ tools and the CLAP headers (set CLAP_SDK to a checkout root to override the default).
 - `install.bat` copies `samplosis.clap` to `D:\clap`. If the copy fails, close REAPER first.
+- `release.bat` builds and publishes `samplosis.clap` as the GitHub release `v` + SMP_VERSION (in
+  `src\samplosis.h`) from the commit checked out, with gh. Raise SMP_VERSION and commit first: Update Samplosis
+  installs a release only when its version is newer than the one running. (The `# Samplosis 0.1.0` line a saved
+  state starts with names the script format, not the plugin's version.)
 - `python -m pytest tests -q` runs the tests (needs numpy, soundfile and psutil). Some of them open test windows.
 - `python tests\measure.py` prints the CPU and memory numbers below, the SoundFont ones too when
   E:\samplepacks\soundfonts\just_t4_fixed.sf2 exists. Its work folder is MEASURE_DIR, else E:\samplepacks\_build, else

@@ -11,6 +11,7 @@ import soundfile as sf
 from conftest import ROOT, write_wav
 from test_cache import point_cache
 from test_sfsynth import write_font as write_sf_font
+from test_update import new_clap, release, server  # noqa: F401 (server: a fixture)
 
 HOST = os.path.join(ROOT, "tests", "host.exe")
 CLAP = os.path.join(ROOT, "samplosis.clap")
@@ -140,7 +141,7 @@ def test_descriptor(P):
     d = lines(out)
     assert d["name"] == "Samplosis"
     assert d["vendor"] == "audioskit"
-    assert d["version"] == "0.1.0"
+    assert d["version"] == "0.2.0"
     assert d["id"] == "com.audioskit.samplosis"
     assert set(d["features"].split()) >= {"instrument", "sampler", "stereo"}
     assert d["params"] == str(NP)
@@ -682,8 +683,9 @@ def test_gui_settings_page(P, tmp_path, settings_file):
                                       # the raw settings and FFmpeg, after Cache size limit
                                       "key tab", "key down", "key home", "key end", "key down", "key tab", "key up",
                                       "key tab", "key tab", "key down", "key tab", "key tab",
-                                      "key tab", "key tab", "key tab",
-                                      "key tab shift", "key tab shift", "key tab shift", "focus Back", "key tab",
+                                      "key tab", "key tab", "key tab", "key tab", "key tab",
+                                      "key tab shift", "key tab shift", "key tab shift", "key tab shift",
+                                      "key tab shift", "focus Back", "key tab",
                                       "focus Browse for FFmpeg", "dialog pick %s" % fake, "key enter", "read FFmpeg",
                                       "focus Back", "key enter", "read Status", "focus Back", "say",
                                       # the Settings page twice more: FFmpeg isn't searched for again
@@ -708,15 +710,18 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert f[25][2] == "Not found" or f[25][2].lower().endswith("ffmpeg.exe"), f[25]
         assert f[26][:2] == ["Button", "Browse for FFmpeg"]
         assert f[27][:2] == ["Edit", "Cache in use"] and f[27][2].endswith(" of 5 GB")
-        assert [x[:2] for x in f[28:30]] == [["Button", "Clear cache"], ["Button", "Back"]]
-        assert [x[:2] for x in f[30:33]] == [["Button", "Clear cache"], ["Edit", "Cache in use"],
+        assert [x[:2] for x in f[28:30]] == [["Button", "Clear cache"], ["Button", "Update Samplosis"]]
+        assert f[30] == ["Edit", "Update", "This is Samplosis 0.2.0"]        # until it is pressed
+        assert f[31][:2] == ["Button", "Back"]
+        assert [x[:2] for x in f[32:37]] == [["Edit", "Update"], ["Button", "Update Samplosis"],
+                                             ["Button", "Clear cache"], ["Edit", "Cache in use"],
                                              ["Button", "Browse for FFmpeg"]]          # Shift+Tab back up
-        assert f[33][:2] == ["Button", "after"]                              # past the end: out of the plugin
-        assert f[34][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
+        assert f[37][:2] == ["Button", "after"]                              # past the end: out of the plugin
+        assert f[38][:2] == ["Button", "Browse for FFmpeg"]                  # the dialog returns to its button
         assert got(out, "read")[0] == ["FFmpeg", str(fake)]
         assert got(out, "read")[1] == ["Status", "Raw settings apply the next time a raw file loads"]
-        assert f[35][:2] == ["Button", "Settings"]           # Back: on the Settings button again
-        assert f[36][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
+        assert f[39][:2] == ["Button", "Settings"]           # Back: on the Settings button again
+        assert f[40][:2] == ["Button", "Settings"]           # Back is gone with its page: nothing to focus by that name
         n = [int(x[0]) for x in got(out, "ffsearches")]
         assert len(n) == 2 and n[0] >= 1 and n[1] == n[0], n               # searched on the first visit and after Browse only
         with open(settings_file) as fh:
@@ -1440,3 +1445,22 @@ def test_gui_mode_is_each_samples(P, tmp_path):
     assert [x[:3] for x in f if x[1] == "Mode"][2] == ["ComboBox", "Mode", "Sample"]
     assert all(", free mode, pitch " in x for x in lists[1][1:]), lists[1]
     assert all(", free mode, pitch -13" in x for x in lists[2][1:]), lists[2]
+
+
+def test_gui_update_button(P, tmp_path, server):
+    """Update Samplosis checks, downloads and swaps in the newer .clap; the result takes the focus to be read."""
+    base, routes = server
+    routes["/latest"] = (200, release(base, "v99.0.0"))
+    routes["/dl/samplosis.clap"] = (200, new_clap())
+    target = tmp_path / "plug" / "samplosis.clap"
+    target.parent.mkdir()
+    target.write_bytes(b"MZ old")
+    out = gui(P, tmp_path, P.script(P.sample()),
+              ["focus Settings", "key enter", "focus Update Samplosis", "key space", "pump 3000", "say",
+               "focus Update Samplosis", "key space", "pump 3000", "say"],
+              env={"SAMPLOSIS_UPDATE_URL": base + "/latest", "SAMPLOSIS_UPDATE_TARGET": str(target)})
+    f = got(out, "focus")
+    assert f[-3] == ["Edit", "Update", "Installed Samplosis 99.0.0. Restart REAPER to use it"], out
+    assert f[-1] == f[-3]                                   # again: the same release, installed again
+    assert target.read_bytes() == new_clap()
+    assert (target.parent / "samplosis.clap.old").exists()

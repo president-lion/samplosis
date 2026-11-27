@@ -63,7 +63,7 @@ enum { ID_VAL = 100,                          /* + parameter id: its slider or c
        ID_STRETCHER, ID_KEEPTONE, ID_DECLICK, ID_DIR, ID_DIRBROWSE, ID_LIMIT, ID_USED, ID_CLEAR, ID_BACK,
        ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
        ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
-       ID_ZLIST, ID_ZADD, ID_ZREMOVE, ID_ZLO, ID_ZHI, ID_ZVEL,
+       ID_ZLIST, ID_ZADD, ID_ZREMOVE, ID_ZLO, ID_ZHI, ID_ZVEL, ID_UPDATE, ID_UPDSTATUS,
        ID_EDIT = 300,                        /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
        ID_OUT = 420,                          /* + channel - 1: its output combo box */
@@ -128,6 +128,8 @@ typedef struct Gui {
                                                  loaded on WM_DROPPED; NULL when none */
   /* the Sampler's samples: the list, Add samples, Remove sample, the selected one's Start key, End key and
      Velocity ("15,80") */
+  HWND upd, updstatus;                        /* Settings: Update Samplosis and what it found */
+  long upd_seen; bool upd_wait;               /* the checks finished when last shown; this window started one */
   HWND zlist, zadd, zremove, zvel;
   Slider *zlo, *zhi;
   uint64_t zlist_key;                         /* what the list shows now (its lines and count), to rebuild on change */
@@ -401,6 +403,7 @@ static int rate_index(int rate) {             /* the Raw sample rate entry for a
   return 0;
 }
 static void sel(HWND c, int k) { if (SendMessageW(c, CB_GETCURSEL, 0, 0) != k) SendMessageW(c, CB_SETCURSEL, (WPARAM)k, 0); }
+static void show_update(Gui *g);
 static void show_settings(Gui *g) {
   SmpSettings s; HWND foc = GetFocus();
   smp_settings_get(&s);
@@ -415,6 +418,18 @@ static void show_settings(Gui *g) {
   sel(g->rawfmt, s.raw_format);
   sel(g->rawend, s.raw_endian);
   set_text(g->ffmpeg, g->ff_text);
+  show_update(g);
+}
+static void show_update(Gui *g) {             /* the Update box: checking, the last check's result, or the version */
+  char m[600]; long done = 0; int busy = smp_update_status(m, sizeof m, &done);
+  if (busy) snprintf(m, sizeof m, "Checking for a newer version...");
+  else if (!m[0]) snprintf(m, sizeof m, "This is Samplosis %s", smp_version());
+  set_text(g->updstatus, m);
+  if (!busy && done != g->upd_seen) {
+    g->upd_seen = done;
+    if (g->upd_wait && GetFocus() == g->upd) SetFocus(g->updstatus);   /* the screen reader reads the result */
+    g->upd_wait = false;
+  }
 }
 static void save_settings(Gui *g, const SmpSettings *s) {
   if (smp_settings_set(s)) beep();
@@ -1347,6 +1362,9 @@ static void click(Gui *g, int id) {
     case ID_DIRBROWSE: browse_folder(g); break;
     case ID_FFBROWSE: browse_ffmpeg(g); break;
     case ID_CLEAR: clear_cache(g); break;
+    case ID_UPDATE:
+      if (smp_update_start()) { g->upd_wait = true; show_update(g); } else beep();   /* one is running */
+      break;
   }
 }
 
@@ -1715,6 +1733,11 @@ static bool build(Gui *g, HWND parent) {
   g->used = labelled(g, 1, "Cache in use", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 140, 470, 24, ID_USED);
   y += ROW;
   g->clear = ctl(g, 1, L"BUTTON", L"Clear cache", T | BS_PUSHBUTTON, 152, y, 120, 26, ID_CLEAR);
+  y += ROW;
+  g->upd = ctl(g, 1, L"BUTTON", L"Update Samplosis", T | BS_PUSHBUTTON, 152, y, 140, 26, ID_UPDATE);
+  y += ROW;
+  g->updstatus = labelled(g, 1, "Update", L"EDIT", T | ES_AUTOHSCROLL | ES_READONLY, 8, y, 140, 470, 24, ID_UPDSTATUS);
+  smp_update_status(NULL, 0, &g->upd_seen);   /* a check finished before this window opened isn't its */
   y += ROW;
   g->back = ctl(g, 1, L"BUTTON", L"Back", T | BS_PUSHBUTTON, 152, y, 120, 26, ID_BACK);
 

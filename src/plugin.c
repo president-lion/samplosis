@@ -47,7 +47,7 @@
 static const char *const features[] = {CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SAMPLER,
                                        CLAP_PLUGIN_FEATURE_STEREO, NULL};
 static const clap_plugin_descriptor_t desc = {
-  CLAP_VERSION_INIT, "com.audioskit.samplosis", "Samplosis", "audioskit", "", "", "", "0.1.0",
+  CLAP_VERSION_INIT, "com.audioskit.samplosis", "Samplosis", "audioskit", "", "", "", SMP_VERSION,
   "A sampler you can use with a screen reader: samples across the keyboard, and SoundFonts", features};
 
 static Plug *plug_of(const clap_plugin_t *p) { return p && p->desc == &desc ? (Plug *)p->plugin_data : NULL; }
@@ -1482,7 +1482,7 @@ static uint32_t f_count(const clap_plugin_factory_t *f) { (void)f; return 1; }
 static const clap_plugin_descriptor_t *f_desc(const clap_plugin_factory_t *f, uint32_t i) { (void)f; return i ? NULL : &desc; }
 static const clap_plugin_factory_t factory = {f_count, f_desc, f_create};
 
-static bool e_init(const char *path) { (void)path; return true; }
+static bool e_init(const char *path) { (void)path; smp_update_cleanup(NULL); return true; }   /* an update's .old */
 static void e_deinit(void) {}
 static const void *e_factory(const char *id) { return strcmp(id, CLAP_PLUGIN_FACTORY_ID) ? NULL : &factory; }
 CLAP_EXPORT const clap_plugin_entry_t clap_entry = {CLAP_VERSION_INIT, e_init, e_deinit, e_factory};

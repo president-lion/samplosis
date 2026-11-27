@@ -9,7 +9,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#define SMP_VERSION "0.2.0"                     /* a release's tag is v and this (release.bat) */
 SMP_API const char *smp_version(void);
+/* update.c: the Settings page's Update Samplosis button */
+SMP_API int smp_version_newer(const char *tag, const char *mine);   /* 1 newer, 0 not, -1 tag isn't a version */
+SMP_API int smp_update_run(const char *api_url, const char *target, char *msg, int n);  /* 1 installed, 0 newest, -1 */
+SMP_API void smp_update_cleanup(const char *path);                  /* deletes path.old* (NULL: this DLL's) */
+SMP_API int smp_update_start(void);                                 /* 1 when a check started */
+SMP_API int smp_update_status(char *msg, int n, long *done);        /* 1 while checking */
 
 /* parameter ids (also the REAPER/CLAP parameter ids) */
 enum {
