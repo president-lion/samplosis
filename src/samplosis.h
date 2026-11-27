@@ -9,7 +9,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define SMP_VERSION "0.3.0"                     /* a release's tag is v and this (release.bat) */
+#define SMP_VERSION "0.3.1"                     /* a release's tag is v and this (release.bat) */
 SMP_API const char *smp_version(void);
 /* update.c: the Settings page's Update Samplosis button */
 SMP_API int smp_version_newer(const char *tag, const char *mine);   /* 1 newer, 0 not, -1 tag isn't a version */

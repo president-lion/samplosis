@@ -1,5 +1,5 @@
 def test_version(lib):
-    assert lib.smp_version() == b"0.3.0"
+    assert lib.smp_version() == b"0.3.1"
 
 
 import ctypes
