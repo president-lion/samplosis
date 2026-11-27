@@ -10,7 +10,7 @@ for /f "tokens=3" %%v in ('findstr /b /c:"#define SMP_VERSION " src\samplosis.h'
 if "%VER%"=="" ( echo SMP_VERSION not found in src\samplosis.h & exit /b 1 )
 gh release view v%VER% >nul 2>&1 && ( echo v%VER% is already released: raise SMP_VERSION in src\samplosis.h & exit /b 1 )
 git diff --quiet HEAD || ( echo Commit your changes first & exit /b 1 )
-call build.bat || exit /b 1
+call "%~dp0build.bat" || exit /b 1
 for /f %%h in ('git rev-parse HEAD') do set "HEAD=%%h"
 git push origin HEAD || exit /b 1
 gh release create v%VER% samplosis.clap --target %HEAD% --title "Samplosis %VER%" --generate-notes || exit /b 1
