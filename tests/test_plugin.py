@@ -141,7 +141,7 @@ def test_descriptor(P):
     d = lines(out)
     assert d["name"] == "Samplosis"
     assert d["vendor"] == "audioskit"
-    assert d["version"] == "0.2.0"
+    assert d["version"] == "0.3.0"
     assert d["id"] == "com.audioskit.samplosis"
     assert set(d["features"].split()) >= {"instrument", "sampler", "stereo"}
     assert d["params"] == str(NP)
@@ -711,7 +711,7 @@ def test_gui_settings_page(P, tmp_path, settings_file):
         assert f[26][:2] == ["Button", "Browse for FFmpeg"]
         assert f[27][:2] == ["Edit", "Cache in use"] and f[27][2].endswith(" of 5 GB")
         assert [x[:2] for x in f[28:30]] == [["Button", "Clear cache"], ["Button", "Update Samplosis"]]
-        assert f[30] == ["Edit", "Update", "This is Samplosis 0.2.0"]        # until it is pressed
+        assert f[30] == ["Edit", "Update", "This is Samplosis 0.3.0"]        # until it is pressed
         assert f[31][:2] == ["Button", "Back"]
         assert [x[:2] for x in f[32:37]] == [["Edit", "Update"], ["Button", "Update Samplosis"],
                                              ["Button", "Clear cache"], ["Edit", "Cache in use"],
