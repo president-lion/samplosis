@@ -1,5 +1,6 @@
 /* Settings file: "name value" per line (cache_dir, cache_limit_gb, stretcher signalsmith|rubberband,
-   keep_tone on|off, declick on|off, ffmpeg_path, raw_rate, raw_channels 1|2, raw_format s16|s24|s32|f32|u8, raw_endian little|big).
+   keep_tone on|off, declick on|off, ffmpeg_path, raw_rate, raw_channels 1|2, raw_format s16|s24|s32|f32|u8, raw_endian little|big,
+   browse_folder, browse_preview on|off).
    Reloaded when the file's last-write time changes. Words read in any case; a value that doesn't read keeps the
    default. */
 #include <windows.h>
@@ -39,6 +40,7 @@ static void tidy(SmpSettings *s) {
   if (s->raw_format < 0 || s->raw_format > SMP_RAW_U8) s->raw_format = SMP_RAW_S16;
   if (s->raw_endian != SMP_RAW_BIG) s->raw_endian = SMP_RAW_LITTLE;
   if (s->no_declick) s->no_declick = 1;
+  if (s->browse_preview) s->browse_preview = 1;
 }
 
 static int path_w(wchar_t *out, int cap) {
@@ -88,6 +90,11 @@ static void parse(char *text, SmpSettings *s) {
       } else if (!strcmp(line, "raw_format")) {
         int i;
         for (i = 0; i <= SMP_RAW_U8; i++) if (!_stricmp(sp, raw_formats[i])) s->raw_format = i;
+      } else if (!strcmp(line, "browse_folder")) {
+        if (strlen(sp) < sizeof s->browse_dir) strcpy(s->browse_dir, sp);
+      } else if (!strcmp(line, "browse_preview")) {
+        if (!_stricmp(sp, "on")) s->browse_preview = 1;
+        else if (!_stricmp(sp, "off")) s->browse_preview = 0;
       } else if (!strcmp(line, "raw_endian")) {
         if (!_stricmp(sp, "little")) s->raw_endian = SMP_RAW_LITTLE;
         else if (!_stricmp(sp, "big")) s->raw_endian = SMP_RAW_BIG;
@@ -132,18 +139,20 @@ static void make_dirs(wchar_t *p) { /* creates every folder above the file name 
 
 int smp_settings_set(const SmpSettings *s) {
   wchar_t p[1100];
-  char text[2600];
+  char text[4200];
   int rc = -1;
   SmpSettings t = *s;
   InitOnceExecuteOnce(&once, init_cs, NULL, NULL);
   if (!path_w(p, 1100)) return -1;
   tidy(&t);
   t.cache_dir[sizeof t.cache_dir - 1] = 0; t.ffmpeg_path[sizeof t.ffmpeg_path - 1] = 0;
+  t.browse_dir[sizeof t.browse_dir - 1] = 0;
   int n = snprintf(text, sizeof text, "cache_dir %s\r\ncache_limit_gb %.10g\r\nstretcher %s\r\nkeep_tone %s\r\ndeclick %s\r\n"
-                   "ffmpeg_path %s\r\nraw_rate %d\r\nraw_channels %d\r\nraw_format %s\r\nraw_endian %s\r\n",
+                   "ffmpeg_path %s\r\nraw_rate %d\r\nraw_channels %d\r\nraw_format %s\r\nraw_endian %s\r\n"
+                   "browse_folder %s\r\nbrowse_preview %s\r\n",
                    t.cache_dir, t.cache_limit_gb, t.stretcher == SMP_STRETCH_RUBBERBAND ? "rubberband" : "signalsmith",
                    t.keep_tone ? "on" : "off", t.no_declick ? "off" : "on", t.ffmpeg_path, t.raw_rate, t.raw_channels, raw_formats[t.raw_format],
-                   t.raw_endian == SMP_RAW_BIG ? "big" : "little");
+                   t.raw_endian == SMP_RAW_BIG ? "big" : "little", t.browse_dir, t.browse_preview ? "on" : "off");
   if (n <= 0 || n >= (int)sizeof text) return -1;
   EnterCriticalSection(&cs);
   make_dirs(p);

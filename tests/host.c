@@ -57,6 +57,7 @@
 #include <io.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <clap/clap.h>
@@ -453,6 +454,7 @@ static void key(WPARAM vk, int shift, int ctrl) {
   if (vk == VK_SPACE) SendMessageW(GetFocus(), WM_CHAR, ' ', 1);
   if (vk == VK_RETURN) SendMessageW(GetFocus(), WM_CHAR, 13, 1);
   if (vk == VK_TAB) SendMessageW(GetFocus(), WM_CHAR, 9, 1);
+  if (vk == VK_BACK) SendMessageW(GetFocus(), WM_CHAR, 8, 1);
   SendMessageW(GetFocus(), WM_KEYUP, vk, 0xC0000001);
   ks[VK_SHIFT] = 0; ks[VK_CONTROL] = 0; SetKeyboardState(ks);
 }
@@ -522,7 +524,8 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
     if (!strcmp(a, "key")) {
       static const struct { const char *n; WPARAM vk; } keys[] = {{"tab", VK_TAB}, {"up", VK_UP}, {"down", VK_DOWN},
         {"enter", VK_RETURN}, {"space", VK_SPACE}, {"escape", VK_ESCAPE}, {"left", VK_LEFT}, {"right", VK_RIGHT},
-        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}, {"delete", VK_DELETE}, {"a", 'A'}};
+        {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"home", VK_HOME}, {"end", VK_END}, {"delete", VK_DELETE}, {"a", 'A'},
+        {"backspace", VK_BACK}};
       char k[32] = ""; int i, found = 0;
       sscanf(arg, "%31s", k);
       for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++)
@@ -599,6 +602,26 @@ static int cmd_gui(const clap_plugin_t *p, const char *state, const char *action
       pr.frames_count = BLOCK; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
       p->process(p, &pr);
       main_thread(p);
+    } else if (!strcmp(a, "blocks")) {      /* n blocks with no events, the window's messages between: their peak */
+      static float l[BLOCK], r[BLOCK]; float *ch[2] = {l, r}, peak = 0;
+      clap_audio_buffer_t ob; clap_process_t pr; EvList el = {NULL, 0};
+      clap_input_events_t in = {&el, el_size, el_get}; clap_output_events_t oe = {NULL, oe_push};
+      int nb = atoi(arg), b, j;
+      if (!active) {
+        if (!p->activate(p, 48000.0, 1, BLOCK)) { printf("error: activate failed\n"); return 1; }
+        p->start_processing(p); active = 1;
+      }
+      for (b = 0; b < nb; b++) {
+        memset(l, 0, sizeof l); memset(r, 0, sizeof r);
+        memset(&ob, 0, sizeof ob); ob.data32 = ch; ob.channel_count = 2;
+        memset(&pr, 0, sizeof pr);
+        pr.frames_count = BLOCK; pr.audio_outputs = &ob; pr.audio_outputs_count = 1; pr.in_events = &in; pr.out_events = &oe;
+        p->process(p, &pr);
+        for (j = 0; j < BLOCK; j++) { if (fabsf(l[j]) > peak) peak = fabsf(l[j]); if (fabsf(r[j]) > peak) peak = fabsf(r[j]); }
+        pump(2);
+      }
+      main_thread(p);
+      printf("blocks: %.4f\n", peak);
     } else if (!strcmp(a, "dropdown")) {    /* open or close the focused combo box's list (silent) */
       SendMessageW(GetFocus(), CB_SHOWDROPDOWN, !strcmp(arg, "open"), 0); pump(60);
     } else if (!strcmp(a, "load")) {

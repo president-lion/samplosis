@@ -76,7 +76,7 @@ def test_settings_raw_and_ffmpeg_roundtrip(lib, settings_file, tmp_path):
     text = open(settings_file, encoding="utf-8").read().splitlines()
     names = [ln.split(" ")[0] for ln in text]             # in this order, after keep_tone
     assert names == ["cache_dir", "cache_limit_gb", "stretcher", "keep_tone", "declick", "ffmpeg_path",
-                     "raw_rate", "raw_channels", "raw_format", "raw_endian"]
+                     "raw_rate", "raw_channels", "raw_format", "raw_endian", "browse_folder", "browse_preview"]
     assert "raw_rate 96000" in text and "raw_channels 1" in text
     assert "raw_format f32" in text and "raw_endian big" in text
     for fmt, k in (("s16", 0), ("S24", 1), ("s32 ", 2), ("F32", 3), ("u8\t", 4)):   # by hand: any case, spaces after

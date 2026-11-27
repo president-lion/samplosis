@@ -75,7 +75,8 @@ Sampler page:
    the one moved to; Ctrl+click picks or unpicks one. Delete removes the picked ones. The one moved to last is the
    selected sample: the Sample box, File, Root note, Mode and the pitch sliders are its. With none it says "No
    samples loaded".
-4. Add samples button: one or more files, added to the list (they are picked, the first of them selected).
+4. Add samples button: opens the file browser (see "The file browser"); the sounds chosen there join the list
+   (they are picked, the first of them selected).
 5. Remove sample button: removes the picked samples (Ctrl+A, then Remove sample, empties the list).
 6. Start key and End key: sliders (notes, like the other note sliders) for the keys of every picked sample (they
    show the selected one's). Moving one
@@ -141,8 +142,8 @@ The first control on both main pages is a tab control named Player, with two tab
   so switching back is quick; the presets load again then).
 - Drops load by file type: an instrument (.sf2, .sf3, .sf4, .sf2pack, .sbk, .dls, .gig, .sfz, .dspreset, .dslibrary or .exs) loads
   into the SoundFont player and switches to it; any other audio file loads into the Sampler and switches to it.
-- The SoundFont page's Browse and the Sampler page's Add samples load only their own kind. On the SoundFont page a
-  .wav gives an error and a beep and the font stays; on the Sampler page a .sf2 does the same.
+- The SoundFont page's Browse loads only its own kind: a .wav there gives an error and a beep and the font stays.
+  The Sampler page's file browser lists only sound files.
 - Settings is one page for both. Back returns to the main page that plays.
 
 ### The samples
@@ -166,6 +167,35 @@ The first control on both main pages is a tab control named Player, with two tab
   changes.
 - With several samples the status says "Ready: 3 samples". A sample from a project whose file is gone stays in the
   list as "Missing: <path>", silent, and is saved back as it was.
+
+### The file browser
+
+Add samples opens a page of the window in place of Windows' file dialog. It lists one folder at a time, at once, with
+no icons or thumbnails to wait for. In Tab order:
+
+1. Folder: an edit box with the folder listed. Type or paste a folder (or a sound file, which opens its folder on
+   it; `%USERPROFILE%`-style names work) and press Enter. Empty, Enter lists the drives.
+2. The list, named for the folder ("Voices"; "C:" at a drive's top; "Drives"). First "Up one folder", then the
+   folders ("Kits, folder"), then the sound files, each sorted as Explorer sorts them ("2 b.wav" before "10 b.wav").
+   Hidden and system files and anything that isn't a sound file aren't listed. Above a drive's top come the drives
+   ("C: Windows, drive").
+   - Enter on a folder, a drive or "Up one folder" opens it; Backspace goes up, onto the folder just left (from a
+     drive's top, to the drives).
+   - Enter on a sound adds it to the samples and goes back to the Sampler page, on the Samples list. Pick several
+     first to add them all: Shift with the arrows, Home, End, Page Up or Page Down; Ctrl+A for all; Ctrl+Up and
+     Ctrl+Down move without picking and Ctrl+Space picks or unpicks. After Ctrl+A, Enter adds every sound picked
+     (folders picked with them are skipped).
+   - Typing a name jumps to the first item from the cursor that starts with it (letters typed within a second make
+     one name); the same letter again goes on to the next one. A name nothing starts with beeps.
+   - A double click works as Enter.
+3. Preview while browsing: a check box (off at first). While it is checked, the sound under the cursor plays through
+   the plugin's output, at its own pitch and volume, as soon as it is decoded; moving off it stops it, and so does
+   leaving the browser. The host has to be processing the track, as REAPER does with the transport stopped.
+4. Cancel: back to the Sampler page, on Add samples, with nothing added. Escape does the same from anywhere on the
+   page.
+
+It opens on the folder it was last in (`browse_folder` in the settings), else the selected sample's folder, else the
+drives; the preview box is remembered too (`browse_preview`).
 
 ### The File combo box
 
@@ -447,7 +477,7 @@ not its name, so a misnamed file still loads.
    stopped and the status says "FFmpeg took too long to decode it". Without FFmpeg, a file only it could read says
    "FFmpeg isn't installed; this format needs it".
 
-Add samples and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
+The file browser and the File combo box on the Sampler page list these extensions: .wav .flac .mp3 .ogg .aif .aiff .aifc .w64
 .rf64 .caf .raw .pcm .opus .wv .ape .m4a .aac .mp4 .wma .ac3 .amr .3gp .alac .dsf .dff .tta .mka .webm .au .snd
 .mpc .spx .oga .m4b .eac3 .dts .mlp .thd .voc .mov .mkv. A decoded file is at most 2 GiB of float samples (about
 1.5 hours of stereo at 48 kHz); a longer one is refused with a plain reason.
@@ -654,6 +684,8 @@ Settings live in `%APPDATA%\Samplosis\settings.txt`, one `name value` per line, 
   "Update failed: " and why (no connection, no permission to write in the plugin's folder, a download that isn't a
   plugin); a failure leaves the plugin as it was. When the check finishes with the focus still on the button, the
   focus moves to the Update box so it is read. It never checks by itself.
+- The file browser's folder and its Preview while browsing box: `browse_folder` (empty: the drives) and
+  `browse_preview on` or `off` (default off), written when the browser is left and when the box changes.
 - The environment variable SAMPLOSIS_SETTINGS names a different settings file (the tests use it).
   SAMPLOSIS_UPDATE_URL and SAMPLOSIS_UPDATE_TARGET point Update Samplosis at another release address and another file
   to replace (the tests use them too).

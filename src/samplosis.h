@@ -68,6 +68,8 @@ typedef struct {
   char ffmpeg_path[1024];
   int raw_rate, raw_channels, raw_format, raw_endian;
   int no_declick;                                     /* 0: declick on (the default), 1: off ("declick off") */
+  char browse_dir[1024];                              /* the file browser's last folder, UTF-8 ("" the drives) */
+  int browse_preview;                                 /* 1: Preview while browsing is checked (off by default) */
 } SmpSettings;
 SMP_API void smp_settings_get(SmpSettings *s);        /* defaults when the file is missing; reloads when it changes */
 SMP_API int smp_settings_set(const SmpSettings *s);   /* 0 when saved */

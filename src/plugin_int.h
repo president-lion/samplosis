@@ -51,6 +51,11 @@ typedef struct Plug {
      how things are again (keep-length progress, say) rather than hiding it behind an old failure */
   char told[1900];
   ULONGLONG told_until;
+  /* the file browser's preview (preview.c) */
+  struct Preview *volatile pv_req;   /* main or worker -> audio thread: the next preview, or a stop */
+  struct Preview *volatile pv_old;   /* audio -> main thread: the one it let go, to free */
+  struct Preview *pv_cur;            /* audio thread: the one playing */
+  struct PvWorker *pv;               /* the decoding thread (made at the first preview) */
 } Plug;
 
 extern const char *const smp_param_label[SMP_NALLPARAMS];    /* "Root note", "Volume", ... "SoundFont volume" */
@@ -126,5 +131,11 @@ int smp_plug_sf_channel_now(Plug *P, int ch, int *bank, int *program);  /* the p
 
 extern const clap_plugin_gui_t smp_gui_ext;
 void smp_gui_close(Plug *P);
+/* preview.c: the file browser's preview through the main output */
+int smp_plug_preview(Plug *P, const char *path);   /* main thread: path (UTF-8) plays; NULL stops */
+void smp_plug_preview_collect(Plug *P);            /* main thread: frees what the audio thread let go */
+void smp_plug_preview_free(Plug *P);               /* main thread, on destroy */
+void smp_plug_preview_mix(Plug *P, float *l, float *r, uint32_t n);   /* audio thread; r NULL: mono */
+int smp_plug_previewing(Plug *P);
 void smp_gui_loaded(Plug *P);                      /* a background load finished: the window shows it */
 #endif

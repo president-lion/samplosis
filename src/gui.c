@@ -41,6 +41,8 @@
 #include <ole2.h>
 #include <initguid.h>
 #include <oleacc.h>
+#include <shlwapi.h>
+#include <wctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,11 +66,12 @@ enum { ID_VAL = 100,                          /* + parameter id: its slider or c
        ID_TABS, ID_FONT, ID_SFBROWSE, ID_SFFILE, ID_SFMODE, ID_SFPRESET, ID_SFCHANNEL, ID_SFSTATUS,
        ID_SFSETTINGS, ID_RAWRATE, ID_RAWCH, ID_RAWFMT, ID_RAWEND, ID_FFMPEG, ID_FFBROWSE,
        ID_ZLIST, ID_ZADD, ID_ZREMOVE, ID_ZLO, ID_ZHI, ID_ZVEL, ID_UPDATE, ID_UPDSTATUS,
+       ID_BRDIR, ID_BRLIST, ID_BRPREVIEW, ID_BRCANCEL,
        ID_EDIT = 300,                        /* + slider number: the edit box that stands in for it */
        ID_CHAN = 400,                         /* + channel - 1: its preset combo box */
        ID_OUT = 420,                          /* + channel - 1: its output combo box */
        ID_KNOB = 440 };                       /* + knob: its slider */
-enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, NPAGES = 3 };
+enum { PG_SAMPLER = 0, PG_SETTINGS = 1, PG_FONT = 2, PG_BROWSE = 3, NPAGES = 4 };
 #define PAGE_CTLS 128
 #define PAGE_STOPS 64
 #define SL_LIMIT (-1)                         /* the slider that isn't a parameter: the cache size limit */
@@ -85,6 +88,8 @@ typedef struct { IDropTarget t; struct Gui *g; int ok; } Drop;
 
 /* a value's slider and the edit box that stands in for it while typing */
 typedef struct { HWND tb, ed; int what; char said[96]; bool editing; const struct Gui *gui; } Slider;
+
+typedef struct { wchar_t *path; int kind; } BrItem;   /* a line of the file browser */
 
 typedef struct Gui {
   Plug *P;
@@ -128,6 +133,12 @@ typedef struct Gui {
                                                  loaded on WM_DROPPED; NULL when none */
   /* the Sampler's samples: the list, Add samples, Remove sample, the selected one's Start key, End key and
      Velocity ("15,80") */
+  /* the file browser: Folder, the list (its label named for the folder), Preview while browsing, Cancel */
+  HWND brdir, brlab, brlist, brprev, brcancel;
+  BrItem *br; int nbr, capbr;                 /* the list's items, in its order */
+  wchar_t br_dir[1100];                       /* the folder listed; "" the drives */
+  wchar_t br_playing[1100];                   /* the file previewing, or "" */
+  wchar_t br_typed[64]; int br_typed_n; ULONGLONG br_typed_at;   /* a name being typed */
   HWND upd, updstatus;                        /* Settings: Update Samplosis and what it found */
   long upd_seen; bool upd_wait;               /* the checks finished when last shown; this window started one */
   HWND zlist, zadd, zremove, zvel;
@@ -720,17 +731,23 @@ static void zones_taken(Gui *g) {
 }
 /* the list's own keys beyond a list box's: Ctrl+A picks every sample, Ctrl+Up and Ctrl+Down move without picking,
    Ctrl+Space picks or unpicks the one moved to. 1 when the key was one of these. */
-static bool zones_key(Gui *g, WPARAM w) {
-  int n = smp_plug_zone_count(g->P), k = (int)SendMessageW(g->zlist, LB_GETCARETINDEX, 0, 0);
-  if (GetKeyState(VK_CONTROL) >= 0 || !n) return false;
-  if (w == 'A') SendMessageW(g->zlist, LB_SETSEL, TRUE, -1);
+/* a list that picks several: Ctrl+A picks all, Ctrl+Up and Ctrl+Down move the cursor alone, Ctrl+Space picks or
+   unpicks the item it is on. true when it was one of those */
+static bool lb_ctrl_key(HWND lb, WPARAM w) {
+  int n = (int)SendMessageW(lb, LB_GETCOUNT, 0, 0), k = (int)SendMessageW(lb, LB_GETCARETINDEX, 0, 0);
+  if (GetKeyState(VK_CONTROL) >= 0 || n <= 0) return false;
+  if (w == 'A') SendMessageW(lb, LB_SETSEL, TRUE, -1);
   else if (w == VK_UP || w == VK_DOWN) {
     k += w == VK_UP ? -1 : 1;
     if (k < 0) k = 0;
     if (k >= n) k = n - 1;
-    SendMessageW(g->zlist, LB_SETCARETINDEX, (WPARAM)k, FALSE);
-  } else if (w == VK_SPACE) SendMessageW(g->zlist, LB_SETSEL, SendMessageW(g->zlist, LB_GETSEL, (WPARAM)k, 0) <= 0, k);
+    SendMessageW(lb, LB_SETCARETINDEX, (WPARAM)k, FALSE);
+  } else if (w == VK_SPACE) SendMessageW(lb, LB_SETSEL, SendMessageW(lb, LB_GETSEL, (WPARAM)k, 0) <= 0, k);
   else return false;
+  return true;
+}
+static bool zones_key(Gui *g, WPARAM w) {
+  if (!smp_plug_zone_count(g->P) || !lb_ctrl_key(g->zlist, w)) return false;
   zones_taken(g);
   return true;
 }
@@ -967,6 +984,7 @@ static void sf_choose(Gui *g, int id, int k) {
 
 static void show_page(Gui *g, int page, HWND to);
 static void file_list(Gui *g, int kind, bool rescan);
+static void br_leave(Gui *g, HWND to);
 static void refresh(Gui *g) {
   int id;
   smp_plug_poll_load(g->P);                   /* a background load that finished is swapped in */
@@ -979,7 +997,8 @@ static void refresh(Gui *g) {
     say_note(g, g->P->load_note);
   }
   if (g->P->e) smp_multi_collect(g->P->e, !g->P->active);   /* replaced samples (all, when nothing processes) */
-  if (g->page != PG_SETTINGS && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
+  if (g->page == PG_BROWSE && smp_plug_plays(g->P)) br_leave(g, NULL);   /* the SoundFont plays now: no Add samples */
+  if (g->page != PG_SETTINGS && g->page != PG_BROWSE && g->page != (smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER)) {
     show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* the tab follows what plays (it refreshes) */
     return;
   }
@@ -1217,6 +1236,247 @@ static void browse_file_as(Gui *g, int kind, int how) {
   focus(kind ? g->sfbrowse : g->zadd);
 }
 
+/* ---- the file browser (Add samples): a page of the window, like Explorer's file list but only folders and sound
+   files. Enter opens a folder or drive, or adds the sound files picked; Backspace goes up (from a drive's top, to
+   the drives); typing a name jumps to it; Tab reaches Preview while browsing, which plays the sound under the
+   cursor through the plugin's output. Escape or Cancel goes back. The folder and the preview box are remembered. */
+enum { BR_UP, BR_DRIVE, BR_FOLDER, BR_FILE };
+typedef struct { wchar_t *name; bool dir; } BrName;
+static int br_cmp(const void *a, const void *b) {     /* folders first, then names as Explorer sorts them ("2" < "10") */
+  const BrName *x = a, *y = b;
+  if (x->dir != y->dir) return x->dir ? -1 : 1;
+  return StrCmpLogicalW(x->name, y->name);
+}
+static void br_clear(Gui *g) {
+  int i;
+  for (i = 0; i < g->nbr; i++) free(g->br[i].path);
+  g->nbr = 0;
+}
+static void br_add(Gui *g, const wchar_t *path, int kind, const wchar_t *text) {
+  if (g->nbr == g->capbr) {
+    int nc = g->capbr ? g->capbr * 2 : 256; BrItem *nb = realloc(g->br, (size_t)nc * sizeof *nb);
+    if (!nb) return;
+    g->br = nb; g->capbr = nc;
+  }
+  if (!(g->br[g->nbr].path = _wcsdup(path ? path : L""))) return;
+  g->br[g->nbr++].kind = kind;
+  SendMessageW(g->brlist, LB_ADDSTRING, 0, (LPARAM)text);
+}
+static bool is_root(const wchar_t *d) {               /* "C:\" or "\\server\share\" */
+  size_t n = wcslen(d); const wchar_t *p;
+  if (n == 3 && d[1] == L':') return true;
+  if (n > 2 && d[0] == L'\\' && d[1] == L'\\') { p = wcschr(d + 2, L'\\'); return p && (!(p = wcschr(p + 1, L'\\')) || !p[1]); }
+  return false;
+}
+static void br_parent(const wchar_t *d, wchar_t *out, int cap) {   /* "" (the drives) above a drive's top */
+  wchar_t *s;
+  if (is_root(d)) { out[0] = 0; return; }
+  swprintf(out, cap, L"%s", d);
+  s = wcsrchr(out, L'\\');
+  if (!s) { out[0] = 0; return; }
+  *s = 0;
+  if (wcslen(out) == 2 && out[1] == L':') wcscat(out, L"\\");
+  else if (is_root(out) || (out[0] == L'\\' && out[1] == L'\\' && !wcschr(out + 2, L'\\'))) {
+    if (!is_root(out)) out[0] = 0;               /* "\\server": no list of shares; the drives */
+  }
+}
+static const wchar_t *br_name(const wchar_t *d) {    /* "Voices" for D:\Music\Voices; the drive itself for its top */
+  const wchar_t *s = wcsrchr(d, L'\\');
+  return s && s[1] ? s + 1 : d;
+}
+static void br_save(Gui *g) {
+  SmpSettings s, t; bool on = SendMessageW(g->brprev, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  smp_settings_get(&s); t = s;
+  if (WideCharToMultiByte(CP_UTF8, 0, g->br_dir, -1, t.browse_dir, sizeof t.browse_dir, NULL, NULL) <= 0) t.browse_dir[0] = 0;
+  t.browse_preview = on;
+  if (strcmp(t.browse_dir, s.browse_dir) || t.browse_preview != s.browse_preview) smp_settings_set(&t);
+}
+/* the sound under the cursor plays while Preview while browsing is checked; anything else stops it */
+static void br_preview(Gui *g) {
+  int k = (int)SendMessageW(g->brlist, LB_GETCARETINDEX, 0, 0);
+  bool on = g->page == PG_BROWSE && SendMessageW(g->brprev, BM_GETCHECK, 0, 0) == BST_CHECKED;
+  if (on && k >= 0 && k < g->nbr && g->br[k].kind == BR_FILE) {
+    char u[1100];
+    if (!wcscmp(g->br[k].path, g->br_playing)) return;
+    if (WideCharToMultiByte(CP_UTF8, 0, g->br[k].path, -1, u, sizeof u, NULL, NULL) <= 0) return;
+    smp_plug_preview(g->P, u);
+    swprintf(g->br_playing, 1100, L"%s", g->br[k].path);
+  } else if (g->br_playing[0]) {
+    smp_plug_preview(g->P, NULL);
+    g->br_playing[0] = 0;
+  }
+}
+static void br_pick(Gui *g, int k) {                  /* only item k picked, the cursor on it */
+  SendMessageW(g->brlist, LB_SETSEL, FALSE, -1);
+  SendMessageW(g->brlist, LB_SETSEL, TRUE, k);
+  SendMessageW(g->brlist, LB_SETCARETINDEX, (WPARAM)k, FALSE);
+}
+/* lists dir ("" the drives), the cursor on the item whose path is select (the folder just left), else the first.
+   false (and a beep) when the folder can't be read: the list stays as it was */
+static bool br_show(Gui *g, const wchar_t *dir, const wchar_t *select) {
+  BrName *names = NULL; int n = 0, cap = 0, i, k = 0; wchar_t full[1200], text[1200];
+  UINT old_mode = 0;
+  SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &old_mode);   /* no "insert a disk" boxes */
+  if (dir[0]) {
+    WIN32_FIND_DATAW d; HANDLE h; size_t dl = wcslen(dir);
+    if (dl + 3 >= 1100) { SetThreadErrorMode(old_mode, NULL); beep(); return false; }
+    swprintf(full, 1200, L"%s%s*", dir, dir[dl - 1] == L'\\' ? L"" : L"\\");
+    h = FindFirstFileExW(full, FindExInfoBasic, &d, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_NOT_FOUND) {
+      SetThreadErrorMode(old_mode, NULL); beep(); return false;
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        bool isdir = (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (d.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+        if (!wcscmp(d.cFileName, L".") || !wcscmp(d.cFileName, L"..")) continue;
+        if (!isdir && !audio_name(d.cFileName)) continue;
+        if (n == cap) {
+          BrName *nn = realloc(names, (size_t)(cap = cap ? cap * 2 : 256) * sizeof *nn);
+          if (!nn) break;
+          names = nn;
+        }
+        if ((names[n].name = _wcsdup(d.cFileName)) != NULL) names[n++].dir = isdir;
+      } while (FindNextFileW(h, &d));
+      FindClose(h);
+    }
+    qsort(names, (size_t)n, sizeof *names, br_cmp);
+  }
+  SendMessageW(g->brlist, WM_SETREDRAW, FALSE, 0);
+  SendMessageW(g->brlist, LB_RESETCONTENT, 0, 0);
+  br_clear(g);
+  if (dir[0]) {
+    wchar_t up[1100]; size_t dl = wcslen(dir);
+    br_parent(dir, up, 1100);
+    br_add(g, up, BR_UP, L"Up one folder");
+    for (i = 0; i < n; i++) {
+      swprintf(full, 1200, L"%s%s%s", dir, dir[dl - 1] == L'\\' ? L"" : L"\\", names[i].name);
+      if (names[i].dir) { swprintf(text, 1200, L"%s, folder", names[i].name); br_add(g, full, BR_FOLDER, text); }
+      else br_add(g, full, BR_FILE, names[i].name);
+      free(names[i].name);
+    }
+  } else {
+    wchar_t drives[512], *r;
+    DWORD dn = GetLogicalDriveStringsW(511, drives);
+    for (r = drives; dn && dn < 511 && *r; r += wcslen(r) + 1) {
+      wchar_t vol[MAX_PATH + 1] = L""; UINT t = GetDriveTypeW(r);
+      if ((t == DRIVE_FIXED || t == DRIVE_RAMDISK) && !GetVolumeInformationW(r, vol, MAX_PATH + 1, NULL, NULL, NULL, NULL, 0))
+        vol[0] = 0;                               /* removable, CD and network drives aren't asked: they can be slow */
+      swprintf(text, 1200, vol[0] ? L"%.2s %s, drive" : L"%.2s%s, drive", r, vol);
+      br_add(g, r, BR_DRIVE, text);
+    }
+  }
+  free(names);
+  SendMessageW(g->brlist, WM_SETREDRAW, TRUE, 0);
+  InvalidateRect(g->brlist, NULL, TRUE);
+  SetThreadErrorMode(old_mode, NULL);
+  swprintf(g->br_dir, 1100, L"%s", dir);
+  {                                            /* the list's name: the folder's, "C:" for a drive's top */
+    wchar_t lab[300]; size_t ln;
+    swprintf(lab, 300, L"%s", dir[0] ? br_name(dir) : L"Drives");
+    ln = wcslen(lab);
+    if (ln > 1 && lab[ln - 1] == L'\\') lab[ln - 1] = 0;
+    SetWindowTextW(g->brlab, lab);
+  }
+  SetWindowTextW(g->brdir, dir);
+  if (select) for (i = 0; i < g->nbr; i++) if (!_wcsicmp(g->br[i].path, select)) { k = i; break; }
+  if (g->nbr) br_pick(g, k);
+  g->br_typed_n = 0;
+  br_preview(g);
+  return true;
+}
+static void br_up(Gui *g) {
+  wchar_t up[1100], from[1100];
+  if (!g->br_dir[0]) { beep(); return; }           /* the drives: nothing above */
+  swprintf(from, 1100, L"%s", g->br_dir);
+  br_parent(from, up, 1100);
+  br_show(g, up, from);
+}
+/* back to the Sampler page (on `to`), the preview stopped and the folder remembered */
+static void br_leave(Gui *g, HWND to) {
+  smp_plug_preview(g->P, NULL); g->br_playing[0] = 0;
+  br_save(g);
+  show_page(g, PG_SAMPLER, to);
+}
+/* Enter on the list: on a folder, drive or the way up, it opens (unless it is part of a pick with sound files in
+   it, as after Ctrl+A); otherwise the picked sound files join the samples */
+static void br_enter(Gui *g) {
+  int k = (int)SendMessageW(g->brlist, LB_GETCARETINDEX, 0, 0), n, i, nf = 0, *sel; wchar_t **files;
+  if (k < 0 || k >= g->nbr) { beep(); return; }
+  n = (int)SendMessageW(g->brlist, LB_GETSELCOUNT, 0, 0);
+  sel = calloc((size_t)(n > 0 ? n : 1), sizeof *sel); files = calloc((size_t)(n > 0 ? n : 1), sizeof *files);
+  if (!sel || !files) { free(sel); free(files); beep(); return; }
+  if (n > 0) n = (int)SendMessageW(g->brlist, LB_GETSELITEMS, (WPARAM)n, (LPARAM)sel);
+  for (i = 0; i < n; i++) if (sel[i] >= 0 && sel[i] < g->nbr && g->br[sel[i]].kind == BR_FILE) files[nf++] = g->br[sel[i]].path;
+  free(sel);
+  if (g->br[k].kind != BR_FILE && (!SendMessageW(g->brlist, LB_GETSEL, (WPARAM)k, 0) || !nf)) {
+    free(files);
+    if (g->br[k].kind == BR_UP) br_up(g);
+    else { wchar_t p[1100]; swprintf(p, 1100, L"%s", g->br[k].path); br_show(g, p, NULL); }
+    return;
+  }
+  if (!nf) { free(files); beep(); return; }
+  smp_plug_preview(g->P, NULL); g->br_playing[0] = 0;
+  load_paths_w(g, files, nf, SMP_LOAD_ADD, false);
+  free(files);
+  br_leave(g, g->zlist);
+}
+/* typing a name: the first item from the cursor on that starts with what was typed in the last second; the same
+   letter again goes on to the next one with it */
+static void br_type(Gui *g, wchar_t c) {
+  ULONGLONG now = GetTickCount64(); int k = (int)SendMessageW(g->brlist, LB_GETCARETINDEX, 0, 0), i, len;
+  bool same = true; wchar_t t[1200];
+  if (now - g->br_typed_at > 1000) g->br_typed_n = 0;
+  g->br_typed_at = now;
+  if (g->br_typed_n < 63) g->br_typed[g->br_typed_n++] = c;
+  g->br_typed[g->br_typed_n] = 0;
+  for (i = 1; i < g->br_typed_n; i++) if (towlower(g->br_typed[i]) != towlower(g->br_typed[0])) same = false;
+  len = same ? 1 : g->br_typed_n;
+  if (!g->nbr) { beep(); return; }
+  for (i = same ? 1 : 0; i <= g->nbr; i++) {
+    int j = ((k < 0 ? 0 : k) + i) % g->nbr;
+    if (SendMessageW(g->brlist, LB_GETTEXTLEN, (WPARAM)j, 0) >= 1200) continue;
+    SendMessageW(g->brlist, LB_GETTEXT, (WPARAM)j, (LPARAM)t);
+    if (!_wcsnicmp(t, g->br_typed, (size_t)len)) { br_pick(g, j); br_preview(g); return; }
+  }
+  beep();
+}
+/* Enter in the Folder box: a folder typed or pasted opens; a sound file opens its folder, on it */
+static void br_go(Gui *g) {
+  wchar_t t[1100], x[1100], full[1100], *q = t; DWORD a; size_t n;
+  GetWindowTextW(g->brdir, t, 1100);
+  while (*q == L' ' || *q == L'"') q++;
+  n = wcslen(q); while (n && (q[n - 1] == L' ' || q[n - 1] == L'"')) q[--n] = 0;
+  if (!*q) { br_show(g, L"", g->br_dir); focus(g->brlist); return; }
+  if (!ExpandEnvironmentStringsW(q, x, 1100) || !GetFullPathNameW(x, 1100, full, NULL)) { beep(); return; }
+  n = wcslen(full);
+  if (n > 3 && full[n - 1] == L'\\' && !is_root(full)) full[--n] = 0;
+  a = GetFileAttributesW(full);
+  if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) { if (br_show(g, full, NULL)) focus(g->brlist); return; }
+  if (a != INVALID_FILE_ATTRIBUTES && audio_name(full)) {
+    wchar_t up[1100]; br_parent(full, up, 1100);
+    if (br_show(g, up, full)) focus(g->brlist);
+    return;
+  }
+  beep();
+}
+/* Add samples: the browser opens on the folder last browsed, else the selected sample's, else the drives */
+static void br_open(Gui *g) {
+  SmpSettings s; wchar_t d[1100] = L"", sel[1100] = L""; char path[1100]; DWORD a;
+  smp_settings_get(&s);
+  SendMessageW(g->brprev, BM_SETCHECK, s.browse_preview ? BST_CHECKED : BST_UNCHECKED, 0);
+  if (s.browse_dir[0] && MultiByteToWideChar(CP_UTF8, 0, s.browse_dir, -1, d, 1100) &&
+      (a = GetFileAttributesW(d)) != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+  } else if (smp_plug_sample_path(g->P, path, sizeof path) && MultiByteToWideChar(CP_UTF8, 0, path, -1, sel, 1100)) {
+    br_parent(sel, d, 1100);
+    if ((a = GetFileAttributesW(d)) == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) d[0] = sel[0] = 0;
+  } else d[0] = 0;
+  g->br_playing[0] = 0;
+  if (!br_show(g, d, sel[0] ? sel : NULL)) br_show(g, L"", NULL);
+  show_page(g, PG_BROWSE, g->brlist);
+  br_preview(g);
+}
+
 /* ---- drag and drop: a file dropped anywhere on the window loads ---- */
 static FORMATETC hdrop_fmt = {CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
 static HRESULT STDMETHODCALLTYPE d_qi(IDropTarget *t, REFIID r, void **o) {
@@ -1326,8 +1586,9 @@ static void show_page(Gui *g, int page, HWND to) {
   HWND f = GetFocus(); int i, q;
   if (page == PG_SETTINGS) { rescan_used(g); find_ffmpeg(g, 0); show_settings(g); }
   if (page == PG_FONT) { SfCfg c; sf_cfg(g, &c); g->sf_one = c.one != 0; }
+  if (g->page == PG_BROWSE && page != PG_BROWSE && g->br_playing[0]) { smp_plug_preview(g->P, NULL); g->br_playing[0] = 0; }
   g->page = page;
-  if (page != PG_SETTINGS) {                  /* the tab control shows the page's tab */
+  if (page == PG_SAMPLER || page == PG_FONT) {   /* the tab control shows the page's tab */
     int k = page == PG_FONT ? 1 : 0;
     g->setting_tab = true;
     if (SendMessageW(g->tabs, TCM_GETCURFOCUS, 0, 0) != k) SendMessageW(g->tabs, TCM_SETCURFOCUS, (WPARAM)k, 0);
@@ -1351,7 +1612,9 @@ static void set_tab(Gui *g, int which) {
 static void click(Gui *g, int id) {
   int m;
   switch (id) {
-    case ID_ZADD: browse_file_as(g, 0, SMP_LOAD_ADD); break;
+    case ID_ZADD: br_open(g); break;
+    case ID_BRCANCEL: br_leave(g, g->zadd); break;
+    case ID_BRPREVIEW: br_save(g); br_preview(g); break;
     case ID_ZREMOVE: zone_remove(g); break;
     case ID_SFBROWSE: browse_file(g, 1); break;
     case ID_SETTINGS: case ID_SFSETTINGS: show_page(g, PG_SETTINGS, NULL); break;
@@ -1390,7 +1653,7 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
   shift = GetKeyState(VK_SHIFT) < 0; ctrl = GetKeyState(VK_CONTROL) < 0;
   s = slider_of(g, h);
   if (m == WM_KEYDOWN && w == VK_TAB && ctrl) {           /* Ctrl+Tab, Ctrl+Shift+Tab: the next or previous tab */
-    if (g->page != PG_SETTINGS) {
+    if (g->page == PG_SAMPLER || g->page == PG_FONT) {
       int n = (int)SendMessageW(g->tabs, TCM_GETITEMCOUNT, 0, 0), k = (int)SendMessageW(g->tabs, TCM_GETCURSEL, 0, 0);
       if (s && h == s->ed) edit_end(g, s, true, false);  /* a value being typed is read first */
       if (n > 0) set_tab(g, ((k < 0 ? 0 : k) + (shift ? n - 1 : 1)) % n);
@@ -1422,6 +1685,18 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id
     if (m == WM_CHAR && w > ' ' && w != 127) { edit_begin(g, s, (wchar_t)w); return 0; }   /* typing starts the box */
     if (m == WM_CHAR) return 0;
   }
+  if (g->page == PG_BROWSE && m == WM_KEYDOWN && w == VK_ESCAPE) { br_leave(g, g->zadd); return 0; }
+  if (g->page == PG_BROWSE && m == WM_CHAR && w == 27) return 0;
+  if (id == ID_BRLIST && m == WM_KEYDOWN) {
+    if (w == VK_RETURN) { br_enter(g); return 0; }
+    if (w == VK_BACK) { br_up(g); return 0; }
+    if (lb_ctrl_key(h, w)) { br_preview(g); return 0; }
+  }
+  if (id == ID_BRLIST && m == WM_CHAR) {
+    if (w == 1 || w == 8 || w == '\r' || w == '\n' || (w == ' ' && ctrl)) return 0;   /* Ctrl+A, Backspace, Enter */
+    if (w > ' ' || (w == ' ' && g->br_typed_n && GetTickCount64() - g->br_typed_at <= 1000)) { br_type(g, (wchar_t)w); return 0; }
+  }
+  if (id == ID_BRDIR && m == WM_KEYDOWN && w == VK_RETURN) { br_go(g); return 0; }
   if (m == WM_KEYDOWN && w == VK_DELETE && id == ID_ZLIST) { zone_remove(g); return 0; }
   if (m == WM_KEYDOWN && id == ID_ZLIST && zones_key(g, w)) return 0;
   if (m == WM_CHAR && id == ID_ZLIST && (w == 1 || (w == ' ' && GetKeyState(VK_CONTROL) < 0))) return 0;   /* Ctrl+A, Ctrl+Space */
@@ -1449,7 +1724,7 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   switch (m) {
     case WM_TIMER:
       if (w == T_OPEN) { KillTimer(h, T_OPEN); if (!GetFocus() || GetFocus() == h || GetAncestor(GetFocus(), GA_ROOT) == GetAncestor(h, GA_ROOT)) focus(g->order[g->page][0]); }
-      else refresh(g);
+      else { smp_plug_preview_collect(g->P); refresh(g); }   /* and frees what the preview let go */
       return 0;
     case WM_COMMAND: {
       int id = LOWORD(w), code = HIWORD(w);
@@ -1470,6 +1745,11 @@ static LRESULT CALLBACK win_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         sf_choose(g, id, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
       } else if (code == LBN_SELCHANGE && id == ID_ZLIST) {   /* samples picked in the list */
         zones_taken(g);
+      } else if (code == LBN_SELCHANGE && id == ID_BRLIST) {  /* the browser's cursor moved: its preview */
+        g->br_typed_n = 0;
+        br_preview(g);
+      } else if (code == LBN_DBLCLK && id == ID_BRLIST) {
+        br_enter(g);
       } else if (code == BN_CLICKED) click(g, id);
       return 0;
     }
@@ -1741,6 +2021,19 @@ static bool build(Gui *g, HWND parent) {
   y += ROW;
   g->back = ctl(g, 1, L"BUTTON", L"Back", T | BS_PUSHBUTTON, 152, y, 120, 26, ID_BACK);
 
+  /* the file browser */
+  y = 8;
+  g->brdir = labelled(g, PG_BROWSE, "Folder", L"EDIT", T | ES_AUTOHSCROLL, 8, y, 120, W_WIDTH - 140, 24, ID_BRDIR);
+  SendMessageW(g->brdir, EM_SETLIMITTEXT, 1000, 0);
+  y += ROW;
+  g->brlab = ctl(g, PG_BROWSE, L"STATIC", L"Drives", SS_LEFT | SS_NOPREFIX, 8, y + 4, 120, 20, -1);
+  g->brlist = ctl(g, PG_BROWSE, L"LISTBOX", L"", T | LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER |
+                  LBS_NOINTEGRALHEIGHT, 132, y, W_WIDTH - 140, 18 * ROW, ID_BRLIST);
+  y += 18 * ROW + 6;
+  g->brprev = ctl(g, PG_BROWSE, L"BUTTON", L"Preview while browsing", T | BS_AUTOCHECKBOX, 132, y, 260, 24, ID_BRPREVIEW);
+  y += ROW;
+  g->brcancel = ctl(g, PG_BROWSE, L"BUTTON", L"Cancel", T | BS_PUSHBUTTON, 132, y, 120, 26, ID_BRCANCEL);
+
   for (id = 0; id < SMP_NALLPARAMS; id++) show_param(g, id, true);
   show_page(g, smp_plug_plays(g->P) ? PG_FONT : PG_SAMPLER, NULL);   /* opens on the tab that plays */
   SetTimer(g->win, T_REFRESH, 250, NULL);
@@ -1757,6 +2050,7 @@ void smp_gui_close(Plug *P) {
   Gui *g = P ? P->gui : NULL;
   if (!g) return;
   g->closing = true;
+  if (g->br_playing[0]) smp_plug_preview(P, NULL);   /* the browser's preview stops with it */
   P->gui = NULL; g->P = NULL;                 /* the plugin may be freed right after this */
   if (g->win) {
     KillTimer(g->win, T_REFRESH); KillTimer(g->win, T_OPEN);
@@ -1779,6 +2073,7 @@ static void gui_free(Gui *g) {
   if (g->ole_init) OleUninitialize();
   if (g->font) DeleteObject(g->font);
   free(g->dropped);
+  br_clear(g); free(g->br);
   memset(g, 0xDD, sizeof *g);                 /* a use after free shows up as garbage, not as old values */
   free(g);
 }

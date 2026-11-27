@@ -335,12 +335,14 @@ static void p_deactivate(const clap_plugin_t *p) {
   P->active = 0;
   if (P->e) smp_multi_collect(P->e, 1);      /* nothing processes now */
   if (P->s) smp_synth_collect_now(P->s);  /* nothing processes now: every replaced font can close */
+  smp_plug_preview_collect(P);           /* and the preview stops */
 }
 
 static void p_destroy(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   smp_gui_close(P);                      /* a host that didn't destroy the window first */
   loader_stop(P);                        /* a window load still decoding is cancelled */
+  smp_plug_preview_free(P);
   smp_multi_free(P->e);
   smp_synth_free(P->s);                  /* here, on the main thread, never at DLL unload (it may join the loader) */
   free(P->text); free(P->scratch); free(P->fade_buf); free(P->sf_line); free(P->sf_used); free(P->sf_knobs);
@@ -610,6 +612,9 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
     else for (i = 0; i < n; i++) { l[i] += P->fade_buf[i]; r[i] += P->fade_buf[P->maxf + i]; }
   } else if (P->s) smp_synth_skip(P->s, (int)n);   /* it still takes its font, so replaced ones close */
 done:
+  if (pr->audio_outputs_count && pr->audio_outputs[0].data32 && pr->audio_outputs[0].channel_count)
+    smp_plug_preview_mix(P, pr->audio_outputs[0].data32[0],
+                         pr->audio_outputs[0].channel_count > 1 ? pr->audio_outputs[0].data32[1] : NULL, n);
   emit_gui_params(P, pr->out_events);
   if (P->collect_left > 0) {
     P->since += n;
@@ -621,6 +626,7 @@ done:
 static void p_main(const clap_plugin_t *p) {
   Plug *P = p->plugin_data;
   if (smp_plug_poll_load(P) && P->gui) smp_gui_loaded(P);   /* a window load finished: swapped in here */
+  smp_plug_preview_collect(P);
   if (P->e) smp_multi_collect(P->e, !P->active);
   if (P->collect_left > 0) InterlockedDecrement(&P->collect_left);
   /* a replaced font closes once the audio thread has let go of it: keep asking until it has */

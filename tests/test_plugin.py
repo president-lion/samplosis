@@ -757,13 +757,12 @@ def test_gui_closed_during_dialog(P, tmp_path, settings_file):
         os.replace(tmp_path / n, d / n)
     text = P.script(d / "b.wav")
     c = d / "c.wav"
-    out = gui(P, tmp_path, text, ["dialog pick %s" % c, "focus Add samples", "key enter", "read Sample", "say"])
-    assert got(out, "read")[0][1].startswith("c.wav, ")
-    assert got(out, "focus")[-1][:2] == ["Button", "Add samples"]
-    out = gui(P, tmp_path, text, ["dialog closegui %s" % c, "focus Add samples", "key enter", "pump 600", "state", "alive"])
-    assert ('state: sample "%s"' % (d / "b.wav")) in out          # not loaded: the window had gone
+    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "dialog closegui %s" % c, "focus Browse for FFmpeg",
+                                  "key enter", "pump 600", "state", "alive"])
+    assert ('state: sample "%s"' % (d / "b.wav")) in out
     assert "alive: plugin\n" in out and "closed" in out
-    out = gui(P, tmp_path, text, ["dialog destroy %s" % c, "focus Add samples", "key enter", "pump 600", "alive"])
+    out = gui(P, tmp_path, text, ["focus Settings", "key enter", "dialog destroy %s" % c, "focus Browse for FFmpeg",
+                                  "key enter", "pump 600", "alive"])
     assert "alive: plugin destroyed" in out and "closed" in out
     # the Settings page's Browse folder
     new = tmp_path / "cache2"
@@ -863,8 +862,7 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
                                   # each page's Browse loads its own kind, whatever the file
                                   "dialog pick %s" % wav, "focus Browse", "key enter", "read SoundFont",
                                   "read Status", "state sample", "counts",
-                                  "key tab ctrl", "dialog pick %s" % (d / "a.sf2"), "focus Add samples", "key enter",
-                                  "read Sample", "read Status", "state plays", "counts",
+                                  "key tab ctrl",
                                   # a dropped .sfz and .dls go to the SoundFont tab; File lists every instrument kind
                                   "drop %s" % (k / "kit.sfz"), "say", "read SoundFont", "list File",
                                   "read Status", "drop %s" % wav, "say", "drop %s" % (k / "bank.dls"), "say",
@@ -889,21 +887,17 @@ def test_gui_soundfont_browse_and_drop(P, tmp_path):
     # a wav through the SoundFont page's Browse: the SoundFont player's error; the sample stays
     assert r[8] == "B.sf2, 6 presets" and r[9].startswith("Can't load drop A3.wav: ") and c[1] == "beeps 1"
     assert st[3].startswith('sample "%s"' % wav)
-    # a .sf2 through the Sampler page's Add samples: the sampler's error; the sampler still plays its sample
-    assert r[10].startswith("drop A3.wav, ") and r[11].startswith("Can't load a.sf2: ")
-    assert r[11].endswith(". Still playing drop A3.wav."), r[11]       # the failure says what still plays
-    assert st[4] == "plays sampler" and c[2] == "beeps 2"
     assert f[-3] == ["Tab", "Player", "SoundFont"], out              # a dropped .sfz: the SoundFont tab
-    assert r[12] == "kit.sfz, SFZ, 1 preset", out
+    assert r[10] == "kit.sfz, SFZ, 1 preset", out
     assert got(out, "list")[1] == ["File", "bank.dls", "g.gig", "h.dspreset", "hh.dslibrary", "i.sf4", "j.sf2pack", "k.exs",
                                    "kit.sfz", "l.sbk", "m.sf2", "n.sf3"], out    # every kind; notes.txt and o.wav aren't
-    assert r[13].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[13].startswith("Loading samples")
-    assert r[13].endswith(". Missing 1 sample (first: gone.wav). "
+    assert r[11].startswith("Ready: kit.sfz, SFZ, 1 preset. ") or r[11].startswith("Loading samples")
+    assert r[11].endswith(". Missing 1 sample (first: gone.wav). "
                           "Ignored 1 SFZ setting it doesn't support (first: foo_bar)"), out
     assert f[-2] == ["Tab", "Player", "Sampler"]
     assert f[-1] == ["Tab", "Player", "SoundFont"], out              # a dropped .dls: the SoundFont tab
-    assert r[14] == "bank.dls, DLS, 5 presets", out
-    assert c[3] == "beeps 2", out
+    assert r[12] == "bank.dls, DLS, 5 presets", out
+    assert c[2] == "beeps 1", out
 
 
 def test_gui_sfz_loads_in_background(P, tmp_path):
@@ -1208,6 +1202,11 @@ def test_state_new_file_resets_knobs(P, tmp_path):
 
 
 # ---- the Sampler's samples: several in one instrument ----
+def browse_add(folder):
+    """Add samples in the file browser: the Folder box goes to folder, Ctrl+A picks every sound there, Enter adds."""
+    return ["focus Add samples", "key enter", "focus Folder", "type %s" % folder, "key enter", "key a ctrl", "key enter"]
+
+
 def tone(tmp_path, name, freq, secs=0.8, rate=44100):
     f = tmp_path / name
     t = np.arange(int(secs * rate)) / rate
@@ -1274,8 +1273,9 @@ def test_gui_sample_ranges(P, tmp_path):
 
 def test_gui_add_and_remove_samples(P, tmp_path):
     a = tone(tmp_path, "a C3.wav", 220)
-    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
-    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Add samples", "key enter",
+    (tmp_path / "more").mkdir()
+    b, c = tone(tmp_path / "more", "b D3.wav", 330), tone(tmp_path / "more", "c E3.wav", 440)
+    out = gui(P, tmp_path, P.script(a), browse_add(tmp_path / "more") + [
                                          "list Samples", "read Samples", "read Sample", "focus Remove sample",
                                          "key enter", "list Samples", "read Samples", "focus Samples", "key delete",
                                          "list Samples", "state sample", "counts"])
@@ -1317,11 +1317,11 @@ def test_gui_drop_several(P, tmp_path):
 
 
 def test_gui_some_samples_fail(P, tmp_path):
-    a = tone(tmp_path, "a C3.wav", 220)
-    bad = tmp_path / "bad.wav"
+    (tmp_path / "in").mkdir()
+    a = tone(tmp_path / "in", "a C3.wav", 220)
+    bad = tmp_path / "in" / "bad.wav"
     bad.write_bytes(b"not a wav")
-    out = gui(P, tmp_path, "keep_length off\n", ["dialog pick %s|%s" % (bad, a), "focus Add samples", "key enter",
-                                                 "list Samples", "read Status", "counts"])
+    out = gui(P, tmp_path, "keep_length off\n", browse_add(tmp_path / "in") + ["list Samples", "read Status", "counts"])
     assert [x.split(",")[0] for x in got(out, "list")[0][1:]] == ["a C3.wav"]
     assert got(out, "read")[0][1].startswith("Can't load bad.wav: ")
     assert got(out, "counts")[0][0] == "beeps 1"
@@ -1425,9 +1425,9 @@ def test_gui_samples_ctrl_keys(P, tmp_path):
 
 def test_gui_add_selects_the_new_ones(P, tmp_path):
     a = tone(tmp_path, "a C3.wav", 220)
-    b, c = tone(tmp_path, "b D3.wav", 330), tone(tmp_path, "c E3.wav", 440)
-    out = gui(P, tmp_path, P.script(a), ["dialog pick %s|%s" % (b, c), "focus Add samples", "key enter",
-                                         "picked Samples"])
+    (tmp_path / "more").mkdir()
+    tone(tmp_path / "more", "b D3.wav", 330), tone(tmp_path / "more", "c E3.wav", 440)
+    out = gui(P, tmp_path, P.script(a), browse_add(tmp_path / "more") + ["picked Samples"])
     assert got(out, "picked")[0] == ["Samples", "1 2"]
 
 
