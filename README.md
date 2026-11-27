@@ -27,6 +27,7 @@ Every single parameter in the plugin maps to a REAPER automation parameter, and 
 * **Keep Length:** Uses time-stretching (choose between Signalsmith Stretch or Rubber Band) so that notes played across different keys retain their natural length instead of speeding up or slowing down.
 * **Background Rendering:** Pitch-shifted copies are generated asynchronously in the background and cached to disk so they are ready instantly when you play.
 * **Multi-Sample Support:** Load up to 128 samples per instance. Give each its own key range, velocity split, and playback mode.
+* **Auto-Mapping by File Name:** Add files named for their notes and dynamics (e.g., `Ab3P.wav`, `Ab3MF.wav`, `C4_ff.wav`) and Samplosis maps them for you. Each note covers the keys halfway to its neighbours, and a note's dynamics (ppp to fff) become velocity layers, softest lowest. The status tells you what it did, e.g. "mapped to 6 notes in up to 2 velocity layers". Files without a note in their name are left alone.
 
 ### The SoundFont / Instrument Player
 * **Streaming:** Instead of hogging RAM, large instruments stream audio directly from disk. Only the first quarter-second of a sample is kept in memory to eliminate latency on note-on; the rest streams seamlessly.
