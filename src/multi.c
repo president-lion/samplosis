@@ -315,6 +315,44 @@ SMP_API int smp_multi_set_range(SmpMulti *m, int i, int klo, int khi, int vlo, i
   sync_zone(m, z);
   return 1;
 }
+/* every sample whose file name gives a note: its note's keys reach halfway to the next sampled notes (the lowest
+   down to C-1, the highest up to G9), and the samples on one note split velocity 1..127, softest lowest (no dynamic
+   ranks as mf; ties keep the list's order). Returns how many notes; *layers the most samples on one */
+SMP_API int smp_multi_map_by_name(SmpMulti *m, int *layers) {
+  int note[SMP_MULTI_MAX], dyn[SMP_MULTI_MAX], notes[SMP_MULTI_MAX], nn = 0, most = 0, i, k;
+  if (layers) *layers = 0;
+  if (!m) return 0;
+  for (i = 0; i < m->n; i++) {
+    note[i] = smp_note_from_filename(m->z[i]->path);
+    dyn[i] = smp_dynamic_from_filename(m->z[i]->path);
+    if (!dyn[i]) dyn[i] = 5;
+    if (note[i] >= 0) {                  /* the distinct notes, kept sorted */
+      int at = 0;
+      while (at < nn && notes[at] < note[i]) at++;
+      if (at == nn || notes[at] != note[i]) {
+        memmove(&notes[at + 1], &notes[at], sizeof notes[0] * (size_t)(nn - at));
+        notes[at] = note[i]; nn++;
+      }
+    }
+  }
+  for (i = 0, k = 0; i < m->n; i++) k += note[i] >= 0;
+  if (k < 2) return 0;                   /* one named sample: nothing to map it against (its ranges stay) */
+  for (k = 0; k < nn; k++) {
+    int lo = k ? (notes[k - 1] + notes[k]) / 2 + 1 : 0, hi = k + 1 < nn ? (notes[k] + notes[k + 1]) / 2 : 127;
+    int L = 0, j, r;
+    for (i = 0; i < m->n; i++) L += note[i] == notes[k];
+    if (L > most) most = L;
+    for (i = 0; i < m->n; i++) {
+      if (note[i] != notes[k]) continue;
+      for (r = 0, j = 0; j < m->n; j++)  /* its layer: the softer ones, and equals before it */
+        if (note[j] == notes[k] && (dyn[j] < dyn[i] || (dyn[j] == dyn[i] && j < i))) r++;
+      smp_multi_set_range(m, i, lo, hi, 1 + r * 127 / L, (r + 1) * 127 / L);
+    }
+  }
+  if (layers) *layers = most;
+  return nn;
+}
+
 SMP_API int smp_multi_key_class(const SmpMulti *m, int i) { return m && i >= 0 && i < m->n ? m->z[i]->pc : 0; }
 SMP_API int smp_multi_set_key_class(SmpMulti *m, int i, int pc) {
   Zone *z;

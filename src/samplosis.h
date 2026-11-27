@@ -202,6 +202,11 @@ SMP_API const char *smp_multi_why(const SmpMulti *m, int i);           /* why a 
 SMP_API void smp_multi_range(const SmpMulti *m, int i, int *key_lo, int *key_hi, int *vel_lo, int *vel_hi);
 SMP_API int smp_multi_set_range(SmpMulti *m, int i, int key_lo, int key_hi, int vel_lo, int vel_hi);   /* keys 0 to
                                     127, velocities 1 to 127, each low not above its high; 0 when they aren't */
+/* maps every sample whose file name gives a note ("Ab3P.wav"): its note's keys reach halfway to the next sampled
+   notes (the lowest from C-1, the highest to G9), when two or more are named so; the samples on one note split velocity 1..127 by their dynamics
+   (ppp..fff, none counting as mf), softest lowest. Returns the notes mapped (0: none); *layers (may be NULL) the
+   most samples on one note */
+SMP_API int smp_multi_map_by_name(SmpMulti *m, int *layers);
 /* a sample that plays some notes in every octave (every D and F, say): a bit per note, bit 0 C to bit 11 B, or 0 for
    a range of keys (setting a range ends it); smp_multi_range then gives its lowest and highest key */
 SMP_API int smp_multi_key_class(const SmpMulti *m, int i);

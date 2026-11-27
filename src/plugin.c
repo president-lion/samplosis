@@ -850,6 +850,18 @@ static int take_samples(Plug *P, SmpSample **ss, int n, int how, int index) {
   t = engine_text(P->e);
   if (t) { free(P->text); P->text = t; }
   if (P->missing) missing_status(P, P->missing); else ready_status(P);
+  if (how != SMP_LOAD_ONE && first >= 0) {   /* samples named for their notes map themselves (and the rest named so) */
+    char path[1100]; int named = 0, notes, layers;
+    for (i = first; i < first + took; i++) { smp_multi_path(P->e, i, path, sizeof path); named |= smp_note_from_filename(path) >= 0; }
+    if (named && (notes = smp_multi_map_by_name(P->e, &layers)) > 0) {
+      size_t len = strlen(P->status);
+      if (layers > 1) snprintf(P->status + len, sizeof P->status - len, ", mapped to %d note%s in up to %d velocity layers",
+                               notes, notes == 1 ? "" : "s", layers);
+      else snprintf(P->status + len, sizeof P->status - len, ", mapped to %d note%s", notes, notes == 1 ? "" : "s");
+      t = engine_text(P->e);
+      if (t) { free(P->text); P->text = t; }
+    }
+  }
   P->bad = 0;
   tell_host(P, SMP_P_ROOT);
   mark_dirty(P);
